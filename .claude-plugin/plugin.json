@@ -1,0 +1,16 @@
+{
+  "name": "claude-tabstatus",
+  "version": "0.1.0",
+  "description": "Puts the Claude Code session state into the terminal tab title as a coloured dot in front of the location, so a tab reads \"working\", \"waiting\" or \"idle\" at a glance without losing where it is.",
+  "author": {
+    "name": "dalf"
+  },
+  "license": "MIT",
+  "keywords": [
+    "terminal",
+    "tab-title",
+    "status",
+    "konsole",
+    "osc"
+  ]
+}

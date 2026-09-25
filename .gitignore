@@ -1,0 +1,10 @@
+# settings.json backups and scratch files, if anyone runs the installer from
+# inside the repo (CLAUDE_CONFIG_DIR=.)
+*.cctab-*
+*.bak-*
+claude-tabstatus.state
+
+# editor and OS noise
+*.swp
+*~
+.DS_Store
