@@ -5,16 +5,53 @@ location, so a row of tabs tells you which session wants you without losing
 track of where each one is.
 
 ```text
-🔵 streaming-browser     working  - Claude is running
-🟠 streaming-browser     waiting  - Claude needs an answer
-⚪ streaming-browser     idle     - Claude has stopped
-⚪ ~                     at $HOME
-⚪ /                     at the filesystem root
+🔵 streaming-browser@master       working  - Claude is running
+🟠 streaming-browser@master       waiting  - Claude needs an answer
+⚪ streaming-browser@master       idle     - Claude has stopped
+⚪ srv:streaming-browser@master   the same session, over ssh
+⚪ ~/code/bug_fedora              not a repo, so the path instead
+⚪ ~                              at $HOME
 ```
 
-The location in this slice is the basename of the working directory. Richer
-locations (`repo@branch`, an ssh host prefix) are listed under
-[Slices](#slices) below.
+## Location
+
+Inside a git repository the location is `<repo>@<branch>`, and the
+subdirectory is deliberately not shown: the branch is the thing that changes
+under you, and every tab of the same repo staying recognizably the same tab is
+the point. Outside a repository there is no branch to show, so the location is
+the whole home-relative path instead of just a basename.
+
+| Situation | Location |
+|---|---|
+| in a repo, any subdirectory of it | `streaming-browser@master` |
+| a branch name with slashes | `claude-tabstatus@feature/tab-title` |
+| a detached HEAD | `streaming-browser@b56583d` |
+| a linked worktree, or a submodule | its own directory name and its own branch |
+| not a repo, under `$HOME` | `~/code/bug_fedora` |
+| not a repo, elsewhere | `/srv/www` |
+| `$HOME` itself | `~` |
+| over ssh | `srv:` in front of any of the above |
+
+**A local session has no prefix at all** - that absence is how you recognize
+it. Only `SSH_CONNECTION` or `SSH_TTY` puts a host in front.
+
+Long locations are elided to 32 columns, and the two forms lose different
+ends, because different halves carry the information:
+
+```text
+~/code/one/two/three/four/five/six   ->  …/two/three/four/five/six
+repo@some-very-long-branch-name      ->  repo@some-very-long-branch-nam…
+```
+
+A path is cut at the front on a component boundary, so both Konsole (which
+elides from the left) and Windows Terminal (which truncates from the right)
+show the same informative tail. See [Location tuning](#location-tuning) to
+change the cap.
+
+The repository is found by walking up for a `.git`, reading `.git/HEAD`
+directly and parsing it with shell parameter expansion. `git` is never
+executed: one `git rev-parse` costs 15-40ms, where the whole location costs
+about 0.12ms, and a later slice will run this on every tool call.
 
 ## Install
 
@@ -140,14 +177,97 @@ terminal that honours a plain OSC 0 title.
   (`claude -p ... | jq`, or a call from a script) is detected as headless and
   skipped. A `-p` run killed before `SessionEnd` leaves the tab armed, as
   above.
-- **A working directory whose name is not valid UTF-8** (legal on Linux)
-  produces a hook line that is not valid JSON, because JSON text must be UTF-8.
-  Quotes, backslashes and control characters are stripped; invalid byte
-  sequences are not, because the only cheap way to detect them would also cost
-  a fork for every perfectly good accented or emoji directory name.
+- **A working directory, branch or hostname whose name is not valid UTF-8**
+  (legal on Linux) produces a hook line that is not valid JSON, because JSON
+  text must be UTF-8. Quotes, backslashes and control characters are stripped
+  from all three; invalid byte sequences are not, because the only cheap way to
+  detect them would also cost a fork for every perfectly good accented or emoji
+  name.
 - Konsole's tab bar elides from the left, so a very narrow tab could in
-  principle clip the leading dot. Measured budget is ~49-60 columns against
-  titles of ~27-37, so in practice it survives.
+  principle clip the leading dot. Measured budget is ~49-60 columns. A local
+  title is ~27-37 columns; over ssh the host prefix adds its own width, which is
+  why the host carries a cap of its own (`CCTAB_MAX_HOST`, default 16) - without
+  one, a 63-character single-label cloud hostname rendered a 91-column title and
+  Windows Terminal, which truncates from the right, showed the host and nothing
+  else.
+- **A `.git` that is not a working repository is not one here either.** An
+  empty `.git` directory, a `gitdir:` pointer to somewhere that no longer
+  exists, or a `HEAD` that does not parse all fall through to the path form,
+  and the walk continues upward - the same thing git does. `/tmp/.git` exists
+  on more machines than you would expect, and without this every path under
+  `/tmp` would claim to be a repo called `tmp`.
+- **The branch is read from `HEAD`, not resolved.** That is the branch you are
+  on, which is what a tab should say, but it means a location can be a branch
+  that has no commits yet, and `@` in a branch name is not escaped. A `HEAD`
+  pointing outside `refs/heads/` keeps its namespace minus the `refs/` prefix,
+  so a bisect reads `bisect/bad` and a detached checkout reads a 7-character
+  short sha. A first line longer than 255 bytes is not treated as a `HEAD` at
+  all - no real one is, and the parse is not free on a huge string - so the walk
+  continues past it and the tab shows the path.
+- **An exported `GIT_DIR` wins over the walk**, exactly as it does for git, so
+  every tab of a shell that exports one (a habit for bare dotfiles repos) reads
+  that repository regardless of the working directory. Unset it per session if
+  that is not what you want.
+- **The repository is found on the physical path.** A working directory reached
+  through a symlink is resolved with `cd -P .` before the walk - fork-free - so
+  the tab reports the same repository and branch `git` does, and names it after
+  the real toplevel rather than after the symlink. The `~` abbreviation still
+  uses the logical path, so a distro whose `/home` is a symlink keeps its `~`.
+- **The location cap counts what the running shell counts.** The unit is bytes
+  unless the shell has multibyte support *and* the locale is UTF-8: bash and
+  BusyBox ash count characters in a UTF-8 locale, dash counts bytes always. So a
+  non-ASCII path elides soonest under dash, and under any shell in the C locale.
+  The cap also budgets one column for the ellipsis, so a multi-column
+  `CCTAB_ELLIPSIS` overshoots it by its extra width.
+- **A location containing non-ASCII characters is never cut mid-string**, only
+  at a `/`. Cutting by count is only safe where the unit is a byte *and* a
+  character, and a half-written UTF-8 sequence would be invalid JSON. So an
+  accented or emoji name with no `/` left to cut at keeps its full length and
+  the terminal elides it instead. The one hard ceiling is 256 units: the
+  quote-and-control-character stripper is a quadratic shell loop, so it stops
+  there and marks the cut rather than spending seconds on a name nobody can
+  read - dropping any trailing high bytes first, so even that cut lands on a
+  character boundary.
+- **The ssh hostname comes from `/proc/sys/kernel/hostname`**, which keeps it
+  fork-free on Linux. Elsewhere it falls back to `$HOSTNAME` and then to a
+  `hostname` fork; set `CCTAB_HOST` to skip the guessing. If none of the three
+  answers, the prefix becomes a literal `ssh:` rather than nothing, because no
+  prefix means "local".
+
+## Glyph position
+
+Konsole's tab bar elides the label from the **left**, so a leading glyph is the
+first thing cut - a 23-cell title in a 19-cell tab renders `…de-tabstatus@main`
+with the dot gone. Windows Terminal truncates from the **right**. So the glyph
+goes on whichever end that terminal preserves:
+
+| Terminal | Position | Crushed to 19 cells |
+|---|---|---|
+| Konsole (detected automatically) | last | `…tatus@main ⚪` |
+| Windows Terminal, and anything unrecognised | first | `⚪ claude-tabst…` |
+
+Detection uses `KONSOLE_VERSION` / `KONSOLE_DBUS_SESSION`, and is deliberately
+suppressed inside `tmux` or `screen`, where those variables leak in from
+whichever terminal first started the server and say nothing about the one
+drawing the tab.
+
+**Over ssh the local terminal cannot be detected** - its variables do not
+travel - so a remote session defaults to `prefix`. If you ssh *from* Konsole,
+set the override in the remote shell:
+
+```sh
+CCTAB_GLYPH_POS=suffix   # last; what Konsole is given automatically
+CCTAB_GLYPH_POS=prefix   # first; the default when the terminal is unknown
+CCTAB_GLYPH_POS=both     # both ends, immune to either, costs two columns
+```
+
+An unrecognised value falls back to `prefix`.
+
+Konsole's elide direction is not configurable: it is
+`QTabBar::setElideMode(Qt::ElideLeft)` at one hardcoded call site, with no
+config key and nothing a Qt stylesheet can override. Widening the tabs
+(*Settings -> Configure Konsole -> Tab Bar*, or `setTabWidthToText false` over
+D-Bus) buys room but is undone by opening more tabs.
 
 ## Glyphs
 
@@ -161,6 +281,27 @@ CCTAB_GLYPH_IDLE="."
 ```
 
 Setting one to the empty string drops the glyph and its separating space.
+
+## Location tuning
+
+```sh
+CCTAB_MAX_LOCATION=32   # columns before the location is elided; 0 = no limit
+CCTAB_MAX_HOST=16       # columns for the ssh host prefix; 0 = no limit
+CCTAB_ELLIPSIS="…"      # the elision marker; "..." for an ASCII-only terminal
+CCTAB_HOST="srv"        # the ssh prefix, instead of this machine's hostname
+```
+
+`CCTAB_MAX_LOCATION` bounds **the location only**, not the whole title: the
+rendered title is that plus 3 columns for the glyph and its space, plus
+`host:` on an ssh session. So sizing it to a tab width undershoots by 3 columns
+locally and by the host width again over ssh - size the two caps together. It is
+clamped up to 8, and a non-numeric value falls back to the default.
+
+`CCTAB_MAX_HOST` is clamped up to 4 and behaves the same way. `CCTAB_HOST` loses
+everything from the first dot, so `srv.example.com` still renders as `srv:`,
+unless the name is all digits and dots, where `192.168.1.5` would otherwise
+become `192:`. It is still only used when `SSH_CONNECTION` or `SSH_TTY` says this
+is an ssh session, so exporting it globally is safe.
 
 ## Tests
 
@@ -181,19 +322,28 @@ assertion goes through `CCTAB_DRY_RUN=1` (which prints the computed title and
 emits nothing) or runs with `CLAUDE_PID` unset.
 
 ```sh
-CCTAB_DRY_RUN=1 sh scripts/tabstatus.sh working   # -> 🔵 claude-tabstatus
+CCTAB_DRY_RUN=1 sh scripts/tabstatus.sh working   # -> 🔵 claude-tabstatus@main
 ```
+
+The repository fixtures are hand-built - a `.git` directory and a one-line
+`HEAD` - so the suite needs no git binary and can assert HEAD bytes that git
+will not write on request, such as a missing trailing newline or a CRLF line
+ending. A cross-check against a real `git init`, `git worktree add` and
+`git checkout --detach` runs at the end when a git binary happens to be
+present, and is skipped, not failed, when it is not.
 
 ## Slices
 
-Built here (slice 1): the plugin skeleton, four hook edges
-(`SessionStart`, `UserPromptSubmit`, `Stop`, `SessionEnd`), Konsole per-tab
-arming and restore, and the location as the working directory's basename.
+Built in slice 1: the plugin skeleton, four hook edges (`SessionStart`,
+`UserPromptSubmit`, `Stop`, `SessionEnd`), and Konsole per-tab arming and
+restore.
+
+Built in slice 2: the real location - `repo@branch` from a fork-free `.git`
+walk, the home-relative path outside a repo, the left-eliding length cap, and
+the ssh host prefix. See [Location](#location).
 
 **Not yet built:**
 
-- `repo@branch` - the git repository name and current branch as the location.
-- An ssh hostname prefix, e.g. `srv:streaming-browser@master`.
 - A tmux branch, for when the session is inside tmux rather than a bare tab.
 - The full 13-edge state machine. Today's four edges cannot see a tool call, a
   permission prompt, or a notification, which is why `waiting` is implemented
