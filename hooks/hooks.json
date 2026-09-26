@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh\" session-start",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/tabstatus\" session-start",
             "timeout": 5
           }
         ]
@@ -18,7 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh\" working",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/tabstatus\" working",
             "timeout": 5
           }
         ]
@@ -30,7 +30,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh\" waiting",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/tabstatus\" waiting",
             "timeout": 5
           }
         ]
@@ -41,7 +41,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh\" waiting",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/tabstatus\" waiting",
             "timeout": 5
           }
         ]
@@ -52,7 +52,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh\" working",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/tabstatus\" working",
             "timeout": 5
           }
         ]
@@ -63,7 +63,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh\" working",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/tabstatus\" working",
             "timeout": 5
           }
         ]
@@ -74,7 +74,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh\" notify",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/tabstatus\" notify",
             "timeout": 5
           }
         ]
@@ -85,7 +85,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh\" idle",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/tabstatus\" idle",
             "timeout": 5
           }
         ]
@@ -96,7 +96,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh\" idle",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/tabstatus\" idle",
             "timeout": 5
           }
         ]
@@ -107,7 +107,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh\" session-end",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/tabstatus\" session-end",
             "timeout": 1
           }
         ]

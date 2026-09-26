@@ -1,0 +1,264 @@
+claude-tabstatus golden corpus
+==============================
+
+What this is
+------------
+A frozen, machine-readable record of what scripts/tabstatus.sh DOES, so the Rust
+port can be proven byte-identical instead of believed to be. 292 cases.
+
+    sh mkfixtures.sh                     rebuild the fixture tree from scratch
+    sh replay.sh <target>                replay every case against <target>
+    sh replay.sh -v -k notify <target>   verbose, only ids containing "notify"
+    python3 gencases.py                  RE-FREEZE the corpus (see below)
+
+<target> is run under /bin/sh when it is a script and executed directly when it
+is a binary. That is the only difference between replaying the shell and
+replaying the port.
+
+    sh replay.sh /home/alexandre/code/claude-tabstatus/bin/tabstatus
+      -> 292 passed, 0 failed, 0 diverged as expected
+
+The shell implementation no longer exists as scripts/tabstatus.sh: the binary
+took over hooks.json and the script was deleted. The byte-identical copy that
+froze this corpus is kept in the repo at ../oracle/tabstatus.sh - sha256
+9d08ff74c23f31bab07ad4fc7b9e357d9aa082dc0bf8e6dcc71043a1d2cf67e5, which is what
+`git show <the deleting commit>^:scripts/tabstatus.sh` hashes to - and that is
+what gencases.py runs. ../oracle/run.sh is the shell-era test suite beside it.
+
+WHERE THE FIXTURES LIVE. Not here. mkfixtures.sh builds them under
+$TMPDIR/cctab-corpus/fixtures, and $CCTAB_FIXTURES overrides that. The reason is
+not tidiness: the corpus HOME is the fixture root, and tabstatus walks UP from the
+cwd looking for a .git, so a fixture tree inside a checkout makes every location
+case answer `repo@branch` instead of `~/...`. When this corpus first moved into
+tests/ with its fixtures beside it, 86 of the cases failed for exactly that
+reason. Keep the tree out of any git repository.
+
+Reference point
+---------------
+Frozen against /bin/sh, which on this machine is bash 5.x, in LC_ALL=C.UTF-8,
+on Linux with /proc. That is the production invocation: hooks.json runs
+`sh "${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh" <edge>`.
+
+CCTAB_REPLAY_SH=/path/to/dash sh replay.sh <script.sh> replays a SCRIPT under
+another interpreter. Under dash, exactly 2 of the 292 cases differ from bash,
+and both are already flagged `diverge` - which is the measured extent of the
+count-unit problem (README limitations 3 and 4).
+
+Files
+-----
+    cases.jsonl        one JSON object per line, one case each
+    mkfixtures.sh      rebuilds the fixture tree under $TMPDIR (POSIX sh, no git,
+                       idempotent)
+    gencases.py        declares the cases and re-freezes cases.jsonl from the
+                       shell oracle at ../oracle/tabstatus.sh
+    refreeze_fixed.py  re-records ONLY the cases a deliberate fix changes, named
+                       one by one in its FIXED table, and drops their `diverge`
+                       flag. Every other line is copied through byte for byte.
+    replay.py          the comparison engine
+    replay.sh          the entry point replay.py is meant to be called through
+    runner.py          shared execution core (execve, pty, pidfile helpers)
+
+Case schema
+-----------
+    id          stable name; also the label replay prints
+    argv        argv[1:] handed to the implementation
+    env         the COMPLETE environment. execve gets exactly this and nothing
+                else, so no ambient KONSOLE_VERSION, SSH_TTY, TMUX, LANG or PATH
+                can change the answer.
+    cwd         relative to fixtures/, or absolute when it starts with /
+    stdin       the hook payload, "" for none
+    stdin_file  a fixture path, used instead of stdin for the 256KB payload
+    stdout      expected bytes; stdout_b64 instead when they are not valid UTF-8
+    stderr      same. Every case in this corpus expects EMPTY stderr.
+    exit        expected status. Every case expects 0 - that is the hook
+                contract: a non-zero PreToolUse hook can block a tool.
+    mode        pipe (default) | pty | pidfile, see below
+    pty_out     for a pty case: the bytes written to the pty, base64 when needed
+    host_token  the expectation carries @@SHORTHOST@@
+    diverge     the Rust port is EXPECTED to change this case. Named after the
+                limitation it fixes. Counted and printed separately; never fails
+                the run. NO CASE CARRIES THIS ANY MORE - see the fix amendment.
+    fixed       this case was re-recorded from the binary because a deliberate
+                fix changed it, and the text names the fix. It is now the
+                specification, not a known deviation.
+    note        why the case exists, when that is not obvious
+
+Tokens, expanded by the runner in env values, cwd, stdin and in the expectation:
+
+    @@FIX@@         the absolute fixtures directory
+    @@SHORTHOST@@   this machine's hostname up to the first dot
+    @@PID_PTY@@     pid of a helper whose fd 1 is a freshly allocated pty
+    @@PID_FILE@@    pid of a helper whose fd 1 is a regular file
+
+Everything else is literal bytes. A lone \uXXXX surrogate escape in the JSON is
+an invalid-UTF-8 byte carried through surrogateescape.
+
+The three modes
+---------------
+    pipe     stdin is the payload, stdout/stderr captured.
+    pidfile  a helper is spawned whose fd 1 is a REGULAR FILE and its pid goes
+             into CLAUDE_PID. That is the redirected `claude -p` shape the
+             headless guard must refuse.
+    pty      a helper is spawned whose fd 1 is a pty, and whatever the
+             implementation writes to that pty is captured. This is the ONLY way
+             to cover session-start and session-end, which write the pty
+             directly; tests/run.sh cannot allocate one and says so. The pty is
+             put in raw mode and REFUSED if the kernel offers /dev/pts/0 ..
+             /dev/pts/5, which are this user's live Konsole tabs.
+
+The pty cases are the ones that pin the Konsole arming and restore byte for
+byte, including the compiled-in defaults the session-end path writes back:
+
+    session-start, Konsole:
+      ESC ]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w BEL ESC ]0;<title> BEL
+    session-end, Konsole:
+      ESC ]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H BEL ESC ]0; BEL
+    either, not Konsole:
+      ESC ]0;<title or empty> BEL
+
+Re-freezing
+-----------
+python3 gencases.py RUNS the reference shell script once per case and overwrites
+cases.jsonl with whatever it produced. Do that only to ADD cases, never to make
+a failing port pass: `git diff` on cases.jsonl is the review.
+
+Known gaps
+----------
+ 1. The $HOSTNAME and `hostname` fallbacks in section 1e are unreachable while
+    /proc/sys/kernel/hostname is readable, which on Linux it always is. One case
+    pins that precedence (ssh-hostname-env-loses-to-proc); the two fallback
+    branches themselves are uncovered.
+ 2. Timing is not captured. Limitation 5 (a 1MB payload costs 159ms under dash,
+    300ms under busybox ash) shows up here only as a 256KB payload that produces
+    the right answer; the corpus cannot fail a slow implementation.
+ 3. No real Claude Code session. Which hook event maps to which edge is
+    hooks.json's contract and is asserted by tests/run.sh, not here.
+ 4. One machine-dependent value, the hostname, tokenized as @@SHORTHOST@@ for
+    the four cases that read it.
+ 5. The corpus pins bash-as-sh. dash costs 2 flagged divergences; busybox ash
+    was not available on this machine to measure.
+
+Amendment, Rust port slice
+--------------------------
+Five cases were ADDED (loc-pwd-*-nonrepo, loc-pwd-dotdot-kept-verbatim), taking
+the corpus to 288 (292 after the notify tail-window cases). The six original loc-pwd-* cases all sit inside a repo, where
+the walk uses the physical path, so none of them could fail an implementation
+that trusts a stale inherited PWD - a differential fuzz against the shell caught
+that where the corpus could not. bash's set_pwd() keeps an inherited PWD only
+when it is absolute AND names the same directory as "." by device and inode, and
+keeps it VERBATIM when it does. The new cases pin both halves.
+
+Known remaining deviation of the Rust port, NOT a corpus case: a locale name
+whose codeset is UTF-8 but which is NOT INSTALLED (e.g. LC_ALL=xx_YY.UTF-8).
+bash's setlocale fails, it warns on stderr and falls back to byte counting; the
+port counts characters. Matching it needs setlocale(LC_ALL, ""), measured at
++187us per invocation against a 234us net hot path.
+
+
+Amendment, the five deliberate fixes
+------------------------------------
+The port was proven byte-identical first, and then the five limitations POSIX sh
+had caused were fixed. TEN cases were re-recorded from the binary with
+refreeze_fixed.py; nothing else in cases.jsonl moved, and cases.jsonl.before-fixes
+is the copy to diff against.
+
+  fix (a) bounded payload read: two 8 KiB WINDOWS of the first line, its front
+          and its back, with everything between them drained unsearched
+      Changes no PRE-EXISTING case, and it took four new ones to see at all.
+      The bound started as a front window only, and review found that silently
+      broke the notify edge rather than merely bounding it: Claude Code
+      serializes `notification_type` LAST, after `message`, and `message` is
+      unbounded - on an MCP elicitation the server writes it - so a message past
+      ~7.35 KB pushed the discriminator out of the window and the edge fell
+      through to painting nothing. Reproduced on a real capture: at msg=7400 the
+      shell painted orange and the front-window-only binary painted nothing.
+      The affected kinds are exactly the ones this Notification is the ONLY
+      signal for (elicitation_dialog, elicitation_url_dialog, agent_needs_input).
+
+      notify-{permission-prompt,idle-prompt,agent-needs-input,silent-kind}-after-
+      a-long-message are the four cases added for it, each a 9000-character
+      message with the kind after it. They are frozen from the SHELL like any
+      other case and are NOT divergences - the shell read the whole line and got
+      them right - so they pin the tail window to shell parity rather than to an
+      opinion. Measured cost of carrying a tail: a 1 MB Notification is 1.7ms and
+      a 4 MB payload 3.8-5.9ms on every edge, against a 5s hook timeout.
+
+      agent_id and `source` are read from the FRONT window only, and that is
+      deliberate rather than an oversight: real captures put agent_id at byte 760
+      of 1360 and `source` at 713 of 769, both before anything unbounded, while a
+      false positive on agent_id would silence every `working` repaint for the
+      rest of the session and the back of a PostToolUse payload is
+      `tool_response`, which can be an object whose keys are not escaped.
+
+  fix (b) agent_id on the working edge
+      stdin-subagent-posttooluse: '(blue) plain@master' -> nothing at all.
+      A background subagent's PostToolUse no longer repaints over an open
+      main-thread dialog. stdin-subagent-permissionrequest is deliberately
+      UNCHANGED: a subagent's dialog is still your dialog.
+
+  fix (c) a name that is not valid UTF-8 no longer breaks the JSON
+      hostile-invalid-utf8-path, hostile-invalid-utf8-path-json: both were
+      recorded as base64 because the bytes were not UTF-8 at all. Now
+      '(white) ~/bad<U+FFFD>utf8' and a terminalSequence line that parses.
+
+  fix (d) the cap counts characters in every locale
+      maxloc-nonascii-path-c-locale, maxloc-nonascii-components-c-locale: the
+      LC_ALL=C answers now equal the C.UTF-8 ones.
+      maxloc-nonascii-mixed-path and maxloc-nonascii-components-utf8-locale kept
+      their expectations and only lost the `diverge` flag: bash-as-sh in C.UTF-8,
+      which is what the corpus was frozen against, already counted characters -
+      they diverged only under dash.
+
+  fix (e) a location OUTSIDE PRINTABLE ASCII is cut like any other
+      maxloc-nonascii-path-exempt, maxloc-nonascii-branch-exempt,
+      maxhost-nonascii-host-exempt: all three were exempted from the cap and
+      overflowed; all three are now cut, on a character boundary.
+      "outside printable ASCII" and not "non-ASCII": the guard that went away was
+      one `case $s in *[!\ -~]*)`, which also exempted a location carrying an
+      ASCII control character or DEL. Those are capped now too. Harmless -
+      sanitize() deletes the control character a step later either way - but a
+      randomised differential produced ~150 extra differences per 600 cases the
+      moment \x01 and \x7f entered the name pool, so the narrower wording was
+      hiding an arm of the change.
+
+      The unit is a CHARACTER and not a COLUMN: a CJK or emoji location is now
+      cut, but to 32 characters, which can be 64 display columns, so a
+      wide-script tab still elides in the terminal. That is the policy, verified
+      against an independent oracle as implemented-as-specified; fixing it needs
+      an East-Asian width table the binary does not carry.
+
+Teeth, measured against mutants of the FIXED implementation (copies under
+scratchpad/mutants2, the repo untouched), corpus / tests-run.sh:
+
+    agent_id check removed          1 / 4 fail
+    UTF-8 repair removed            1 / 5 fail   (only the dry-run case: the
+                                                  writer's own escape keeps the
+                                                  JSON line valid - belt and
+                                                  braces, and each half is
+                                                  caught separately)
+    non-ASCII cap exemption back    3 / 7 fail
+    locale-dependent counting back  2 / 3 fail
+    payload bound raised to 64 MB   0 / 4 fail
+    tail window removed             3 / 2 fail   (measured: the three painting
+                                                  long-message cases and the two
+                                                  new run.sh assertions. The
+                                                  silent-kind case cannot fail -
+                                                  silence is the mutant's answer
+                                                  too - which is why it is in the
+                                                  corpus as a guard against the
+                                                  tail INVENTING a state, not as
+                                                  a test of finding one.)
+    writer stops escaping           0 / 4 fail
+
+The last two are the honest shape of this corpus: it pins BYTES for a fixed set
+of inputs, and neither a timing regression nor a hostile CCTAB_GLYPH_IDLE is in
+that set. tests/run.sh covers both.
+
+Also fixed here: replay.py aborted the whole run with UnicodeEncodeError when a
+case whose cwd carries an invalid byte FAILED, because it printed the cwd raw -
+exactly when the report was needed. It prints ascii() now.
+
+The locale note above is obsolete, and worth recording as closed: the binary
+does not call setlocale and does not read LC_ALL, LC_CTYPE or LANG at all, so an
+uninstalled UTF-8 locale name - the one measured non-byte-identity of the pure
+port - can no longer change a title.

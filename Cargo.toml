@@ -1,0 +1,24 @@
+[package]
+name = "tabstatus"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Puts the Claude Code session state into the terminal tab title."
+license = "GPL-3.0-or-later"
+publish = false
+
+# Zero dependencies, deliberately: std only. A hook that runs on every
+# PostToolUse must not pull a supply chain in, and everything needed here is a
+# hand-rolled JSON writer plus a byte-level reimplementation of the shell
+# string operators the reference implementation used.
+
+[[bin]]
+name = "tabstatus"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

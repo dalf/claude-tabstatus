@@ -5,7 +5,7 @@
   "author": {
     "name": "dalf"
   },
-  "license": "MIT",
+  "license": "GPL-3.0-or-later",
   "keywords": [
     "terminal",
     "tab-title",

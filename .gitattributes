@@ -1,1 +1,6 @@
 * text=auto eol=lf
+
+# The committed platform binaries. `* text=auto` above would otherwise leave
+# them to git's content heuristic, and a checkout that guessed "text" would
+# rewrite line endings inside an executable.
+bin/tabstatus-* binary

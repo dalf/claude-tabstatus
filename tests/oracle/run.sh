@@ -1,29 +1,18 @@
 #!/bin/sh
 # claude-tabstatus test suite.
 #
-#   sh tests/run.sh
-#   CCTAB_TEST_BIN=/path/to/tabstatus sh tests/run.sh
+#   sh   tests/run.sh
+#   dash tests/run.sh
+#   CCTAB_TEST_SH=/bin/sh busybox sh tests/run.sh    # multi-call shells
 #
 # Dependency-free: no bats, no jq. Exits non-zero if anything fails.
 #
-# What is under test is bin/tabstatus, the SAME binary hooks/hooks.json invokes -
-# not a build in target/, so a stale committed binary fails here rather than in
-# somebody's tab. The suite used to run scripts/tabstatus.sh under three shells
-# in four locales, because the implementation's answer depended on both; a binary
-# has no interpreter and, since the length cap became locale-independent, no
-# locale dependence either, so that whole axis is gone.
-#
-# Every assertion runs the binary through CCTAB_DRY_RUN=1, or with CLAUDE_PID
-# unset, so nothing here can ever write an escape sequence to a real terminal.
+# Every assertion runs the script under test through CCTAB_DRY_RUN=1, or with
+# CLAUDE_PID unset, so nothing here can ever write an escape sequence to a real
+# terminal.
 
 here=$(cd -- "$(dirname -- "$0")" && pwd) || exit 1
-repo=$(cd -- "$here/.." && pwd) || exit 1
-bin=${CCTAB_TEST_BIN:-$repo/bin/tabstatus}
-if [ ! -x "$bin" ]; then
-    printf 'error: %s is missing or not executable.\n' "$bin" >&2
-    printf '       Build it: sh scripts/build.sh\n' >&2
-    exit 1
-fi
+script=$here/../scripts/tabstatus.sh
 
 tmp=$(mktemp -d) || exit 1
 cleanup() { rm -rf "$tmp"; }
@@ -31,6 +20,42 @@ cleanup() { rm -rf "$tmp"; }
 # `trap cleanup EXIT HUP INT TERM` would clean up and then keep running.
 trap cleanup EXIT
 trap 'cleanup; exit 130' HUP INT TERM
+
+# Run the script under test with the SAME interpreter that is running this
+# file, so `dash tests/run.sh` really exercises dash. CCTAB_TEST_SH overrides.
+#
+# /proc/$$/exe alone is not enough. On a multi-call binary - busybox ash, which
+# is /bin/sh on Alpine, or toybox - it resolves to .../bin/busybox, and
+# `busybox /path/to/tabstatus.sh` is read as an applet name, so every assertion
+# would fail for a reason that has nothing to do with the code under test.
+# Some shells also exec the last command of a `-c` string, which makes the
+# probe resolve to whatever that was. So: require a shell-shaped name, and
+# require it to actually run a script file.
+sh_under_test=${CCTAB_TEST_SH-}
+if [ -z "$sh_under_test" ]; then
+    _probe=$(readlink "/proc/$$/exe" 2>/dev/null) || _probe=
+    case ${_probe##*/} in
+    sh | dash | ash | bash | ksh | ksh93 | mksh | zsh | yash | posh) ;;
+    *) _probe= ;;
+    esac
+    if [ -n "$_probe" ] && [ -x "$_probe" ]; then
+        printf ':\n' >"$tmp/probe.sh"
+        "$_probe" "$tmp/probe.sh" >/dev/null 2>&1 || _probe=
+        rm -f "$tmp/probe.sh"
+    else
+        _probe=
+    fi
+    sh_under_test=${_probe:-sh}
+fi
+# Resolve to an absolute path, so that an assertion can empty PATH and still
+# have an interpreter to run.
+case $sh_under_test in
+/*) ;;
+*)
+    _abs=$(command -v "$sh_under_test" 2>/dev/null) || _abs=
+    [ -z "$_abs" ] || sh_under_test=$_abs
+    ;;
+esac
 
 # Section 2c picks which END of the title the glyph goes on, from the terminal.
 # Left unpinned, this suite would render differently depending on where it is
@@ -61,7 +86,7 @@ check() {
 dry() {
     _edge=$1
     _dir=${2-$here}
-    (cd -- "$_dir" 2>/dev/null && HOME=$tmp CCTAB_DRY_RUN=1 "$bin" "$_edge" </dev/null)
+    (cd -- "$_dir" 2>/dev/null && HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" "$_edge" </dev/null)
 }
 
 # mkrepo <dir> <HEAD contents> -- a hand-built repository
@@ -88,8 +113,8 @@ nest() {
     printf '%s' "$_p"
 }
 
-printf 'binary under test: %s\n' "$bin"
-printf 'version:           %s\n\n' "$("$bin" version)"
+printf 'interpreter under test: %s\n' "$sh_under_test"
+printf 'script under test:      %s\n\n' "$script"
 
 # Every path-form expectation below assumes $tmp is not itself inside a
 # repository. It normally is not, because mktemp puts us under /tmp, but if
@@ -121,7 +146,7 @@ check 'edge idle'                        '⚪ ~/plaindir' "$(dry idle "$tmp/plai
 check 'edge session-end -> empty title'  ''             "$(dry session-end "$tmp/plaindir")"
 check 'unknown edge falls back to idle'  '⚪ ~/plaindir' "$(dry no-such-edge "$tmp/plaindir")"
 check 'missing edge argument -> idle'    '⚪ ~/plaindir' \
-    "$(cd -- "$tmp/plaindir" && HOME=$tmp CCTAB_DRY_RUN=1 "$bin" </dev/null)"
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" </dev/null)"
 
 # --- location: not a repo, so the path -------------------------------------
 # The asymmetry with the repo form below is the design: no branch to show means
@@ -132,18 +157,18 @@ check 'a non-repo renders the home-relative path' '⚪ ~/code/bug_fedora' \
     "$(dry idle "$tmp/code/bug_fedora")"
 check '$PWD == $HOME renders as ~' '⚪ ~' "$(dry idle "$tmp")"
 check 'a HOME with a trailing slash still renders as ~' '⚪ ~' \
-    "$(cd -- "$tmp" && HOME=$tmp/ CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp" && HOME=$tmp/ CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'a path outside HOME stays absolute' "⚪ $tmp/plaindir" \
-    "$(cd -- "$tmp/plaindir" && HOME=/nonexistent-home CCTAB_MAX_LOCATION=0 CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/plaindir" && HOME=/nonexistent-home CCTAB_MAX_LOCATION=0 CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'root renders as /' '⚪ /' \
-    "$(cd -- / && HOME=/nonexistent-home CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- / && HOME=/nonexistent-home CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'an empty HOME does not produce a stray ~' "⚪ $tmp/plaindir" \
-    "$(cd -- "$tmp/plaindir" && HOME= CCTAB_MAX_LOCATION=0 CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/plaindir" && HOME= CCTAB_MAX_LOCATION=0 CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 # A HOME *prefix* is not a HOME component: /tmp/x/homeless is not under /tmp/x/home.
 mkdir -p "$tmp/homeprefix" "$tmp/homeprefixed"
 check 'a sibling whose name only starts with HOME is not abbreviated' \
     "⚪ $tmp/homeprefixed" \
-    "$(cd -- "$tmp/homeprefixed" && HOME=$tmp/homeprefix CCTAB_MAX_LOCATION=0 CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/homeprefixed" && HOME=$tmp/homeprefix CCTAB_MAX_LOCATION=0 CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 
 # --- location: inside a repo ----------------------------------------------
 mkrepo "$tmp/repos/plain" 'ref: refs/heads/master
@@ -315,29 +340,29 @@ check 'a repo 64 levels up is past the bound' '⚪ …/a/a/a/a/a/a/a/a/a/a/a/a/a
 
 # --- location: GIT_DIR overrides the walk ---------------------------------
 check 'GIT_DIR (absolute) overrides the walk' '⚪ plain@master' \
-    "$(cd -- "$tmp/plaindir" && GIT_DIR=$tmp/repos/plain/.git HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/plaindir" && GIT_DIR=$tmp/repos/plain/.git HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'GIT_DIR (relative) is resolved against $PWD' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && GIT_DIR=.git HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && GIT_DIR=.git HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 mkdir -p "$tmp/bare/proj.git"
 printf 'ref: refs/heads/bare-branch\n' >"$tmp/bare/proj.git/HEAD"
 check 'GIT_DIR on a bare repo drops the .git suffix' '⚪ proj@bare-branch' \
-    "$(cd -- "$tmp/plaindir" && GIT_DIR=$tmp/bare/proj.git HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/plaindir" && GIT_DIR=$tmp/bare/proj.git HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'a GIT_DIR that is not a repo falls back to the path' '⚪ ~/plaindir' \
-    "$(cd -- "$tmp/plaindir" && GIT_DIR=$tmp/junk/no-such-gitdir HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/plaindir" && GIT_DIR=$tmp/junk/no-such-gitdir HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'an empty GIT_DIR is ignored, not honoured' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && GIT_DIR= HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && GIT_DIR= HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 # A GIT_DIR carrying dot components would otherwise put a bare `.` or `..` in the
 # tab, and `GIT_DIR=.` inside a bare repo is a real idiom. Name it after the
 # working directory in that case, minus a `.git` suffix so that a bare repo reads
 # the same as it does when GIT_DIR names it absolutely.
 check 'GIT_DIR=. in a bare repo does not render as a dot' '⚪ proj@bare-branch' \
-    "$(cd -- "$tmp/bare/proj.git" && GIT_DIR=. HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/bare/proj.git" && GIT_DIR=. HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'a GIT_DIR with a /./ component names the repo' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && GIT_DIR=$tmp/repos/plain/./.git HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && GIT_DIR=$tmp/repos/plain/./.git HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'a GIT_DIR with a /../ component names the repo' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && GIT_DIR=$tmp/repos/plain/sub/../.git HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && GIT_DIR=$tmp/repos/plain/sub/../.git HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'a GIT_DIR of .git/. names the repo' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && GIT_DIR=.git/. HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && GIT_DIR=.git/. HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 
 # --- location: $PWD comes from the environment ----------------------------
 # A hook subprocess inherits its environment, so $PWD can arrive stale, absent
@@ -345,13 +370,13 @@ check 'a GIT_DIR of .git/. names the repo' '⚪ plain@master' \
 # at startup and replaces it when it does not match, which is what makes the
 # whole block able to trust it - assert that rather than assume it.
 check 'a stale PWD naming a real directory is not trusted' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && PWD=/etc HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && PWD=/etc HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'a relative PWD is not trusted' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && PWD=relative HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && PWD=relative HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'a PWD naming a directory that does not exist is not trusted' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && PWD=/no/such/dir HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && PWD=/no/such/dir HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'an unset PWD still resolves' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && unset PWD; HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && unset PWD; HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 
 # --- location: the length cap ---------------------------------------------
 # A path is cut at the FRONT on a component boundary, because the trailing
@@ -362,60 +387,50 @@ mkdir -p "$tmp/one/two/three/four/five/six/seven/eight"
 check 'a long path is elided from the left, on a boundary' '⚪ …/four/five/six/seven/eight' \
     "$(dry idle "$tmp/one/two/three/four/five/six/seven/eight")"
 check 'CCTAB_MAX_LOCATION=0 turns the cap off' "⚪ ~/one/two/three/four/five/six/seven/eight" \
-    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_MAX_LOCATION=0 HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_MAX_LOCATION=0 HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'CCTAB_MAX_LOCATION widens the cap' "⚪ …/two/three/four/five/six/seven/eight" \
-    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_MAX_LOCATION=40 HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_MAX_LOCATION=40 HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'CCTAB_MAX_LOCATION narrows the cap' '⚪ …/seven/eight' \
-    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_MAX_LOCATION=16 HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_MAX_LOCATION=16 HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'a garbage CCTAB_MAX_LOCATION falls back to the default' '⚪ …/four/five/six/seven/eight' \
-    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_MAX_LOCATION=lots HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_MAX_LOCATION=lots HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 # A leading zero is an illegal octal constant to the shell's arithmetic, which
 # would abort the script and emit an empty title; it has to be rejected, not
 # clamped. A three-digit 032 is legal arithmetic but still not what anyone
 # meant, so it gets the default too.
 check 'a leading-zero cap is rejected, not evaluated' '⚪ …/four/five/six/seven/eight' \
-    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_MAX_LOCATION=08 HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_MAX_LOCATION=08 HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'a leading-zero cap writes nothing to stderr' '' \
-    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_MAX_LOCATION=08 HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null 2>&1 >/dev/null)"
-(cd -- "$tmp/plaindir" && CCTAB_MAX_LOCATION=08 HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null >/dev/null 2>&1)
+    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_MAX_LOCATION=08 HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null 2>&1 >/dev/null)"
+(cd -- "$tmp/plaindir" && CCTAB_MAX_LOCATION=08 HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null >/dev/null 2>&1)
 check 'a leading-zero cap still exits 0' '0' "$?"
 check 'a padded cap like 032 is rejected too' '⚪ …/four/five/six/seven/eight' \
-    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_MAX_LOCATION=032 HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_MAX_LOCATION=032 HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'a cap below 8 is raised to 8' '⚪ …/eight' \
-    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_MAX_LOCATION=2 HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_MAX_LOCATION=2 HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 # One component that does not fit has no boundary left to cut on, so it is cut
 # inside, and the marker loses its slash to say so.
 mkdir -p "$tmp/aaaaaaaaaabbbbbbbbbbccccccccccdddddddddd"
 check 'one over-long component is cut inside itself' '⚪ …abbbbbbbbbbccccccccccdddddddddd' \
     "$(dry idle "$tmp/aaaaaaaaaabbbbbbbbbbccccccccccdddddddddd")"
 # A count-based cut must never land inside a UTF-8 sequence. The unit `?` and
-# A non-ASCII location is cut like any other. The shell could not do this: its
-# ${#var} counted BYTES unless the shell had multibyte support and the locale was
-# UTF-8 - bash and busybox ash counted characters in a UTF-8 locale, dash counted
-# bytes always, every shell counted bytes in C - so cutting by count risked
-# leaving half a UTF-8 sequence in the JSON string, and the implementation
-# exempted any location carrying a non-ASCII byte from the cap entirely. That was
-# the case a narrow tab needed most. The binary decodes UTF-8 itself, so the unit
-# is a character in every locale and the exemption is gone (README limitations 3
-# and 4). The cut is on a character boundary by construction.
+# ${#var} count is a BYTE unless the shell has multibyte support and the locale is
+# UTF-8: bash-as-sh and busybox ash count characters in a UTF-8 locale, dash
+# counts bytes always, and every shell counts bytes in C. So cutting by count
+# would put an invalid byte into the JSON string literal. A location carrying any
+# non-ASCII byte therefore keeps its full length - deliberately over the cap - and
+# these two assertions are identical in all three shells, which is the point: a
+# mid-sequence cut would make them differ.
 mkdir -p "$tmp/ééééééééééééééééééééééééééééééééééééé"
-check 'a long non-ASCII component is cut like an ASCII one' '⚪ …ééééééééééééééééééééééééééééééé' \
+check 'a long non-ASCII component is not cut mid-character' '⚪ …/ééééééééééééééééééééééééééééééééééééé' \
     "$(dry idle "$tmp/ééééééééééééééééééééééééééééééééééééé")"
-check 'the cut lands on a character boundary, so it is 32 characters' '32' \
-    "$(dry idle "$tmp/ééééééééééééééééééééééééééééééééééééé" | sed 's/^⚪ //' | LC_ALL=C.UTF-8 awk '{print length($0)}')"
 mkrepo "$tmp/repos/accentlong" 'ref: refs/heads/ééééééééééééééééééééééééééééééééééééé
 '
-check 'a long non-ASCII branch is cut at the back like an ASCII one' '⚪ accentlong@éééééééééééééééééééé…' \
+check 'a long non-ASCII branch is not cut mid-character' '⚪ accentlong@ééééééééééééééééééééééééééééééééééééé' \
     "$(dry idle "$tmp/repos/accentlong")"
-# The same answer in the C locale, which is the half of the fix the corpus cases
-# maxloc-nonascii-*-c-locale pin: LANG cannot change a title any more.
-check 'LC_ALL=C gives the same answer as C.UTF-8' '⚪ …ééééééééééééééééééééééééééééééé' \
-    "$(cd -- "$tmp/ééééééééééééééééééééééééééééééééééééé" && LC_ALL=C HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
-check 'and so does an uninstalled UTF-8 locale name' '⚪ …ééééééééééééééééééééééééééééééé' \
-    "$(cd -- "$tmp/ééééééééééééééééééééééééééééééééééééé" && LC_ALL=xx_YY.UTF-8 HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
 
 check 'CCTAB_ELLIPSIS overrides the marker' '⚪ .../four/five/six/seven/eight' \
-    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_ELLIPSIS=... HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_ELLIPSIS=... HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 # A repo is cut at the BACK instead: the repo name is what identifies the tab,
 # so the branch is what gives way.
 mkrepo "$tmp/repos/longbranch" 'ref: refs/heads/some-very-long-branch-name-indeed
@@ -429,27 +444,27 @@ check 'a repo@branch under the cap is untouched' '⚪ plain@master' "$(dry idle 
 # whole signal, so the default must stay bare.
 check 'a local session gets no host prefix' '⚪ plain@master' "$(dry idle "$tmp/repos/plain")"
 check 'SSH_TTY adds the host prefix' '⚪ srv:plain@master' \
-    "$(cd -- "$tmp/repos/plain" && SSH_TTY=/dev/pts/9 CCTAB_HOST=srv HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && SSH_TTY=/dev/pts/9 CCTAB_HOST=srv HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'SSH_CONNECTION alone also adds it' '⚪ srv:plain@master' \
-    "$(cd -- "$tmp/repos/plain" && SSH_CONNECTION='10.0.0.1 22 10.0.0.2 22' CCTAB_HOST=srv HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && SSH_CONNECTION='10.0.0.1 22 10.0.0.2 22' CCTAB_HOST=srv HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'an empty SSH_TTY is not an ssh session' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && SSH_TTY= SSH_CONNECTION= CCTAB_HOST=srv HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && SSH_TTY= SSH_CONNECTION= CCTAB_HOST=srv HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'the domain is stripped from the hostname' '⚪ srv:plain@master' \
-    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_HOST=srv.example.com HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_HOST=srv.example.com HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'the ssh prefix also applies to a path location' '⚪ srv:~/plaindir' \
-    "$(cd -- "$tmp/plaindir" && SSH_TTY=x CCTAB_HOST=srv HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/plaindir" && SSH_TTY=x CCTAB_HOST=srv HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 # The prefix is added after the cap and deliberately not counted by it: the
 # host must not be the thing that gets eaten.
 check 'the host prefix is not eaten by the cap' '⚪ srv:…/four/five/six/seven/eight' \
-    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && SSH_TTY=x CCTAB_HOST=srv HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && SSH_TTY=x CCTAB_HOST=srv HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 # With no CCTAB_HOST, Linux answers from /proc, with no fork. Compare against
 # what this machine says rather than hard-coding a hostname.
 if [ -r /proc/sys/kernel/hostname ]; then
     IFS= read -r _realhost 2>/dev/null </proc/sys/kernel/hostname
     check 'the hostname comes from /proc when CCTAB_HOST is unset' "⚪ ${_realhost%%.*}:plain@master" \
-        "$(cd -- "$tmp/repos/plain" && SSH_TTY=x HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+        "$(cd -- "$tmp/repos/plain" && SSH_TTY=x HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
     check 'reading the hostname needs no external command' "⚪ ${_realhost%%.*}:plain@master" \
-        "$(cd -- "$tmp/repos/plain" && SSH_TTY=x HOME=$tmp PATH= CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+        "$(cd -- "$tmp/repos/plain" && SSH_TTY=x HOME=$tmp PATH= CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 else
     printf 'SKIP  /proc hostname assertions (no /proc/sys/kernel/hostname)\n'
 fi
@@ -459,33 +474,33 @@ fi
 # host and nothing else. So the host has a cap of its own.
 _k8s=my-cluster-worker-pool-a-7f9d8c6b5-x2kqz
 check 'a long single-label host is capped' '⚪ my-cluster-work…:plain@master' \
-    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_HOST=$_k8s HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_HOST=$_k8s HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'CCTAB_MAX_HOST narrows the host cap' '⚪ my-clu…:plain@master' \
-    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_MAX_HOST=7 CCTAB_HOST=$_k8s HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_MAX_HOST=7 CCTAB_HOST=$_k8s HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'CCTAB_MAX_HOST=0 turns the host cap off' "⚪ $_k8s:plain@master" \
-    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_MAX_HOST=0 CCTAB_HOST=$_k8s HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_MAX_HOST=0 CCTAB_HOST=$_k8s HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'a garbage CCTAB_MAX_HOST falls back to the default' '⚪ my-cluster-work…:plain@master' \
-    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_MAX_HOST=08 CCTAB_HOST=$_k8s HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_MAX_HOST=08 CCTAB_HOST=$_k8s HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'a host under the cap is untouched' '⚪ build-runner-eu:plain@master' \
-    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_HOST=build-runner-eu HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_HOST=build-runner-eu HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 # A dotted quad is not host.domain: chopping 192.168.1.5 to `192` names nothing.
 check 'an all-digits-and-dots host keeps its dots' '⚪ 192.168.1.5:plain@master' \
-    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_MAX_HOST=0 CCTAB_HOST=192.168.1.5 HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_MAX_HOST=0 CCTAB_HOST=192.168.1.5 HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 # An ssh session whose hostname resolves to nothing must not render byte for byte
 # like a local one: that would invert the one signal the whole design rests on.
 check 'an ssh session with no resolvable host says ssh' '⚪ ssh:plain@master' \
-    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_HOST=.example.com HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_HOST=.example.com HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 
 # --- location: no forks on the hot path ----------------------------------
 # Slice 3 runs this script on every PostToolUse, so the location must cost no
 # process. An empty PATH is the cheap proof: `git`, `hostname` and `basename`
 # would all be unreachable, and the answer must still be right.
 check 'a repo location needs no external command' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && PATH= HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && PATH= HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'a path location needs no external command' '⚪ ~/code/bug_fedora' \
-    "$(cd -- "$tmp/code/bug_fedora" && PATH= HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/code/bug_fedora" && PATH= HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'an elided path needs no external command' '⚪ …/four/five/six/seven/eight' \
-    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && PATH= HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && PATH= HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 
 # --- JSON-hostile names ---------------------------------------------------
 # The sanitizer is slice 1's, but slice 2 gave it three new ways to be fed: a
@@ -511,10 +526,10 @@ mkrepo "$tmp/repos/ctrlbranch" "$(printf 'ref: refs/heads/a\001b')"
 check 'a control byte inside a branch name is stripped' '⚪ ctrlbranch@ab' \
     "$(dry idle "$tmp/repos/ctrlbranch")"
 check 'a hostile hostname is sanitized too' '⚪ srv:plain@master' \
-    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_HOST='s"r\v' HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_HOST='s"r\v' HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 # The sanitizer is a pure-shell loop, so an empty PATH must not degrade it.
 check 'sanitizing needs no external command' '⚪ ~/weird' \
-    "$(cd -- "$tmp/we\"ird" && PATH= HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/we\"ird" && PATH= HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 # That loop is QUADRATIC, and the 1d cap does not bound its input: a non-ASCII
 # location is exempt from cutting by count, and CCTAB_MAX_LOCATION=0 turns the cap
 # off outright. Unbounded, a few hundred hostile characters cost seconds and a few
@@ -523,7 +538,7 @@ check 'sanitizing needs no external command' '⚪ ~/weird' \
 _c200=aaaaaaaaaabbbbbbbbbbccccccccccddddddddddeeeeeeeeeeffffffffffgggggggggghhhhhhhhhhiiiiiiiiiijjjjjjjjjjkkkkkkkkkkllllllllllmmmmmmmmmmnnnnnnnnnnoooooooooopppppppppp
 _deepq=$tmp/sanbound/q\"$_c200/$_c200
 mkdir -p "$_deepq"
-_out=$(cd -- "$_deepq" && CCTAB_MAX_LOCATION=0 HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)
+_out=$(cd -- "$_deepq" && CCTAB_MAX_LOCATION=0 HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)
 check 'a pathological quoted location still exits 0' '0' "$?"
 check 'the quote is still gone from a bounded location' 'clean' \
     "$(case $_out in *'"'*) printf quoted ;; *) printf clean ;; esac)"
@@ -549,13 +564,13 @@ check 'a % in a branch name is not a printf format' '⚪ pct@100%s%d' \
 
 # --- glyph overrides ------------------------------------------------------
 check 'CCTAB_GLYPH_WORKING override' '> plain@master' \
-    "$(cd -- "$tmp/repos/plain" && CCTAB_GLYPH_WORKING='>' CCTAB_DRY_RUN=1 "$bin" working </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && CCTAB_GLYPH_WORKING='>' CCTAB_DRY_RUN=1 "$sh_under_test" "$script" working </dev/null)"
 check 'CCTAB_GLYPH_WAITING override' '? plain@master' \
-    "$(cd -- "$tmp/repos/plain" && CCTAB_GLYPH_WAITING='?' CCTAB_DRY_RUN=1 "$bin" waiting </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && CCTAB_GLYPH_WAITING='?' CCTAB_DRY_RUN=1 "$sh_under_test" "$script" waiting </dev/null)"
 check 'CCTAB_GLYPH_IDLE override' '. plain@master' \
-    "$(cd -- "$tmp/repos/plain" && CCTAB_GLYPH_IDLE='.' CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && CCTAB_GLYPH_IDLE='.' CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 check 'an empty glyph override leaves no leading space' 'plain@master' \
-    "$(cd -- "$tmp/repos/plain" && CCTAB_GLYPH_IDLE= CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && CCTAB_GLYPH_IDLE= CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle </dev/null)"
 
 # --- glyph position ---------------------------------------------------------
 # Konsole elides the tab label from the LEFT, so a leading glyph is the first
@@ -563,7 +578,7 @@ check 'an empty glyph override leaves no leading space' 'plain@master' \
 # else, with CCTAB_GLYPH_POS overriding both.
 _gp() { # _gp <env assignments...> -- runs `idle` in the plain repo
     ( cd -- "$tmp/repos/plain" && env "$@" CCTAB_DRY_RUN=1 \
-        "$bin" idle </dev/null )
+        "$sh_under_test" "$script" idle </dev/null )
 }
 check 'default position is prefix when the terminal is unknown' '⚪ plain@master' \
     "$(_gp -u KONSOLE_VERSION -u KONSOLE_DBUS_SESSION -u CCTAB_GLYPH_POS)"
@@ -591,11 +606,11 @@ check 'the ssh host prefix stays at the front in suffix position' 'srv:plain@mas
 # --- stdin drain ----------------------------------------------------------
 payload='{"session_id":"abc","transcript_path":"/tmp/t.jsonl","cwd":"/x","hook_event_name":"Stop"}'
 check 'a one-line payload on stdin is drained, not echoed' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '%s\n' "$payload" | CCTAB_DRY_RUN=1 "$bin" idle)"
+    "$(cd -- "$tmp/repos/plain" && printf '%s\n' "$payload" | CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle)"
 check 'a payload with no trailing newline is drained' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '%s' "$payload" | CCTAB_DRY_RUN=1 "$bin" idle)"
+    "$(cd -- "$tmp/repos/plain" && printf '%s' "$payload" | CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle)"
 check 'a multi-line payload is drained' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '%s\n%s\n%s\n' "$payload" "$payload" "$payload" | CCTAB_DRY_RUN=1 "$bin" idle)"
+    "$(cd -- "$tmp/repos/plain" && printf '%s\n%s\n%s\n' "$payload" "$payload" "$payload" | CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle)"
 
 # --- the payload-discriminated edges --------------------------------------
 # Two edges look at the payload, and both do it with `case` globs on the raw
@@ -607,7 +622,7 @@ check 'a multi-line payload is drained' '⚪ plain@master' \
 dryp() {
     _edge=$1
     _dir=${2-$here}
-    (cd -- "$_dir" 2>/dev/null && HOME=$tmp CCTAB_DRY_RUN=1 "$bin" "$_edge")
+    (cd -- "$_dir" 2>/dev/null && HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" "$_edge")
 }
 # notif <notification_type> [message]
 notif() {
@@ -666,9 +681,9 @@ check 'notify: a kind that merely contains a known one is not it' '0' \
 # A payload that is not one line, and one with no trailing newline: the first
 # line is what carries the kind, and `read` assigns a partial last line.
 check 'notify: a payload with no trailing newline still parses' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"notification_type":"idle_prompt"}' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" notify)"
+    "$(cd -- "$tmp/repos/plain" && printf '{"notification_type":"idle_prompt"}' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" notify)"
 check 'notify: a multi-line payload is read and drained' '🟠 plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"notification_type":"permission_prompt"}\ntrailing\ntrailing\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" notify)"
+    "$(cd -- "$tmp/repos/plain" && printf '{"notification_type":"permission_prompt"}\ntrailing\ntrailing\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" notify)"
 (notif idle_prompt | dryp notify "$tmp/repos/plain" >/dev/null 2>&1)
 check 'notify: a painting kind exits 0' '0' "$?"
 (notif agent_completed | dryp notify "$tmp/repos/plain" >/dev/null 2>&1)
@@ -692,7 +707,7 @@ done
 # start. The glob carries the whole `"source":"compact"` spelling for that
 # reason.
 check 'session-start: the word compact elsewhere is not the source' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"cwd":"%s/compact","hook_event_name":"SessionStart","source":"startup"}\n' "$tmp" | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" session-start)"
+    "$(cd -- "$tmp/repos/plain" && printf '{"cwd":"%s/compact","hook_event_name":"SessionStart","source":"startup"}\n' "$tmp" | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" session-start)"
 # ...and no payload at all still paints, which is what keeps the by-hand
 # recovery recipe in the README working from a shell.
 check 'session-start: no payload still paints idle' '⚪ plain@master' \
@@ -705,13 +720,13 @@ check 'session-start: no payload still paints idle' '⚪ plain@master' \
 # arms), which is why hooks.json's matcher is the load-bearing guard and this is
 # only the belt.
 check 'session-start: compact with a space after the colon is still caught' '0' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"SessionStart","source": "compact"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" session-start | wc -c | tr -d ' ')"
+    "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"SessionStart","source": "compact"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" session-start | wc -c | tr -d ' ')"
 check 'session-start: a pretty-printed compact payload escapes the belt' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '{\n  "hook_event_name": "SessionStart",\n  "source": "compact"\n}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" session-start)"
+    "$(cd -- "$tmp/repos/plain" && printf '{\n  "hook_event_name": "SessionStart",\n  "source": "compact"\n}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" session-start)"
 # Same whitespace variant on the notify side falls through to silence, which is
 # the safe direction: an unpainted tab keeps the state it already showed.
 check 'notify: a spaced-out kind is silent, not misread' '0' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"Notification","notification_type": "permission_prompt"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" notify | wc -c | tr -d ' ')"
+    "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"Notification","notification_type": "permission_prompt"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" notify | wc -c | tr -d ' ')"
 
 # --- the edges that must NOT read the payload ------------------------------
 # PostToolUse is the hot edge - one per tool call - and its payload carries the
@@ -731,39 +746,15 @@ _bigpl=$tmp/bigpayload.json
 printf '{"session_id":"s1","cwd":"%s","hook_event_name":"PostToolUse","tool_name":"Read","tool_use_id":"tu1","duration_ms":23,"tool_response":"%s{\\"notification_type\\":\\"idle_prompt\\"}"}\n' \
     "$tmp/repos/plain" "$_pad" >"$_bigpl"
 check 'working: a 256KB payload is drained, not read' '🔵 plain@master' \
-    "$(cd -- "$tmp/repos/plain" && HOME=$tmp CCTAB_DRY_RUN=1 "$bin" working <"$_bigpl")"
-(cd -- "$tmp/repos/plain" && HOME=$tmp CCTAB_DRY_RUN=1 "$bin" working <"$_bigpl" >/dev/null 2>&1)
+    "$(cd -- "$tmp/repos/plain" && HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" working <"$_bigpl")"
+(cd -- "$tmp/repos/plain" && HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" working <"$_bigpl" >/dev/null 2>&1)
 check 'working: a 256KB payload still exits 0' '0' "$?"
 check 'working: a tool_response mentioning idle_prompt is still working' '🔵 plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"PostToolUse","tool_response":"{\\"notification_type\\":\\"idle_prompt\\"}"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" working)"
-# A background subagent's PostToolUse paints NOTHING. This is the defect the
-# binary exists to fix: PostToolUse is registered unmatched, so a subagent's tool
-# calls fire it in the main session and used to repaint `working` over an open
-# main-thread permission dialog, N times for N tool calls, with only a one-shot
-# notification to restore the orange. `agent_id` is present only inside a
-# subagent call, so its presence is the discriminator - and reading it needed the
-# bounded payload read, which is why the shell could not have this fix.
-check 'working: a subagent PostToolUse paints nothing' '' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"agent_id":"aec99e1f4bda1972b","agent_type":"general-purpose","hook_event_name":"PostToolUse","tool_name":"Read"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" working)"
-(cd -- "$tmp/repos/plain" && printf '{"agent_id":"a1","hook_event_name":"PostToolUse"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" working >/dev/null 2>&1)
-check 'working: a suppressed subagent edge still exits 0' '0' "$?"
-# ABSENT, not empty, is what marks the main thread. A future payload with an
-# empty agent_id must not silence the edge for a whole session.
-check 'working: a main-thread PostToolUse with no agent_id paints working' '🔵 plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"PostToolUse","tool_name":"Read","tool_response":"ok"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" working)"
-check 'working: an EMPTY agent_id is not a subagent' '🔵 plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"agent_id":"","hook_event_name":"PostToolUse","tool_name":"Read"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" working)"
-check 'working: a null agent_id is not a subagent either' '🔵 plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"agent_id":null,"hook_event_name":"PostToolUse","tool_name":"Read"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" working)"
-check 'working: agent_id quoted inside a tool_response is not a subagent' '🔵 plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"PostToolUse","tool_response":"{\\"agent_id\\":\\"a1\\"}"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" working)"
-check 'working: one space after the colon is still a subagent' '' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"agent_id": "a1","hook_event_name":"PostToolUse"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" working)"
-# The other edges never look at agent_id: UserPromptSubmit also maps to working
-# and carries no payload discriminator, and idle must not be suppressible.
-check 'idle: agent_id in the payload does not suppress idle' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"agent_id":"a1","hook_event_name":"Stop"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle)"
-
+    "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"PostToolUse","tool_response":"{\\"notification_type\\":\\"idle_prompt\\"}"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" working)"
+# A subagent's tool call paints working too, and that is correct: the main
+# session really is working while a subagent runs.
+check 'working: a subagent PostToolUse still paints working' '🔵 plain@master' \
+    "$(cd -- "$tmp/repos/plain" && printf '{"agent_id":"aec99e1f4bda1972b","agent_type":"general-purpose","hook_event_name":"PostToolUse","tool_name":"Read"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" working)"
 # The deliberate reversal of the intended table: a PermissionRequest carrying
 # agent_id was to be a NO-OP. Measured, that paints the wrong state - an async
 # subagent's dialog arrives AFTER the main session's Stop, so the tab would read
@@ -771,9 +762,9 @@ check 'idle: agent_id in the payload does not suppress idle' '⚪ plain@master' 
 # failure this whole state is for. The edge paints waiting either way and the
 # script never looks at agent_id.
 check 'waiting: a subagent PermissionRequest still paints waiting' '🟠 plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"agent_id":"aec99e1f4bda1972b","agent_type":"general-purpose","hook_event_name":"PermissionRequest","tool_name":"Write"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" waiting)"
+    "$(cd -- "$tmp/repos/plain" && printf '{"agent_id":"aec99e1f4bda1972b","agent_type":"general-purpose","hook_event_name":"PermissionRequest","tool_name":"Write"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" waiting)"
 check 'waiting: a main-thread PermissionRequest paints waiting' '🟠 plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"PermissionRequest","tool_name":"Write","permission_suggestions":[]}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" waiting)"
+    "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"PermissionRequest","tool_name":"Write","permission_suggestions":[]}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" waiting)"
 # The invariant behind section 0's split, asserted from the outside: ONLY notify
 # and session-start read the payload, so nothing a payload says can talk another
 # edge out of its state. One line carrying BOTH discriminators, in the compact
@@ -783,7 +774,7 @@ for _c in 'working:🔵' 'waiting:🟠' 'idle:⚪'; do
     _e=${_c%%:*}
     _g=${_c#*:}
     check "the $_e edge cannot be redirected by a payload" "$_g plain@master" \
-        "$(cd -- "$tmp/repos/plain" && printf '%s\n' "$_both" | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" "$_e")"
+        "$(cd -- "$tmp/repos/plain" && printf '%s\n' "$_both" | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" "$_e")"
 done
 
 # --- hooks.json: the wiring is part of the contract -----------------------
@@ -849,8 +840,8 @@ while IFS= read -r _l; do
         _matcher=${_l#*: \"}
         _matcher=${_matcher%\"*}
         ;;
-    *'bin/tabstatus\" '*)
-        _edge=${_l#*'bin/tabstatus\" '}
+    *'tabstatus.sh\" '*)
+        _edge=${_l#*'tabstatus.sh\" '}
         _edge=${_edge%%\"*}
         _ncmd=$((_ncmd + 1))
         case $_known in
@@ -929,7 +920,7 @@ check 'hooks.json does not register SubagentStop' 'absent' \
 
 # --- exit status ----------------------------------------------------------
 for e in session-start working waiting idle notify session-end no-such-edge; do
-    (cd -- "$tmp/repos/plain" && CCTAB_DRY_RUN=1 "$bin" "$e" </dev/null >/dev/null 2>&1)
+    (cd -- "$tmp/repos/plain" && CCTAB_DRY_RUN=1 "$sh_under_test" "$script" "$e" </dev/null >/dev/null 2>&1)
     check "exit 0 on dry-run edge $e" '0' "$?"
 done
 
@@ -939,25 +930,25 @@ done
 # subtle bug this test exists to catch.
 expect_json='{"terminalSequence":"\u001b]0;🔵 plain@master\u0007","suppressOutput":true}'
 check 'working emits the terminalSequence JSON line' "$expect_json" \
-    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; "$bin" working </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; "$sh_under_test" "$script" working </dev/null)"
 check 'idle emits the terminalSequence JSON line' \
     '{"terminalSequence":"\u001b]0;⚪ plain@master\u0007","suppressOutput":true}' \
-    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; "$bin" idle </dev/null)"
+    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; "$sh_under_test" "$script" idle </dev/null)"
 check 'the emitted JSON line has no raw ESC byte' '0' \
-    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; "$bin" working </dev/null | tr -dc '\033' | wc -c | tr -d ' ')"
+    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; "$sh_under_test" "$script" working </dev/null | tr -dc '\033' | wc -c | tr -d ' ')"
 check 'the emitted JSON is exactly one line' '1' \
-    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; "$bin" working </dev/null | wc -l | tr -d ' ')"
+    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; "$sh_under_test" "$script" working </dev/null | wc -l | tr -d ' ')"
 # The notify edge on the real path, where a silently-painting no-op would
 # actually reach a tab: an ignored kind must put NOTHING on stdout, not a
 # terminalSequence carrying an empty title.
 check 'notify idle_prompt emits the idle terminalSequence' \
     '{"terminalSequence":"\u001b]0;⚪ plain@master\u0007","suppressOutput":true}' \
-    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; notif idle_prompt | "$bin" notify)"
+    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; notif idle_prompt | "$sh_under_test" "$script" notify)"
 check 'notify permission_prompt emits the waiting terminalSequence' \
     '{"terminalSequence":"\u001b]0;🟠 plain@master\u0007","suppressOutput":true}' \
-    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; notif permission_prompt | "$bin" notify)"
+    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; notif permission_prompt | "$sh_under_test" "$script" notify)"
 check 'notify: an ignored kind emits no JSON line at all' '0' \
-    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; notif agent_completed | "$bin" notify | wc -c | tr -d ' ')"
+    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; notif agent_completed | "$sh_under_test" "$script" notify | wc -c | tr -d ' ')"
 # There is deliberately NO `source compact emits nothing on the real path`
 # assertion here. It used to exist and it was vacuous: it ran with CLAUDE_PID=1,
 # `readlink /proc/1/fd/1` fails for an unprivileged user, so the tty guard in
@@ -971,322 +962,17 @@ check 'notify: an ignored kind emits no JSON line at all' '0' \
 
 # Headless guard: no CLAUDE_PID means the direct-write edges do nothing at all.
 check 'session-start with no CLAUDE_PID emits nothing' '' \
-    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; "$bin" session-start </dev/null 2>&1)"
+    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; "$sh_under_test" "$script" session-start </dev/null 2>&1)"
 check 'session-end with no CLAUDE_PID emits nothing' '' \
-    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; "$bin" session-end </dev/null 2>&1)"
-(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; "$bin" session-start </dev/null >/dev/null 2>&1)
+    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; "$sh_under_test" "$script" session-end </dev/null 2>&1)"
+(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; "$sh_under_test" "$script" session-start </dev/null >/dev/null 2>&1)
 check 'session-start with no CLAUDE_PID still exits 0' '0' "$?"
 
 # A CLAUDE_PID that resolves to something that is not a tty must also be inert.
 check 'a CLAUDE_PID whose fd 1 is not a tty emits nothing' '' \
-    "$(cd -- "$tmp/repos/plain" && CLAUDE_PID=1 "$bin" session-start </dev/null 2>&1)"
+    "$(cd -- "$tmp/repos/plain" && CLAUDE_PID=1 "$sh_under_test" "$script" session-start </dev/null 2>&1)"
 check 'a nonsense CLAUDE_PID emits nothing' '' \
-    "$(cd -- "$tmp/repos/plain" && CLAUDE_PID=not-a-pid "$bin" session-start </dev/null 2>&1)"
-
-# --- the bounded payload read ---------------------------------------------
-# Only two 8 KiB WINDOWS of the first line are ever searched - its front and its
-# back - and everything between them is drained without being looked at. That
-# bound is what makes the hot edge affordable; in the shell, reading the line and
-# running `case` globs over it cost 165ms under dash and 20ms under bash-as-sh on
-# a 1 MB Notification, measured on this machine, against a 5s hook timeout.
-#
-# There has to be a back window because a Notification serializes
-# `notification_type` LAST, after the unbounded `message`: with a front window
-# alone, an MCP elicitation carrying a ~7.4 KB message silently lost the
-# discriminator and the notify edge painted nothing at all.
-#
-# The bound is asserted through its OBSERVABLE consequences, which is the honest
-# way to test it without a clock in the suite: a last-member discriminator is
-# seen at any message size, and one that is neither near the front nor near the
-# back is not seen.
-_pad8k=$(awk 'BEGIN{while(i++<9000)printf "a"}')
-check 'notify: idle_prompt inside the front window is seen' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"notification_type":"idle_prompt","message":"%s"}\n' "$_pad8k" | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" notify)"
-check 'notify: the same kind as the LAST member is seen too' '⚪ plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"message":"%s","notification_type":"idle_prompt"}\n' "$_pad8k" | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" notify)"
-# The real shape, at a size no prefix window could have reached.
-_pad200k=$(awk 'BEGIN{while(i++<200000)printf "a"}')
-check 'notify: permission_prompt last after a 200KB message is seen' '🟠 plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"message":"%s","notification_type":"permission_prompt"}\n' "$_pad200k" | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" notify)"
-check 'notify: a kind in neither window is not seen' '' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"a":"%s","notification_type":"idle_prompt","b":"%s"}\n' "$_pad8k" "$_pad8k" | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" notify)"
-# agent_id is read from the FRONT window only, on purpose: a false positive there
-# silences every `working` repaint for the rest of the session, and the back of a
-# PostToolUse payload is `tool_response`, which can be an object whose keys are
-# not escaped. Real captures put agent_id at byte 760 of 1360.
-check 'working: agent_id only in the back window does not silence' '🔵 plain@master' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"tool_response":"%s","agent_id":"a1"}\n' "$_pad8k" | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" working)"
-# A payload far past any real one is still drained and still answers.
-_bigger=$tmp/4mb.json
-awk 'BEGIN{printf "{\"hook_event_name\":\"PostToolUse\",\"tool_response\":\""; while(i++<4194304)printf "a"; printf "\"}\n"}' >"$_bigger"
-check 'working: a 4MB payload is drained and paints' '🔵 plain@master' \
-    "$(cd -- "$tmp/repos/plain" && HOME=$tmp CCTAB_DRY_RUN=1 "$bin" working <"$_bigger")"
-(cd -- "$tmp/repos/plain" && HOME=$tmp CCTAB_DRY_RUN=1 "$bin" working <"$_bigger" >/dev/null 2>&1)
-check 'working: a 4MB payload still exits 0' '0' "$?"
-# The drain is not optional: stdin has to reach EOF, or Claude Code's writer sees
-# EPIPE on a pipe it is still filling. What is asserted here is that a payload
-# that size costs nothing in ANSWERS; the cost in time is in the README.
-
-# --- a name that is not valid UTF-8 --------------------------------------
-# JSON text must be UTF-8, so an invalid byte in a directory, branch or hostname
-# used to produce a hook line Claude Code could not parse - and therefore no
-# title at all (README limitation 2). The byte is replaced by U+FFFD at the
-# boundary where a path stops being a path and becomes text; the expectations
-# below are the bytes, so this needs no JSON parser.
-_badname=$(printf 'bad\377utf8')
-mkdir -p "$tmp/$_badname"
-check 'an invalid byte in a path becomes U+FFFD' '⚪ ~/bad�utf8' \
-    "$(dry idle "$tmp/$_badname")"
-check 'and the emitted line is valid JSON' \
-    '{"terminalSequence":"\u001b]0;⚪ ~/bad�utf8\u0007","suppressOutput":true}' \
-    "$(cd -- "$tmp/$_badname" && HOME=$tmp "$bin" idle </dev/null)"
-mkrepo "$tmp/repos/badbranch" "$(printf 'ref: refs/heads/b\377r\n')"
-check 'an invalid byte in a branch becomes U+FFFD' '⚪ badbranch@b�r' \
-    "$(dry idle "$tmp/repos/badbranch")"
-check 'an invalid byte in the ssh host becomes U+FFFD' '⚪ s�v:plain@master' \
-    "$(cd -- "$tmp/repos/plain" && SSH_TTY=x CCTAB_HOST="$(printf 's\377v')" HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
-# The other way a broken line could be emitted: the glyph and the ellipsis are
-# attached AFTER the sanitizer, so the writer escapes whatever it is given.
-check 'a hostile glyph cannot break the JSON line' \
-    '{"terminalSequence":"\u001b]0;q\"x ~/plaindir\u0007","suppressOutput":true}' \
-    "$(cd -- "$tmp/plaindir" && CCTAB_GLYPH_POS=prefix CCTAB_GLYPH_IDLE='q"x' HOME=$tmp "$bin" idle </dev/null)"
-# The length cap's own ellipsis runs THROUGH the sanitizer, because section 2
-# comes after section 1d, so its quote is deleted rather than escaped.
-check "the cap's ellipsis is sanitized, not escaped" \
-    '{"terminalSequence":"\u001b]0;⚪ qx/four/five/six/seven/eight\u0007","suppressOutput":true}' \
-    "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && CCTAB_ELLIPSIS='q"x' CCTAB_GLYPH_POS=prefix HOME=$tmp "$bin" idle </dev/null)"
-# The sanitizer's OWN 256-character bound appends its ellipsis after the loop,
-# so that copy reaches the writer unsanitized - the one place a hostile
-# CCTAB_ELLIPSIS could still have broken the line. It needs a quote in the path
-# to enter the loop at all, and the cap off to get past 256 characters.
-_long=$(awk 'BEGIN{while(i++<100)printf "a"}')
-mkdir -p "$tmp/q\"$_long/$_long/$_long"
-check 'the 256-character bound ellipsis is escaped by the writer' 'yes' \
-    "$(cd -- "$tmp/q\"$_long/$_long/$_long" && CCTAB_MAX_LOCATION=0 CCTAB_ELLIPSIS='q"x' HOME=$tmp "$bin" idle </dev/null | grep -q 'aq\\"x\\u0007' && printf yes)"
-
-# --- install / uninstall --------------------------------------------------
-# Against a throwaway config dir under $tmp, never the real one:
-# CLAUDE_CONFIG_DIR is what the installer reads, and $tmp is removed on exit.
-_cfg=$tmp/config
-_ins() { ( cd -- "$repo" && HOME=$tmp CLAUDE_CONFIG_DIR=$_cfg "$bin" "$@" </dev/null 2>&1 ); }
-_ins install >/dev/null
-check 'install: created settings.json with just the one key' \
-    '{
-  "env": {
-    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"
-  }
-}' "$(cat "$_cfg/settings.json")"
-check 'install: mode 600, because that file holds env values' '600' \
-    "$(stat -c %a "$_cfg/settings.json" 2>/dev/null || printf 600)"
-check 'install: linked the plugin at the repo' "$repo" \
-    "$(readlink "$_cfg/skills/claude-tabstatus")"
-check 'install: recorded the prior state' 'yes' \
-    "$([ -f "$_cfg/claude-tabstatus.state" ] && printf yes)"
-check 'install: is idempotent' 'yes' \
-    "$(_ins install | grep -q 'already "1" - unchanged' && printf yes)"
-check 'doctor: reports a healthy install' 'yes' \
-    "$(_ins doctor | grep -q 'env key:   OK' && _ins doctor | grep -q 'plugin:    OK' && printf yes)"
-_ins uninstall >/dev/null
-check 'uninstall: removed the key and the empty env with it' '{}' \
-    "$(cat "$_cfg/settings.json")"
-check 'uninstall: removed the link' '' "$(ls -d "$_cfg/skills/claude-tabstatus" 2>/dev/null)"
-check 'uninstall: removed the state record' '' \
-    "$(ls "$_cfg/claude-tabstatus.state" 2>/dev/null)"
-# Every other byte of an existing file survives, which is the point of splicing
-# the member in instead of reprinting the document.
-rm -rf "$_cfg"
-mkdir -p "$_cfg"
-printf '{\n  "permissions": {"allow": []},\n\n  "env": {\n    "FOO": "bar"\n  },\n  "model": "opus"\n}\n' >"$_cfg/settings.json"
-cp "$_cfg/settings.json" "$tmp/settings.orig"
-_ins install >/dev/null
-check 'install: adds exactly one line to an existing file' '4a5
->     "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1",' \
-    "$(diff "$tmp/settings.orig" "$_cfg/settings.json")"
-_ins uninstall >/dev/null
-check 'uninstall: puts the file back byte for byte' '' \
-    "$(diff "$tmp/settings.orig" "$_cfg/settings.json")"
-# An empty "env" the USER already had must survive an uninstall: the state file
-# records whether the env object was there before, because without that the
-# uninstaller cannot tell one it created from an empty one it found. A
-# differential fuzz of 680 documents found exactly this.
-rm -rf "$_cfg"
-mkdir -p "$_cfg"
-printf '{\n  "env": {},\n  "model": "opus"\n}\n' >"$_cfg/settings.json"
-cp "$_cfg/settings.json" "$tmp/settings.emptyenv"
-_ins install >/dev/null
-_ins uninstall >/dev/null
-check 'uninstall: an empty env the user already had is kept' '' \
-    "$(diff "$tmp/settings.emptyenv" "$_cfg/settings.json")"
-# ...and one the installer created is not left behind.
-rm -rf "$_cfg"
-mkdir -p "$_cfg"
-printf '{\n  "model": "opus"\n}\n' >"$_cfg/settings.json"
-cp "$_cfg/settings.json" "$tmp/settings.noenv"
-_ins install >/dev/null
-_ins uninstall >/dev/null
-check 'uninstall: an env the installer created is removed' '' \
-    "$(diff "$tmp/settings.noenv" "$_cfg/settings.json")"
-# A state file written by the SHELL installer (state_version 1) still restores a
-# value the user had set themselves: it recorded the value under a different name,
-# and its source text is what gets spliced back.
-rm -rf "$_cfg"
-mkdir -p "$_cfg"
-printf '{\n  "env": {\n    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1",\n    "X": "y"\n  }\n}\n' >"$_cfg/settings.json"
-printf '{"state_version":1,"written_by":"claude-tabstatus install.sh","env_key":"CLAUDE_CODE_DISABLE_TERMINAL_TITLE","env_key_before":{"had":true,"value":"0"},"symlink_before":{"had":false,"target":null}}\n' >"$_cfg/claude-tabstatus.state"
-_ins uninstall >/dev/null
-check 'uninstall: a state_version 1 record still restores the old value' \
-    '{
-  "env": {
-    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "0",
-    "X": "y"
-  }
-}' "$(cat "$_cfg/settings.json")"
-# A document this tool cannot round-trip is refused, whole.
-rm -rf "$_cfg"
-mkdir -p "$_cfg"
-printf '[1, 2]' >"$_cfg/settings.json"
-_out=$(_ins install)
-check 'install: refuses a settings.json that is not an object' 'yes' \
-    "$(printf '%s' "$_out" | grep -q 'not the expected shape' && printf yes)"
-check 'install: and changes nothing when it refuses' '[1, 2]' "$(cat "$_cfg/settings.json")"
-check 'install: not even the symlink' '' "$(ls -d "$_cfg/skills/claude-tabstatus" 2>/dev/null)"
-# --- the half-states, which are the whole point of the write ordering ------
-# install writes settings.json (Claude Code's own title OFF) and then the plugin
-# symlink (which paints the replacement). Between those two writes there is a
-# state that paints NO tab title at all, so every refusal has to happen before
-# the first of them. Two paths used to reach step 3 with settings already edited.
-rm -rf "$_cfg"; mkdir -p "$_cfg"
-: >"$_cfg/skills"                      # a regular file where the directory goes
-_out=$(_ins install)
-check 'install: refuses a skills path that is not a directory' 'yes' \
-    "$(printf '%s' "$_out" | grep -q 'not a directory' && printf yes)"
-check 'install: and settings.json was never written' '' \
-    "$(ls "$_cfg/settings.json" 2>/dev/null)"
-rm -rf "$_cfg"; mkdir -p "$_cfg/skills"; chmod 500 "$_cfg/skills"
-_out=$(_ins install)
-chmod 700 "$_cfg/skills"
-check 'install: refuses an unwritable skills directory' 'yes' \
-    "$(printf '%s' "$_out" | grep -q 'is not writable, and the plugin symlink' && printf yes)"
-check 'install: and settings.json was never written either' '' \
-    "$(ls "$_cfg/settings.json" 2>/dev/null)"
-# Installing with no bin/tabstatus is strictly worse than not installing: the env
-# key switches Claude Code's title painting off and all ten hooks then exit 127.
-# It used to WARN and exit 0.
-rm -rf "$_cfg"; mkdir -p "$_cfg"
-_fake=$tmp/fakerepo
-mkdir -p "$_fake/.claude-plugin" "$_fake/hooks" "$_fake/bin"
-printf '{}\n' >"$_fake/.claude-plugin/plugin.json"
-printf '{}\n' >"$_fake/hooks/hooks.json"
-cp "$bin" "$_fake/bin/runner"
-_fins() { ( cd -- "$_fake" && HOME=$tmp CLAUDE_CONFIG_DIR=$_cfg "$_fake/bin/runner" "$@" </dev/null 2>&1 ); }
-_out=$(_fins install)
-check 'install: refuses when bin/tabstatus is missing' 'yes' \
-    "$(printf '%s' "$_out" | grep -q 'refused rather than warned about' && printf yes)"
-( cd -- "$_fake" && HOME=$tmp CLAUDE_CONFIG_DIR=$_cfg "$_fake/bin/runner" install </dev/null >/dev/null 2>&1 )
-check 'install: and exits nonzero so a wrapper can see it' '1' "$?"
-check 'install: nothing was written without the binary' '' \
-    "$(ls "$_cfg/settings.json" "$_cfg/skills/claude-tabstatus" 2>/dev/null)"
-check 'install: --force installs anyway, for the build-it-next case' 'yes' \
-    "$(_fins install --force | grep -q 'WARNING' && printf yes)"
-check 'install: --force really did write the key' 'yes' \
-    "$(grep -q CLAUDE_CODE_DISABLE_TERMINAL_TITLE "$_cfg/settings.json" && printf yes)"
-check 'install: an unknown option is refused' 'yes' \
-    "$(_fins install --nonsense | grep -q 'unknown option' && printf yes)"
-# uninstall is the MIRROR: settings.json first, the link last. Its one reachable
-# refusal - the key is set but no state record proves we set it - used to fire
-# AFTER the link had already been removed, leaving exactly the blank-tab state.
-rm -rf "$_cfg"; mkdir -p "$_cfg/skills"
-printf '{\n  "env": {\n    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"\n  }\n}\n' >"$_cfg/settings.json"
-ln -s "$repo" "$_cfg/skills/claude-tabstatus"
-_out=$(_ins uninstall)
-check 'uninstall: refuses to remove a key it cannot prove it set' 'yes' \
-    "$(printf '%s' "$_out" | grep -q 'no record that we set it' && printf yes)"
-check 'uninstall: and the plugin symlink is still there' "$repo" \
-    "$(readlink "$_cfg/skills/claude-tabstatus")"
-check 'uninstall: --force removes both' '' \
-    "$(_ins uninstall --force >/dev/null; readlink "$_cfg/skills/claude-tabstatus" 2>/dev/null)"
-# Duplicate members: this parser resolves first-wins, JSON.parse (hence Claude
-# Code) resolves last-wins. Splicing into the first one reported success while the
-# key was not in the effective environment.
-rm -rf "$_cfg"; mkdir -p "$_cfg"
-printf '{"env":{"A":"1"},"model":"x","env":{"B":"2"}}\n' >"$_cfg/settings.json"
-cp "$_cfg/settings.json" "$tmp/settings.dup"
-_out=$(_ins install)
-check 'install: refuses a document with duplicate keys' 'yes' \
-    "$(printf '%s' "$_out" | grep -q 'appears more than once at the top level' && printf yes)"
-check 'install: and the duplicate document is untouched' '' \
-    "$(diff "$tmp/settings.dup" "$_cfg/settings.json")"
-rm -rf "$_cfg"; mkdir -p "$_cfg"
-printf '{"env":{"A":"1","A":"2"}}\n' >"$_cfg/settings.json"
-check 'install: refuses duplicates inside env too' 'yes' \
-    "$(_ins install | grep -q 'appears more than once inside "env"' && printf yes)"
-# A zero-byte settings.json is a real state (a truncated write, an editor that
-# creates the file before it saves) and Claude Code reads it as no settings.
-rm -rf "$_cfg"; mkdir -p "$_cfg"
-: >"$_cfg/settings.json"
-chmod 640 "$_cfg/settings.json"
-_ins install >/dev/null
-check 'install: writes an empty settings.json fresh' \
-    '{
-  "env": {
-    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"
-  }
-}' "$(cat "$_cfg/settings.json")"
-check 'install: and keeps the mode the empty file had' '640' \
-    "$(stat -c %a "$_cfg/settings.json" 2>/dev/null || printf 640)"
-# doctor has to run on the config that is BROKEN - that is its whole job.
-rm -rf "$_cfg"; mkdir -p "$_cfg"
-ln -s "$tmp/no-such-settings.json" "$_cfg/settings.json"
-check 'doctor: reports a dangling settings symlink and carries on' 'yes' \
-    "$(_ins doctor | grep -q 'which does not exist' && _ins doctor | grep -q '^title:' && printf yes)"
-check 'install: refuses the same dangling symlink' 'yes' \
-    "$(_ins install | grep -q 'could not be resolved' && printf yes)"
-check 'doctor: exits 0 on a broken config' '0' \
-    "$(_ins doctor >/dev/null 2>&1; printf %s $?)"
-# A killed run leaves a pid-named probe or temp file; the next run sweeps the ones
-# whose pid is gone, and leaves a live pid's alone.
-rm -rf "$_cfg"; mkdir -p "$_cfg"
-: >"$_cfg/.cctab-wtest.999999"
-: >"$_cfg/.settings.json.cctab-tmp.999999"
-: >"$_cfg/.cctab-wtest.$$"
-_ins install >/dev/null
-check 'install: sweeps scratch files from a killed run' '' \
-    "$(ls "$_cfg/.cctab-wtest.999999" "$_cfg/.settings.json.cctab-tmp.999999" 2>/dev/null)"
-check "install: leaves a LIVE pid's scratch file alone" 'yes' \
-    "$([ -f "$_cfg/.cctab-wtest.$$" ] && printf yes)"
-rm -rf "$_cfg"
-
-# The subcommands must not collide with the edge names, in either direction.
-check 'an edge name is not a subcommand' '⚪ ~/plaindir' "$(dry idle "$tmp/plaindir")"
-check 'a subcommand name never paints' '' \
-    "$(cd -- "$tmp/plaindir" && HOME=$tmp CCTAB_DRY_RUN=1 "$bin" doctor </dev/null | grep '^⚪')"
-
-# --- the committed binaries must match the sources -----------------------
-# bin/ holds binaries that are COMMITTED, so they can go stale against src/ and
-# ship a version nobody built. Git does not preserve mtimes, so "older than the
-# newest source file" cannot be answered after a clone; a digest of the sources
-# the binary was built from can, and it also catches an edit that kept its
-# timestamp. scripts/build.sh writes both manifests; this recomputes them.
-check 'bin/tabstatus exists and is executable' 'yes' \
-    "$([ -x "$repo/bin/tabstatus" ] && printf yes)"
-check 'bin/tabstatus resolves to a committed platform binary' 'yes' \
-    "$(_t=$(readlink "$repo/bin/tabstatus") && [ -f "$repo/bin/$_t" ] && printf yes)"
-_sources="Cargo.toml $(cd -- "$repo" && ls src/*.rs | sort)"
-if command -v sha256sum >/dev/null 2>&1 && [ -f "$repo/bin/sources.sha256" ]; then
-    check 'the committed binaries are not stale (sha256 of src/ and Cargo.toml)' '' \
-        "$(cd -- "$repo" && sha256sum $_sources | diff - bin/sources.sha256)"
-elif [ -f "$repo/bin/sources.cksum" ]; then
-    check 'the committed binaries are not stale (cksum of src/ and Cargo.toml)' '' \
-        "$(cd -- "$repo" && cksum $_sources | diff - bin/sources.cksum)"
-else
-    printf 'FAIL  no source manifest in bin/ - run sh scripts/build.sh\n'
-    fail=$((fail + 1))
-fi
-# And the binary really is the version Cargo.toml describes, which catches a
-# manifest refreshed without a rebuild.
-check 'bin/tabstatus reports the version in Cargo.toml' \
-    "$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo/Cargo.toml" | head -1)" \
-    "$("$repo/bin/tabstatus" version </dev/null | awk '{print $2}')"
+    "$(cd -- "$tmp/repos/plain" && CLAUDE_PID=not-a-pid "$sh_under_test" "$script" session-start </dev/null 2>&1)"
 
 # --- cross-check against a real git ---------------------------------------
 # Everything above is hand-built, which is what keeps this suite dependency

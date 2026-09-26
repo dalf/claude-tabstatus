@@ -8,3 +8,18 @@ claude-tabstatus.state
 *.swp
 *~
 .DS_Store
+
+# Rust build output
+/target
+
+# Build output, deliberately NOT committed. bin/ is produced by
+# `sh scripts/build.sh`; binaries will ship as GitHub release assets instead of
+# living in git history. A fresh clone therefore has no bin/ until you build,
+# and `tabstatus install` refuses rather than half-installing.
+/bin
+
+# The golden corpus's fixture tree is built under $TMPDIR, not here - it must not
+# live inside a git repo, or the location walk answers repo@branch for every case.
+# This entry is only a belt for `sh mkfixtures.sh ./fixtures`.
+/tests/corpus/fixtures
+__pycache__/

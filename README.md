@@ -39,23 +39,23 @@ Three states, and the hook events that paint them:
 
 The `SessionStart` and `PreToolUse` scopes are hook *matchers*, so those hooks
 do not even run outside them. The `Notification` kinds and the `compact` source
-are `case` globs inside the script, so those hooks run and then decide - which
-costs one ~2.5ms process on a notification, and buys a decision the test suite
-can assert rather than one that lives only in a config file.
+are substring tests inside the binary, so those hooks run and then decide -
+which costs one ~0.6ms process on a notification, and buys a decision the test
+suite can assert rather than one that lives only in a config file.
 
 Some of that is less obvious than it looks:
 
 - **`PostToolUse` is registered unmatched**, so it runs on every tool call, and
   it is the recovery from waiting: 24-42ms after you answer a dialog the tab is
-  blue again. It repaints for a *subagent's* tool calls too, which is right
-  while the main session is working and wrong while a main-thread dialog is open
-  - see Known limitations. The cost of the edge is the process spawn, about
-  2.5ms, so 900 tool calls in a heavy session cost ~2.2s spread over minutes -
-  invisible beside the tool calls themselves. A matcher would only skip the
-  emission, a fraction of that, and it would also miss a permission-gated `Read`
-  outside the project directory. It never reads its payload: that payload
-  carries the whole `tool_response`, hundreds of KB on a large read, and the
-  state it paints does not depend on it.
+  blue again. It reads one thing from its payload - `agent_id` - and paints
+  nothing when it is there, because a *subagent's* tool call firing in the main
+  session must not repaint over a dialog you are looking at. A matcher could not
+  do that: a matcher sees only `tool_name`. The cost of the edge is the process
+  spawn, about 0.61ms measured, so 900 tool calls in a heavy session cost ~0.55s
+  spread over minutes - invisible beside the tool calls themselves. The payload
+  carries the whole `tool_response`, hundreds of KB on a large read, and only its
+  first 8 KiB is ever searched; the rest is drained unread, so a 4 MB response
+  costs 2.4ms instead of the 165ms the shell version spent on 1 MB.
 - **`PreToolUse` is matched to exactly the two tools that always block on you.**
   Unmatched, it would paint waiting on every tool call. `PermissionRequest`
   fires for both of those tools anyway, 11-19ms later, so this edge is really
@@ -87,17 +87,41 @@ Some of that is less obvious than it looks:
   not read as the session going idle - and it also fires for the internal
   compaction summarizer, with an empty `agent_type` that no matcher could
   filter, right before a `SessionStart`/`compact`.
+- **The `agent_id` filter has a cost, and it is a tab left orange.** The two
+  cases it cannot tell apart are both a subagent's `PostToolUse`: one arriving
+  while *your* dialog is open (must not paint) and one arriving after you
+  answered the *subagent's* dialog (should paint blue). Stateless, there is no
+  field that separates them, so the filter takes the safe half and pays for it:
+  after you approve a subagent's dialog, nothing repaints until the `Task`
+  returns, so the tab **reads orange for the rest of that subagent's run**.
+  Registering `SubagentStop` → `working` does not fix it - measured, not assumed:
+  a real `SubagentStop` payload carries `agent_id` (byte 760 of 1439), so the
+  `working` edge silences it exactly like any other subagent event. An edge that
+  skipped the filter would close this window and reopen the worse one, painting
+  blue over a main-thread dialog that is still open. Orange-while-working is the
+  benign direction - you glance, find nothing to answer, move on - and
+  blue-while-blocked is the damaging one, so this is the trade taken on purpose.
 - **`StopFailure` is there because `Stop` is not.** When a turn dies on an API
   error - `rate_limit`, `overloaded` - only `StopFailure` fires, so without it a
   rate-limited turn would leave the tab blue indefinitely.
 
-The script is **stateless**: what it paints is a pure function of the edge name
-plus, on two edges, a handful of `case` globs on the raw payload line. Nothing
-is written anywhere, so nothing is stale after a `kill -9` and there is nothing
-to prune. Only `Notification` and `SessionStart` look at their payload, both
-under a kilobyte; the globs carry the compact `"key":"value"` spelling Claude
-Code actually writes, and a payload that matches nothing falls through to
-painting nothing, which leaves whatever the tab already showed.
+The binary is **stateless**: what it paints is a pure function of the edge name
+plus, on three edges, a handful of substring tests on the raw payload line.
+Nothing is written anywhere, so nothing is stale after a `kill -9` and there is
+nothing to prune. `Notification`, `SessionStart` and `PostToolUse` look at their
+payload and nothing else does, and all three search only **bounded windows** of
+the first line: its first 8 KiB, plus - for `Notification` alone - its last
+8 KiB. Nothing between them is ever searched, so the cost does not depend on what
+a tool returned. The back window is not symmetry: a `Notification` serializes
+`notification_type` **last**, after the unbounded `message`, so with a front
+window alone an MCP elicitation carrying a long message lost its own
+discriminator and the tab painted nothing at all. `agent_id` and `source` are
+read from the front window only, because they are serialized before anything
+unbounded (byte 760 of 1360 and byte 713 of 769 in real captures) and because a
+false positive on `agent_id` would silence every `working` repaint for the rest of
+the session. The tests carry the compact `"key":"value"` spelling Claude Code
+actually writes, and a payload that matches nothing falls through to painting
+nothing, which leaves whatever the tab already showed.
 
 ## Location
 
@@ -143,34 +167,66 @@ about 0.12ms, and a later slice will run this on every tool call.
 
 ```sh
 git clone <this repo> ~/code/claude-tabstatus
-sh ~/code/claude-tabstatus/install.sh
+cd ~/code/claude-tabstatus
+sh scripts/build.sh          # needs cargo, or mise with a rust tool
+./bin/tabstatus install
 ```
 
-Then start a **new** Claude Code session. Updating later is `git pull` plus a
-new session - the installed plugin is a symlink to the clone, so there is
-nothing to reinstall.
+Then start a **new** Claude Code session. Updating later is `git pull`, a
+rebuild, and a new session - the installed plugin is a symlink to the clone, so
+there is nothing to reinstall.
 
-`jq` is required; the installer refuses to run without it, because it edits
-`settings.json` with jq specifically so that no existing key can be clobbered.
+The build step is temporary: binaries are not committed, and will ship as
+GitHub release assets so that installing needs no toolchain.
+
+**No dependencies.** `bin/tabstatus` is a single binary - one executable, zero
+crates, nothing linked but libc - and it is both the hook and the installer. There is no `jq`, no Python, and no shell script left in the runtime
+path. Building it needs cargo; running it needs nothing. [Build](#build) covers
+the targets.
 
 Avoid changing configuration in other Claude Code sessions while the installer
-runs. It reads, merges and renames `settings.json`, and although it re-checks
-the file's identity immediately before the rename and aborts if it moved, the
-safe habit is to install when nothing else is writing that file.
+runs. It reads, merges and renames `settings.json`, and although it re-reads the
+file immediately before the rename and aborts if it changed, the safe habit is to
+install when nothing else is writing that file.
+
+```sh
+bin/tabstatus doctor      # is it linked, is the key set, what would this tab say
+bin/tabstatus version
+```
+
+`doctor` is the thing to run when a tab is not painting: it reports the plugin
+link, the env key, the terminal it detected, which end of the title the glyph
+therefore goes on, and the title this directory would render right now.
+
+### install and uninstall are ordered, both ways
+
+`install` writes `settings.json` **first** and the plugin symlink **last**;
+`uninstall` is the mirror, settings first and the link last. The reason is the
+half-state between the two writes: the env key switches Claude Code's own title
+painting off and the plugin paints the replacement, so "key set, plugin gone" is
+the one combination that paints **no tab title at all**. Both halves therefore
+preflight every refusal - the repo shape, `bin/tabstatus`, the `skills` directory
+and its writability, `settings.json`'s shape, mode and parent, a `settings.json`
+symlink that does not resolve, and whether there is a state record proving the key
+is ours - so nothing between the two writes can decide to stop. A `settings.json`
+with duplicate members at the top level or inside `env` is refused too: this tool
+resolves first-wins and `JSON.parse` resolves last-wins, so editing it could set a
+key Claude Code never reads.
 
 ## Uninstall
 
 ```sh
-sh ~/code/claude-tabstatus/uninstall.sh
-sh ~/code/claude-tabstatus/uninstall.sh --force            # no state record: remove anyway
-sh ~/code/claude-tabstatus/uninstall.sh --restore-backup   # roll settings.json back wholesale
+~/code/claude-tabstatus/bin/tabstatus uninstall
+~/code/claude-tabstatus/bin/tabstatus uninstall --force            # no state record: remove anyway
+~/code/claude-tabstatus/bin/tabstatus uninstall --restore-backup   # roll settings.json back wholesale
 ```
 
 The uninstaller is an undo, not a delete: it puts back whatever
 `claude-tabstatus.state` says was there before. If you had already set
-`CLAUDE_CODE_DISABLE_TERMINAL_TITLE` yourself, your value comes back. If that
-record is missing and the key is present, the key is left alone unless you pass
-`--force`, because there is then no way to tell it apart from your own setting.
+`CLAUDE_CODE_DISABLE_TERMINAL_TITLE` yourself, your value comes back, byte for
+byte - the state file records the value's original *text*. If that record is
+missing and the key is present, the key is left alone unless you pass `--force`,
+because there is then no way to tell it apart from your own setting.
 
 ## What it changes
 
@@ -183,25 +239,43 @@ Three things, and nothing else:
    no marketplace entry and no `enabledPlugins` line. There is deliberately no
    `SKILL.md`, so the plugin costs essentially no model context.
 3. `~/.claude/claude-tabstatus.state`, a small JSON record of what was there
-   before, written once and removed by `uninstall.sh`.
+   before, written once and removed by `uninstall`.
 
 The first one is not optional. Claude Code repaints its own terminal title
 roughly every 960ms, straight over ours, and a plugin cannot set environment
-variables - so the switch has to live in `settings.json`. The installer copies
-`settings.json` to `settings.json.cctab-preinstall` before touching it, merges
-with jq, verifies the result parses, and refuses to proceed if anything other
-than that one key would change. The file keeps its mode (a `settings.json`
-locked to 0600 stays 0600), a `settings.json` that is a symlink stays a symlink
-with its target updated, and a read-only one is refused rather than quietly
-overwritten.
+variables - so the switch has to live in `settings.json`.
 
-jq reprints the whole document, so a hand-formatted `settings.json` comes back
-reindented to 2-space JSON. Values and key order survive; the installer says so
-when it happens, and the original formatting is in the backup.
+That file is edited as a **text splice, not a reprint**: it is parsed only to
+find out where the member goes, and then one line is inserted. Every other byte
+survives literally - key order, indentation, blank lines, your own escapes - so
+the diff of an install is exactly one line:
+
+```diff
+   "env": {
++    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1",
+     "ANTHROPIC_API_KEY": "sk-...",
+```
+
+and the diff of an uninstall is nothing at all. (The jq-based shell installer
+reprinted the document, which reindented hand-formatted files and needed a
+warning to say so.)
+
+Before that, it copies `settings.json` to `settings.json.cctab-preinstall`; after
+it, the spliced text must parse *and*, with our one key removed from both
+documents, compare structurally identical to the original - same keys, same
+order, same values - or nothing is written. The file keeps its mode (a
+`settings.json` locked to 0600 stays 0600, and a 0644 one stays 0644: the temp
+file is created with the original's mode rather than the umask's), a
+`settings.json` that is a symlink stays a symlink with its target updated, and a
+read-only one, an unparseable one, or one whose top level is not an object is
+refused rather than quietly overwritten.
 
 `settings.json` is written first and the symlink last, so a failure while
 editing settings cannot leave the plugin loaded with the built-in title still
-repainting over it.
+repainting over it. The symlink handles the three shapes that can be in its way
+distinctly: an existing symlink elsewhere is repointed and its old target
+recorded, a *broken* symlink is reported as broken and replaced, and a real
+directory is refused outright.
 
 Disabling the built-in title also means Claude Code no longer clears the title
 on exit, so this plugin owns the restore on `SessionEnd`.
@@ -266,17 +340,6 @@ terminal that honours a plain OSC 0 title.
   110s of absolute quiet - 1.8x the 60s threshold - produced no hook and no
   repaint, and the tab was still orange when the session ended 113s later. So the stuck colour can be orange, which is
   the damaging direction: a tab claiming it needs you when nothing does.
-- **A background subagent repaints over an open dialog.** `PostToolUse` is
-  registered unmatched and a subagent's tool calls fire it in the *main*
-  session, so while you are looking at a main-thread permission dialog, a
-  subagent doing N tool calls paints `working` N times over the orange. The
-  `permission_prompt` notification restores it once, 6s in, and then never again
-  - it is one-shot per dialog - so with a long-running background subagent the
-  tab can read blue, "busy, don't bother", for as long as that subagent runs
-  while Claude is in fact blocked on you. There is no stateless fix: a matcher
-  sees only `tool_name`, and discriminating on `agent_id` means reading a
-  payload that carries the whole `tool_response`, on the hottest edge in the
-  table. That trade was judged worse than the bug; it is written down instead.
 - **Some dialogs are invisible to every hook.** A dialog that is neither a tool
   call nor a notification - the LSP recommendation, the plugin hint, the
   auto-mode-default upsell - fires no `PermissionRequest`, no matched
@@ -300,7 +363,7 @@ terminal that honours a plain OSC 0 title.
   tab:
 
   ```sh
-  CLAUDE_PID=$$ sh ~/code/claude-tabstatus/scripts/tabstatus.sh session-end
+  CLAUDE_PID=$$ ~/code/claude-tabstatus/bin/tabstatus session-end
   ```
 
 - **The Konsole restore puts back Konsole's stock formats**, `%d : %n` and
@@ -323,19 +386,17 @@ terminal that honours a plain OSC 0 title.
   (`claude -p ... | jq`, or a call from a script) is detected as headless and
   skipped. A `-p` run killed before `SessionEnd` leaves the tab armed, as
   above.
-- **A working directory, branch or hostname whose name is not valid UTF-8**
-  (legal on Linux) produces a hook line that is not valid JSON, because JSON
-  text must be UTF-8. Quotes, backslashes and control characters are stripped
-  from all three; invalid byte sequences are not, because the only cheap way to
-  detect them would also cost a fork for every perfectly good accented or emoji
-  name.
 - Konsole's tab bar elides from the left, so a very narrow tab could in
   principle clip the leading dot. Measured budget is ~49-60 columns. A local
   title is ~27-37 columns; over ssh the host prefix adds its own width, which is
   why the host carries a cap of its own (`CCTAB_MAX_HOST`, default 16) - without
   one, a 63-character single-label cloud hostname rendered a 91-column title and
   Windows Terminal, which truncates from the right, showed the host and nothing
-  else.
+  else. Both caps count **characters, not columns**: one character is one unit
+  whatever it draws as, so a CJK or emoji location fills about twice the tab width
+  the count implies, and a multi-column `CCTAB_ELLIPSIS` overshoots by its extra
+  width. Counting columns needs a width table this binary deliberately does not
+  carry.
 - **A `.git` that is not a working repository is not one here either.** An
   empty `.git` directory, a `gitdir:` pointer to somewhere that no longer
   exists, or a `HEAD` that does not parse all fall through to the path form,
@@ -359,21 +420,6 @@ terminal that honours a plain OSC 0 title.
   the tab reports the same repository and branch `git` does, and names it after
   the real toplevel rather than after the symlink. The `~` abbreviation still
   uses the logical path, so a distro whose `/home` is a symlink keeps its `~`.
-- **The location cap counts what the running shell counts.** The unit is bytes
-  unless the shell has multibyte support *and* the locale is UTF-8: bash and
-  BusyBox ash count characters in a UTF-8 locale, dash counts bytes always. So a
-  non-ASCII path elides soonest under dash, and under any shell in the C locale.
-  The cap also budgets one column for the ellipsis, so a multi-column
-  `CCTAB_ELLIPSIS` overshoots it by its extra width.
-- **A location containing non-ASCII characters is never cut mid-string**, only
-  at a `/`. Cutting by count is only safe where the unit is a byte *and* a
-  character, and a half-written UTF-8 sequence would be invalid JSON. So an
-  accented or emoji name with no `/` left to cut at keeps its full length and
-  the terminal elides it instead. The one hard ceiling is 256 units: the
-  quote-and-control-character stripper is a quadratic shell loop, so it stops
-  there and marks the cut rather than spending seconds on a name nobody can
-  read - dropping any trailing high bytes first, so even that cut lands on a
-  character boundary.
 - **The ssh hostname comes from `/proc/sys/kernel/hostname`**, which keeps it
   fork-free on Linux. Elsewhere it falls back to `$HOSTNAME` and then to a
   `hostname` fork; set `CCTAB_HOST` to skip the guessing. If none of the three
@@ -431,11 +477,24 @@ Setting one to the empty string drops the glyph and its separating space.
 ## Location tuning
 
 ```sh
-CCTAB_MAX_LOCATION=32   # columns before the location is elided; 0 = no limit
-CCTAB_MAX_HOST=16       # columns for the ssh host prefix; 0 = no limit
+CCTAB_MAX_LOCATION=32   # characters before the location is elided; 0 = no limit
+CCTAB_MAX_HOST=16       # characters for the ssh host prefix; 0 = no limit
 CCTAB_ELLIPSIS="…"      # the elision marker; "..." for an ASCII-only terminal
 CCTAB_HOST="srv"        # the ssh prefix, instead of this machine's hostname
 ```
+
+Both caps count **characters**, in every locale, and cut every location the same
+way: `~/étéétéétéétété` elides exactly like an ASCII path of the same length. The
+unit used to be a byte or a character depending on the shell and `$LANG`, which is
+why the cap used to be skipped for any location holding a byte outside printable
+ASCII - not only a non-ASCII one, but also one carrying an ASCII control character
+or DEL, since the old guard was a single `*[!\ -~]*` test.
+
+A character is **not** a column. A CJK or emoji location is now cut, but to 32
+*characters*, which can be up to 64 display columns, so a wide-script tab still
+elides in the terminal on top of being cut here. Counting East-Asian wide and
+fullwidth code points as two would fix that and is not done: it needs a width
+table this binary deliberately does not carry.
 
 `CCTAB_MAX_LOCATION` bounds **the location only**, not the whole title: the
 rendered title is that plus 3 columns for the glyph and its space, plus
@@ -449,26 +508,79 @@ unless the name is all digits and dots, where `192.168.1.5` would otherwise
 become `192:`. It is still only used when `SSH_CONNECTION` or `SSH_TTY` says this
 is an ssh session, so exporting it globally is safe.
 
+## Build
+
+`bin/` is **build output and is gitignored.** It holds a binary per platform plus
+`bin/tabstatus`, a relative symlink to the one for this machine - that is the
+path `hooks/hooks.json` invokes. A fresh clone has no `bin/` until you build,
+and `tabstatus install` refuses rather than half-installing.
+
+Binaries are meant to ship as **GitHub release assets** rather than in git
+history, so that installing needs no toolchain. That is not wired up yet.
+
+```sh
+sh scripts/build.sh          # the host target, refresh bin/ and the digests
+sh scripts/build.sh --all    # every target in the list
+```
+
+| Target | State |
+|---|---|
+| `x86_64-unknown-linux-gnu` | builds, 441 KB |
+| `x86_64-pc-windows-gnu` | **does not build**, see below |
+
+Windows is deliberately **not** in the build script's target list. The target and
+its mingw linker are both installed here and the failure is not theirs: the source
+is Unix-only by construction. 28 compile errors across five source files, all of
+them `std::os::unix` - byte-oriented paths (`OsStrExt`), file modes, symlinks, and
+the `/proc/$CLAUDE_PID/fd/1` lookup the two direct-write edges need. Windows has no
+byte paths at all (its `OsString` is WTF-16), so this is a port, not a
+cross-compile, and it is not faked with an untested `.exe`. Listing it made
+`sh scripts/build.sh --all` exit 1 on every run even when the host build had
+succeeded, which made the documented release step useless as a success signal.
+
+**On a platform with no committed binary**, build one *before* installing:
+
+```sh
+sh scripts/build.sh
+bin/tabstatus install
+```
+
+`install` **refuses** when `bin/tabstatus` is missing, and says the same thing.
+That refusal is not pedantry: the env key it would write switches Claude Code's
+own title painting off, and all ten hooks would then resolve to a command that
+exits 127 - a tab nothing paints at all, which is strictly worse than no install.
+`install --force` overrides it for the case where you are about to build.
+Zero crates, so `cargo build` needs no network.
+
 ## Tests
 
 ```sh
-sh   tests/run.sh
-dash tests/run.sh
-CCTAB_TEST_SH=/bin/sh busybox sh tests/run.sh   # multi-call shells
+sh tests/run.sh
+CCTAB_TEST_BIN=target/release/tabstatus sh tests/run.sh   # a build you just made
 ```
 
-The suite runs `scripts/tabstatus.sh` under the same interpreter that is
-running the suite, so `dash tests/run.sh` really exercises dash. On a
-multi-call shell (BusyBox ash, toybox) that self-detection cannot work -
-`/proc/$$/exe` is the `busybox` binary, which reads its first argument as an
-applet name - so it falls back to `sh`; `CCTAB_TEST_SH` overrides it outright.
+279 assertions, and what they drive is `bin/tabstatus` - the same binary
+`hooks/hooks.json` invokes, so a stale committed binary fails here rather than in
+somebody's tab. The suite used to run the shell implementation under three shells
+in four locales, because its answer depended on both; a binary has no
+interpreter, and since the length cap became locale-independent it has no locale
+dependence either, so that whole axis is gone.
+
+Two of the assertions exist only to guard the committed binaries: `bin/` carries
+a digest of the `src/*.rs` and `Cargo.toml` it was built from, and the suite
+recomputes it. Git does not preserve mtimes, so "is the binary older than the
+newest source file" cannot be answered after a clone - a digest can, and it also
+catches an edit that kept its timestamp. The binary's own `version` is checked
+against `Cargo.toml` as well.
 
 Dependency-free, and nothing in the suite can write to a real terminal: every
 assertion goes through `CCTAB_DRY_RUN=1` (which prints the computed title and
-emits nothing) or runs with `CLAUDE_PID` unset.
+emits nothing) or runs with `CLAUDE_PID` unset. `install` and `uninstall` are
+asserted against a throwaway `CLAUDE_CONFIG_DIR` under `mktemp -d`, never a real
+config.
 
 ```sh
-CCTAB_DRY_RUN=1 sh scripts/tabstatus.sh working   # -> 🔵 claude-tabstatus@main
+CCTAB_DRY_RUN=1 bin/tabstatus working   # -> 🔵 claude-tabstatus@main
 ```
 
 The two payload-reading edges are assertable the same way, with the payload on
@@ -476,10 +588,11 @@ stdin - including the cases that must paint *nothing*, which print no bytes at
 all rather than an empty title:
 
 ```sh
-echo '{"notification_type":"idle_prompt"}'  | CCTAB_DRY_RUN=1 sh scripts/tabstatus.sh notify
-echo '{"notification_type":"agent_needs_input"}' | CCTAB_DRY_RUN=1 sh scripts/tabstatus.sh notify
-echo '{"notification_type":"agent_completed"}' | CCTAB_DRY_RUN=1 sh scripts/tabstatus.sh notify
-echo '{"hook_event_name":"SessionStart","source":"compact"}' | CCTAB_DRY_RUN=1 sh scripts/tabstatus.sh session-start
+echo '{"notification_type":"idle_prompt"}'  | CCTAB_DRY_RUN=1 bin/tabstatus notify
+echo '{"notification_type":"agent_needs_input"}' | CCTAB_DRY_RUN=1 bin/tabstatus notify
+echo '{"notification_type":"agent_completed"}' | CCTAB_DRY_RUN=1 bin/tabstatus notify
+echo '{"agent_id":"a1","hook_event_name":"PostToolUse"}' | CCTAB_DRY_RUN=1 bin/tabstatus working
+echo '{"hook_event_name":"SessionStart","source":"compact"}' | CCTAB_DRY_RUN=1 bin/tabstatus session-start
 ```
 
 Every no-op in the state table has its own assertion, because a no-op that
@@ -490,7 +603,7 @@ crash, it just overwrites a correct state with a wrong one a minute later.
 suite parses it into one `event matcher edge timeout` row per registered hook
 and checks that against the table above in both directions: every row is
 present, nothing else is registered, ten hooks exactly, one command per group,
-`SubagentStop` still absent, and no edge name the script does not implement (an
+`SubagentStop` still absent, and no edge name the binary does not implement (an
 unknown edge falls back to idle, so a typo there would silently paint the wrong
 state on every notification). Presence checks alone are not enough, and that is
 measured rather than argued: a copy of this tree with `Stop` → working and
@@ -505,9 +618,33 @@ Two things the suite deliberately does not assert. The real emitting path of
 `session-start` and `session-end` needs an allocated pty, which would cost a
 dependency; it is checked by hand instead - 82 bytes for a startup, the OSC 50
 arming pair of [Konsole](#konsole) followed by the idle title, and 0 bytes for a
-compaction. And the belt is pinned at its real reach rather than a wished-for
+compaction - and by the 292-case golden corpus in
+[`tests/corpus/`](tests/corpus/), which replays every edge over a freshly
+allocated pty and compares bytes. And the belt is pinned at its real reach rather than a wished-for
 one: `{"source": "compact"}` on one line is caught, the same payload
 pretty-printed over three lines is not, because only the first line is read.
+
+### The golden corpus
+
+```sh
+sh tests/corpus/replay.sh bin/tabstatus     # 292 passed, 0 failed
+```
+
+`tests/corpus/cases.jsonl` is the frozen, byte-level record of what the POSIX sh
+implementation did - argv, cwd, environment, stdin, and the exact stdout, stderr
+and pty bytes it answered with - and it is what makes "byte-for-byte port" a claim
+anyone can re-check rather than one you have to believe. The shell itself is kept
+beside it as [`tests/oracle/tabstatus.sh`](tests/oracle/tabstatus.sh), byte
+identical to the deleted `scripts/tabstatus.sh`, so the corpus can be re-frozen
+from the real oracle; `tests/oracle/run.sh` is the shell-era suite. Ten cases were
+deliberately re-recorded after the port, each named in `refreeze_fixed.py` for the
+limitation it closes, and the pre-fix freeze is kept as
+`cases.jsonl.before-fixes`.
+
+The fixture tree is built under `$TMPDIR`, not in the repo, and that is
+load-bearing: the corpus `HOME` is the fixture root, and since `tabstatus` walks
+*up* from the cwd looking for a `.git`, a fixture tree inside a checkout makes
+every location case answer `repo@branch` instead of `~/...`.
 
 The repository fixtures are hand-built - a `.git` directory and a one-line
 `HEAD` - so the suite needs no git binary and can assert HEAD bytes that git
@@ -531,12 +668,41 @@ edges (`PreToolUse`, `PermissionRequest`, `PostToolUse`, `PostToolUseFailure`,
 `Notification`, `StopFailure`), the notification-kind three-way, and the
 `compact` guard on `SessionStart`. See [States](#states).
 
+Built in slice 4: one Rust binary in place of 875 lines of POSIX sh and two
+installer scripts, and the five limitations the shell had caused. It was ported
+first and fixed second: a golden corpus of 292 cases recorded what the shell did,
+byte for byte, including its bugs, and the port had to reproduce all of it before
+anything was allowed to change - after which ten of those cases were re-recorded
+on purpose, each named for the limitation it closed. What the language bought:
+
+| | shell | binary |
+|---|---|---|
+| hot edge, small payload | 3.1ms | 0.61ms |
+| `notify`, 1 MB payload | 20ms (bash), 165ms (dash) | 1.1ms |
+| `working` or `notify`, 4 MB payload | linear, unbounded | 2.4ms |
+| a subagent's `PostToolUse` | repaints over your dialog | paints nothing |
+| `notify` with a long `message` | painted | painted (needed a tail window) |
+| a non-UTF-8 name | invalid JSON, no title at all | U+FFFD, a title |
+| the length cap's unit | bytes or characters, per shell and locale | characters |
+| a location outside printable ASCII | never cut, overflows the tab | cut like any other |
+| dependencies | `sh`, `jq` | none |
+
+The binary column is best-of-300 on this machine with an exec floor of 288us
+(`/bin/true` through the same harness), so the
+interesting column is the difference, not the absolute. **Which machine and which
+shell matters for the `shell` column and cannot be reproduced from this checkout:**
+the only POSIX sh installed here is bash 5.3 as `/bin/sh` (there is no `dash` and
+no `busybox`), so the bash figures are re-measurable and the `dash` ones are
+historical - taken on the machine that had it during slices 1-3, and quoted rather
+than re-run. The `binary` column and the whole ratio are reproducible here with
+`sh tests/corpus/replay.sh` and the timing harness in the slice notes.
+
 **Not yet built:**
 
 - A tmux branch, for when the session is inside tmux rather than a bare tab.
 - A compaction *edge*, as opposed to today's guard. `SessionStart` carries
   `"matcher": "startup|resume|clear|fork"`, which leaves out `compact`, and the
-  script refuses a `compact` payload as well; neither of those paints anything
+  binary refuses a `compact` payload as well; neither of those paints anything
   while a compaction runs mid-turn. A tab that said so would be better, and the
   place for it is a second `SessionStart` group with `"matcher": "compact"` (or
   the first-class `PreCompact` / `PostCompact` events).
@@ -553,4 +719,4 @@ edges (`PreToolUse`, `PermissionRequest`, `PostToolUse`, `PostToolUseFailure`,
 
 ## Licence
 
-MIT. See [LICENSE](LICENSE).
+GPL-3.0-or-later. See [LICENSE](LICENSE).
