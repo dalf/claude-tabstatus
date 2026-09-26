@@ -1,5 +1,5 @@
 {
-  "description": "Writes the session state (working / idle) plus the location into the terminal tab title, arming Konsole's per-tab title format on SessionStart and restoring it on SessionEnd.",
+  "description": "Writes the session state (working / waiting / idle) plus the location into the terminal tab title, arming Konsole's per-tab title format on SessionStart and restoring it on SessionEnd.",
   "hooks": {
     "SessionStart": [
       {
@@ -24,7 +24,74 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion|ExitPlanMode",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh\" waiting",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh\" waiting",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh\" working",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh\" working",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh\" notify",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh\" idle",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
       {
         "hooks": [
           {

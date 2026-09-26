@@ -612,8 +612,314 @@ check 'a payload with no trailing newline is drained' '⚪ plain@master' \
 check 'a multi-line payload is drained' '⚪ plain@master' \
     "$(cd -- "$tmp/repos/plain" && printf '%s\n%s\n%s\n' "$payload" "$payload" "$payload" | CCTAB_DRY_RUN=1 "$sh_under_test" "$script" idle)"
 
+# --- the payload-discriminated edges --------------------------------------
+# Two edges look at the payload, and both do it with `case` globs on the raw
+# line. The fixtures below are shaped exactly as Claude Code writes them:
+# compact JSON, no space after `:` or `,`, one trailing newline. A fixture with
+# spaces in it would assert a contract the product does not have.
+#
+# dryp is dry() with the payload arriving on OUR stdin instead of /dev/null.
+dryp() {
+    _edge=$1
+    _dir=${2-$here}
+    (cd -- "$_dir" 2>/dev/null && HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" "$_edge")
+}
+# notif <notification_type> [message]
+notif() {
+    printf '{"session_id":"s1","transcript_path":"%s/t.jsonl","cwd":"%s","scratchpad_dir":"%s/sp","hook_event_name":"Notification","message":"%s","notification_type":"%s"}\n' \
+        "$tmp" "$tmp/repos/plain" "$tmp" "${2-Claude needs your permission}" "$1"
+}
+# sstart <source>
+sstart() {
+    printf '{"session_id":"s1","transcript_path":"%s/t.jsonl","cwd":"%s","scratchpad_dir":"%s/sp","hook_event_name":"SessionStart","source":"%s","model":"claude-haiku-4-5"}\n' \
+        "$tmp" "$tmp/repos/plain" "$tmp" "$1"
+}
+
+# THE one that must not regress. idle_prompt is the quiet-turn nudge and it
+# fires after EVERY quiet turn end, so painting it waiting would turn every idle
+# tab orange a minute later and collapse two of the three states into one.
+check 'notify: idle_prompt paints idle, never waiting' '⚪ plain@master' \
+    "$(notif idle_prompt 'Claude is waiting for your input' | dryp notify "$tmp/repos/plain")"
+# The waiting kinds. permission_prompt is the 6-second backstop behind
+# PermissionRequest; the other three are the cases PermissionRequest never
+# covers - a worker/teammate prompt, an agent asking for input, and an MCP
+# elicitation dialog.
+for k in permission_prompt worker_permission_prompt agent_needs_input \
+    elicitation_dialog elicitation_url_dialog; do
+    check "notify: $k paints waiting" '🟠 plain@master' \
+        "$(notif "$k" | dryp notify "$tmp/repos/plain")"
+done
+# The no-ops. Each of these is a real notification kind that is NOT a state
+# change, and the failure mode they guard against is the quiet one: a kind that
+# silently paints would overwrite a correct state with a wrong one. So assert
+# ZERO BYTES, not an empty title - an empty title blanks the tab, which is what
+# session-end does on purpose and what these must never do.
+for k in agent_completed elicitation_complete elicitation_response \
+    computer_use_exit push_notification auth_success; do
+    check "notify: $k paints nothing at all" '0' \
+        "$(notif "$k" | dryp notify "$tmp/repos/plain" | wc -c | tr -d ' ')"
+done
+# notification_type is a plain string in the event schema, not a closed enum, so
+# a kind this version has never heard of is a certainty, not a hypothetical. It
+# must be silent too, in both directions: no paint, and no stderr.
+check 'notify: an unknown future kind paints nothing' '0' \
+    "$(notif some_kind_invented_later | dryp notify "$tmp/repos/plain" | wc -c | tr -d ' ')"
+check 'notify: an unknown kind is silent on stderr too' '' \
+    "$(notif some_kind_invented_later | dryp notify "$tmp/repos/plain" 2>&1 >/dev/null)"
+check 'notify: an empty payload paints nothing' '0' \
+    "$(dryp notify "$tmp/repos/plain" </dev/null | wc -c | tr -d ' ')"
+# idle_prompt is tested FIRST in the script, so a payload carrying both spellings
+# resolves to idle. What must not happen is the reverse: a waiting notification
+# whose free-text message merely mentions the other kind must stay waiting.
+check 'notify: idle_prompt inside the message does not steal the paint' '🟠 plain@master' \
+    "$(notif permission_prompt 'the idle_prompt kind is not this one' | dryp notify "$tmp/repos/plain")"
+# The value is matched whole: worker_permission_prompt is its own kind and must
+# not be mistaken for permission_prompt by a sloppy glob, and a kind that merely
+# ENDS in a known one is not that kind.
+check 'notify: a kind that merely contains a known one is not it' '0' \
+    "$(notif not_really_idle_prompt_either | dryp notify "$tmp/repos/plain" | wc -c | tr -d ' ')"
+# A payload that is not one line, and one with no trailing newline: the first
+# line is what carries the kind, and `read` assigns a partial last line.
+check 'notify: a payload with no trailing newline still parses' '⚪ plain@master' \
+    "$(cd -- "$tmp/repos/plain" && printf '{"notification_type":"idle_prompt"}' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" notify)"
+check 'notify: a multi-line payload is read and drained' '🟠 plain@master' \
+    "$(cd -- "$tmp/repos/plain" && printf '{"notification_type":"permission_prompt"}\ntrailing\ntrailing\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" notify)"
+(notif idle_prompt | dryp notify "$tmp/repos/plain" >/dev/null 2>&1)
+check 'notify: a painting kind exits 0' '0' "$?"
+(notif agent_completed | dryp notify "$tmp/repos/plain" >/dev/null 2>&1)
+check 'notify: a no-op kind exits 0' '0' "$?"
+
+# SessionStart's `compact` source. hooks.json's matcher already excludes it;
+# this is the belt to that brace, and the failure it prevents is the worst one
+# in the table - an auto-compaction re-fires SessionStart MID-TURN, which would
+# repaint the idle dot while Claude is still working and arm the tab a second
+# time with no matching unarm.
+check 'session-start: source compact paints nothing at all' '0' \
+    "$(sstart compact | dryp session-start "$tmp/repos/plain" | wc -c | tr -d ' ')"
+(sstart compact | dryp session-start "$tmp/repos/plain" >/dev/null 2>&1)
+check 'session-start: source compact exits 0' '0' "$?"
+for s in startup resume clear fork; do
+    check "session-start: source $s still paints idle" '⚪ plain@master' \
+        "$(sstart "$s" | dryp session-start "$tmp/repos/plain")"
+done
+# The word alone is not the discriminator: a session started in a directory
+# called `compact`, or resumed from a transcript named after one, is a normal
+# start. The glob carries the whole `"source":"compact"` spelling for that
+# reason.
+check 'session-start: the word compact elsewhere is not the source' '⚪ plain@master' \
+    "$(cd -- "$tmp/repos/plain" && printf '{"cwd":"%s/compact","hook_event_name":"SessionStart","source":"startup"}\n' "$tmp" | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" session-start)"
+# ...and no payload at all still paints, which is what keeps the by-hand
+# recovery recipe in the README working from a shell.
+check 'session-start: no payload still paints idle' '⚪ plain@master' \
+    "$(dry session-start "$tmp/repos/plain")"
+# The belt's exact reach, pinned in both directions, because the comment in
+# section 0b now claims it. A space after the colon IS caught - that is the one
+# whitespace variant a hand-rolled payload is most likely to have - and a
+# pretty-printed multi-line payload is NOT, because section 0 keeps only the
+# first line. The second case fails OPEN (it paints and, on a real Konsole,
+# arms), which is why hooks.json's matcher is the load-bearing guard and this is
+# only the belt.
+check 'session-start: compact with a space after the colon is still caught' '0' \
+    "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"SessionStart","source": "compact"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" session-start | wc -c | tr -d ' ')"
+check 'session-start: a pretty-printed compact payload escapes the belt' '⚪ plain@master' \
+    "$(cd -- "$tmp/repos/plain" && printf '{\n  "hook_event_name": "SessionStart",\n  "source": "compact"\n}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" session-start)"
+# Same whitespace variant on the notify side falls through to silence, which is
+# the safe direction: an unpainted tab keeps the state it already showed.
+check 'notify: a spaced-out kind is silent, not misread' '0' \
+    "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"Notification","notification_type": "permission_prompt"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" notify | wc -c | tr -d ' ')"
+
+# --- the edges that must NOT read the payload ------------------------------
+# PostToolUse is the hot edge - one per tool call - and its payload carries the
+# whole tool_response, hundreds of KB on a large Read. It paints `working`
+# unconditionally and never looks at the bytes, which is both why it can afford
+# to run on every call and why a tool_response containing the text of some other
+# event cannot mislead it. Build a 256KB payload whose response body ends in a
+# verbatim idle_prompt notification - a transcript, a log or this very test file
+# is enough to produce one - and assert the title is still `working`.
+_pad=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+_i=0
+while [ "$_i" -lt 13 ]; do
+    _pad=$_pad$_pad
+    _i=$((_i + 1))
+done
+_bigpl=$tmp/bigpayload.json
+printf '{"session_id":"s1","cwd":"%s","hook_event_name":"PostToolUse","tool_name":"Read","tool_use_id":"tu1","duration_ms":23,"tool_response":"%s{\\"notification_type\\":\\"idle_prompt\\"}"}\n' \
+    "$tmp/repos/plain" "$_pad" >"$_bigpl"
+check 'working: a 256KB payload is drained, not read' '🔵 plain@master' \
+    "$(cd -- "$tmp/repos/plain" && HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" working <"$_bigpl")"
+(cd -- "$tmp/repos/plain" && HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" working <"$_bigpl" >/dev/null 2>&1)
+check 'working: a 256KB payload still exits 0' '0' "$?"
+check 'working: a tool_response mentioning idle_prompt is still working' '🔵 plain@master' \
+    "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"PostToolUse","tool_response":"{\\"notification_type\\":\\"idle_prompt\\"}"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" working)"
+# A subagent's tool call paints working too, and that is correct: the main
+# session really is working while a subagent runs.
+check 'working: a subagent PostToolUse still paints working' '🔵 plain@master' \
+    "$(cd -- "$tmp/repos/plain" && printf '{"agent_id":"aec99e1f4bda1972b","agent_type":"general-purpose","hook_event_name":"PostToolUse","tool_name":"Read"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" working)"
+# The deliberate reversal of the intended table: a PermissionRequest carrying
+# agent_id was to be a NO-OP. Measured, that paints the wrong state - an async
+# subagent's dialog arrives AFTER the main session's Stop, so the tab would read
+# idle while a prompt only the human can answer is on screen, which is the exact
+# failure this whole state is for. The edge paints waiting either way and the
+# script never looks at agent_id.
+check 'waiting: a subagent PermissionRequest still paints waiting' '🟠 plain@master' \
+    "$(cd -- "$tmp/repos/plain" && printf '{"agent_id":"aec99e1f4bda1972b","agent_type":"general-purpose","hook_event_name":"PermissionRequest","tool_name":"Write"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" waiting)"
+check 'waiting: a main-thread PermissionRequest paints waiting' '🟠 plain@master' \
+    "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"PermissionRequest","tool_name":"Write","permission_suggestions":[]}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" waiting)"
+# The invariant behind section 0's split, asserted from the outside: ONLY notify
+# and session-start read the payload, so nothing a payload says can talk another
+# edge out of its state. One line carrying BOTH discriminators, in the compact
+# spelling, at the front of the payload where a glob would certainly see it.
+_both='{"hook_event_name":"PostToolUse","notification_type":"idle_prompt","source":"compact","tool_response":"x"}'
+for _c in 'working:🔵' 'waiting:🟠' 'idle:⚪'; do
+    _e=${_c%%:*}
+    _g=${_c#*:}
+    check "the $_e edge cannot be redirected by a payload" "$_g plain@master" \
+        "$(cd -- "$tmp/repos/plain" && printf '%s\n' "$_both" | HOME=$tmp CCTAB_DRY_RUN=1 "$sh_under_test" "$script" "$_e")"
+done
+
+# --- hooks.json: the wiring is part of the contract -----------------------
+# Every assertion above tests the script. These test the CONFIG, because two of
+# slice 3's failure modes live there and nothing else would catch them:
+#
+#   * an edge name typo. The script maps any unknown edge to `idle`, so
+#     `notifiy` in hooks.json would quietly paint idle on every notification -
+#     including the permission ones, which is the state this slice exists to
+#     show.
+#   * a dropped matcher. PreToolUse -> waiting is registered for exactly the two
+#     tools that always block on the user; without the matcher it would paint
+#     waiting on EVERY tool call.
+#
+# Read with the `read` builtin and parameter expansion rather than with jq or
+# sed, which keeps the suite's dependency list exactly where it already was.
+_hooks=$here/../hooks/hooks.json
+# Parse hooks.json into one `event matcher edge timeout` row per registered
+# hook, with `-` for an absent matcher, and assert the WHOLE table. Presence
+# checks - "PostToolUse appears somewhere", "the word waiting appears
+# somewhere" - pass just as happily on a transposed file that would paint idle
+# when you submit a prompt; measured, a copy of this tree with Stop -> working
+# and UserPromptSubmit -> idle passed the earlier presence-only assertions and
+# `claude plugin validate` as well. The pairing is the part of slice 3 that
+# lives ONLY in config, so it is the part that has to be pinned here.
+#
+# Line-based, with the `read` builtin and parameter expansion rather than jq or
+# sed, which keeps the suite's dependency list exactly where it already was.
+# Indentation is the discriminator: an event key sits at 4 spaces, a hook GROUP
+# opens at 6 and closes at 6, `"matcher"` and the inner `"hooks"` sit at 8, and
+# a hook entry's fields sit at 12. A row is emitted when the GROUP closes, not
+# when its `"timeout"` line goes by, because JSON keys have no required order -
+# `"matcher"` written after `"hooks"` is the same file, and a parser keyed on
+# field order read it as unmatched. Measured: that spelling is exactly what
+# json.dump produces when a matcher is added programmatically, and it slipped
+# past the first version of this loop.
+#
+# This assumes the file's 2-space pretty format. Reformatting it to one line
+# would produce no rows at all and fail every assertion below, which is the safe
+# direction: loud, not silent.
+_ev=
+_matcher=-
+_edge=
+_t=
+_ncmd=0
+_rows=
+_unknown=
+_badgroup=
+_known=' session-start working waiting idle notify session-end '
+while IFS= read -r _l; do
+    case $_l in
+    '    "'*'": ['*)
+        _ev=${_l#*\"}
+        _ev=${_ev%%\"*}
+        ;;
+    '      {'*)
+        _matcher=-
+        _edge=
+        _t=
+        _ncmd=0
+        ;;
+    '        "matcher": "'*)
+        _matcher=${_l#*: \"}
+        _matcher=${_matcher%\"*}
+        ;;
+    *'tabstatus.sh\" '*)
+        _edge=${_l#*'tabstatus.sh\" '}
+        _edge=${_edge%%\"*}
+        _ncmd=$((_ncmd + 1))
+        case $_known in
+        *" $_edge "*) ;;
+        *) _unknown="$_unknown $_edge" ;;
+        esac
+        ;;
+    '            "timeout": '*)
+        _t=${_l#*: }
+        _t=${_t%,}
+        ;;
+    '      }'*)
+        _rows="$_rows$_ev $_matcher $_edge $_t
+"
+        [ "$_ncmd" = 1 ] || _badgroup="$_badgroup[$_ev:$_ncmd commands]"
+        ;;
+    esac
+done <"$_hooks"
+
+# The table, as the README states it. Every row asserted, both directions.
+_want='SessionStart startup|resume|clear|fork session-start 5
+UserPromptSubmit - working 5
+PreToolUse AskUserQuestion|ExitPlanMode waiting 5
+PermissionRequest - waiting 5
+PostToolUse - working 5
+PostToolUseFailure - working 5
+Notification - notify 5
+Stop - idle 5
+StopFailure - idle 5
+SessionEnd - session-end 1'
+# An edge name the script does not implement would be painted `idle` by the
+# fallback in section 3, so a typo there is silent in production.
+check 'hooks.json uses no edge the script does not implement' '' "$_unknown"
+# Each wanted row is present, with its matcher (or its deliberate absence) and
+# its timeout. `- ` in the row is what pins PermissionRequest, PostToolUse,
+# PostToolUseFailure, Notification, Stop and StopFailure as UNMATCHED: a matcher
+# on any of them would change the row and fail here.
+printf '%s\n' "$_want" >"$tmp/want.rows"
+printf '%s' "$_rows" >"$tmp/got.rows"
+while IFS= read -r _w; do
+    [ -n "$_w" ] || continue
+    check "hooks.json wires [$_w]" 'yes' \
+        "$(case "
+$_rows" in *"
+$_w
+"*) printf yes ;; *) printf no ;; esac)"
+done <"$tmp/want.rows"
+# ...and nothing else is registered. This is what catches an ADDED event -
+# SubagentStop, a second SessionStart group - rather than a changed one.
+_extra=
+while IFS= read -r _g; do
+    [ -n "$_g" ] || continue
+    case "
+$_want
+" in
+    *"
+$_g
+"*) ;;
+    *) _extra="$_extra[$_g]" ;;
+    esac
+done <"$tmp/got.rows"
+check 'hooks.json registers nothing the table does not list' '' "$_extra"
+check 'hooks.json registers exactly ten hooks' '10' \
+    "$(printf '%s' "$_rows" | wc -l | tr -d ' ')"
+# One command per group, so that a second hook smuggled into an existing group -
+# which the row above would not show - fails here instead.
+check 'every hooks.json group holds exactly one command' '' "$_badgroup"
+# SubagentStop is DELIBERATELY absent: a subagent finishing must not read as the
+# session going idle, and it also fires for the internal compaction summarizer
+# (with an empty agent_type, which no matcher could filter) right before a
+# SessionStart/compact. Pinned by name too, so that adding it has to be a
+# decision and not a diff nobody reads.
+_conf=$(cat "$_hooks")
+check 'hooks.json does not register SubagentStop' 'absent' \
+    "$(case $_conf in *SubagentStop*) printf present ;; *) printf absent ;; esac)"
+
 # --- exit status ----------------------------------------------------------
-for e in session-start working waiting idle session-end no-such-edge; do
+for e in session-start working waiting idle notify session-end no-such-edge; do
     (cd -- "$tmp/repos/plain" && CCTAB_DRY_RUN=1 "$sh_under_test" "$script" "$e" </dev/null >/dev/null 2>&1)
     check "exit 0 on dry-run edge $e" '0' "$?"
 done
@@ -632,6 +938,27 @@ check 'the emitted JSON line has no raw ESC byte' '0' \
     "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; "$sh_under_test" "$script" working </dev/null | tr -dc '\033' | wc -c | tr -d ' ')"
 check 'the emitted JSON is exactly one line' '1' \
     "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; "$sh_under_test" "$script" working </dev/null | wc -l | tr -d ' ')"
+# The notify edge on the real path, where a silently-painting no-op would
+# actually reach a tab: an ignored kind must put NOTHING on stdout, not a
+# terminalSequence carrying an empty title.
+check 'notify idle_prompt emits the idle terminalSequence' \
+    '{"terminalSequence":"\u001b]0;⚪ plain@master\u0007","suppressOutput":true}' \
+    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; notif idle_prompt | "$sh_under_test" "$script" notify)"
+check 'notify permission_prompt emits the waiting terminalSequence' \
+    '{"terminalSequence":"\u001b]0;🟠 plain@master\u0007","suppressOutput":true}' \
+    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; notif permission_prompt | "$sh_under_test" "$script" notify)"
+check 'notify: an ignored kind emits no JSON line at all' '0' \
+    "$(cd -- "$tmp/repos/plain" && unset CLAUDE_PID; notif agent_completed | "$sh_under_test" "$script" notify | wc -c | tr -d ' ')"
+# There is deliberately NO `source compact emits nothing on the real path`
+# assertion here. It used to exist and it was vacuous: it ran with CLAUDE_PID=1,
+# `readlink /proc/1/fd/1` fails for an unprivileged user, so the tty guard in
+# section 5 empties $tty and the script exits before emitting anything -
+# measured, 0 bytes for source=compact AND 0 bytes for source=startup, so the
+# assertion would have passed with the compact belt deleted. The belt itself is
+# asserted in dry run above; the tty guard is asserted below. Covering the
+# emitting path properly needs a real pty, which this suite cannot allocate
+# without a dependency - done by hand instead, over an allocated pty: 0 bytes
+# for compact, 82 bytes (the OSC 50 arming pair plus the idle title) for startup.
 
 # Headless guard: no CLAUDE_PID means the direct-write edges do nothing at all.
 check 'session-start with no CLAUDE_PID emits nothing' '' \

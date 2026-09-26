@@ -4,8 +4,15 @@
 #
 #   sh "${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh" <edge>
 #
-# Slice 1 edges:  session-start | working | idle | session-end
-# `waiting` is implemented and testable but no slice-1 hook emits it yet.
+# Edges:  session-start | working | waiting | idle | notify | session-end
+#
+# The first five paint; `notify` decides between idle, waiting and painting
+# nothing at all by looking at the notification kind, and session-end unpaints.
+# Which hook event maps to which edge is hooks.json's business, not this
+# script's - see the state table in the README. The script is STATELESS: what it
+# paints is a pure function of the edge argument plus, for two edges, a handful
+# of `case` globs on the raw payload. Nothing is written, so nothing is stale
+# after a SIGKILL and there is nothing to prune.
 #
 # POSIX sh only. No [[ ]], no arrays, no ${v//x/y}, no ${v^^}, no process
 # substitution, no `local`. Exercised under bash-as-sh, dash and busybox ash.
@@ -26,29 +33,219 @@
 # This script always exits 0. A non-zero PreToolUse hook can block a tool, and
 # a non-zero hook anywhere is noise.
 
+edge=${1-}
+
 # ---------------------------------------------------------------------------
-# 0. Drain the hook payload from stdin.
+# 0. Take the hook payload off stdin.
 #
-# Slice 1 does not parse it; it only has to be consumed so the writer never
-# sees EPIPE. One `cat` fork, deliberately, rather than a shell `read` loop:
-# POSIX `read` may not consume past the line it returns, so on a pipe every
-# shell reads a byte per syscall. Measured end to end under /bin/sh, payload
-# piped in (30 runs, us per invocation):
+# Two ways in, because two edges have to SEE the payload and the hot ones must
+# never touch it.
 #
-#            0KB    16KB    64KB   256KB
-#   loop    1970    5447   13697   46617
-#   cat     2672    3619    2576    2914
+#   * `notify` and `session-start` read it into a variable with the `read`
+#     builtin, which costs no fork. Both payloads are small and single-line -
+#     measured 845 bytes for a Notification and 769 for a SessionStart - and at
+#     that size the builtin is in fact FASTER than the `cat` below, in every
+#     shell this is tested under.
+#   * Every other edge only has to CONSUME stdin, so the writer never sees
+#     EPIPE. One `cat` fork, deliberately, rather than a shell `read` loop:
+#     POSIX `read` may not consume past the line it returns, so on a pipe every
+#     shell reads a byte per syscall, which makes the read branch LINEAR in the
+#     payload while `cat` is flat.
 #
-# so one fork buys a flat cost, and the crossover is under 16KB. PostToolUse -
-# the hot edge a later slice adds - carries the whole tool_response, which is
-# precisely the case the loop pessimized.
+# How linear depends on the shell, and the figures below are the reason this
+# comment does not simply say "small". us per invocation, 40 reps, one payload
+# with the discriminator as its last field, `read` (notify) against `cat`
+# (working), all three shells this script is exercised under:
+#
+#   read         845B    2KB     8KB    64KB   256KB     1MB
+#     bash       2072   2214    2215    3303    6584   19584
+#     dash       1298   1559    3039   12561   40978  159785
+#     busybox    2358   2854    5021   20799   76117  299807
+#   cat is flat everywhere: 1.4-3.1ms at every size in that row, and at 1MB
+#   4.6ms under bash, 1.8 under dash, 3.0 under busybox ash.
+#
+# So the crossover is NOT one number: about 32KB under bash, but only about 2KB
+# under dash and busybox ash. `read` wins at the sizes these two edges actually
+# see, and nowhere else. THE RULE for whoever wires the next edge: an edge may
+# take the `read` branch only if its payload schema has no unbounded field.
+# Notification is {message, title?, notification_type} and SessionStart is
+# {source - an enum of five words - agent_type?, model?, session_title?, a few
+# numbers}, both on top of a base of {session_id, transcript_path, cwd,
+# prompt_id?, permission_mode?, agent_id?}: bounded strings throughout, which is
+# what bounds the read. The unbounded fields in the hook schema are `tool_input`
+# and `tool_response`, both arbitrary JSON, and every event carrying one is on
+# the `cat` branch below.
+#
+# PostToolUse is the reason that split exists. It is the hot edge - one per tool
+# call - and its payload carries the whole tool_response, hundreds of KB on a
+# large Read, which is precisely the case the read loop pessimizes. It also has
+# nothing to decide: it paints `working` unconditionally, which stays correct
+# even for a subagent's tool call, because the main session really is working
+# then. So it takes the `cat` branch and never touches the bytes.
+#
+# PostToolUseFailure takes it too, and that one costs something: its payload
+# carries `is_interrupt`, the only discriminator in the whole table that could
+# tell an ABORTED tool call (idle) from a failed one (working). Reading it means
+# reading a payload that also carries the tool_input of whatever was aborted - a
+# Write's entire file content - at the prices above. Not worth it while the flag
+# cannot be true: the hook dispatch is handed the turn's own abort signal, so an
+# interrupt skips the spawn altogether, which is exactly why a measured Ctrl+C
+# produced no hook at all. Every PostToolUseFailure observed so far carried
+# is_interrupt:false, a tool that REPORTED an error, and a turn that continued -
+# for which `working` is the right paint. If that ever changes, the flag is in
+# the payload and this is the tradeoff to reopen.
 #
 # `[ -t 0 ]` is there so that running this by hand from a terminal does not
-# block on a stdin that never reaches EOF. A real hook always gets a pipe.
+# block on a stdin that never reaches EOF. A real hook always gets a pipe. It
+# leaves $payload empty, which every glob in 0b treats as "no discriminator
+# present", i.e. paint the edge as asked.
 # ---------------------------------------------------------------------------
-[ -t 0 ] || cat >/dev/null 2>&1
+payload=
+if [ ! -t 0 ]; then
+    case $edge in
+    notify | session-start)
+        # 2>/dev/null because a closed rather than empty stdin makes `read`
+        # complain in some shells, and this script is never allowed to be noise.
+        IFS= read -r payload 2>/dev/null
+        # Then drain whatever follows, in case a future payload is not one line.
+        # Builtins only: a second `cat` here would put a second fork on an edge
+        # that currently has none.
+        while IFS= read -r _junk 2>/dev/null; do :; done
+        ;;
+    *) cat >/dev/null 2>&1 ;;
+    esac
+fi
 
-edge=${1-}
+# ---------------------------------------------------------------------------
+# 0b. The two edges whose state the payload decides.
+#
+# Both tests are `case` globs on the raw line. Never jq: a fork per
+# notification, to parse 845 bytes that can be matched literally, plus a
+# dependency the rest of the plugin does not have.
+#
+# What the globs can see, exactly. They carry the compact spelling Claude Code
+# actually writes - `"key":"value"`, JSON.stringify output, no space after `:` or
+# `,` - and the session-start one also tolerates one space after the colon.
+# They do NOT see past the first line, because section 0 keeps one line and
+# drains the rest. So a pretty-printed payload matches nothing, and the two
+# edges then fail in OPPOSITE directions:
+#
+#   * notify falls through to silence, which is the safe direction: an unpainted
+#     tab keeps the state it already showed.
+#   * session-start falls through to PAINTING AND ARMING - the exact pair of
+#     failures the compact case below exists to prevent. Measured: a
+#     pretty-printed `{"source": "compact"}` on three lines paints idle in all
+#     three shells. So hooks.json's `"matcher": "startup|resume|clear|fork"` is
+#     the load-bearing guard, and this glob is only a belt to it. A belt that
+#     fails open is still worth having against a hand-edited config; it must
+#     just not be mistaken for the guard.
+#
+# The globs also trust the producer to emit conforming JSON, in two specific
+# ways: a raw unescaped `"` inside a string value satisfies a glob's leading
+# quote, and a literal NUL inside the discriminator is dropped by `read`, which
+# splices `"permi<NUL>ssion_prompt"` into a real match. A conforming encoder
+# writes `\"` and `\u0000`, so neither is reachable from Claude Code - measured,
+# an escaped injection in `message` or `cwd` is correctly defeated - but a
+# producer bug here would be amplified rather than absorbed.
+#
+# NOTIFY. `notification_type` is a plain string in the event schema (required,
+# but not a closed enum), so this is a three-way and the third branch is silence:
+#
+#   * idle_prompt is the quiet-turn nudge, fired messageIdleNotifThresholdMs
+#     (default 60000, user-configurable) after a turn ends. It is the one kind
+#     that MUST NOT paint waiting - it arrives after EVERY quiet turn end, so
+#     mapping it to waiting would turn every idle tab orange a minute later and
+#     collapse two of the three states into one. Matched first for that reason.
+#     It is also the only recovery this design has from an INTERRUPTED turn -
+#     and it recovers nothing after a dialog the user walks away from, because
+#     the keystroke that dismisses one also cancels this notification for good.
+#     See the Ctrl+C note in the README.
+#   * The waiting kinds are a BACKSTOP, not the fast path. permission_prompt is
+#     scheduled 6000ms after the dialog goes up (measured +6.004 to +6.021s over
+#     four sessions), fires at most once per dialog, and is suppressed outright
+#     by CLAUDE_CODE_DISABLE_PERMISSION_PROMPT_NOTIFY_HOOKS. PermissionRequest,
+#     23ms after PreToolUse, is the real-time signal.
+#
+#     The product cancels the notification if the dialog resolves or the user
+#     types first, but that cancellation is BEST-EFFORT and has been measured
+#     losing: in one session this hook fired in the same millisecond as the
+#     answering keystroke, so its `waiting` and PostToolUse's `working` were
+#     emitted concurrently and landed 38ms apart. The order came out right;
+#     nothing guarantees it, and if the backstop ever writes last the tab sticks
+#     orange until the next edge.
+#
+#     permission_prompt is kept anyway, even though PermissionRequest covers
+#     every tool-call dialog in real time, because it is the ONLY signal for the
+#     dialogs that are not tool calls: the managed-settings review and the
+#     sandbox network request both notify with this kind. The other four kinds
+#     are what PermissionRequest does not cover either - a worker/teammate
+#     prompt, an agent asking for input, and the two MCP elicitation dialogs.
+#   * Everything else is deliberately silent - agent_completed,
+#     elicitation_complete, elicitation_response, computer_use_exit,
+#     push_notification, auth_success, and whatever kind a later Claude Code
+#     invents. None of them is a state change, and the elicitation pair in
+#     particular is the RESPONSE side of an elicitation, not a wait.
+#
+# Why the three-way lives HERE and not in hooks.json, since the hook runner can
+# match a Notification registration on notification_type - it is the field it
+# extracts for that event, exactly as it extracts `source` for SessionStart.
+# Two matcher-scoped blocks (idle_prompt -> idle, the five waiting kinds ->
+# waiting) would delete this read and these globs outright. They would also
+# RACE: the runner skips matcher filtering entirely when the extracted value is
+# falsy, so a Notification whose notification_type is absent or EMPTY fires both
+# blocks and the tab keeps whichever painted last, where today it keeps what it
+# had. Today that needs a producer bug - the field is required - but the failure
+# it trades for is nondeterministic colour, and this plugin's whole claim is that
+# the colour is not a guess. One block listing the six kinds acted on here has no
+# race, and buys the spawn for the eight kinds that are already no-ops: a handful
+# of 2.5ms processes per session, in exchange for making the backstop's existence
+# depend on a field name inside a binary this plugin does not control, and on a
+# matcher that no test here can exercise end to end. Rejected on that trade. If
+# the read ever becomes the bottleneck, this is the door.
+#
+# What no glob here can see: a dialog that blocks the session and notifies
+# NOTHING. The LSP recommendation, the plugin hint and the auto-mode-default
+# upsell are dialogs with no notification and no tool call, so no hook of any
+# kind fires and the tab keeps whatever it last showed. The product's own 60s
+# nudge cannot correct it either, because that notifier is gated on no dialog
+# being on screen. That is the boundary of what hooks can see; it is in the
+# README under "Known limitations" so the next reader does not call it a bug.
+#
+# SESSION-START. hooks.json's matcher already excludes `compact`; this is the
+# belt to that brace, because the failure it prevents is the worst one in the
+# table. An auto-compaction re-fires SessionStart MID-TURN, which would repaint
+# the idle dot while Claude is still working AND arm the tab a second time with
+# no matching unarm. Two globs, once per session, on a 769-byte payload - the
+# only thing standing between that failure and a config line somebody edits,
+# within the limit stated above: it catches the spelling Claude Code emits and
+# the same line with a space after the colon, not a reformatted payload.
+# ---------------------------------------------------------------------------
+case $edge in
+notify)
+    case $payload in
+    *'"notification_type":"idle_prompt"'*)
+        edge=idle
+        ;;
+    *'"notification_type":"permission_prompt"'* \
+        | *'"notification_type":"worker_permission_prompt"'* \
+        | *'"notification_type":"agent_needs_input"'* \
+        | *'"notification_type":"elicitation_dialog"'* \
+        | *'"notification_type":"elicitation_url_dialog"'*)
+        edge=waiting
+        ;;
+    *)
+        # Not a state change. Emit nothing at all - not an empty title, which
+        # would blank the tab - and do not spend the location walk on it.
+        exit 0
+        ;;
+    esac
+    ;;
+session-start)
+    case $payload in
+    *'"source":"compact"'* | *'"source": "compact"'*) exit 0 ;;
+    esac
+    ;;
+esac
 
 # ---------------------------------------------------------------------------
 # 1. LOCATION
@@ -66,9 +263,9 @@ edge=${1-}
 # Fork-free throughout: the repo is found by walking up with `[ -e ]`, HEAD is
 # read with the `read` builtin, and everything else is parameter expansion.
 # `git rev-parse` would be shorter and completely correct and would cost 15-40ms
-# per call; this whole script costs ~4ms, and slice 3 runs it on every
-# PostToolUse. So: no `git`, at the price of reimplementing the two parts of
-# its repository discovery that actually show up in a tab.
+# per call; this whole script costs ~2.5ms, and it runs on every PostToolUse,
+# one per tool call. So: no `git`, at the price of reimplementing the two
+# parts of its repository discovery that actually show up in a tab.
 #
 # Every `read` below puts `2>/dev/null` BEFORE the input redirection.
 # Redirections are applied left to right, so that is the only order in which a
@@ -570,7 +767,8 @@ session-end)
     ;;
 *)
     # idle, session-start, and any edge a future hooks.json adds that this
-    # version of the script does not know about yet.
+    # version of the script does not know about yet. `notify` never reaches
+    # here: 0b has already turned it into idle, into waiting, or into silence.
     glyph=${CCTAB_GLYPH_IDLE-⚪}
     ;;
 esac

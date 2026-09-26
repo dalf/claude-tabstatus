@@ -13,6 +13,92 @@ track of where each one is.
 ⚪ ~                              at $HOME
 ```
 
+Claude Code's own title cannot tell you the second line from the third: it
+renders one static glyph whether Claude is thinking or waiting for an answer
+from you. Telling those two apart across a row of tabs is what this exists for.
+
+## States
+
+Three states, and the hook events that paint them:
+
+| Event | Scoped to | Paints |
+|---|---|---|
+| `SessionStart` | `startup\|resume\|clear\|fork` | ⚪ idle, and arms the Konsole tab |
+| `SessionStart` | `source` is `compact` | *nothing* |
+| `UserPromptSubmit` | | 🔵 working |
+| `PreToolUse` | `AskUserQuestion\|ExitPlanMode` | 🟠 waiting |
+| `PermissionRequest` | | 🟠 waiting |
+| `PostToolUse` | | 🔵 working |
+| `PostToolUseFailure` | | 🔵 working |
+| `Notification` | `permission_prompt`, `worker_permission_prompt`, `agent_needs_input`, `elicitation_dialog`, `elicitation_url_dialog` | 🟠 waiting |
+| `Notification` | `idle_prompt` | ⚪ idle |
+| `Notification` | any other kind | *nothing* |
+| `Stop` | | ⚪ idle |
+| `StopFailure` | | ⚪ idle |
+| `SessionEnd` | | clears the title, restores the tab |
+
+The `SessionStart` and `PreToolUse` scopes are hook *matchers*, so those hooks
+do not even run outside them. The `Notification` kinds and the `compact` source
+are `case` globs inside the script, so those hooks run and then decide - which
+costs one ~2.5ms process on a notification, and buys a decision the test suite
+can assert rather than one that lives only in a config file.
+
+Some of that is less obvious than it looks:
+
+- **`PostToolUse` is registered unmatched**, so it runs on every tool call, and
+  it is the recovery from waiting: 24-42ms after you answer a dialog the tab is
+  blue again. It repaints for a *subagent's* tool calls too, which is right
+  while the main session is working and wrong while a main-thread dialog is open
+  - see Known limitations. The cost of the edge is the process spawn, about
+  2.5ms, so 900 tool calls in a heavy session cost ~2.2s spread over minutes -
+  invisible beside the tool calls themselves. A matcher would only skip the
+  emission, a fraction of that, and it would also miss a permission-gated `Read`
+  outside the project directory. It never reads its payload: that payload
+  carries the whole `tool_response`, hundreds of KB on a large read, and the
+  state it paints does not depend on it.
+- **`PreToolUse` is matched to exactly the two tools that always block on you.**
+  Unmatched, it would paint waiting on every tool call. `PermissionRequest`
+  fires for both of those tools anyway, 11-19ms later, so this edge is really
+  only insurance for a permission path that gets bypassed.
+- **A `Notification` never paints waiting on `idle_prompt`.** That kind is the
+  quiet-turn nudge, fired `messageIdleNotifThresholdMs` (default 60s) after a
+  turn ends, so mapping it to waiting would turn every idle tab orange a minute
+  later and collapse two of the three states into one. It is also the only
+  recovery from an interrupted turn - see the Ctrl+C limitation below.
+- **The waiting notifications are a backstop, not the fast path.**
+  `permission_prompt` is scheduled 6.00s after the dialog appears, fires at most
+  once per dialog, and is suppressed outright by
+  `CLAUDE_CODE_DISABLE_PERMISSION_PROMPT_NOTIFY_HOOKS`. `PermissionRequest` is
+  the real-time signal. What the notifications add is what `PermissionRequest`
+  does not cover: a worker prompt, an agent asking for input, an MCP elicitation
+  dialog, and the dialogs that are not tool calls at all - the managed-settings
+  review, the sandbox network request - which is why `permission_prompt` is kept
+  even though it is redundant for every tool dialog. The product does cancel the
+  notification when you answer first, but best-effort: measured once firing in
+  the same millisecond as the answering keystroke, so its orange and
+  `PostToolUse`'s blue were emitted concurrently and landed 38ms apart. The
+  order came out right; nothing guarantees it.
+- **A subagent's `PermissionRequest` paints waiting too.** An asynchronous
+  `Task` returns in ~6ms, so the main session's `Stop` has usually already
+  fired: measured, a subagent's dialog arrived a second *after* the tab went
+  idle, and nothing repainted until a human answered it. Treating it as a no-op
+  would leave the tab idle while you are the one blocking.
+- **`SubagentStop` is deliberately not registered.** A subagent finishing must
+  not read as the session going idle - and it also fires for the internal
+  compaction summarizer, with an empty `agent_type` that no matcher could
+  filter, right before a `SessionStart`/`compact`.
+- **`StopFailure` is there because `Stop` is not.** When a turn dies on an API
+  error - `rate_limit`, `overloaded` - only `StopFailure` fires, so without it a
+  rate-limited turn would leave the tab blue indefinitely.
+
+The script is **stateless**: what it paints is a pure function of the edge name
+plus, on two edges, a handful of `case` globs on the raw payload line. Nothing
+is written anywhere, so nothing is stale after a `kill -9` and there is nothing
+to prune. Only `Notification` and `SessionStart` look at their payload, both
+under a kilobyte; the globs carry the compact `"key":"value"` spelling Claude
+Code actually writes, and a payload that matches nothing falls through to
+painting nothing, which leaves whatever the tab already showed.
+
 ## Location
 
 Inside a git repository the location is `<repo>@<branch>`, and the
@@ -141,9 +227,69 @@ terminal that honours a plain OSC 0 title.
 
 ## Known limitations
 
-- **Ctrl+C mid-turn emits no hook.** Interrupting Claude fires neither `Stop`
-  nor anything else, so the tab keeps reading `working` until the next prompt
-  is submitted or the session ends.
+- **Ctrl+C emits no hook at all, and neither does walking away from a
+  permission dialog.** These are the two ways a turn can end with nothing to
+  paint, and they are the wrong titles this design can produce: the tab keeps
+  reading `working` (after an interrupt) or `waiting` (after a dialog you never
+  answer) with nothing actually happening.
+
+  It is not for want of an event. `PostToolUseFailure` exists and carries an
+  `is_interrupt` flag, but the hook is handed the turn's own abort signal and
+  bails before spawning anything, so an interrupt - the thing that aborts that
+  signal - skips it by construction. Measured end to end: a pre-approved
+  `ping -c 40` interrupted mid-run produced no `PostToolUseFailure`, no
+  `PostToolUse` and no `Stop`. Interrupting a *thinking* turn is the same, and
+  so is pressing Esc at a permission dialog - measured twice, no hook of any
+  kind fires. `PostToolUseFailure` is still registered, because it does fire for
+  a tool that *reports* an error, after which the turn continues - so it paints
+  `working`, not idle.
+
+  (Declining with "No, and tell Claude what to do differently" and then actually
+  submitting the feedback is a different path, and this README does not claim it
+  either way: the probe that tried it selected the option and never submitted,
+  so what it measured was the feedback box - itself a wait, correctly orange.
+  Reading the code, a denial is not an abort, so it should reach
+  `PostToolUseFailure` and then a normal `Stop`, which would need no recovery at
+  all. Unverified.)
+
+  **The interrupt heals itself in about a minute. The abandoned dialog does
+  not.** When a turn ends, aborted or not, the product schedules its
+  `idle_prompt` notification, and this plugin maps that to idle - so a tab left
+  blue by Ctrl+C goes white about 60s later (`messageIdleNotifThresholdMs`,
+  configurable) if you leave the keyboard alone, and immediately if you just type
+  your next prompt. But that notifier checks, when its timer fires, whether you
+  have touched the keyboard since the turn ended, drops the notification if you
+  have, and never re-arms - and that is precisely what breaks the other case.
+  Dismissing a dialog *is* touching the keyboard, so nothing repaints: the tab
+  stays **orange until the next `UserPromptSubmit`, which may be never.**
+  Measured: Esc at a `Write` dialog, then
+  110s of absolute quiet - 1.8x the 60s threshold - produced no hook and no
+  repaint, and the tab was still orange when the session ended 113s later. So the stuck colour can be orange, which is
+  the damaging direction: a tab claiming it needs you when nothing does.
+- **A background subagent repaints over an open dialog.** `PostToolUse` is
+  registered unmatched and a subagent's tool calls fire it in the *main*
+  session, so while you are looking at a main-thread permission dialog, a
+  subagent doing N tool calls paints `working` N times over the orange. The
+  `permission_prompt` notification restores it once, 6s in, and then never again
+  - it is one-shot per dialog - so with a long-running background subagent the
+  tab can read blue, "busy, don't bother", for as long as that subagent runs
+  while Claude is in fact blocked on you. There is no stateless fix: a matcher
+  sees only `tool_name`, and discriminating on `agent_id` means reading a
+  payload that carries the whole `tool_response`, on the hottest edge in the
+  table. That trade was judged worse than the bug; it is written down instead.
+- **Some dialogs are invisible to every hook.** A dialog that is neither a tool
+  call nor a notification - the LSP recommendation, the plugin hint, the
+  auto-mode-default upsell - fires no `PermissionRequest`, no matched
+  `PreToolUse` and no `Notification`, so the tab keeps whatever it last showed,
+  usually idle white, while a modal waits for you. The product's own 60s nudge
+  cannot correct it either: that notifier is gated on no dialog being on screen.
+  A white tab over one of those modals is the boundary of what hooks can see,
+  not a bug.
+- **MCP elicitation is backstop-only.** A server asking the user its own
+  question has real-time events, `Elicitation` and `ElicitationResult`, and this
+  plugin registers neither (see [Not yet built](#slices)), so the tab turns
+  orange only when the `elicitation_dialog` notification arrives about 6s later,
+  and only if you have not touched the keyboard in the meantime.
 - **Konsole repaints the tab on a ~2s tick**, not when the title arrives, so
   the dot trails the actual state change by up to about two seconds. That, not
   the ~2ms hook, is the responsiveness ceiling.
@@ -325,6 +471,44 @@ emits nothing) or runs with `CLAUDE_PID` unset.
 CCTAB_DRY_RUN=1 sh scripts/tabstatus.sh working   # -> 🔵 claude-tabstatus@main
 ```
 
+The two payload-reading edges are assertable the same way, with the payload on
+stdin - including the cases that must paint *nothing*, which print no bytes at
+all rather than an empty title:
+
+```sh
+echo '{"notification_type":"idle_prompt"}'  | CCTAB_DRY_RUN=1 sh scripts/tabstatus.sh notify
+echo '{"notification_type":"agent_needs_input"}' | CCTAB_DRY_RUN=1 sh scripts/tabstatus.sh notify
+echo '{"notification_type":"agent_completed"}' | CCTAB_DRY_RUN=1 sh scripts/tabstatus.sh notify
+echo '{"hook_event_name":"SessionStart","source":"compact"}' | CCTAB_DRY_RUN=1 sh scripts/tabstatus.sh session-start
+```
+
+Every no-op in the state table has its own assertion, because a no-op that
+quietly paints is the failure this table is most likely to hide: it does not
+crash, it just overwrites a correct state with a wrong one a minute later.
+
+`hooks/hooks.json` is asserted as a **table**, not as a bag of strings. The
+suite parses it into one `event matcher edge timeout` row per registered hook
+and checks that against the table above in both directions: every row is
+present, nothing else is registered, ten hooks exactly, one command per group,
+`SubagentStop` still absent, and no edge name the script does not implement (an
+unknown edge falls back to idle, so a typo there would silently paint the wrong
+state on every notification). Presence checks alone are not enough, and that is
+measured rather than argued: a copy of this tree with `Stop` → working and
+`UserPromptSubmit` → idle passed an earlier "every event appears somewhere"
+version of these assertions, and `claude plugin validate` passed it too. Eight
+deliberate mutations of `hooks.json` - transposed edges, a matcher added to
+`PostToolUse`, the matcher dropped from `PreToolUse`, a missing timeout, a
+changed timeout, an added `SubagentStop`, a second hook smuggled into a group,
+an edge-name typo - now each fail at least one assertion.
+
+Two things the suite deliberately does not assert. The real emitting path of
+`session-start` and `session-end` needs an allocated pty, which would cost a
+dependency; it is checked by hand instead - 82 bytes for a startup, the OSC 50
+arming pair of [Konsole](#konsole) followed by the idle title, and 0 bytes for a
+compaction. And the belt is pinned at its real reach rather than a wished-for
+one: `{"source": "compact"}` on one line is caught, the same payload
+pretty-printed over three lines is not, because only the first line is read.
+
 The repository fixtures are hand-built - a `.git` directory and a one-line
 `HEAD` - so the suite needs no git binary and can assert HEAD bytes that git
 will not write on request, such as a missing trailing newline or a CRLF line
@@ -342,20 +526,26 @@ Built in slice 2: the real location - `repo@branch` from a fork-free `.git`
 walk, the home-relative path outside a repo, the left-eliding length cap, and
 the ssh host prefix. See [Location](#location).
 
+Built in slice 3: the `waiting` state and the recovery from it - six more hook
+edges (`PreToolUse`, `PermissionRequest`, `PostToolUse`, `PostToolUseFailure`,
+`Notification`, `StopFailure`), the notification-kind three-way, and the
+`compact` guard on `SessionStart`. See [States](#states).
+
 **Not yet built:**
 
 - A tmux branch, for when the session is inside tmux rather than a bare tab.
-- The full 13-edge state machine. Today's four edges cannot see a tool call, a
-  permission prompt, or a notification, which is why `waiting` is implemented
-  but never actually emitted yet.
-- A compaction edge. `SessionStart` here carries
-  `"matcher": "startup|resume|clear|fork"`, which deliberately leaves out
-  `compact`: an auto-compaction fires mid-turn, and without the matcher it
-  repainted the idle dot while Claude was still working, and armed the tab a
-  second time with no matching unarm. A compaction edge should be a *second*
-  `SessionStart` group with `"matcher": "compact"` (or the first-class
-  `PreCompact` / `PostCompact` events), selected declaratively rather than by
-  parsing the payload's `source` field.
+- A compaction *edge*, as opposed to today's guard. `SessionStart` carries
+  `"matcher": "startup|resume|clear|fork"`, which leaves out `compact`, and the
+  script refuses a `compact` payload as well; neither of those paints anything
+  while a compaction runs mid-turn. A tab that said so would be better, and the
+  place for it is a second `SessionStart` group with `"matcher": "compact"` (or
+  the first-class `PreCompact` / `PostCompact` events).
+- The `Elicitation` and `ElicitationResult` events. An MCP server asking the
+  user is a true waiting state, and today it is covered only by the
+  `elicitation_dialog` notification kinds, which no session here has been able to
+  reproduce. Registering the events directly would be the real signal; their
+  match query is the MCP server name, not the kind, so they would go in
+  unmatched.
 - Konsole `TabColor`, which rides on the same OSC 50 property list as the
   arming and would let the tab itself carry the colour. Whoever adds it also
   has to add `TabColor=#000000` to the `SessionEnd` list, or the colour
