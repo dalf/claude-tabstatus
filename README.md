@@ -510,6 +510,12 @@ is an ssh session, so exporting it globally is safe.
 
 ## Build
 
+The default target is **musl, not gnu.** A static-pie binary starts in 243us
+against the gnu build's 556us - below even `/bin/true`'s 312us, because it never
+enters `ld.so` - and it carries no `GLIBC_2.34` requirement, which matters when
+the binary's main home is a remote box reached over ssh whose glibc you do not
+control.
+
 `bin/` is **build output and is gitignored.** It holds a binary per platform plus
 `bin/tabstatus`, a relative symlink to the one for this machine - that is the
 path `hooks/hooks.json` invokes. A fresh clone has no `bin/` until you build,
@@ -525,6 +531,7 @@ sh scripts/build.sh --all    # every target in the list
 
 | Target | State |
 |---|---|
+| `x86_64-unknown-linux-musl` | **default**, 533 KB, static-pie |
 | `x86_64-unknown-linux-gnu` | builds, 441 KB |
 | `x86_64-pc-windows-gnu` | **does not build**, see below |
 
