@@ -45,11 +45,12 @@ host=x86_64-unknown-linux-musl
 
 # Only targets that actually COMPILE. x86_64-pc-windows-gnu is deliberately not
 # here: the source is Unix-only by construction (std::os::unix, /proc, symlinks,
-# character devices) and fails with 28 errors across five source files. Listing it
-# made `sh scripts/build.sh --all` - one of the two commands the README documents -
-# exit 1 on every run even when the host build had succeeded, so the documented
-# release step was permanently red and useless as a success signal. Windows is a
-# port, not a cross-compile; README's Build table says so.
+# character devices) and does not compile for it at all - measured, 53 errors
+# across six source files. Listing it made `sh scripts/build.sh --all`, one of the
+# two commands the README documents, exit 1 on every run even when the host build
+# had succeeded, so the documented release step was permanently red and useless as
+# a success signal. Windows is a port, not a cross-compile; README's Build table
+# says so.
 TARGETS="x86_64-unknown-linux-musl x86_64-unknown-linux-gnu"
 
 build_one() {

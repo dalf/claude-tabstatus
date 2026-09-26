@@ -531,18 +531,18 @@ sh scripts/build.sh --all    # every target in the list
 
 | Target | State |
 |---|---|
-| `x86_64-unknown-linux-musl` | **default**, 533 KB, static-pie |
+| `x86_64-unknown-linux-musl` | **default**, 529 KB, static-pie |
 | `x86_64-unknown-linux-gnu` | builds, 441 KB |
 | `x86_64-pc-windows-gnu` | **does not build**, see below |
 
 Windows is deliberately **not** in the build script's target list. The target and
 its mingw linker are both installed here and the failure is not theirs: the source
-is Unix-only by construction. 28 compile errors across five source files, all of
-them `std::os::unix` - byte-oriented paths (`OsStrExt`), file modes, symlinks, and
-the `/proc/$CLAUDE_PID/fd/1` lookup the two direct-write edges need. Windows has no
-byte paths at all (its `OsString` is WTF-16), so this is a port, not a
-cross-compile, and it is not faked with an untested `.exe`. Listing it made
-`sh scripts/build.sh --all` exit 1 on every run even when the host build had
+is Unix-only by construction. Measured, it is 53 compile errors across six source
+files, every one a `std::os::unix` error - byte-oriented paths (`OsStrExt`), file
+modes, symlinks, and the `/proc/$CLAUDE_PID/fd/1` lookup the two direct-write edges
+need. Windows has no byte paths at all (its `OsString` is WTF-16), so this is a
+port, not a cross-compile, and it is not faked with an untested `.exe`. Listing it
+made `sh scripts/build.sh --all` exit 1 on every run even when the host build had
 succeeded, which made the documented release step useless as a success signal.
 
 **On a platform with no committed binary**, build one *before* installing:
@@ -572,6 +572,18 @@ somebody's tab. The suite used to run the shell implementation under three shell
 in four locales, because its answer depended on both; a binary has no
 interpreter, and since the length cap became locale-independent it has no locale
 dependence either, so that whole axis is gone.
+
+Beside the two shell harnesses there are in-crate unit tests, which those
+harnesses cannot replace: they pin the argv and environment parsing, the location
+walk, the length cap and its elision, the two payload windows and the JSON writers
+at FUNCTION granularity, so a refactor can be checked a piece at a time instead of
+only end to end. Some of what they assert is invisible from outside the binary at
+all - that `repair` answers differently from `String::from_utf8_lossy` on a
+truncated sequence, for one.
+
+```sh
+cargo test   # 101 tests, beside the 279 assertions and the 292 corpus cases
+```
 
 Two of the assertions exist only to guard the committed binaries: `bin/` carries
 a digest of the `src/*.rs` and `Cargo.toml` it was built from, and the suite
@@ -703,6 +715,40 @@ no `busybox`), so the bash figures are re-measurable and the `dash` ones are
 historical - taken on the machine that had it during slices 1-3, and quoted rather
 than re-run. The `binary` column and the whole ratio are reproducible here with
 `sh tests/corpus/replay.sh` and the timing harness in the slice notes.
+
+Built in slice 5: nothing. The port was transliterated from the shell
+deliberately, so that it could be proved; this slice made it Rust without
+letting it change its mind about anything. `src/sh.rs` - 608 lines
+reimplementing shell string operators on bytes - is gone, argv and the
+environment are parsed into types once at the boundary, the closed sets are
+enums, absence is `Option`, and a failed write is an `io::Error` that only
+`main` turns into exit 0. The contract was byte-identical output; what holds it
+is the 292-case corpus, the 279 assertions, ~50,000 paired invocations against
+the pre-refactor binary, and 101 new in-crate unit tests. Two defects were found
+and deliberately NOT fixed, because mixing a fix into this slice would have cost
+the proof - they are the two below.
+
+**Known defects, reproduced and deferred.** Both predate the Rust port, both are
+reproduced by the current binary, and both belong to a slice that is allowed to
+change behaviour:
+
+- `doctor` aborts with exit 1 when `settings.json` is a **directory**. The read
+  error propagates, so the env-key, settings, state, terminal, glyph, pty and
+  title lines never print. Every other broken shape - empty, whitespace,
+  unparseable, an array, missing, a dangling symlink - is reported and exits 0,
+  which is what the command is for. Reproduce with `mkdir <config>/settings.json
+  && tabstatus doctor`. The fix is to report an I/O error as one more `env key:
+  FAIL` line and let the rest of the report run.
+- `install` writes the state record (step 1) **before** it edits `settings.json`
+  (step 2), so an install that aborts between the two - the
+  concurrent-modification guard is one reachable way - leaves a record saying
+  `env_had: false` with no key ever written. If you then set
+  `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` yourself, `uninstall` reads that orphan,
+  concludes the key is ours and removes it; the refusal that exists to prevent
+  exactly this only fires when there is no record at all. The damage is
+  recoverable, because the `.cctab-preuninstall` copy is written first. The fix
+  is to write the record only after settings.json has actually changed, or to
+  cross-check the recorded `settings_path` before editing.
 
 **Not yet built:**
 

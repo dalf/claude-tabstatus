@@ -125,7 +125,7 @@ pub fn parse(doc: &[u8]) -> Result<J, String> {
     Ok(v)
 }
 
-impl<'a> P<'a> {
+impl P<'_> {
     fn ws(&mut self) {
         while self.i < self.b.len() && matches!(self.b[self.i], b' ' | b'\t' | b'\r' | b'\n') {
             self.i += 1;
@@ -409,43 +409,144 @@ pub fn push_utf8(out: &mut Vec<u8>, cp: u32) {
 /// write the state file because a path on this machine is not - would be worse
 /// than recording a path that cannot be restored verbatim.
 pub fn quote(s: &[u8]) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
+    let text = crate::text::repair(s);
+    let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
-    let mut i = 0;
-    while i < s.len() {
-        let b = s[i];
-        if b < 0x80 {
-            match b {
-                b'"' => out.push_str("\\\""),
-                b'\\' => out.push_str("\\\\"),
-                b'\n' => out.push_str("\\n"),
-                b'\r' => out.push_str("\\r"),
-                b'\t' => out.push_str("\\t"),
-                0x08 => out.push_str("\\b"),
-                0x0c => out.push_str("\\f"),
-                0x00..=0x1f | 0x7f => {
-                    let _ = write!(out, "\\u{:04x}", b);
-                }
-                _ => out.push(b as char),
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
             }
-            i += 1;
-            continue;
-        }
-        match crate::sh::utf8_len(&s[i..]) {
-            // Already valid UTF-8, which JSON allows raw.
-            Some(n) => {
-                match std::str::from_utf8(&s[i..i + n]) {
-                    Ok(t) => out.push_str(t),
-                    Err(_) => out.push('\u{fffd}'),
-                }
-                i += n;
-            }
-            None => {
-                out.push('\u{fffd}');
-                i += 1;
-            }
+            // Everything else, including a repaired U+FFFD, is legal raw.
+            c => out.push(c),
         }
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn obj(doc: &str) -> Obj {
+        match parse(doc.as_bytes()) {
+            Ok(J::Obj(o)) => o,
+            Ok(_) => panic!("expected an object, got another JSON value"),
+            Err(e) => panic!("expected an object, got the refusal {:?}", e),
+        }
+    }
+
+    fn str_of(doc: &str, key: &str) -> Vec<u8> {
+        match &obj(doc).get(key).expect("the key").val {
+            J::Str(s) => s.clone(),
+            _ => panic!("not a string"),
+        }
+    }
+
+    #[test]
+    fn escapes_are_folded_and_surrogate_pairs_are_joined() {
+        assert_eq!(str_of(r#"{"k":"a\nb"}"#, "k"), b"a\nb");
+        assert_eq!(str_of(r#"{"k":"a\/b"}"#, "k"), b"a/b");
+        assert_eq!(str_of(r#"{"k":"A"}"#, "k"), b"A");
+        // U+1F535, as a surrogate pair.
+        assert_eq!(str_of(r#"{"k":"🔵"}"#, "k"), "\u{1f535}".as_bytes());
+        // A LONE surrogate is not a character, so it comes through as U+FFFD
+        // rather than as an invalid encoding.
+        assert_eq!(str_of(r#"{"k":"\ud83d"}"#, "k"), "\u{fffd}".as_bytes());
+    }
+
+    #[test]
+    fn duplicate_keys_are_preserved_rather_than_collapsed() {
+        // The installer refuses a document with duplicate keys; it can only do
+        // that if the parser hands it both.
+        let o = obj(r#"{"a":1,"a":2}"#);
+        assert_eq!(o.members.len(), 2);
+    }
+
+    #[test]
+    fn the_spans_point_at_the_document_text() {
+        // This is what lets the installer splice one member into the document
+        // instead of reprinting it.
+        let doc = r#"{"a": 12 }"#;
+        let o = obj(doc);
+        assert_eq!(o.open, 0);
+        assert_eq!(o.close, 9);
+        let m = o.get("a").expect("the key");
+        assert_eq!(&doc[m.start..m.end], r#""a": 12"#);
+        assert_eq!(&doc[m.val_start..m.end], "12");
+    }
+
+    #[test]
+    fn the_parser_is_strict() {
+        for doc in [
+            r#"{"a":1,}"#,
+            r#"{a:1}"#,
+            r#"{'a':1}"#,
+            r#"{"a":01}"#,
+            r#"{"a":1}// trailing"#,
+            r#"{"a":/*c*/1}"#,
+            r#"{"a":}"#,
+            r#"{"a"}"#,
+            r#"{"a":1"#,
+            "{\"a\":\"raw\u{9}control\"}",
+            "",
+        ] {
+            assert!(parse(doc.as_bytes()).is_err(), "should refuse {:?}", doc);
+        }
+    }
+
+    #[test]
+    fn nesting_past_max_depth_is_refused() {
+        let n = MAX_DEPTH as usize;
+        let ok = "[".repeat(n - 1) + &"]".repeat(n - 1);
+        assert!(parse(ok.as_bytes()).is_ok());
+        let deep = "[".repeat(n + 1) + &"]".repeat(n + 1);
+        assert!(parse(deep.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn the_writer_escapes_what_a_string_literal_cannot_hold() {
+        assert_eq!(quote(b"plain"), r#""plain""#);
+        assert_eq!(quote(b"a\"b"), r#""a\"b""#);
+        assert_eq!(quote(b"a\\b"), r#""a\\b""#);
+        assert_eq!(quote(b"\n\r\t"), r#""\n\r\t""#);
+        assert_eq!(quote(&[0x08, 0x0c]), r#""\b\f""#);
+        assert_eq!(quote(&[0x01, 0x1f, 0x7f]), "\"\\u0001\\u001f\\u007f\"");
+        // A forward slash needs no escape, and U+0085 is legal raw.
+        assert_eq!(quote(b"a/b"), r#""a/b""#);
+        assert_eq!(quote("\u{85}".as_bytes()), "\"\u{85}\"");
+    }
+
+    #[test]
+    fn the_writer_repairs_a_path_that_is_not_valid_utf8() {
+        // `install` quotes filesystem paths into the state record, and a path
+        // the kernel accepts can be bytes JSON cannot carry. One U+FFFD per
+        // offending byte, and never a refusal to write the record.
+        assert_eq!(quote(b"/home/a\xffb"), "\"/home/a\u{fffd}b\"");
+        assert_eq!(quote(b"\xe2\x82"), "\"\u{fffd}\u{fffd}\"");
+        // And the result parses back as a string.
+        let doc = format!("{{\"repo\":{}}}", quote(b"/tmp/\xffx"));
+        assert_eq!(str_of(&doc, "repo"), "/tmp/\u{fffd}x".as_bytes());
+    }
+
+    #[test]
+    fn a_round_trip_through_quote_and_parse_keeps_the_bytes() {
+        for raw in [
+            &b"plain"[..],
+            &b"a\"b\\c"[..],
+            &b"tab\there"[..],
+            "caf\u{e9} \u{1f535}".as_bytes(),
+        ] {
+            let doc = format!("{{\"k\":{}}}", quote(raw));
+            assert_eq!(str_of(&doc, "k"), raw, "{:?}", raw);
+        }
+    }
 }

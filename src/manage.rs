@@ -1,33 +1,31 @@
 //! `install`, `uninstall`, `doctor`, `version` - the management half of the
 //! binary.
 //!
-//! It is in the SAME binary as the hook, and that is a measured choice rather
-//! than a convenience: merging the installer into the hook cost -9us on the hot
-//! edge and 90KB of file size. Code that never runs is never paged in, so a
-//! second executable would have bought nothing and cost a second thing to keep
-//! in step. One file to copy, one path in hooks.json, one `--version`.
+//! It shares the hook's binary, which was measured rather than assumed: merging it
+//! cost -9us on the hot edge and 90KB of file size, because code that never runs is
+//! never paged in. One file to copy, one path in hooks.json, one `--version`.
 //!
-//! What it changes is exactly what the shell installer changed:
+//! What it changes:
 //!
 //!   1. one key   <config>/settings.json -> env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE = "1"
 //!   2. a symlink <config>/skills/claude-tabstatus -> this repo
 //!   3. a record  <config>/claude-tabstatus.state  -> what was there before
 //!
-//! settings.json is written FIRST and the symlink LAST, so a failure while
-//! editing settings cannot leave the plugin loaded with Claude Code's built-in
-//! title still repainting over it - which looks broken rather than uninstalled.
-//! uninstall is the MIRROR of that, settings first and the link last, for the
-//! sharper version of the same reason: the half-state where the env key is still
-//! set and the plugin is gone paints NO tab title at all. Both halves preflight
-//! every refusal, so the window between the two writes contains nothing that can
-//! decide to stop.
+//! settings.json is written FIRST and the symlink LAST, so a failure mid-edit
+//! cannot leave the plugin loaded with Claude Code's built-in title repainting over
+//! it - which looks broken rather than uninstalled. uninstall mirrors that for the
+//! sharper version of the same reason: env key still set and plugin gone paints NO
+//! title at all. Both halves preflight every refusal, so the window between the two
+//! writes holds nothing that can decide to stop.
 //!
 //! CLAUDE_CONFIG_DIR overrides the config directory, which is how the tests
 //! point all of this at a throwaway tree instead of a real one.
 
 use crate::settings::{self, Outcome};
-use crate::{json, location, render, sh};
-use std::ffi::OsString;
+use crate::config::{self, Config, Terminal};
+use crate::edge::{Glyph, Paint};
+use crate::{json, render};
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -38,67 +36,126 @@ const KEY: &str = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE";
 const PLUGIN: &str = "claude-tabstatus";
 const STATE_VERSION: i32 = 2;
 
-/// The management names. Checked against argv before anything else, and
-/// deliberately disjoint from the edge names - `working`, `waiting`, `idle`,
-/// `notify`, `session-start`, `session-end` - so no hook can reach this half and
-/// no typo of a subcommand can reach the paint path with a real edge's name.
-pub fn is_subcommand(a: &[u8]) -> bool {
-    matches!(
-        a,
-        b"install" | b"uninstall" | b"doctor" | b"version" | b"--version" | b"-V"
-            | b"help" | b"--help" | b"-h"
-    )
+/// One of this half's options. Spelled here and nowhere else; which subcommand
+/// accepts which is [`Subcommand::parse`]'s business.
+enum Flag {
+    Force,
+    RestoreBackup,
 }
 
-pub fn dispatch(a: &[u8], args: &[Vec<u8>]) -> i32 {
-    match a {
-        b"install" => {
-            let mut force = false;
-            for arg in args {
-                match &arg[..] {
-                    b"--force" => force = true,
-                    other => {
-                        fail(&format!(
-                            "unknown option {}",
-                            String::from_utf8_lossy(other)
-                        ));
-                        return 1;
-                    }
-                }
-            }
-            run(|c| install(c, force))
-        }
-        b"uninstall" => {
-            let mut force = false;
-            let mut restore = false;
-            for arg in args {
-                match &arg[..] {
-                    b"--force" => force = true,
-                    b"--restore-backup" => restore = true,
-                    other => {
-                        fail(&format!(
-                            "unknown option {}",
-                            String::from_utf8_lossy(other)
-                        ));
-                        return 1;
-                    }
-                }
-            }
-            run(|c| uninstall(c, force, restore))
-        }
-        b"doctor" => run(doctor),
-        b"version" | b"--version" | b"-V" => {
-            version();
-            0
-        }
-        _ => {
-            usage();
-            0
+impl Flag {
+    fn parse(a: &OsStr) -> Option<Flag> {
+        match a.as_bytes() {
+            b"--force" => Some(Flag::Force),
+            b"--restore-backup" => Some(Flag::RestoreBackup),
+            _ => None,
         }
     }
 }
 
-fn run<F: FnOnce(&Ctx) -> Result<(), String>>(f: F) -> i32 {
+/// A management subcommand and its options, decided once from argv. Nothing below
+/// this type looks at an argument again.
+pub enum Subcommand {
+    Install {
+        force: bool,
+    },
+    Uninstall {
+        force: bool,
+        restore_backup: bool,
+    },
+    Doctor,
+    Version,
+    Help,
+    /// A verb this half owns, given an option that verb does not accept. It
+    /// carries the offending argument so the message can name it, and it is a
+    /// variant rather than an early `Err` because parsing must not need a `Ctx`:
+    /// `install --nope` is refused even where there is no config directory to
+    /// find.
+    BadOption(OsString),
+}
+
+impl Subcommand {
+    /// `None` when argv[1] is not one of this half's names, which is what sends
+    /// the run on to the paint path.
+    ///
+    /// The verbs are spelled ONCE, here, and are deliberately disjoint from the
+    /// edge names - `working`, `waiting`, `idle`, `notify`, `session-start`,
+    /// `session-end` - so no hook can reach this half, and no typo of a subcommand
+    /// can reach the paint path carrying a real edge's name.
+    pub fn parse(first: Option<&OsStr>, rest: &[OsString]) -> Option<Subcommand> {
+        Some(match first?.as_bytes() {
+            b"install" => install_options(rest),
+            b"uninstall" => uninstall_options(rest),
+            // These three take no options and IGNORE any argument given, which is
+            // what they have always done: `doctor --force` runs doctor.
+            b"doctor" => Subcommand::Doctor,
+            b"version" | b"--version" | b"-V" => Subcommand::Version,
+            b"help" | b"--help" | b"-h" => Subcommand::Help,
+            _ => return None,
+        })
+    }
+
+    /// The exit code. This half keeps its own: `install` exits non-zero on a
+    /// refusal so a wrapper can see it. "Always exit 0" is the PAINT path's
+    /// contract, not this one's.
+    pub fn run(self) -> i32 {
+        match self {
+            Subcommand::Install { force } => with_ctx(|c| install(c, force)),
+            Subcommand::Uninstall {
+                force,
+                restore_backup,
+            } => with_ctx(|c| uninstall(c, force, restore_backup)),
+            Subcommand::Doctor => with_ctx(doctor),
+            Subcommand::Version => {
+                version();
+                0
+            }
+            Subcommand::Help => {
+                usage();
+                0
+            }
+            Subcommand::BadOption(arg) => {
+                fail(&format!(
+                    "unknown option {}",
+                    String::from_utf8_lossy(arg.as_bytes())
+                ));
+                1
+            }
+        }
+    }
+}
+
+fn install_options(rest: &[OsString]) -> Subcommand {
+    let mut force = false;
+    for arg in rest {
+        match Flag::parse(arg) {
+            Some(Flag::Force) => force = true,
+            // `--restore-backup` is a real flag, but not one install accepts.
+            _ => return Subcommand::BadOption(arg.clone()),
+        }
+    }
+    Subcommand::Install { force }
+}
+
+fn uninstall_options(rest: &[OsString]) -> Subcommand {
+    let mut force = false;
+    let mut restore_backup = false;
+    for arg in rest {
+        match Flag::parse(arg) {
+            Some(Flag::Force) => force = true,
+            Some(Flag::RestoreBackup) => restore_backup = true,
+            None => return Subcommand::BadOption(arg.clone()),
+        }
+    }
+    Subcommand::Uninstall {
+        force,
+        restore_backup,
+    }
+}
+
+/// Resolve the config directory once, then run one command against it. The only
+/// place a refusal from either half becomes a message on stderr and an exit code.
+fn with_ctx<F: FnOnce(&Ctx) -> Result<(), String>>(f: F) -> i32 {
     let ctx = match Ctx::new() {
         Ok(c) => c,
         Err(e) => {
@@ -204,19 +261,19 @@ struct Ctx {
 impl Ctx {
     fn new() -> Result<Ctx, String> {
         let repo = repo_root()?;
-        let config = match sh::env_raw("CLAUDE_CONFIG_DIR") {
-            Some(v) if !v.is_empty() => PathBuf::from(OsString::from_vec(v)),
-            _ => {
-                let home = sh::env_str("HOME");
-                if home.is_empty() {
+        // Both stay OsString: a HOME or CLAUDE_CONFIG_DIR that is not valid
+        // UTF-8 still names a real directory, and repairing it here would edit a
+        // different one.
+        let config = match config::var_nonempty("CLAUDE_CONFIG_DIR") {
+            Some(v) => PathBuf::from(v),
+            None => match config::var_nonempty("HOME") {
+                Some(home) => PathBuf::from(home).join(".claude"),
+                None => {
                     return Err("neither CLAUDE_CONFIG_DIR nor HOME is set, so there \
                                 is no config directory to work on"
-                        .to_string());
+                        .to_string())
                 }
-                let mut p = PathBuf::from(OsString::from_vec(home));
-                p.push(".claude");
-                p
-            }
+            },
         };
         let skills = config.join("skills");
         let link = skills.join(PLUGIN);
@@ -498,13 +555,11 @@ fn refuse_unresolved(c: &Ctx) -> Option<String> {
 
 /// Unlink this tool's own scratch files left behind by a run that was killed.
 ///
-/// `dir_writable`'s probe and `write_atomic`'s temp file are both named with the
-/// pid that created them, so nothing ever collides with a stale one and nothing
-/// ever cleaned one up: 400 SIGKILLed runs left a permanent `.cctab-wtest.<pid>`
-/// and a permanent `.settings.json.cctab-tmp.<pid>` in the config directory. Both
-/// are per-run scratch, so a name whose pid is no longer in /proc is litter by
-/// definition. A LIVE pid is left alone, because a concurrent install's temp file
-/// is the one thing here that must not be removed under it.
+/// `dir_writable`'s probe and `write_atomic`'s temp file are named with the pid that
+/// created them, so nothing collides with a stale one - and nothing used to clean
+/// one up either. Both are per-run scratch, so a name whose pid is no longer in
+/// /proc is litter by definition. A LIVE pid is left alone: a concurrent install's
+/// temp file is the one thing here that must not be removed under it.
 fn sweep_litter(dir: &Path) {
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -512,24 +567,26 @@ fn sweep_litter(dir: &Path) {
     };
     for e in rd.flatten() {
         let raw = e.file_name();
-        let name = match raw.to_str() {
-            Some(n) => n,
-            None => continue,
-        };
-        // `.cctab-wtest.<pid>` and `.<file>.cctab-tmp.<pid>` - our two scratch
-        // shapes, and nothing else in either directory ends in `.<digits>` after
-        // one of those markers.
-        let pid = match name
-            .strip_prefix(".cctab-wtest.")
-            .or_else(|| name.rsplit_once(".cctab-tmp.").map(|(_, p)| p))
-        {
-            Some(p) if !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) => p,
-            _ => continue,
-        };
+        let Some(name) = raw.to_str() else { continue };
+        let Some(pid) = scratch_pid(name) else { continue };
         if !Path::new(&format!("/proc/{}", pid)).exists() {
             let _ = fs::remove_file(e.path());
         }
     }
+}
+
+/// The pid inside one of this tool's two scratch names, or `None` for a name that
+/// is not ours to remove.
+///
+/// `.cctab-wtest.<pid>` and `.<file>.cctab-tmp.<pid>` are the only two shapes, and
+/// the pid must be all digits: nothing else in either directory ends in
+/// `.<digits>` after one of those markers.
+fn scratch_pid(name: &str) -> Option<&str> {
+    let pid = name
+        .strip_prefix(".cctab-wtest.")
+        .or_else(|| name.rsplit_once(".cctab-tmp.").map(|(_, p)| p))?;
+    let numeric = !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit());
+    numeric.then_some(pid)
 }
 
 /// Every directory this tool writes scratch files into.
@@ -553,8 +610,35 @@ fn refuse_link(p: &Path, what: &str) -> String {
 
 // --- install ----------------------------------------------------------------
 
+/// Three writes, in the order the module header explains, with every refusal
+/// decided before the first of them.
 fn install(c: &Ctx, force: bool) -> Result<(), String> {
-    // ---- preflight: every refusal happens before anything is written -------
+    let hook = c.hook_binary();
+    let existing = install_preflight(c, force, &hook)?;
+    install_header(c, &hook);
+    // Clear this tool's own scratch files left by a killed run, in the two
+    // directories it is about to write.
+    sweep_all(c);
+    fs::create_dir_all(&c.config)
+        .map_err(|e| format!("cannot create {}: {}", c.config.display(), e))?;
+
+    record_prior_state(c, existing.as_deref())?;
+    write_env_key(c, existing)?;
+    link_the_plugin(c)?;
+
+    say("");
+    say("Done. Nothing else on this machine was modified.");
+    say("Start a NEW Claude Code session for the plugin and the env key to take effect.");
+    say("To undo: tabstatus uninstall");
+    Ok(())
+}
+
+/// Every reason to refuse, and the settings document to edit if there is none.
+///
+/// `Ok(None)` means "write settings.json fresh": either it does not exist, or it
+/// exists and holds nothing but whitespace, which Claude Code reads as no settings
+/// at all.
+fn install_preflight(c: &Ctx, force: bool, hook: &Path) -> Result<Option<Vec<u8>>, String> {
     if let Some(e) = refuse_unresolved(c) {
         return Err(e);
     }
@@ -568,7 +652,6 @@ fn install(c: &Ctx, force: bool) -> Result<(), String> {
     // and all ten hooks then resolve to a command that exits 127, so nothing
     // paints the tab at all. Refused rather than warned about, because the
     // warning exited 0 and was invisible to any wrapper script.
-    let hook = c.hook_binary();
     if !hook.is_file() && !force {
         return Err(format!(
             "{} is missing, so none of the ten hooks could run - and installing \
@@ -658,7 +741,11 @@ fn install(c: &Ctx, force: bool) -> Result<(), String> {
     } else {
         None
     };
+    Ok(existing)
+}
 
+/// What is about to be touched, before anything is.
+fn install_header(c: &Ctx, hook: &Path) {
     say(&format!("repo:     {}", c.repo.display()));
     say(&format!("config:   {}", c.config.display()));
     if let Some(l) = &c.settings_link {
@@ -667,7 +754,7 @@ fn install(c: &Ctx, force: bool) -> Result<(), String> {
     if hook.is_file() {
         say(&format!("binary:   {}", hook.display()));
     } else {
-        // Only reachable with --force, which the preflight above demands.
+        // Only reachable with --force, which the preflight demands.
         say(&format!(
             "binary:   WARNING - {} is missing, so NOTHING will paint until you \
              build it.\n          Installing anyway because --force was given.\n\
@@ -676,14 +763,11 @@ fn install(c: &Ctx, force: bool) -> Result<(), String> {
         ));
     }
     say("");
-    // Clear this tool's own scratch files left by a killed run, in the two
-    // directories it is about to write.
-    sweep_all(c);
+}
 
-    fs::create_dir_all(&c.config)
-        .map_err(|e| format!("cannot create {}: {}", c.config.display(), e))?;
-
-    // ---- 1. record what was here, once ------------------------------------
+/// Step 1: what was here before we touched it, written once and never rewritten -
+/// a second install must not record the state the FIRST one left.
+fn record_prior_state(c: &Ctx, existing: Option<&[u8]>) -> Result<(), String> {
     if c.state.exists() {
         say(&format!("state:    {} exists - keeping the original record", c.state.display()));
     } else {
@@ -691,11 +775,11 @@ fn install(c: &Ctx, force: bool) -> Result<(), String> {
             LinkState::Link(t, _) => (true, Some(t.as_os_str().as_bytes().to_vec())),
             _ => (false, None),
         };
-        let env_raw = match &existing {
+        let env_raw = match existing {
             Some(doc) => settings::env_raw_text(doc, KEY)?,
             None => None,
         };
-        let env_object_had = match &existing {
+        let env_object_had = match existing {
             Some(doc) => settings::has_env_object(doc)?,
             None => false,
         };
@@ -709,8 +793,11 @@ fn install(c: &Ctx, force: bool) -> Result<(), String> {
         write_atomic(&c.state, &state_text(c, &s), 0o600)?;
         say(&format!("state:    recorded the prior state in {}", c.state.display()));
     }
+    Ok(())
+}
 
-    // ---- 2. the settings key ----------------------------------------------
+/// Step 2: the one key, spliced into the document we parsed in the preflight.
+fn write_env_key(c: &Ctx, existing: Option<Vec<u8>>) -> Result<(), String> {
     match existing {
         None => {
             // 0600 from birth: this file is where people keep API keys. A blank
@@ -756,11 +843,13 @@ fn install(c: &Ctx, force: bool) -> Result<(), String> {
             }
         },
     }
+    Ok(())
+}
 
-    // ---- 3. the symlink ---------------------------------------------------
-    // Everything below is preflighted above, so a failure here is a surprise
-    // (a race, a full disk). Say what state it leaves, because settings.json has
-    // already been written by now.
+/// Step 3: the skills symlink. Everything here is preflighted, so a failure is a
+/// surprise - a race, a full disk - and it has to say what state it leaves,
+/// because settings.json has already been written by the time it runs.
+fn link_the_plugin(c: &Ctx) -> Result<(), String> {
     fs::create_dir_all(&c.skills).map_err(|e| late_failure(c, &format!("cannot create {}: {}", c.skills.display(), e)))?;
     match link_state(&c.link) {
         LinkState::Absent => {
@@ -794,11 +883,6 @@ fn install(c: &Ctx, force: bool) -> Result<(), String> {
         LinkState::Dir => return Err(refuse_link(&c.link, "a real directory, not a symlink")),
         LinkState::Other => return Err(refuse_link(&c.link, "not a symlink")),
     }
-
-    say("");
-    say("Done. Nothing else on this machine was modified.");
-    say("Start a NEW Claude Code session for the plugin and the env key to take effect.");
-    say("To undo: tabstatus uninstall");
     Ok(())
 }
 
@@ -828,8 +912,58 @@ fn late_failure(c: &Ctx, what: &str) -> String {
 
 // --- uninstall --------------------------------------------------------------
 
+/// What uninstall's preflight found, so that no decision below it has to re-read
+/// a file or re-parse a document.
+struct Prior {
+    /// settings.json holds nothing but whitespace, which counts as "no settings"
+    /// exactly as it does in install.
+    blank_settings: bool,
+    state: Option<State>,
+}
+
+/// The mirror of install: settings first and the link last. See the module header
+/// for why that order is the sharper of the two.
 fn uninstall(c: &Ctx, force: bool, restore_backup: bool) -> Result<(), String> {
-    // ---- preflight: every refusal happens before anything is removed -------
+    let prior = match uninstall_preflight(c, force, restore_backup)? {
+        Preflight::Go(prior) => prior,
+        Preflight::Refused => return Ok(()),
+    };
+    uninstall_header(c, &prior);
+    sweep_all(c);
+
+    remove_env_key(c, &prior, force, restore_backup)?;
+    unlink_the_plugin(c, &prior)?;
+    remove_state(c)?;
+
+    say("");
+    say("Done. Start a NEW Claude Code session for the change to take effect.");
+    for b in [&c.backup, &c.safety] {
+        if b.exists() {
+            say(&format!(
+                "A copy of settings.json is left at {} - delete it when you are happy.",
+                b.display()
+            ));
+        }
+    }
+    say(&format!("The repo itself at {} was not touched.", c.repo.display()));
+    Ok(())
+}
+
+/// Either what uninstall needs, or the one refusal that is not a failure.
+enum Preflight {
+    Go(Prior),
+    /// `env.KEY` is set with no record that we set it. Already reported on stderr,
+    /// and the process exits 0: declining to remove a key we cannot prove we
+    /// created is the correct outcome, not an error.
+    Refused,
+}
+
+/// Every refusal, decided before anything is removed.
+fn uninstall_preflight(
+    c: &Ctx,
+    force: bool,
+    restore_backup: bool,
+) -> Result<Preflight, String> {
     if let Some(e) = refuse_unresolved(c) {
         return Err(e);
     }
@@ -872,22 +1006,29 @@ fn uninstall(c: &Ctx, force: bool, restore_backup: bool) -> Result<(), String> {
             fail("not removing the plugin symlink either - the two together are what");
             fail("paints the tab, and removing only one leaves a tab nothing paints.");
             fail("Re-run with --force to remove both anyway: tabstatus uninstall --force");
-            return Ok(());
+            return Ok(Preflight::Refused);
         }
     }
+    Ok(Preflight::Go(Prior { blank_settings, state }))
+}
 
+/// What is about to be undone, before anything is.
+fn uninstall_header(c: &Ctx, prior: &Prior) {
     say(&format!("config:   {}", c.config.display()));
     if let Some(l) = &c.settings_link {
         say(&format!("settings: following the symlink {} -> {}", l.display(), c.settings.display()));
     }
-    match &state {
+    match &prior.state {
         Some(_) => say(&format!("state:    {}", c.state.display())),
         None => say(&format!("state:    no record at {}", c.state.display())),
     }
     say("");
-    sweep_all(c);
+}
 
-    // ---- 1. settings.json -------------------------------------------------
+/// Step 1: put settings.json back - to the value install found, or to the
+/// pre-install copy when `--restore-backup` asks for the whole file.
+fn remove_env_key(c: &Ctx, prior: &Prior, force: bool, restore_backup: bool) -> Result<(), String> {
+    let (blank_settings, state) = (prior.blank_settings, &prior.state);
     if restore_backup {
         if !c.backup.exists() {
             return Err(format!(
@@ -963,13 +1104,16 @@ fn uninstall(c: &Ctx, force: bool, restore_backup: bool) -> Result<(), String> {
             }
         }
     }
+    Ok(())
+}
 
-    // ---- 2. the symlink ---------------------------------------------------
-    // AFTER settings.json, the mirror image of install's ordering and for the
-    // same reason: the env key switches Claude Code's own title painting off and
-    // the plugin paints the replacement, so the moment where only one of the two
-    // is undone must be the moment where the KEY is already back. A failure
-    // between them then leaves a working install rather than a blank tab.
+/// Step 2, AFTER settings.json: the mirror image of install's ordering and for the
+/// same reason. The env key switches Claude Code's own title painting off and the
+/// plugin paints the replacement, so the moment where only one of the two is undone
+/// must be the moment where the KEY is already back. A failure between them then
+/// leaves a working install rather than a blank tab.
+fn unlink_the_plugin(c: &Ctx, prior: &Prior) -> Result<(), String> {
+    let state = &prior.state;
     match link_state(&c.link) {
         LinkState::Link(t, _) => {
             let recorded = state.as_ref().and_then(|s| {
@@ -998,35 +1142,41 @@ fn uninstall(c: &Ctx, force: bool, restore_backup: bool) -> Result<(), String> {
         LinkState::Dir => return Err(refuse_link(&c.link, "a real directory, not a symlink")),
         LinkState::Other => return Err(refuse_link(&c.link, "not a symlink")),
     }
+    Ok(())
+}
 
-    // ---- 3. the state record ----------------------------------------------
+/// Step 3: the record itself, which has served its purpose by now.
+fn remove_state(c: &Ctx) -> Result<(), String> {
     if c.state.exists() {
         fs::remove_file(&c.state)
             .map_err(|e| format!("cannot remove {}: {}", c.state.display(), e))?;
         say(&format!("state:    removed {}", c.state.display()));
     }
-
-    say("");
-    say("Done. Start a NEW Claude Code session for the change to take effect.");
-    for b in [&c.backup, &c.safety] {
-        if b.exists() {
-            say(&format!(
-                "A copy of settings.json is left at {} - delete it when you are happy.",
-                b.display()
-            ));
-        }
-    }
-    say(&format!("The repo itself at {} was not touched.", c.repo.display()));
     Ok(())
 }
 
 // --- doctor -----------------------------------------------------------------
 
+/// What is installed, and what the runtime half would do right now.
+///
+/// Read-only by construction: the one command whose job is to explain a broken
+/// config has to be able to run on the config that is broken.
 fn doctor(c: &Ctx) -> Result<(), String> {
     say(&format!("tabstatus {} ({})", env!("CARGO_PKG_VERSION"), target_triple()));
     say(&format!("repo:      {}", c.repo.display()));
     say(&format!("config:    {}", c.config.display()));
+    report_binary(c);
+    report_plugin(c);
+    report_env_key(c)?;
+    report_state(c);
+    report_runtime();
+    report_title();
+    Ok(())
+}
 
+/// The binary hooks.json invokes, which is the one thing whose absence makes every
+/// hook exit 127.
+fn report_binary(c: &Ctx) {
     let hook = c.hook_binary();
     match fs::metadata(&hook) {
         Ok(m) if m.permissions().mode() & 0o111 != 0 => {
@@ -1039,7 +1189,9 @@ fn doctor(c: &Ctx) -> Result<(), String> {
             hook.display()
         )),
     }
+}
 
+fn report_plugin(c: &Ctx) {
     match link_state(&c.link) {
         LinkState::Absent => say(&format!(
             "plugin:    FAIL not linked. Run `tabstatus install`. ({})",
@@ -1066,7 +1218,16 @@ fn doctor(c: &Ctx) -> Result<(), String> {
             say(&format!("plugin:    WARN {} exists and is not a symlink", c.link.display()))
         }
     }
+}
 
+/// The env key, and the file it lives in.
+///
+/// This is the one branch of the report that can end it: an I/O error reading
+/// settings.json propagates, so a settings.json that is a DIRECTORY aborts the
+/// report at this line where every other broken shape is described and exits 0.
+/// That is the reference implementation's behaviour, reproduced deliberately;
+/// changing it belongs to a slice that is allowed to change behaviour.
+fn report_env_key(c: &Ctx) -> Result<(), String> {
     if let Some(t) = &c.settings_unresolved {
         say(&format!(
             "env key:   FAIL {} is a symlink to {}, which does not exist",
@@ -1109,6 +1270,10 @@ fn doctor(c: &Ctx) -> Result<(), String> {
     } else {
         say(&format!("env key:   FAIL {} does not exist", c.settings.display()));
     }
+    Ok(())
+}
+
+fn report_state(c: &Ctx) {
     say(&format!(
         "state:     {}",
         if c.state.exists() {
@@ -1117,17 +1282,20 @@ fn doctor(c: &Ctx) -> Result<(), String> {
             format!("absent ({}), so uninstall will not remove the env key without --force", c.state.display())
         }
     ));
+}
 
-    // ---- what the runtime half would do right now -------------------------
-    let konsole_vars = sh::env_set("KONSOLE_VERSION") || sh::env_set("KONSOLE_DBUS_SESSION");
-    let mux = if sh::env_set("TMUX") {
+/// What the runtime half would decide from this environment: which terminal, which
+/// glyph position, and whether there is a pty to write to.
+fn report_runtime() {
+    let konsole_vars = config::flag("KONSOLE_VERSION") || config::flag("KONSOLE_DBUS_SESSION");
+    let mux = if config::flag("TMUX") {
         "tmux"
-    } else if sh::env_set("STY") {
+    } else if config::flag("STY") {
         "screen"
     } else {
         ""
     };
-    let konsole = render::is_konsole();
+    let konsole = Terminal::detect() == Terminal::Konsole;
     say(&format!(
         "terminal:  {}",
         if konsole {
@@ -1143,8 +1311,8 @@ fn doctor(c: &Ctx) -> Result<(), String> {
     if !mux.is_empty() {
         say(&format!("           multiplexer: {}, so no OSC 50 arming is sent", mux));
     }
-    let pos = sh::env_str("CCTAB_GLYPH_POS");
-    let implied: &str = if !pos.is_empty() {
+    let pos = config::var_nonempty("CCTAB_GLYPH_POS");
+    let implied: &str = if pos.is_some() {
         "from CCTAB_GLYPH_POS"
     } else if konsole {
         "suffix - Konsole elides the tab label from the left"
@@ -1153,39 +1321,230 @@ fn doctor(c: &Ctx) -> Result<(), String> {
     };
     say(&format!(
         "glyph:     {}{}",
-        if pos.is_empty() {
-            String::new()
-        } else {
-            format!("{} ", String::from_utf8_lossy(&pos))
+        match &pos {
+            None => String::new(),
+            Some(p) => format!("{} ", String::from_utf8_lossy(p.as_bytes())),
         },
         implied
     ));
-    match sh::env_raw("CLAUDE_PID") {
-        Some(p) if !p.is_empty() => say(&format!(
+    match config::var_nonempty("CLAUDE_PID") {
+        Some(p) => say(&format!(
             "pty:       CLAUDE_PID={} - session-start and session-end write it directly",
-            String::from_utf8_lossy(&p)
+            String::from_utf8_lossy(p.as_bytes())
         )),
-        _ => say("pty:       CLAUDE_PID is not set, so this is not a hook subprocess \
+        None => say("pty:       CLAUDE_PID is not set, so this is not a hook subprocess \
                   (session-start and session-end would do nothing)"),
     }
+}
 
-    let title = current_title(b"idle");
+/// The runtime half's own pipeline, CALLED rather than copied, so this line cannot
+/// drift from what actually paints.
+fn report_title() {
+    let title = render::compose(Paint::Line(Glyph::Idle), &Config::from_env());
     let mut line = b"title:     ".to_vec();
-    line.extend_from_slice(&title);
+    line.extend_from_slice(title.as_bytes());
     line.push(b'\n');
     let out = std::io::stdout();
     let mut l = out.lock();
     let _ = l.write_all(&line);
     let _ = l.write_all(b"           (what this directory would paint on an idle tab)\n");
-    Ok(())
 }
 
-/// The runtime half's own pipeline, so `doctor` cannot drift from what paints.
-fn current_title(edge: &[u8]) -> Vec<u8> {
-    let cwd = location::cwd();
-    let (place, in_repo) = location::place(&cwd);
-    let place = render::apply_length_cap(place, in_repo);
-    let place = render::apply_ssh_prefix(place);
-    let place = render::sanitize(place);
-    render::title(edge, place, render::is_konsole())
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(words: &[&str]) -> Subcommand {
+        let all: Vec<OsString> = words.iter().map(OsString::from).collect();
+        let (first, rest) = all.split_first().expect("at least a verb");
+        Subcommand::parse(Some(first), rest).expect("a management verb")
+    }
+
+    fn not_a_subcommand(word: Option<&str>) -> bool {
+        let first = word.map(OsString::from);
+        Subcommand::parse(first.as_deref(), &[]).is_none()
+    }
+
+    #[test]
+    fn every_verb_and_every_spelling_of_one_parses() {
+        assert!(matches!(parse(&["install"]), Subcommand::Install { force: false }));
+        assert!(matches!(
+            parse(&["uninstall"]),
+            Subcommand::Uninstall { force: false, restore_backup: false }
+        ));
+        assert!(matches!(parse(&["doctor"]), Subcommand::Doctor));
+        for w in ["version", "--version", "-V"] {
+            assert!(matches!(parse(&[w]), Subcommand::Version), "{}", w);
+        }
+        for w in ["help", "--help", "-h"] {
+            assert!(matches!(parse(&[w]), Subcommand::Help), "{}", w);
+        }
+    }
+
+    #[test]
+    fn no_edge_and_no_typo_of_a_verb_reaches_this_half() {
+        // The disjointness the module header rests on: every edge name, and the
+        // near-misses, fall through to the paint path.
+        for w in [
+            "working", "waiting", "idle", "notify", "session-start", "session-end",
+            "", "Install", "instal", "installx", "--force", "doctor ", "-v",
+        ] {
+            assert!(not_a_subcommand(Some(w)), "{:?} must not be a subcommand", w);
+        }
+        assert!(not_a_subcommand(None), "no argv at all is not a subcommand");
+    }
+
+    #[test]
+    fn a_flag_attaches_only_to_the_verb_that_accepts_it() {
+        assert!(matches!(parse(&["install", "--force"]), Subcommand::Install { force: true }));
+        assert!(matches!(
+            parse(&["uninstall", "--force"]),
+            Subcommand::Uninstall { force: true, restore_backup: false }
+        ));
+        assert!(matches!(
+            parse(&["uninstall", "--restore-backup"]),
+            Subcommand::Uninstall { force: false, restore_backup: true }
+        ));
+        assert!(matches!(
+            parse(&["uninstall", "--restore-backup", "--force"]),
+            Subcommand::Uninstall { force: true, restore_backup: true }
+        ));
+        // Repeats are idempotent, as they were.
+        assert!(matches!(parse(&["install", "--force", "--force"]), Subcommand::Install { force: true }));
+    }
+
+    #[test]
+    fn an_option_the_verb_does_not_accept_is_named_rather_than_ignored() {
+        // `--restore-backup` is a real flag, but install has never taken it.
+        for words in [
+            &["install", "--restore-backup"][..],
+            &["install", "--bogus"][..],
+            &["install", "--force", "--bogus"][..],
+            &["uninstall", "--bogus"][..],
+        ] {
+            match parse(words) {
+                Subcommand::BadOption(a) => assert_eq!(a, OsString::from(words[words.len() - 1])),
+                _ => panic!("{:?} should be a BadOption", words),
+            }
+        }
+    }
+
+    #[test]
+    fn the_three_read_only_verbs_ignore_their_arguments() {
+        // Reproduced, not improved: `doctor --force` has always run doctor.
+        assert!(matches!(parse(&["doctor", "--force", "--bogus"]), Subcommand::Doctor));
+        assert!(matches!(parse(&["version", "--bogus"]), Subcommand::Version));
+        assert!(matches!(parse(&["help", "--bogus"]), Subcommand::Help));
+    }
+
+    #[test]
+    fn only_this_tools_own_scratch_names_with_a_numeric_pid_are_litter() {
+        assert_eq!(scratch_pid(".cctab-wtest.123"), Some("123"));
+        assert_eq!(scratch_pid(".settings.json.cctab-tmp.4567"), Some("4567"));
+        assert_eq!(scratch_pid(".cctab-tmp.9"), Some("9"));
+        // Ours in shape but not in pid.
+        assert_eq!(scratch_pid(".cctab-wtest.notanumber"), None);
+        assert_eq!(scratch_pid(".cctab-wtest."), None);
+        assert_eq!(scratch_pid(".settings.json.cctab-tmp."), None);
+        assert_eq!(scratch_pid(".cctab-wtest.12a"), None);
+        // Not ours at all.
+        assert_eq!(scratch_pid("settings.json"), None);
+        assert_eq!(scratch_pid(".settings.json.cctab-preinstall"), None);
+        assert_eq!(scratch_pid(".bashrc"), None);
+        assert_eq!(scratch_pid("cctab-wtest.123"), None);
+    }
+
+    fn ctx() -> Ctx {
+        let config = PathBuf::from("/cfg");
+        Ctx {
+            repo: PathBuf::from("/repo"),
+            skills: config.join("skills"),
+            link: config.join("skills").join(PLUGIN),
+            settings: config.join("settings.json"),
+            settings_link: None,
+            settings_unresolved: None,
+            state: config.join(format!("{}.state", PLUGIN)),
+            backup: config.join("settings.json.cctab-preinstall"),
+            safety: config.join("settings.json.cctab-preuninstall"),
+            config,
+        }
+    }
+
+    #[test]
+    fn with_suffix_appends_to_the_whole_name_not_to_the_stem() {
+        let p = with_suffix(Path::new("/a/settings.json"), ".cctab-preinstall");
+        assert_eq!(p, PathBuf::from("/a/settings.json.cctab-preinstall"));
+    }
+
+    /// The record `uninstall` reads back, so its writer has to produce something
+    /// this crate's own parser accepts.
+    #[test]
+    fn the_state_record_is_json_and_round_trips_what_uninstall_reads() {
+        let s = State {
+            env_had: true,
+            // The value's original SOURCE text, quotes included.
+            env_raw: Some(b"\"0\"".to_vec()),
+            env_object_had: true,
+            link_had: true,
+            link_target: Some(b"/elsewhere".to_vec()),
+        };
+        let raw = state_text(&ctx(), &s);
+        let v = json::parse(&raw).expect("the record is valid JSON");
+        let root = v.as_obj().expect("an object at the top");
+        let field = |m: &str, k: &str| -> Option<Vec<u8>> {
+            root.get(m)?.val.as_obj()?.get(k)?.val.as_str().map(<[u8]>::to_vec)
+        };
+        let flag = |m: &str, k: &str| -> Option<bool> {
+            root.get(m)?.val.as_obj()?.get(k)?.val.as_bool()
+        };
+        assert!(root.get("state_version").is_some());
+        assert_eq!(flag("env_key_before", "had"), Some(true));
+        assert_eq!(field("env_key_before", "raw").as_deref(), Some(&b"\"0\""[..]));
+        assert_eq!(flag("env_object_before", "had"), Some(true));
+        assert_eq!(flag("symlink_before", "had"), Some(true));
+        assert_eq!(field("symlink_before", "target").as_deref(), Some(&b"/elsewhere"[..]));
+    }
+
+    #[test]
+    fn a_record_with_nothing_recorded_writes_explicit_nulls() {
+        let s = State {
+            env_had: false,
+            env_raw: None,
+            env_object_had: false,
+            link_had: false,
+            link_target: None,
+        };
+        let raw = state_text(&ctx(), &s);
+        json::parse(&raw).expect("the record is valid JSON");
+        let text = String::from_utf8(raw).expect("ascii paths give ascii output");
+        assert!(text.contains("\"raw\": null"), "{}", text);
+        assert!(text.contains("\"target\": null"), "{}", text);
+    }
+
+    /// A config directory whose name is not valid UTF-8 still has to produce a
+    /// record the parser accepts - and the per-byte replacement rule the length cap
+    /// depends on elsewhere is the same one `json::quote` applies here.
+    #[test]
+    fn an_invalid_utf8_path_is_quoted_one_replacement_per_byte() {
+        let mut c = ctx();
+        c.repo = PathBuf::from(OsString::from_vec(b"/repo/tr\xf0\x9f\x98x".to_vec()));
+        let raw = state_text(&c, &State {
+            env_had: false,
+            env_raw: None,
+            env_object_had: false,
+            link_had: false,
+            link_target: None,
+        });
+        let v = json::parse(&raw).expect("still valid JSON");
+        let repo = v.as_obj().and_then(|o| o.get("repo")).and_then(|m| m.val.as_str());
+        // Three bytes of a truncated four-byte sequence: three U+FFFD, not one.
+        assert_eq!(repo, Some("/repo/tr\u{fffd}\u{fffd}\u{fffd}x".as_bytes()));
+    }
+
+    #[test]
+    fn the_target_triple_names_the_build_that_is_running() {
+        let t = target_triple();
+        assert!(t.contains('-'), "{}", t);
+        assert_ne!(t, "unknown-target", "this crate is built for a named target");
+    }
 }

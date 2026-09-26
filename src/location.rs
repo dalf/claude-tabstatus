@@ -1,341 +1,340 @@
-//! Section 1 of the script: where this session is, as a tab wants to read it.
+//! Where this session is, as a tab wants to read it.
 //!
 //!     streaming-browser@master       inside a git repo
 //!     ~/code/bug_fedora              not a repo: the home-relative path
 //!
-//! Fork-free, and deliberately not `git rev-parse`: that call is correct and
-//! costs 15-40ms, against a whole-hook budget of a fraction of a millisecond on
-//! an edge that fires once per tool call. So the two parts of git's repository
-//! discovery that actually show up in a tab are reimplemented here, and nothing
-//! else about a repository is consulted.
+//! This module is the crossing: it works on `Path`, because that is what the
+//! filesystem deals in, and returns a [`Place`] and a hostname that are `String`,
+//! because from there on the value is only ever measured, cut and shown.
 
-use crate::sh::{
-    self, after_first_slash, basename, char_count, dirname, env_raw, env_set, env_str,
-    pat_first_chars, pat_strip_trailing_cntrl, pat_trim_step, read_first_line, rstrip_slash,
-    utf8_repair,
-};
+use crate::config::Config;
+use crate::git;
+use crate::text;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 /// The two forms of the current directory. They differ, and the difference is
 /// load-bearing:
 ///
-///   * `phys` has every symlink resolved and is what the repository walk uses.
-///     A cwd reached through a symlink has no `.git` on its LOGICAL ancestors,
-///     so walking the logical path loses the repo and the branch entirely.
+///   * `phys` has every symlink resolved and is what the repository walk uses. A
+///     cwd reached through a symlink has no `.git` on its LOGICAL ancestors, so
+///     walking the logical path loses the repo and the branch entirely.
 ///   * `logical` is `$PWD` as inherited, and is what the `~` abbreviation uses,
 ///     so that a distro whose /home is a symlink to /var/home keeps its `~`.
 pub struct Cwd {
-    pub logical: Vec<u8>,
-    pub phys: Vec<u8>,
-    pub home: Vec<u8>,
+    pub logical: PathBuf,
+    pub phys: PathBuf,
 }
 
-pub fn cwd() -> Cwd {
-    let real = std::env::current_dir()
-        .ok()
-        .map(|p| sh::from_os(p.into_os_string()));
-    let inherited = env_raw("PWD");
+/// The composed location, and - as the variant rather than as a flag - which END
+/// the length policy is allowed to cut at.
+pub enum Place {
+    /// `repo@branch`, cut at the BACK: the repo name is what identifies the tab.
+    Repo(String),
+    /// A home-relative or absolute path, cut at the FRONT on a component
+    /// boundary: the last components are the ones that say where you are.
+    Path(String),
+}
 
-    // The shell script read `$PWD`, but `$PWD` inside a shell is NOT simply the
-    // inherited variable: bash re-validates it at startup (set_pwd() in
-    // variables.c) and replaces it with getcwd() unless it is absolute AND
-    // names the same directory as `.` by device and inode. Measured: PWD=/etc,
-    // PWD=relative, PWD=. and PWD=/no/such/dir are all replaced, while
-    // PWD=/a/b/../b and a PWD that reaches the cwd through a symlink are kept
-    // VERBATIM - bash does not canonicalize a PWD that passes the check.
-    //
-    // The port is invoked directly, with no shell to do that, so it has to do
-    // it itself. Skipping it is not a cosmetic difference: a stale PWD would
-    // then decide the tab, where the shell version corrected it. The golden
-    // corpus does NOT catch this - all six of its PWD cases sit inside a repo,
-    // where the walk uses the physical path and the answer is the same either
-    // way - a differential fuzz against the shell did.
-    let mut pwd = match &inherited {
-        Some(p) if p.starts_with(b"/") && same_dir_as_cwd(p) => p.clone(),
-        // getcwd() failing leaves bash with whatever PWD already held.
-        _ => real
-            .clone()
-            .or_else(|| inherited.clone())
-            .unwrap_or_default(),
-    };
-    // [ -n "${PWD-}" ] || PWD=$(pwd 2>/dev/null)
-    if pwd.is_empty() {
-        pwd = real.clone().unwrap_or_default();
+impl Place {
+    pub fn text(&self) -> &str {
+        match self {
+            Place::Repo(s) | Place::Path(s) => s,
+        }
     }
-    // A relative or empty PWD would make every path operation below meaningless.
-    if !pwd.starts_with(b"/") {
-        pwd = b"/".to_vec();
+
+    pub fn into_text(self) -> String {
+        match self {
+            Place::Repo(s) | Place::Path(s) => s,
+        }
     }
-    let logical = pwd;
-    // `CDPATH= cd -P . 2>/dev/null` rewrites $PWD to getcwd(); a failure (an
-    // unreadable or deleted cwd) leaves the logical path in place.
+}
+
+pub fn cwd(cfg: &Config) -> Cwd {
+    let real = std::env::current_dir().ok();
+    let logical = logical_pwd(cfg.pwd.as_deref(), real.as_deref());
+    // `cd -P .` rewrites $PWD to getcwd(); a failure - an unreadable or deleted
+    // cwd - leaves the logical path in place.
     let phys = match &real {
-        Some(b) if b.starts_with(b"/") => b.clone(),
+        Some(p) if p.is_absolute() => p.clone(),
         _ => logical.clone(),
     };
-    // ${HOME%/}: a HOME carrying a trailing slash would otherwise miss the
-    // comparisons below and render the home directory as its full path.
-    let home = rstrip_slash(&env_str("HOME")).to_vec();
-    Cwd { logical, phys, home }
+    Cwd { logical, phys }
 }
 
-/// Section 1a. Reads one candidate `.git` and returns its branch, or `None`
-/// when the candidate is not a repository.
+/// `$PWD` the way a shell would have had it, and always absolute.
 ///
-/// "Is a repository" means "HEAD parses". git also insists on objects/ and
-/// refs/; one readable file is cheaper and rules out what actually turns up in
-/// the wild, which is an empty `.git` directory left behind by another tool -
-/// without which an empty /tmp/.git would make every path under /tmp render as
-/// `tmp`.
-fn branch_of(candidate: &[u8]) -> Option<Vec<u8>> {
-    let mut gd: Vec<u8> = candidate.to_vec();
-
-    // .git may be a FILE holding "gitdir: <path>" - a linked worktree or a
-    // submodule - and that path may be relative to the directory holding it.
-    // The joined path is left unnormalized; the kernel resolves it.
-    if is_file(&gd) {
-        let raw = read_first_line(&gd);
-        // A gitdir: line holds a path, so PATH_MAX bounds anything legitimate.
-        // Longer means some other file that happens to be called .git.
-        if char_count(&raw) > 4096 {
-            return None;
+/// `$PWD` inside a shell is NOT simply the inherited variable: bash re-validates it
+/// at startup (`set_pwd()` in variables.c) and replaces it with `getcwd()` unless it
+/// is absolute AND names the same directory as `.` by device and inode. A `$PWD`
+/// that passes is never canonicalized. This binary is invoked directly, with no
+/// shell to do that, so it does it itself - otherwise a stale `$PWD` decides the
+/// tab. The cases are pinned by the unit tests below; the golden corpus does not
+/// reach this, because all six of its `$PWD` cases sit inside a repo where the walk
+/// uses the physical path anyway.
+fn logical_pwd(inherited: Option<&OsStr>, real: Option<&Path>) -> PathBuf {
+    let inherited = inherited.map(Path::new);
+    if let Some(p) = inherited {
+        if p.is_absolute() && same_dir_as_cwd(p) {
+            return p.to_path_buf();
         }
-        // One trailing control character: a CR from a Windows checkout.
-        let line: &[u8] = pat_strip_trailing_cntrl(&raw);
-        // 'gitdir: '?* - the ?* means the path must be non-empty.
-        let rest = line.strip_prefix(b"gitdir: ".as_slice())?;
-        if rest.is_empty() {
-            return None;
-        }
-        gd = if rest.starts_with(b"/") {
-            rest.to_vec()
-        } else {
-            // ${1%/*}/$_gd, relative to the directory holding the .git file.
-            let mut j = dirname(candidate).to_vec();
-            j.push(b'/');
-            j.extend_from_slice(rest);
-            j
-        };
     }
-
-    let mut head_path = rstrip_slash(&gd).to_vec();
-    head_path.extend_from_slice(b"/HEAD");
-    if !is_file(&head_path) {
-        return None;
+    // `getcwd()` failing leaves whatever `$PWD` already held; a relative or empty
+    // answer would make every path operation below meaningless, so `/` is the one
+    // explicit default.
+    match real.or(inherited) {
+        Some(p) if p.is_absolute() => p.to_path_buf(),
+        _ => PathBuf::from("/"),
     }
-    let mut head = read_first_line(&head_path);
-    // A real HEAD's first line is a 41-byte object id or a ref name, and git's
-    // own limit on a ref is well inside 255 bytes. This guard has to come
-    // BEFORE the cuts below, because in the shell those cuts were quadratic and
-    // a 100KB first line stalled the hook for 6.5 seconds.
-    if char_count(&head) > 255 {
-        return None;
-    }
-    // Trim the trailing line noise: a CR from a Windows checkout, and the
-    // spaces or tabs git itself ignores after a ref name.
-    while let Some(start) = pat_trim_step(&head) {
-        head.truncate(start);
-    }
-
-    if let Some(r) = head.strip_prefix(b"ref: ".as_slice()) {
-        if r.is_empty() {
-            return None;
-        }
-        // A symref normally points into refs/heads/. When it does not, keep the
-        // namespace but drop the uninformative `refs/`, so a HEAD left on
-        // refs/remotes/origin/main reads `origin/main`.
-        let b = if let Some(t) = r.strip_prefix(b"refs/heads/".as_slice()) {
-            t
-        } else if let Some(t) = r.strip_prefix(b"refs/remotes/".as_slice()) {
-            t
-        } else if let Some(t) = r.strip_prefix(b"refs/".as_slice()) {
-            t
-        } else {
-            r
-        };
-        if b.is_empty() {
-            return None;
-        }
-        return Some(b.to_vec());
-    }
-    // At least 7 characters and all hex: an object id, so HEAD is detached.
-    if char_count(&head) >= 7 && !head.iter().any(|b| !b.is_ascii_hexdigit()) {
-        return Some(pat_first_chars(&head, 7).to_vec());
-    }
-    None
 }
 
-/// bash's `same_file(path, ".")`: same device and inode, symlinks followed.
-/// False when either stat fails, which is what rejects a stale or nonexistent
-/// PWD.
-fn same_dir_as_cwd(path: &[u8]) -> bool {
+/// bash's `same_file(path, ".")`: same device and inode, symlinks followed. False
+/// when either stat fails, which is what rejects a stale or nonexistent `$PWD`.
+fn same_dir_as_cwd(path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let a = match std::fs::metadata(sh::as_path(path)) {
-        Ok(m) => m,
-        Err(_) => return false,
-    };
-    let b = match std::fs::metadata(".") {
-        Ok(m) => m,
-        Err(_) => return false,
+    let (a, b) = match (std::fs::metadata(path), std::fs::metadata(".")) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => return false,
     };
     a.dev() == b.dev() && a.ino() == b.ino()
 }
 
-fn is_file(path: &[u8]) -> bool {
-    std::fs::metadata(sh::as_path(path))
-        .map(|m| m.is_file())
-        .unwrap_or(false)
-}
-
-fn exists(path: &[u8]) -> bool {
-    std::fs::metadata(sh::as_path(path)).is_ok()
-}
-
-struct Repo {
-    top: Vec<u8>,
-    branch: Vec<u8>,
-}
-
-/// Section 1b. An explicit GIT_DIR wins over the walk, as it does for git, and
-/// a GIT_DIR that is not a repository is not second-guessed by walking anyway.
-fn find_repo(c: &Cwd) -> Option<Repo> {
-    if env_set("GIT_DIR") {
-        let gd = env_str("GIT_DIR");
-        let abs = if gd.starts_with(b"/") {
-            gd
-        } else {
-            let mut j = c.logical.clone();
-            j.push(b'/');
-            j.extend_from_slice(&gd);
-            j
-        };
-        let branch = branch_of(&abs)?;
-        // Name the repo after GIT_DIR's own location rather than after $PWD:
-        // /w/repo/.git -> repo, and a bare /srv/repo.git -> repo.
-        let mut top = rstrip_slash(&abs).to_vec();
-        if top.ends_with(b"/.git") {
-            top.truncate(top.len() - 5);
-        } else if top.ends_with(b".git") {
-            top.truncate(top.len() - 4);
-        }
-        return Some(Repo { top, branch });
-    }
-    // Walk up looking for a .git that checks out. Bounded at 64 components, far
-    // past any real tree, so no pathological path can spin here. Each step is
-    // one stat and no fork.
-    let mut dir = c.phys.clone();
-    for _ in 0..64 {
-        let mut probe = rstrip_slash(&dir).to_vec();
-        probe.extend_from_slice(b"/.git");
-        if exists(&probe) {
-            if let Some(branch) = branch_of(&probe) {
-                return Some(Repo { top: dir, branch });
+pub fn place(c: &Cwd, cfg: &Config) -> Place {
+    match git::find_repo(&c.logical, &c.phys, cfg.git_dir.as_deref()) {
+        Some(r) => {
+            // A GIT_DIR carrying dot components leaves one as the label -
+            // `GIT_DIR=.` inside a bare repo is a real idiom - and a tab labelled
+            // `.` says nothing, so the working directory names it instead.
+            //
+            // The fallback is taken VERBATIM, dots included: it is deliberately
+            // not filtered a second time, so a `$PWD` of `/x/.` with `GIT_DIR=.`
+            // really does label the tab `.`. Measured against the reference
+            // implementation and pinned below.
+            let name = label(&r.top)
+                .unwrap_or_else(|| strip_git_suffix(last_component(&c.logical)));
+            // The display boundary for the repo name: it came from a path, so it
+            // may not be valid UTF-8. The branch crossed already, in `git`.
+            let mut out = text::repair(name.as_bytes());
+            // A repo checked out at / has no label to show.
+            if out.is_empty() {
+                out.push('/');
             }
+            out.push('@');
+            out.push_str(&r.branch);
+            Place::Repo(out)
         }
-        if &dir[..] == b"/" {
-            break;
-        }
-        dir = dirname(&dir).to_vec();
-        if dir.is_empty() {
-            dir = b"/".to_vec();
-        }
-    }
-    None
-}
-
-/// Section 1c. The composed location, and whether it came from a repository -
-/// which decides at which END the length policy in section 1d cuts.
-pub fn place(c: &Cwd) -> (Vec<u8>, bool) {
-    if let Some(r) = find_repo(c) {
-        let mut place = basename(rstrip_slash(&r.top)).to_vec();
-        // A GIT_DIR carrying dot components leaves one as the basename -
-        // `GIT_DIR=.` inside a bare repo is a real idiom - and a tab labelled
-        // `.` says nothing. Name it after the working directory instead.
-        if place.is_empty() || &place[..] == b"." || &place[..] == b".." {
-            let mut p = basename(rstrip_slash(&c.logical)).to_vec();
-            if p.ends_with(b".git") {
-                p.truncate(p.len() - 4);
-            }
-            place = p;
-        }
-        // A repo checked out at / has no basename to show.
-        if place.is_empty() {
-            place = b"/".to_vec();
-        }
-        place.push(b'@');
-        place.extend_from_slice(&r.branch);
-        // The display boundary: from here on this is text, not a path to open,
-        // so an invalid byte becomes U+FFFD. Everything above used the raw bytes
-        // the kernel gave us, which is what the .git walk needs. Fixes README
-        // limitation 2 - a name that is legal on Linux and illegal in JSON.
-        (utf8_repair(place), true)
-    } else {
-        // Not a repo: the home-relative path. ~ for HOME itself, ~/x/y beneath
-        // it, and anything outside HOME stays absolute.
-        let mut place = c.logical.clone();
-        if !c.home.is_empty() {
-            if c.logical == c.home {
-                place = b"~".to_vec();
-            } else {
-                let mut pref = c.home.clone();
-                pref.push(b'/');
-                if c.logical.starts_with(&pref[..]) {
-                    place = b"~".to_vec();
-                    place.extend_from_slice(&c.logical[c.home.len()..]);
-                }
-            }
-        }
-        (utf8_repair(place), false)
+        // Not a repo: the home-relative path.
+        None => Place::Path(text::repair(&abbreviate(&c.logical, cfg.home.as_deref()))),
     }
 }
 
-/// Used by the length policy in render.rs; kept next to the path logic it
-/// belongs to.
-pub fn peel_leading_component(place: &[u8]) -> Option<Vec<u8>> {
-    let rest = after_first_slash(place);
-    if rest == place || rest.is_empty() {
-        None
-    } else {
-        Some(rest.to_vec())
+/// The path's last component, as a tab label wants it: exactly ONE trailing slash
+/// is tolerated and nothing else is normalised.
+///
+/// Close to `Path::file_name` but deliberately not it: `file_name` normalises
+/// EVERY trailing slash away, so a `GIT_DIR` a user spelled `/a///.git` by hand
+/// would still yield `a` where this yields nothing.
+fn last_component(path: &Path) -> &OsStr {
+    let b = path.as_os_str().as_bytes();
+    let b = b.strip_suffix(b"/").unwrap_or(b);
+    let b = match b.iter().rposition(|&c| c == b'/') {
+        Some(i) => &b[i + 1..],
+        None => b,
+    };
+    OsStr::from_bytes(b)
+}
+
+/// [`last_component`], unless it is nothing a tab can be named after. `/`, `.`,
+/// `..` and nothing-at-all are all `None`, which is `place`'s signal to fall back
+/// to the working directory.
+fn label(path: &Path) -> Option<&OsStr> {
+    let name = last_component(path);
+    match name.as_bytes() {
+        b"" | b"." | b".." => None,
+        _ => Some(name),
     }
 }
 
-/// Section 1e's name resolution, in the script's order: CCTAB_HOST overrides
-/// outright, /proc is the fork-free path, $HOSTNAME is next (bash sets it, dash
-/// and ash do not), and `hostname` is the last resort and the only fork in the
-/// whole block - reached only where /proc is absent.
-pub fn hostname() -> Vec<u8> {
-    utf8_repair(hostname_raw())
+/// `repo.git` -> `repo`, so the working directory of a bare checkout names the
+/// tab after the repository rather than after its `.git`.
+fn strip_git_suffix(name: &OsStr) -> &OsStr {
+    let b = name.as_bytes();
+    OsStr::from_bytes(b.strip_suffix(b".git").unwrap_or(b))
 }
 
-fn hostname_raw() -> Vec<u8> {
-    let mut h = env_str("CCTAB_HOST");
-    if h.is_empty() {
-        h = read_first_line(b"/proc/sys/kernel/hostname");
+/// `~` for HOME itself, `~/x/y` beneath it, and anything outside HOME left
+/// absolute.
+///
+/// The prefix test insists on the `/` that follows HOME, so `/home/alex` cannot
+/// claim `/home/alex2`, and it is taken on path BYTES rather than through
+/// `Path::starts_with`, which would silently normalise a doubled slash that a
+/// `$PWD` kept verbatim can still hold.
+fn abbreviate(logical: &Path, home: Option<&Path>) -> Vec<u8> {
+    let l = logical.as_os_str().as_bytes();
+    let home = match home {
+        Some(h) => h.as_os_str().as_bytes(),
+        None => return l.to_vec(),
+    };
+    if l == home {
+        return b"~".to_vec();
     }
-    if h.is_empty() {
-        h = env_raw("HOSTNAME").unwrap_or_default();
+    if let Some(rest) = l.strip_prefix(home) {
+        if rest.starts_with(b"/") {
+            let mut out = b"~".to_vec();
+            out.extend_from_slice(rest);
+            return out;
+        }
     }
-    if h.is_empty() {
-        h = hostname_command();
-    }
-    h
+    l.to_vec()
 }
 
-fn hostname_command() -> Vec<u8> {
+/// The host name, in order: `CCTAB_HOST` overrides outright, `/proc` is the
+/// fork-free path, `$HOSTNAME` is next (bash sets it, dash and ash do not), and
+/// `hostname` is the last resort and the ONLY fork in this binary.
+///
+/// `None` means no name resolved, and what to paint instead is the caller's
+/// business. This never returns `Some("")`: a source that answers with nothing is
+/// not a name, so each step rejects an empty answer and tries the next.
+pub fn hostname(cfg: &Config) -> Option<String> {
+    hostname_raw(cfg).map(|b| text::repair(&b))
+}
+
+fn hostname_raw(cfg: &Config) -> Option<Vec<u8>> {
+    if let Some(h) = &cfg.host_override {
+        return Some(h.as_bytes().to_vec());
+    }
+    // A one-line system file, read the same way git's own metadata is.
+    git::first_line(Path::new("/proc/sys/kernel/hostname"))
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            cfg.hostname_env
+                .as_ref()
+                .map(|h| h.as_bytes().to_vec())
+                .filter(|h| !h.is_empty())
+        })
+        .or_else(hostname_command)
+}
+
+fn hostname_command() -> Option<Vec<u8>> {
     use std::process::{Command, Stdio};
-    match Command::new("hostname")
+    let out = Command::new("hostname")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
-    {
-        Ok(o) if o.status.success() => {
-            // Command substitution strips every trailing newline.
-            let mut v = o.stdout;
-            while v.last() == Some(&b'\n') {
-                v.pop();
-            }
-            v
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // Command substitution strips every trailing newline, and a name that is
+    // nothing but newlines is no name.
+    let mut v = out.stdout;
+    while v.last() == Some(&b'\n') {
+        v.pop();
+    }
+    (!v.is_empty()).then_some(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stale_or_relative_pwd_is_replaced_by_getcwd() {
+        let real = Path::new("/real/cwd");
+        let p = |pwd: &str| logical_pwd(Some(OsStr::new(pwd)), Some(real));
+        // None of these names the cwd by device and inode.
+        assert_eq!(p("relative/dir"), real);
+        assert_eq!(p("."), real);
+        assert_eq!(p(""), real);
+        assert_eq!(p("/no/such/directory/anywhere"), real);
+    }
+
+    #[test]
+    fn a_pwd_that_names_the_cwd_is_kept_verbatim() {
+        // `/a/b/../b` names the cwd and must survive uncanonicalized, so this is
+        // run against the real cwd - the check is a device-and-inode test, not a
+        // string test.
+        let real = std::env::current_dir().expect("a cwd");
+        let name = real.file_name().expect("the cwd has a name").to_owned();
+        let dotdot = real.join("..").join(name);
+        let got = logical_pwd(Some(dotdot.as_os_str()), Some(&real));
+        assert_eq!(got, dotdot, "a passing $PWD is not canonicalized");
+    }
+
+    #[test]
+    fn a_relative_answer_from_everywhere_falls_back_to_root() {
+        assert_eq!(logical_pwd(None, None), PathBuf::from("/"));
+        assert_eq!(logical_pwd(Some(OsStr::new("rel")), None), PathBuf::from("/"));
+        assert_eq!(logical_pwd(None, Some(Path::new("rel"))), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn an_absolute_pwd_survives_a_getcwd_that_failed() {
+        let got = logical_pwd(Some(OsStr::new("/gone/away")), None);
+        assert_eq!(got, PathBuf::from("/gone/away"));
+    }
+
+    #[test]
+    fn the_label_is_the_last_component_with_one_trailing_slash_tolerated() {
+        let l = |s: &str| last_component(Path::new(s)).to_str().expect("ascii").to_owned();
+        assert_eq!(l("/a/b/repo"), "repo");
+        assert_eq!(l("/a/b/repo/"), "repo");
+        assert_eq!(l("repo"), "repo");
+        assert_eq!(l("/"), "");
+        assert_eq!(l(""), "");
+        assert_eq!(l("//"), "");
+        // A second trailing slash is where `Path::file_name` would disagree.
+        assert_eq!(l("/a//"), "");
+        // Dot components come back as themselves.
+        assert_eq!(l("/a/."), ".");
+        assert_eq!(l("/a/.."), "..");
+    }
+
+    #[test]
+    fn nothing_a_tab_can_be_named_after_is_no_label() {
+        for s in ["/", "", "//", "/a//", "/a/.", "/a/..", ".", ".."] {
+            assert_eq!(label(Path::new(s)), None, "{:?}", s);
         }
-        _ => Vec::new(),
+        assert_eq!(label(Path::new("/a/repo")), Some(OsStr::new("repo")));
+        // `.git` is stripped only on the FALLBACK, never on the label itself.
+        assert_eq!(label(Path::new("/a/r.git")), Some(OsStr::new("r.git")));
+    }
+
+    #[test]
+    fn the_fallback_label_is_taken_verbatim_dots_included() {
+        // What `place` does when `label(top)` is None: the working directory's
+        // last component, with `.git` off and NO second filtering pass. A $PWD of
+        // `/x/.` therefore labels the tab `.`, which the reference implementation
+        // does too - it is reproduced here rather than fixed.
+        fn fallback(s: &str) -> &OsStr {
+            strip_git_suffix(last_component(Path::new(s)))
+        }
+        assert_eq!(fallback("/x/repo"), OsStr::new("repo"));
+        assert_eq!(fallback("/x/repo.git"), OsStr::new("repo"));
+        assert_eq!(fallback("/x/."), OsStr::new("."));
+        assert_eq!(fallback("/x/.."), OsStr::new(".."));
+        assert_eq!(fallback("/"), OsStr::new(""));
+    }
+
+    #[test]
+    fn the_home_abbreviation_replaces_only_a_whole_component_prefix() {
+        let a = |cwd: &str, home: Option<&str>| {
+            String::from_utf8(abbreviate(Path::new(cwd), home.map(Path::new))).expect("ascii")
+        };
+        assert_eq!(a("/home/alex", Some("/home/alex")), "~");
+        assert_eq!(a("/home/alex/code", Some("/home/alex")), "~/code");
+        assert_eq!(a("/home/alex/", Some("/home/alex")), "~/");
+        // The sibling a naive string prefix would swallow.
+        assert_eq!(a("/home/alex2/code", Some("/home/alex")), "/home/alex2/code");
+        assert_eq!(a("/etc", Some("/home/alex")), "/etc");
+        assert_eq!(a("/home/alex", None), "/home/alex");
+    }
+
+    #[test]
+    fn an_invalid_byte_in_a_path_survives_as_a_replacement_character() {
+        let cwd = Path::new(OsStr::from_bytes(b"/home/alex/b\xffd"));
+        let home = Path::new("/home/alex");
+        assert_eq!(text::repair(&abbreviate(cwd, Some(home))), "~/b\u{fffd}d");
     }
 }

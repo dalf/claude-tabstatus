@@ -75,7 +75,7 @@ fn root_of(doc: &[u8]) -> Result<J, String> {
 /// The `env` member, checked for shape. `Ok(None)` means there is no `env` key,
 /// which is fine; an `env` that is not an object is a refusal, because merging
 /// into it would produce something Claude Code cannot read.
-fn env_of<'a>(root: &'a Obj) -> Result<Option<&'a Member>, String> {
+fn env_of(root: &Obj) -> Result<Option<&Member>, String> {
     match root.get("env") {
         None => Ok(None),
         Some(m) => match &m.val {
