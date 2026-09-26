@@ -24,7 +24,7 @@
 use crate::settings::{self, Outcome};
 use crate::config::{self, Config, Terminal};
 use crate::edge::{Glyph, Paint};
-use crate::{json, render, tmux};
+use crate::{json, render, state, tmux};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
@@ -969,6 +969,7 @@ fn uninstall(c: &Ctx, force: bool, restore_backup: bool) -> Result<(), String> {
     remove_env_key(c, &prior, force, restore_backup)?;
     unlink_the_plugin(c, &prior)?;
     remove_state(c)?;
+    remove_records();
     // The tmux server's own set-titles pair, which SessionStart saved aside. Only
     // uninstall restores it: the options are server-wide, so a SessionEnd doing it
     // would unpaint the other claude windows still running.
@@ -1196,6 +1197,32 @@ fn remove_state(c: &Ctx) -> Result<(), String> {
     Ok(())
 }
 
+/// The wait-ownership records, which are the OTHER thing an install leaves on the
+/// disk. Best effort and unannounced when there is nowhere they could be: the
+/// directory is created by the first edge that has something to record, so its
+/// absence is the normal case.
+///
+/// Removing a still-LIVE session's record is harmless, because a session with no
+/// record degrades to the stateless answer, which is exactly what it painted before
+/// this plugin existed; and by this point the plugin is unlinked, so no hook of any
+/// session will run again to write another. Without this the files sat in
+/// `$XDG_RUNTIME_DIR` until logout, unmentioned by a report that ends "Done." and
+/// "The repo itself was not touched" - which reads as a complete account of what is
+/// left behind.
+fn remove_records() {
+    let Some((d, gone, dir_gone)) = state::purge() else {
+        return;
+    };
+    if dir_gone {
+        say(&format!("records:  removed {} ({gone} record(s))", d.display()));
+    } else if gone > 0 {
+        say(&format!(
+            "records:  removed {gone} record(s) from {}, which holds other files",
+            d.display()
+        ));
+    }
+}
+
 // --- doctor -----------------------------------------------------------------
 
 /// What is installed, and what the runtime half would do right now.
@@ -1210,6 +1237,7 @@ fn doctor(c: &Ctx) -> Result<(), String> {
     report_plugin(c);
     report_env_key(c)?;
     report_state(c);
+    report_record();
     report_runtime();
     report_tmux();
     report_title();
@@ -1324,6 +1352,54 @@ fn report_state(c: &Ctx) {
             format!("absent ({}), so uninstall will not remove the env key without --force", c.state.display())
         }
     ));
+}
+
+/// The wait-ownership records: where they live, whether the layer is on at all,
+/// what each record holds, and which of them the next session-start will reap.
+///
+/// "disabled" is the silent answer to almost every question this layer can raise -
+/// a tab behaving exactly as it did before the layer existed is indistinguishable
+/// from a layer that is working correctly - so the reason is printed, not implied.
+///
+/// Read-only, deliberately: it NAMES the stale files rather than deleting them,
+/// because the command you run when something is already wrong must not be the one
+/// that removes the evidence. The verdicts come from the same function the reaper
+/// calls, so the report cannot drift from the behaviour.
+fn report_record() {
+    let s = state::survey();
+    let dir = match &s.dir {
+        Err(why) => {
+            say(&format!("record:    disabled - {why}"));
+            say(
+                "           so every edge falls back to the stateless answer, which is \
+                 the behaviour from before wait ownership existed",
+            );
+            return;
+        }
+        Ok(d) => d,
+    };
+    say(&format!(
+        "record:    {} ({} record{}, {} stale)",
+        dir.display(),
+        s.records.len(),
+        if s.records.len() == 1 { "" } else { "s" },
+        s.stale
+    ));
+    // Before anything about what is in there, because a directory nothing can be
+    // written to is the one failure mode every OTHER line of this report renders as
+    // healthy - "nothing recorded" included - while the tab is stuck orange.
+    if let Some(why) = s.writable {
+        say(&format!("           FAIL {why}"));
+    }
+    if s.records.is_empty() {
+        say(
+            "           nothing recorded, which is also what a session that has raised \
+             no dialog leaves behind",
+        );
+    }
+    for (name, what) in &s.records {
+        say(&format!("           {name}: {what}"));
+    }
 }
 
 /// What the runtime half would decide from this environment: which terminal, which

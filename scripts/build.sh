@@ -16,6 +16,16 @@
 # stale binary from shipping silently. sha256sum is preferred and cksum is the
 # POSIX fallback, so the check works wherever either exists.
 #
+# ONE MANIFEST PER TRIPLE, plus an unsuffixed pair for the host. Writing a single
+# unsuffixed manifest for ALL sources after building only the host left the other
+# triple's binary silently behind while `sha256sum -c bin/sources.sha256` read
+# fully green - measured: a gnu binary built 37 minutes before the musl one, with
+# a manifest that vouched for both. A manifest now names the binary it vouches
+# for, and a triple this run did not build keeps whatever manifest it had, so a
+# verify of it fails instead of inheriting somebody else's freshness. The
+# unsuffixed pair is the HOST's, because bin/tabstatus is the host binary and that
+# is what the test suite and the installed plugin run.
+#
 # cargo comes from mise here. A non-interactive shell does not have it on PATH,
 # hence the full path.
 set -eu
@@ -88,12 +98,21 @@ ln -sfn "tabstatus-$host" bin/tabstatus
 # The staleness manifests. Sorted by path so the file is stable, and listing
 # exactly the inputs a rebuild depends on.
 sources="Cargo.toml $(ls src/*.rs | sort)"
-# shellcheck disable=SC2086
-if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum $sources >bin/sources.sha256
-fi
-# shellcheck disable=SC2086
-cksum $sources >bin/sources.cksum
+have_sha256=
+command -v sha256sum >/dev/null 2>&1 && have_sha256=yes
+for t in $list; do
+    case " $failed " in *" $t "*) continue ;; esac
+    # shellcheck disable=SC2086
+    [ -z "$have_sha256" ] || sha256sum $sources >"bin/sources.$t.sha256"
+    # shellcheck disable=SC2086
+    cksum $sources >"bin/sources.$t.cksum"
+    # The host's manifest is also the unsuffixed one, because bin/tabstatus is the
+    # host binary.
+    if [ "$t" = "$host" ]; then
+        [ -z "$have_sha256" ] || cp -f "bin/sources.$t.sha256" bin/sources.sha256
+        cp -f "bin/sources.$t.cksum" bin/sources.cksum
+    fi
+done
 
 printf '\nbin/:\n'
 ls -l bin/

@@ -18,6 +18,10 @@ pub enum Edge {
     Idle,
     Notify,
     SessionEnd,
+    /// A subagent finished. It paints NOTHING on its own - see [`Edge::resolve`] -
+    /// and exists only for the state layer, which uses it to clear a wait that
+    /// agent owned.
+    SubagentStop,
     /// No argument, or a word this version does not know.
     Unknown,
 }
@@ -65,6 +69,7 @@ impl Edge {
             Some(b"idle") => Edge::Idle,
             Some(b"notify") => Edge::Notify,
             Some(b"session-end") => Edge::SessionEnd,
+            Some(b"subagent-stop") => Edge::SubagentStop,
             // An edge a later `hooks.json` adds, or no argument at all. Both
             // paint the IDLE form rather than nothing: a tab that keeps painting
             // is the forward-compatible choice, and it is pinned by the tests.
@@ -75,7 +80,28 @@ impl Edge {
     /// Whether this edge's state depends on the payload. The other edges only
     /// drain stdin, and never pay for a window of it.
     pub fn reads_payload(self) -> bool {
-        matches!(self, Edge::Notify | Edge::SessionStart | Edge::Working)
+        matches!(
+            self,
+            Edge::Notify | Edge::SessionStart | Edge::Working | Edge::SubagentStop
+        )
+    }
+
+    /// Whether this edge needs the payload's TAIL once there is a record to
+    /// consult - i.e. an edge whose STATELESS answer needs no payload at all but
+    /// whose stateful one does, and whose discriminator is not a front member.
+    ///
+    /// Exactly one: `idle`. `state::free` reads `background_tasks`, which a `Stop`
+    /// serializes after `last_assistant_message`, so a front window alone loses it
+    /// on any turn with a long final message - and losing it means every wait
+    /// stands when it should have been retired, which is the tab staying orange.
+    /// The other stateful-only edges want `session_id` and `agent_id`, both front
+    /// members, so they keep paying for the front window alone.
+    ///
+    /// Deliberately NOT folded into `reads_payload`: that predicate also governs
+    /// the STATELESS path, where nothing about `idle` depends on the payload, and
+    /// making it build a tail there would spend the work for no answer.
+    pub fn reads_state_tail(self) -> bool {
+        matches!(self, Edge::Idle)
     }
 
     /// The edge plus its payload, resolved to a single decision. `None` means
@@ -122,13 +148,19 @@ impl Edge {
                 Some(Paint::SessionStart)
             }
             Edge::SessionEnd => Some(Paint::SessionEnd),
+            // Stateless, a subagent finishing is not a state change at all: it
+            // must not read as the session going idle, and it fires for the
+            // internal compaction summarizer too. With no state directory this
+            // edge is therefore a complete no-op, which is what makes registering
+            // the hook safe on a machine that has nowhere to keep a record.
+            Edge::SubagentStop => None,
         }
     }
 }
 
 /// What a Notification is telling us, which is a three-way and the third branch
 /// is silence.
-enum Notification {
+pub enum Notification {
     /// The quiet-turn nudge, fired ~60s after a turn ends. It is the one kind
     /// that MUST NOT paint waiting - it arrives after EVERY quiet turn end, so
     /// mapping it to waiting would turn every idle tab orange a minute later and
@@ -159,7 +191,7 @@ const WAITING_KINDS: [&[u8]; 5] = [
 ];
 
 impl Notification {
-    fn detect(payload: &Payload) -> Notification {
+    pub fn detect(payload: &Payload) -> Notification {
         // Both windows, because `notification_type` is serialized LAST, after an
         // unbounded `message`.
         if payload.has(b"\"notification_type\":\"idle_prompt\"") {
@@ -188,6 +220,7 @@ mod tests {
         assert_eq!(edge("idle"), Edge::Idle);
         assert_eq!(edge("notify"), Edge::Notify);
         assert_eq!(edge("session-end"), Edge::SessionEnd);
+        assert_eq!(edge("subagent-stop"), Edge::SubagentStop);
     }
 
     #[test]
@@ -207,14 +240,28 @@ mod tests {
     }
 
     #[test]
-    fn only_three_edges_pay_for_a_payload_window() {
+    fn only_the_edges_with_a_discriminator_pay_for_a_payload_window() {
         assert!(Edge::Notify.reads_payload());
         assert!(Edge::SessionStart.reads_payload());
         assert!(Edge::Working.reads_payload());
+        assert!(Edge::SubagentStop.reads_payload());
         assert!(!Edge::Waiting.reads_payload());
         assert!(!Edge::Idle.reads_payload());
         assert!(!Edge::SessionEnd.reads_payload());
         assert!(!Edge::Unknown.reads_payload());
+        // And exactly one edge needs the tail only once a record exists.
+        for e in [
+            Edge::Notify,
+            Edge::SessionStart,
+            Edge::Working,
+            Edge::SubagentStop,
+            Edge::Waiting,
+            Edge::SessionEnd,
+            Edge::Unknown,
+        ] {
+            assert!(!e.reads_state_tail(), "{e:?}");
+        }
+        assert!(Edge::Idle.reads_state_tail());
     }
 
     #[test]
@@ -237,6 +284,13 @@ mod tests {
         // Two spaces is not the spelling Claude Code writes.
         let p = payload(br#"{"source":  "compact"}"#);
         assert_eq!(Edge::SessionStart.resolve(&p), Some(Paint::SessionStart));
+    }
+
+    #[test]
+    fn a_subagent_stop_paints_nothing_without_a_state_directory() {
+        let p = payload(br#"{"agent_id":"abc","hook_event_name":"SubagentStop"}"#);
+        assert_eq!(Edge::SubagentStop.resolve(&p), None);
+        assert_eq!(Edge::SubagentStop.resolve(&Payload::empty()), None);
     }
 
     #[test]

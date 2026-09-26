@@ -235,7 +235,7 @@ fn carrier_at(paint: Paint, place: &str, epoch: u64) -> String {
 ///
 /// No width is imposed: every extraction below is anchored, not offset, so a
 /// mocked `CCTAB_NOW=5` works exactly like a real ten-digit one.
-fn now() -> u64 {
+pub fn now() -> u64 {
     epoch(config::var_nonempty("CCTAB_NOW").as_deref())
 }
 
@@ -253,7 +253,7 @@ fn epoch(raw: Option<&OsStr>) -> u64 {
 /// Seconds before a state decays. `0` disables the tier, which is expressed as a
 /// deadline no age can reach rather than as a second shape of format: the
 /// generated string then stays one constant per glyph position.
-const NEVER: &str = "2147483647";
+const NEVER: u32 = 2_147_483_647;
 /// MEASURED, not reasoned. `working` is repainted by `UserPromptSubmit`,
 /// `PostToolUse` and `PostToolUseFailure` only, so during one long tool call
 /// nothing paints at all - `PreToolUse` is matched to `AskUserQuestion` and
@@ -270,27 +270,36 @@ const NEVER: &str = "2147483647";
 /// running - the exact class of lie this slice exists to remove, pointed the
 /// other way. The 3600s disappear horizon still catches a genuinely stuck one.
 const DEFAULT_TTL_WORKING: u32 = 1200;
-const DEFAULT_TTL_WAITING: u32 = 900;
+pub const DEFAULT_TTL_WAITING: u32 = 900;
 const DEFAULT_TTL_GONE: u32 = 3600;
 
 /// One to six digits with no leading zero; `0` is "never"; anything else is the
 /// default. The same grammar `Cap` uses, for the same reason - `str::parse`
 /// would read `08` as 8 and `0000000` as 0.
 fn ttl(key: &str, default: u32) -> String {
-    ttl_of(config::var(key).as_deref(), default)
+    ttl_secs(key, default).to_string()
 }
 
-fn ttl_of(raw: Option<&OsStr>, default: u32) -> String {
+/// The same TTL as a NUMBER, because `state` measures an outstanding wait against
+/// `CCTAB_TTL_WAITING` too - so that inside tmux the record and the title stop
+/// lying at the same moment, off one knob and one grammar.
+pub fn ttl_secs(key: &str, default: u32) -> u64 {
+    u64::from(ttl_of(config::var(key).as_deref(), default))
+}
+
+fn ttl_of(raw: Option<&OsStr>, default: u32) -> u32 {
     match raw.map(OsStr::as_bytes) {
-        Some(b"0") => NEVER.to_owned(),
+        // "never", expressed as a deadline no age can reach rather than as a
+        // second shape of format.
+        Some(b"0") => NEVER,
         Some(v)
             if (1..=6).contains(&v.len())
                 && (b'1'..=b'9').contains(&v[0])
                 && v.iter().all(u8::is_ascii_digit) =>
         {
-            String::from_utf8_lossy(v).into_owned()
+            v.iter().fold(0u32, |a, c| a * 10 + u32::from(c - b'0'))
         }
-        _ => default.to_string(),
+        _ => default,
     }
 }
 
@@ -998,7 +1007,7 @@ fn shown_ttl(key: &str, default: u32) -> String {
 }
 
 fn shown(v: &str) -> String {
-    if v == NEVER {
+    if v == NEVER.to_string() {
         "never".to_owned()
     } else {
         format!("{v}s")
@@ -1053,13 +1062,13 @@ mod tests {
     fn the_ttl_grammar_is_the_caps_grammar() {
         let t = |v: Option<&str>| ttl_of(v.map(OsStr::new), 300);
         assert_eq!(t(Some("0")), NEVER);
-        assert_eq!(t(Some("1")), "1");
-        assert_eq!(t(Some("999999")), "999999");
+        assert_eq!(t(Some("1")), 1);
+        assert_eq!(t(Some("999999")), 999_999);
         // A leading zero, a seventh digit, a sign and a word are all the default.
         for bad in ["08", "0300", "1000000", "-1", "3.5", "nope", " 8", ""] {
-            assert_eq!(t(Some(bad)), "300", "{bad:?}");
+            assert_eq!(t(Some(bad)), 300, "{bad:?}");
         }
-        assert_eq!(t(None), "300");
+        assert_eq!(t(None), 300);
     }
 
     /// The format is one constant per glyph position, so it can be pinned here
@@ -1155,7 +1164,7 @@ mod tests {
 
     #[test]
     fn a_ttl_of_never_is_reported_as_never_and_not_as_the_sentinel() {
-        assert_eq!(shown(NEVER), "never");
+        assert_eq!(shown(&NEVER.to_string()), "never");
         assert_eq!(shown("1200"), "1200s");
         assert_eq!(shown("0"), "0s", "0 never reaches here - ttl() maps it to NEVER");
     }

@@ -35,6 +35,7 @@ Three states, and the hook events that paint them:
 | `Notification` | any other kind | *nothing* |
 | `Stop` | | ⚪ idle |
 | `StopFailure` | | ⚪ idle |
+| `SubagentStop` | | *nothing*, unless that agent owned the wait |
 | `SessionEnd` | | clears the title, restores the tab |
 
 The `SessionStart` and `PreToolUse` scopes are hook *matchers*, so those hooks
@@ -47,10 +48,12 @@ Some of that is less obvious than it looks:
 
 - **`PostToolUse` is registered unmatched**, so it runs on every tool call, and
   it is the recovery from waiting: 24-42ms after you answer a dialog the tab is
-  blue again. It reads one thing from its payload - `agent_id` - and paints
-  nothing when it is there, because a *subagent's* tool call firing in the main
+  blue again. It reads two things from its payload - `agent_id` and `session_id` -
+  and a *subagent's* tool call paints nothing unless that subagent is the one you
+  were waiting on, because a background subagent's tool call firing in the main
   session must not repaint over a dialog you are looking at. A matcher could not
-  do that: a matcher sees only `tool_name`. The cost of the edge is the process
+  do either: a matcher sees only `tool_name`. Wait ownership, below, is the whole
+  of that distinction. The cost of the edge is the process
   spawn, about 0.61ms measured, so 900 tool calls in a heavy session cost ~0.55s
   spread over minutes - invisible beside the tool calls themselves. The payload
   carries the whole `tool_response`, hundreds of KB on a large read, and only its
@@ -83,33 +86,38 @@ Some of that is less obvious than it looks:
   fired: measured, a subagent's dialog arrived a second *after* the tab went
   idle, and nothing repainted until a human answered it. Treating it as a no-op
   would leave the tab idle while you are the one blocking.
-- **`SubagentStop` is deliberately not registered.** A subagent finishing must
-  not read as the session going idle - and it also fires for the internal
-  compaction summarizer, with an empty `agent_type` that no matcher could
-  filter, right before a `SessionStart`/`compact`.
-- **The `agent_id` filter has a cost, and it is a tab left orange.** The two
-  cases it cannot tell apart are both a subagent's `PostToolUse`: one arriving
-  while *your* dialog is open (must not paint) and one arriving after you
-  answered the *subagent's* dialog (should paint blue). Stateless, there is no
-  field that separates them, so the filter takes the safe half and pays for it:
-  after you approve a subagent's dialog, nothing repaints until the `Task`
-  returns, so the tab **reads orange for the rest of that subagent's run**.
-  Registering `SubagentStop` → `working` does not fix it - measured, not assumed:
-  a real `SubagentStop` payload carries `agent_id` (byte 760 of 1439), so the
-  `working` edge silences it exactly like any other subagent event. An edge that
-  skipped the filter would close this window and reopen the worse one, painting
-  blue over a main-thread dialog that is still open. Orange-while-working is the
-  benign direction - you glance, find nothing to answer, move on - and
-  blue-while-blocked is the damaging one, so this is the trade taken on purpose.
+- **`SubagentStop` is registered and paints nothing of its own.** A subagent
+  finishing must not read as the session going idle - and it also fires for
+  agents nothing announced: measured, a `SubagentStop` for `a8e90c10`, with an
+  empty `agent_type` and no matching `SubagentStart`, nine seconds *before* the
+  user answered a different agent's dialog, and another one immediately before a
+  `SessionStart`/`compact`. No matcher could filter those. The owner test does:
+  this edge clears the wait whose `agent_id` matches and is otherwise a complete
+  no-op, which is also what it is when there is nowhere to keep a record. It is
+  here because it is the only signal for a dialog you **declined** - no hook
+  fires for a denial, the tool never runs, and no `PostToolUse` ever arrives.
+- **The `agent_id` filter used to cost a tab left orange, and that is what wait
+  ownership fixes.** The two cases the filter cannot tell apart are both a
+  subagent's `PostToolUse`: one arriving while *your* dialog is open (must not
+  paint) and one arriving after you answered the *subagent's* dialog (should
+  un-paint). No field separates them - the difference is in what came before - so
+  stateless the filter took the safe half and paid for it: after approving a
+  subagent's dialog, nothing repainted until the `Task` returned, so the tab read
+  orange for the rest of that subagent's run, which is minutes. Inside tmux the
+  decay healed it after `CCTAB_TTL_WAITING`; in a plain Konsole tab nothing
+  healed it at all. It is now resolved by recording *who* raised the wait.
 - **`StopFailure` is there because `Stop` is not.** When a turn dies on an API
   error - `rate_limit`, `overloaded` - only `StopFailure` fires, so without it a
   rate-limited turn would leave the tab blue indefinitely.
 
-The binary is **stateless**: what it paints is a pure function of the edge name
-plus, on three edges, a handful of substring tests on the raw payload line.
-Nothing is written anywhere, so nothing is stale after a `kill -9` and there is
-nothing to prune. `Notification`, `SessionStart` and `PostToolUse` look at their
-payload and nothing else does, and all three search only **bounded windows** of
+What the binary paints is a function of the edge name, a handful of substring
+tests on the raw payload line, and - for the four edges that can be part of a
+wait - one small record per session. Wait ownership, below, is why that record
+exists and what is in it; with nowhere to keep it, every edge falls back to the
+stateless answer, which is what the whole golden corpus still pins byte for byte.
+`Notification`, `SessionStart`, `PostToolUse` and `SubagentStop` look at their
+payload for a discriminator of their own, and all of them search only **bounded
+windows** of
 the first line: its first 8 KiB, plus - for `Notification` alone - its last
 8 KiB. Nothing between them is ever searched, so the cost does not depend on what
 a tool returned. The back window is not symmetry: a `Notification` serializes
@@ -119,9 +127,297 @@ discriminator and the tab painted nothing at all. `agent_id` and `source` are
 read from the front window only, because they are serialized before anything
 unbounded (byte 760 of 1360 and byte 713 of 769 in real captures) and because a
 false positive on `agent_id` would silence every `working` repaint for the rest of
-the session. The tests carry the compact `"key":"value"` spelling Claude Code
+the session. `session_id` is the payload's **first** member in every capture, so
+it is in the front window by construction. The tests carry the compact `"key":"value"` spelling Claude Code
 actually writes, and a payload that matches nothing falls through to painting
 nothing, which leaves whatever the tab already showed.
+
+### Wait ownership
+
+The model here is partly taken from
+[Yannis-Adn/terminal-addons](https://github.com/Yannis-Adn/terminal-addons) (MIT),
+whose `wt-tab-status` keeps one state file per session holding a state *and the
+owner of a wait*, and only lets the waiting agent end the wait. `src/state.rs`
+credits the exact functions, and records the four places this diverges - the
+largest being that its `PermissionRequest` branch no-ops on a subagent's dialog,
+which the capture below shows would paint idle while a human is being asked.
+
+
+A wait is an **overlay on a base**. The base is what the tab shows when nothing
+is waiting; a dialog covers it; clearing the *last* dialog restores it. Who
+raised a wait is therefore part of the state, and it cannot be recovered from any
+one payload - which is why this is the one thing the binary writes down.
+
+The capture that forced it, timings relative to that session's `SessionStart`:
+
+| t | event | `agent_id` | stateless | with ownership |
+|---|---|---|---|---|
+| 66.283 | `PreToolUse` `tool_name=Agent` | - | 🔵 | 🔵 base `w` |
+| 68.946 | `Stop` `background_tasks=[subagent:running:aec99e]` | - | ⚪ | ⚪ base `i` |
+| 69.960 | `PermissionRequest` | `aec99e1f` | 🟠 | 🟠 wait owned by `aec99e1f` |
+| 75.983 | `Notification` `permission_prompt` | *absent* | 🟠 | 🟠 no second owner added |
+| 98.459 | `SubagentStop` | `a8e90c10` | - | *nothing*: owns no wait |
+| 107.496 | `PostToolUse` (you approved) | `aec99e1f` | *nothing* | ⚪ the base comes back |
+| 110.230 | `SubagentStop` | `aec99e1f` | - | *nothing*: already cleared |
+
+Three things in that sequence decide the design, and each one rules out a simpler
+answer:
+
+- The main thread's `Stop` lands **before** the subagent's dialog. So no-oping a
+  subagent `PermissionRequest` is not the fix either - it would paint idle while
+  something genuinely wants your approval.
+- The event that resolves the dialog is the **subagent's own** `PostToolUse`,
+  which the stateless filter has to discard.
+- `SubagentStop` fires for agents nothing announced. A wait is cleared only by an
+  `agent_id` that **matches**, or the ghost at 98.459 would have un-painted a live
+  dialog nine seconds early.
+
+The rules, in full:
+
+| edge | what it does to the record | what it paints |
+|---|---|---|
+| `waiting` | adds this owner (`agent_id`, or the main loop), with its own epoch | 🟠 always |
+| `waiting` from a `Notification` | adds an *unknown* owner, and only when nothing is waiting; an owned wait raised while `?` is the only one outstanding replaces it | 🟠 always |
+| `working`, a `PostToolUse` on the main thread | base ← `w`; clears the main and unknown waits | the base, or nothing if a wait remains |
+| `working`, a `UserPromptSubmit` **you typed** | base ← `w`; clears **every** wait | the base |
+| `working`, a subagent | clears the wait it owns, or a lone `?`; base untouched | the base if that emptied the set, else nothing |
+| `idle` | base ← `i`; clears a main wait, and **every** wait when `background_tasks` is `[]` | ⚪, or nothing if a wait remains |
+| `subagent-stop` | clears the wait it owns, or a lone `?` | the base if that emptied the set, else nothing |
+| `session-start` | resets the record, and reaps | ⚪ as before |
+| `session-end` | removes the record | clears the title |
+
+Four consequences worth naming:
+
+- **Two dialogs at once are both remembered.** A main-thread dialog queued behind
+  a subagent's is the realistic overlap, and a single owner slot gets it wrong
+  whichever one it keeps: answering the main one must not restore the base while
+  the agent's dialog is still on screen. So the record holds a *set*, newest last,
+  and the base comes back when the set empties.
+- **A main-thread tool call no longer repaints over a subagent's dialog.** This is
+  the half of the fix that matters most, and stateless it was not even possible to
+  attempt: the blunt `agent_id` filter only caught *subagent* tool calls.
+- **`Stop` does not paint idle over an outstanding dialog** - not while something
+  is actually running. It always clears a *main* wait, because the loop could not
+  have stopped while a main-thread dialog blocked it (a rejected `ExitPlanMode`,
+  whose `PostToolUse` never comes, is exactly that). What it does with the others
+  depends on `background_tasks`: see the next block.
+- **`UserPromptSubmit` clears everything, but only when you typed it.** You cannot
+  type at the prompt while a modal is up, so a prompt of yours proves the screen is
+  clear whoever owned the dialog. The trap is that not every `UserPromptSubmit` is
+  yours: the capture's 110.251 event carries
+  `"prompt":"<task-notification>..."`, which the *product* injects when an async
+  agent finishes, and with two agents running the first one's completion would then
+  retire the second one's live dialog. So the prompt must be present and must not
+  begin with `<` - deliberately broader than the one spelling measured, because
+  every injected prompt shape is an XML-ish tag, and the injected event is redundant
+  anyway: that agent's own `SubagentStop` fires 20ms earlier.
+
+**An overlay nothing can lift is worse than no overlay at all.** While any wait is
+held, neither `working` nor `idle` paints - that is the whole mechanism - so a wait
+that outlives its dialog freezes the tab orange, and outside tmux nothing decays it.
+Every wait therefore has four independent retirement conditions, and each is a
+proof rather than a guess:
+
+| what retires it | why it is a proof |
+|---|---|
+| the owner's own completion | that agent's `PostToolUse`, or its `SubagentStop` when you declined and no tool ever ran |
+| a `UserPromptSubmit` you typed | a modal dialog and a usable prompt cannot both be on screen |
+| `background_tasks` empty at `Stop` | the array holds one entry per live subagent - the capture's 68.946 `Stop` lists the very agent that raises the dialog a second later - so an empty one proves nothing outside the main loop is running, and therefore that no subagent's dialog and no unattributable dialog is outstanding |
+| its own expiry | `CCTAB_TTL_WAITING`, **per wait** |
+
+The last three exist because the captures are emphatic that *abandoning* a dialog
+fires no hook whatsoever: Esc on a live dialog (`s2`), declining one (`s7`) and
+Ctrl+C mid-tool (`s5`) each emit nothing at all until the next prompt. Nothing the
+owner does can be waited for, because the owner does nothing.
+
+"Absent" is not "empty", and that asymmetry is deliberate in both directions. A
+`Notification` carries no `background_tasks` at all, and a Claude Code that renamed
+the member would carry none either, so a missing array leaves every wait standing -
+the conservative answer. A *non-empty* one leaves them standing for the same reason,
+which is exactly the capture's 68.946 `Stop`.
+
+The per-wait epoch is the other half. With one epoch for the whole list, raising any
+dialog refreshed it, so every later dialog pushed a *stale* wait's expiry out with
+it: measured on that shape with the TTL set to 3s, one abandoned subagent wait plus
+four ordinary main turns 2s apart left **16 consecutive edges painting nothing**, 8s
+into a 3s horizon - a tab frozen orange for the rest of the session, with the TTL
+unable to rescue it. Each wait now carries its own clock, and an expiry is written
+back to the record rather than recomputed, so raising the TTL later cannot resurrect
+a wait already declared dead.
+
+**A stale record is normal, not exceptional.** A session killed with `SIGKILL`
+fires no `SessionEnd`, so the record has three independent bounds and no daemon:
+
+- An outstanding **wait** older than `CCTAB_TTL_WAITING` (900s - the same knob, and
+  the same grammar, that tmux decays an orange title with, so inside tmux the
+  record and the title stop lying at the same moment), measured **per wait** against
+  that wait's own epoch.
+- A **`SessionStart` in any session reaps the others**, by asking whether the
+  process that wrote each record is still running. Every write stamps the record
+  with `$CLAUDE_PID` *and that pid's start time* - field 22 of `/proc/<pid>/stat` -
+  and the reaper unlinks a record only when that pair no longer names a running
+  process. (`SessionStart` is where it usually happens; doing it on any write is
+  what covers a session whose `SessionStart` ran before this plugin was installed,
+  which would otherwise be left on the one-day mtime rule for its whole life.)
+- The directory is under `$XDG_RUNTIME_DIR`, which the OS empties at logout.
+
+The reaper **provably cannot delete a live session's record that carries an
+origin**, and the pair is why.
+A hook process is a child of `$CLAUDE_PID`, so that process exists whenever any of
+its own hooks are firing, and a start time is immutable for the life of a process.
+So the unlink predicate is false for every live session, whatever the record's age -
+and *age is what a naive reaper would have used*. An mtime horizon cannot do this
+job: a session sitting at its prompt touches nothing, so any horizon short enough to
+be useful would eventually delete the record of a session that is merely idle. The
+start time is also what makes pid recycling harmless - a recycled pid reads as
+*gone*, not as alive, because the start time under it differs. The error the rule
+*can* make is the harmless one: keeping a dead session's record if a new process
+were handed the same pid inside the same 10ms tick, which needs 4194304 intervening
+spawns (`pid_max`, measured, at `CLK_TCK` 100).
+
+The parse has one trap worth naming, because the obvious `awk '{print $22}'` falls
+into it: field 2 of `/proc/<pid>/stat` is the executable name in parentheses, and it
+may itself contain spaces and parentheses. Measured on this machine, one process
+reads `(npm exec chrome...)` - exactly the sort of thing a `claude` session spawns -
+so the field is read *after the last* `") "`, in the binary and in the test alike.
+
+A file that names no origin - a record written before this field existed, or a
+`.tmp` from a crashed write, or a *newer* version's record whose writer may be
+running right now - falls back to mtime with a **one-day** horizon, deliberately
+long for the reason above.
+
+**The reaper deletes only what it can prove is ours, and everything else is left
+alone forever.** A file whose name is not a session id, a file that is not a record
+in any version's shape, a file it could not read, and anything that is not a regular
+file or a symlink: none of those is a candidate at any age. That is stricter than it
+looks necessary and the reason is concrete - `CCTAB_STATE_DIR` is a documented knob,
+the name grammar `[A-Za-z0-9_-]{1,64}` cannot tell a session id from `id_rsa`, and an
+earlier rule that fell back to mtime for anything it could not parse deleted a
+30-day-old private key out of a directory that had other things in it. The price is
+bounded litter in a tmpfs that logout empties; `doctor` names every file it will not
+take, and says why. **Point `CCTAB_STATE_DIR` at a dedicated directory.**
+
+Correctness never depends on any of it: `SessionStart` rewrites its *own* record
+before reaping, so a resumed or reused session id can never read a dead session's
+record as authoritative. Reaping is hygiene, and `tabstatus doctor` names every
+record it would take.
+
+The record is one file per `session_id`, so five concurrent sessions never contend.
+It is written temp-then-`rename`, because two hooks of one turn do overlap -
+measured 1ms apart - and a reader must see the old record or the new one, never a
+torn one. 240 concurrent hooks against one record leave one well-formed file and no
+temporary.
+
+**Each read-modify-write holds an exclusive `flock` on that session's own record**,
+and "a lost update self-corrects on the next edge" - which this section used to
+claim - is false in the one direction that matters. When the lost update is a
+*clear*, the record keeps a phantom wait, and then `working`, `idle` and the 3s idle
+nudge all decline to paint: the tab is orange until the TTL, which outside tmux is
+the fifteen-minute lie this whole layer exists to remove. Measured on the same code
+with the lock disabled, 400 rounds of a subagent's un-painting `PostToolUse`
+launched simultaneously with main's `Stop`: **76 of 400 lost the clear**, and 36 of
+400 in the reverse direction lost the wait. With the lock, 0 of 1200 across three
+runs, and five concurrent sessions never touch each other's file.
+
+Two details of the lock are load-bearing. It is taken on the record path, and
+because `write_if_changed` renames over that path the inode can change under a
+waiter - which would leave it holding an exclusive lock on an unlinked inode while a
+third hook held the new one - so after locking it checks that it holds the inode the
+path names *now*, and retries when it does not. And it does **not** create the file:
+with no record there is nothing to lock, but a record that does not exist also holds
+no wait, so the update that can still be lost there is a first wait or a base, never
+a clear. `std::fs::File::lock` ships in std (1.89), so this costs no dependency; it
+is the reason `rust-version` moved from 1.74 to 1.89.
+
+```text
+cts1                                           the tag: version 1 of the wire
+b i                                            base = w | a | i
+p 3709427 84460384                             the session's (pid, start time)
+w aec99e1f4bda1972b:1790380630 -:1790380631    one wait per word: owner, then epoch
+```
+
+`-` is the main loop and `?` is an unknown owner, which is why an `agent_id` is
+accepted only as `[A-Za-z0-9_-]{1,64}` - the same test that stops a `session_id`
+from choosing the path it is filed under. Unknown keys are **skipped**, and a base
+letter this version cannot paint reads as idle, so a newer version's record
+degrades rather than being misread; and a record this version did not *change* is
+not rewritten, so it keeps the fields it did not understand.
+
+**What it costs, per edge - and how to re-measure it.** This section used to carry
+remembered numbers, and they did not reproduce: a per-edge cost of tens of
+microseconds against a fork-and-exec floor of several hundred is below the noise of a
+desktop that is also doing something else, and an earlier harness that forked three
+times per invocation put an 1100us floor under a 500us measurement. So the numbers
+live in a script instead:
+
+```sh
+sh scripts/bench-state.sh                      # the layer against itself, switched off
+sh scripts/bench-state.sh <baseline-binary>    # ...and against a pre-slice build
+```
+
+It interleaves every arm within each round, reports the spread as well as the
+minimum, and gives the **median of the per-round paired deltas** rather than a
+difference of two minima. Two independent 21-round passes of 200 execs on this
+machine, no baseline argument, so the comparison is the layer against itself with no
+state directory:
+
+| arm | state I/O | min us | spread | vs layer-off |
+|---|---|---|---|---|
+| `new-nostate` — the layer switched off | none | 460 | 42 | +0 |
+| **`working`, main thread, record already current** | read | 475 | 145 | **+15us** |
+| `working`, main thread, a wait held by somebody else | read | 453 | 62 | −8us |
+| `working`, a transition | read + write | 479 | 54 | **+22us** |
+| `working`, a subagent that owns no wait | read | 436 | 48 | −24us |
+| `working`, the subagent that owns the wait | read + write | 446 | 42 | −14us |
+| `idle` / `Stop` | read | 474 | 176 | **+16us** |
+
+The two arms that come out *negative* are not noise and are worth understanding: an
+edge that owns no wait, or that holds one somebody else owns, returns before the
+location walk and before the emit, so it is genuinely cheaper than a painting edge.
+The layer's own cost is the +15us on the hot `working` read and the +15 to +22us on a
+transition, against a ~460us floor - so under 5% there, and under 3% of the 767us a
+real hook costs including the harness fork.
+
+The half of the claim that is cheap to **check** rather than to believe is write
+avoidance, and it holds: 50 steady-state main-thread `working` edges leave the
+record's mtime untouched, and a subagent tool call that owns no wait returns without
+writing - or creating - anything at all. That asymmetry is why `write_if_changed`
+earns its place: after the first main-thread tool call of a turn sets the base, every
+later one in that turn is a read and nothing else, so transitions are a handful per
+turn against hundreds of tool calls.
+
+**The edges that used to only drain stdin now read a window, and that had to be
+bounded.** `waiting`, `idle` and `session-end` have no discriminator of their own;
+they read a payload only because the record is filed under `session_id`. `waiting`
+and `session-end` read the **front** window alone - `session_id` and `agent_id` are
+both front members. The distinction is not cosmetic, because building a tail means
+scanning every byte of the payload for the end of the line, and a
+`PermissionRequest` for a `Write` carries the whole file in `tool_input`: the first
+version of this read the full window on those edges and cost **+555us** on a 1 MiB
+payload, rising with payload size.
+
+`idle` is the one exception, and it is a deliberate trade. It reads
+`background_tasks`, which a `Stop` serializes *after* `last_assistant_message`, so a
+front window alone loses it on any turn that ended with a long message - and losing
+it means every wait stands when it should have been retired, which is the tab staying
+orange. It therefore builds a tail: once per turn, not once per tool call, and
+measured at +16us on a 2 KB payload and +44 to +53us against a pre-slice build. A
+300 KB `Stop` replayed through both binaries is byte-identical.
+
+**Seams, designed and deliberately not built.** `Stop` carries `background_tasks`,
+which is `[]` when the session is genuinely idle and otherwise holds
+`{id, type:"subagent", status:"running"}` per live agent, where `id` *is* the
+`agent_id` of the hooks that agent fires. Half the read is already here: `idle` asks
+that array the only question a wait needs - whether it is empty - with one needle and
+no parse. Purple needs the **ids**, which is the part not built. A reserved
+`g <id>...` line records that set, a fourth base letter paints it, and
+`subagent-stop` - already wired - removes the id and repaints the base. That is the
+un-paint the purple state needs, and it is the same mechanism above. It also sharpens
+the rule above: an agent wait whose id is absent from `g` is stale even while *other*
+agents run, where today an empty array is the only signal. A reserved `n <epoch> <text>` line, last in the
+record because everything above it is ASCII words, caches the session title
+`aiTitle` from a bounded tail read of `transcript_path`. Both keys are already
+skipped by this version's parser. `src/state.rs` carries the detail.
 
 ## Location
 
@@ -198,6 +494,56 @@ bin/tabstatus version
 link, the env key, the terminal it detected, which end of the title the glyph
 therefore goes on, and the title this directory would render right now.
 
+Its `record:` lines cover [wait ownership](#wait-ownership): where the records live,
+how many there are, what each one holds in words rather than in wire format, and
+which of them the next `session-start` will reap and why.
+
+```text
+record:    /run/user/1000/claude-tabstatus (3 records, 1 stale)
+           8e6d6eb9-...: base working, session pid 3709427 live, waiting on 1 (aec99e1f raised 10s ago)
+           a1b2c3d4-...: base idle, session pid 4242 GONE, nothing waiting; STALE (pid 4242 is not
+           that process any more), the next session-start reaps it
+           notes.txt: not a record in any version's shape - treated as absent; not a name this
+           writes, so the reaper leaves it alone
+```
+
+A record it cannot parse is reported as such rather than as a healthy idle one, which
+is what it used to do: an empty file, a binary one, a *newer* version's record and one
+too big to be a record each printed the same line as an idle session, so the report
+was the wrong place to look when something was wrong.
+
+It also answers the one question every other line renders as healthy - **can a record
+be written at all?** A state directory that is readable but not writable records no
+wait, so a subagent's `PostToolUse` finds none to clear and paints nothing, and the
+tab stays orange until the Task returns. That is the whole defect this layer exists to
+fix, back in silence, under a report that says `nothing recorded, which is also what a
+session that has raised no dialog leaves behind`:
+
+```text
+record:    /run/user/1000/claude-tabstatus (1 record, 0 stale)
+           FAIL not writable - no wait is ever recorded, so a subagent's dialog stays
+           orange until the Task returns
+```
+
+Two things about that report are deliberate. It is **read-only** - the command you
+run when something is already wrong must not be the command that deletes the
+evidence, so it names the stale files instead of taking them, and the verdicts come
+from the same function the reaper calls so the two cannot drift. The one exception is
+the writability probe above, which creates and immediately unlinks a file named for
+its own pid; that destroys no evidence, and a report that cannot answer the question
+is worse than useless. And when there is nowhere to keep a record it says so, with
+the reason:
+
+```text
+record:    disabled - no CCTAB_STATE_DIR and no XDG_RUNTIME_DIR
+           so every edge falls back to the stateless answer, which is the behaviour
+           from before wait ownership existed
+```
+
+That line exists because "disabled" is the silent answer to almost every question
+this layer can raise: a tab behaving exactly as it did before wait ownership is
+indistinguishable from a layer that is working correctly.
+
 ### install and uninstall are ordered, both ways
 
 `install` writes `settings.json` **first** and the plugin symlink **last**;
@@ -228,6 +574,14 @@ byte - the state file records the value's original *text*. If that record is
 missing and the key is present, the key is left alone unless you pass `--force`,
 because there is then no way to tell it apart from your own setting.
 
+It also removes the wait-ownership records - `records:  removed
+/run/user/1000/claude-tabstatus (2 record(s))` - which is the only other thing the
+running plugin leaves on disk. Taking a still-live session's record is harmless: a
+session with no record paints exactly what it painted before this plugin existed, and
+by that point the plugin is unlinked so no hook will write another. It draws the same
+line the reaper does, though: if `CCTAB_STATE_DIR` points at a directory holding
+anything else, only the records go and it says so.
+
 ## What it changes
 
 Three things, and nothing else:
@@ -240,6 +594,11 @@ Three things, and nothing else:
    `SKILL.md`, so the plugin costs essentially no model context.
 3. `~/.claude/claude-tabstatus.state`, a small JSON record of what was there
    before, written once and removed by `uninstall`.
+
+Plus one thing that is not configuration: the running plugin keeps a small
+per-session record under `$XDG_RUNTIME_DIR/claude-tabstatus` (see
+[wait ownership](#wait-ownership)). `uninstall` removes that directory too, and says
+so; it is on a tmpfs the OS empties at logout in any case.
 
 The first one is not optional. Claude Code repaints its own terminal title
 roughly every 960ms, straight over ours, and a plugin cannot set environment
@@ -567,7 +926,15 @@ set-titles-string is not ours any more` - so start a new claude session, or
 - **The tmux status line.** A glyph per window in `window-status-format` uses
   exactly this carrier and the cell expression drops into it unchanged, but the
   target here is the *tab*, and the status line is your real estate.
-- **A fourth glyph for background work**, and **OSC 9;4 progress**.
+- **A fourth glyph for background work**, and **OSC 9;4 progress**. The record
+  reserves the `g` key for the first, and the state layer's `subagent-stop` edge is
+  already the un-painter it needs; the seam is designed in full at the bottom of
+  `src/state.rs` and in [Wait ownership](#wait-ownership), and built not at all.
+- **A cached session title.** The record reserves the `n` key for it, last in the
+  file so that its free-form text arrives whole. Same seam, same status: designed,
+  not built. It is the one future field that would put a record read on the
+  *painting* path rather than only on the edges listed above, because the title goes
+  into the tab text - budget it at the ~+13us a read measures here.
 - **A per-session policy.** The options are server-wide; per-session glyphs or
   TTLs would need the deadlines carried in the record instead.
 - **Re-arming a server that lost our OPTIONS** some other way than a restart
@@ -632,7 +999,13 @@ invocation, no arming.
   Measured: Esc at a `Write` dialog, then
   110s of absolute quiet - 1.8x the 60s threshold - produced no hook and no
   repaint, and the tab was still orange when the session ended 113s later. So the stuck colour can be orange, which is
-  the damaging direction: a tab claiming it needs you when nothing does.
+  the damaging direction: a tab claiming it needs you when nothing does. Wait
+  ownership does not fix this one, and cannot: nothing fires, so nothing repaints.
+  What it does is stop the stale *record* from outliving the stale colour, so the
+  next edge that does fire is not also suppressed by it - and there are now four ways
+  out rather than one: the next prompt you type, the next `Stop` whose
+  `background_tasks` is empty, that agent's own `SubagentStop`, and the wait's own
+  `CCTAB_TTL_WAITING` expiry.
 - **Some dialogs are invisible to every hook.** A dialog that is neither a tool
   call nor a notification - the LSP recommendation, the plugin hint, the
   auto-mode-default upsell - fires no `PermissionRequest`, no matched
@@ -824,14 +1197,21 @@ Everything the runtime half reads, in one place:
 | `CCTAB_HOST` | `/proc`'s hostname | the ssh prefix, instead of this machine's name |
 | `CCTAB_TERMINAL` | unset | `konsole` (matched case-insensitively) arms Konsole's per-tab format even over ssh or inside tmux, and moves the strip to the end Konsole does not elide; any other value says explicitly NOT Konsole. **The one knob here that changes what paints outside tmux as well as in.** |
 | `CCTAB_TTL_WORKING` | `1200` | seconds before 🔵 decays to ⚪ in a tmux tab; `0` = never |
-| `CCTAB_TTL_WAITING` | `900` | seconds before 🟠 decays to ⚪; `0` = never |
+| `CCTAB_TTL_WAITING` | `900` | seconds before 🟠 decays to ⚪ in a tmux tab, **and** before an outstanding wait in the state record expires; `0` = never |
 | `CCTAB_TTL_GONE` | `3600` | seconds before a cell leaves the tmux strip; `0` = never |
 | `CCTAB_NO_TMUX` | unset | set to anything: no record, no `tmux` invocation, no arming |
 | `CCTAB_DRY_RUN` | unset | `1` prints the computed tab title and emits nothing |
-| `CCTAB_NOW` | unset | test only: pins the epoch the tmux record carries |
+| `CCTAB_STATE_DIR` | `$XDG_RUNTIME_DIR/claude-tabstatus` | where the per-session wait record lives. Unset **and** no `XDG_RUNTIME_DIR` means no record at all, and every edge falls back to the stateless answer. **Use a dedicated directory:** `session-start` reaps in it. It deletes only files it can prove are its own records ([wait ownership](#wait-ownership)), but it is still the wrong place to keep anything else |
+| `CCTAB_NOW` | unset | test only: pins the epoch the tmux record and the state record carry |
 
 `CLAUDE_PID` is exported into every hook subprocess and is how `session-start`
-and `session-end` find the pty. `TMUX`, `TMUX_PANE`, `STY`, `KONSOLE_VERSION`,
+and `session-end` find the pty. `XDG_RUNTIME_DIR` is read for the state
+directory - deliberately with no `$HOME` fallback, because that would put a record
+inside the golden corpus's fixture `HOME` and make every case carrying a
+`session_id` order-dependent. That it reaches a *hook* subprocess at all is
+measured, not assumed: a temporary probe build logged what a real `PostToolUse`
+hook sees, and it was `xdg=Some("/run/user/1000")`. `TMUX`, `TMUX_PANE`, `STY`,
+`KONSOLE_VERSION`,
 `KONSOLE_DBUS_SESSION`, `SSH_CONNECTION`, `SSH_TTY`, `HOME`, `PWD`, `HOSTNAME`
 and `GIT_DIR` are read as they are.
 
@@ -852,14 +1232,24 @@ Binaries are meant to ship as **GitHub release assets** rather than in git
 history, so that installing needs no toolchain. That is not wired up yet.
 
 ```sh
-sh scripts/build.sh          # the host target, refresh bin/ and the digests
+sh scripts/build.sh          # the host target, refresh bin/ and its digests
 sh scripts/build.sh --all    # every target in the list
 ```
 
+**Zero dependencies, std only**, and `rust-version` is **1.89** - raised from 1.74
+for `std::fs::File::lock`, which is what makes the state layer's read-modify-write
+atomic without a crate. The alternative was a bounded compare-and-retry loop: more
+code, and only probably correct.
+
+A digest is written **per triple built**, `bin/sources.<triple>.sha256`, plus an
+unsuffixed copy for the host because `bin/tabstatus` is the host binary. A single
+unsuffixed manifest covering all sources let a build of only the host leave the other
+triple's binary behind while a verify read fully green.
+
 | Target | State |
 |---|---|
-| `x86_64-unknown-linux-musl` | **default**, 529 KB, static-pie |
-| `x86_64-unknown-linux-gnu` | builds, 441 KB |
+| `x86_64-unknown-linux-musl` | **default**, 589 KB, static-pie |
+| `x86_64-unknown-linux-gnu` | builds |
 | `x86_64-pc-windows-gnu` | **does not build**, see below |
 
 Windows is deliberately **not** in the build script's target list. The target and
@@ -881,7 +1271,7 @@ bin/tabstatus install
 
 `install` **refuses** when `bin/tabstatus` is missing, and says the same thing.
 That refusal is not pedantry: the env key it would write switches Claude Code's
-own title painting off, and all ten hooks would then resolve to a command that
+own title painting off, and all eleven hooks would then resolve to a command that
 exits 127 - a tab nothing paints at all, which is strictly worse than no install.
 `install --force` overrides it for the case where you are about to build.
 Zero crates, so `cargo build` needs no network.
@@ -893,7 +1283,7 @@ sh tests/run.sh
 CCTAB_TEST_BIN=target/release/tabstatus sh tests/run.sh   # a build you just made
 ```
 
-371 assertions, and what they drive is `bin/tabstatus` - the same binary
+463 assertions, and what they drive is `bin/tabstatus` - the same binary
 `hooks/hooks.json` invokes, so a stale committed binary fails here rather than in
 somebody's tab. The suite used to run the shell implementation under three shells
 in four locales, because its answer depended on both; a binary has no
@@ -909,8 +1299,16 @@ all - that `repair` answers differently from `String::from_utf8_lossy` on a
 truncated sequence, for one.
 
 ```sh
-cargo test   # 112 tests, beside the 371 assertions and the 312 corpus cases
+cargo test   # 150 tests, beside the 463 assertions and the 312 corpus cases
 ```
+
+The state section pins `CLAUDE_PID` per case rather than inheriting it, and that is
+a gate property rather than tidiness: the layer reads that variable to stamp a
+record's origin, so run from inside a Claude Code session - which is how this project
+is developed, and the only place a developer would run it - the ambient session's pid
+used to land in records two cases assert byte for byte, and the declared gate was RED
+in the one environment it is actually invoked from. It is not unset globally, because
+the headless-guard and pty sections need the ambient one.
 
 Eighty-one of the assertions are the tmux section, and they drive a PRIVATE
 tmux server - `tmux -L cctabprobe -f /dev/null`, killed afterwards, with no
@@ -922,8 +1320,10 @@ whole of the server side, including that re-rendering the same paint after a wai
 gives a different answer with no process running and no hook firing.
 
 Two of the assertions exist only to guard the committed binaries: `bin/` carries
-a digest of the `src/*.rs` and `Cargo.toml` it was built from, and the suite
-recomputes it. Git does not preserve mtimes, so "is the binary older than the
+a digest of the `src/*.rs` and `Cargo.toml` it was built from, *per triple built*
+plus an unsuffixed copy for the host, and the suite recomputes it. The per-triple
+split matters: one manifest written for all sources after building only the host left
+the other triple's binary silently behind while `sha256sum -c` read fully green. Git does not preserve mtimes, so "is the binary older than the
 newest source file" cannot be answered after a clone - a digest can, and it also
 catches an edit that kept its timestamp. The binary's own `version` is checked
 against `Cargo.toml` as well.
@@ -957,8 +1357,8 @@ crash, it just overwrites a correct state with a wrong one a minute later.
 `hooks/hooks.json` is asserted as a **table**, not as a bag of strings. The
 suite parses it into one `event matcher edge timeout` row per registered hook
 and checks that against the table above in both directions: every row is
-present, nothing else is registered, ten hooks exactly, one command per group,
-`SubagentStop` still absent, and no edge name the binary does not implement (an
+present, nothing else is registered, eleven hooks exactly, one command per group,
+and no edge name the binary does not implement (an
 unknown edge falls back to idle, so a typo there would silently paint the wrong
 state on every notification). Presence checks alone are not enough, and that is
 measured rather than argued: a copy of this tree with `Stop` → working and
@@ -966,8 +1366,8 @@ measured rather than argued: a copy of this tree with `Stop` → working and
 version of these assertions, and `claude plugin validate` passed it too. Eight
 deliberate mutations of `hooks.json` - transposed edges, a matcher added to
 `PostToolUse`, the matcher dropped from `PreToolUse`, a missing timeout, a
-changed timeout, an added `SubagentStop`, a second hook smuggled into a group,
-an edge-name typo - now each fail at least one assertion.
+changed timeout, an added event, a second hook smuggled into a group, an
+edge-name typo - now each fail at least one assertion.
 
 Two things the suite deliberately does not assert. The real emitting path of
 `session-start` and `session-end` needs an allocated pty, which would cost a
@@ -1096,8 +1496,45 @@ change behaviour:
   is to write the record only after settings.json has actually changed, or to
   cross-check the recorded `settings_path` before editing.
 
+Built in slice 7: **wait ownership**, and with it the state layer the next two
+slices need. The stateless invariant was the right constraint for six slices and
+the wrong one for this defect: the two cases the `agent_id` filter could not tell
+apart - a background subagent's tool call, and the tool call that resolved the
+dialog you just approved - differ only in what came before. So there is now one
+small record per session, and a wait is an overlay on a base rather than a colour.
+What it closed: approving a subagent's dialog left the tab orange until the `Task`
+returned, and a main-thread tool call repainted blue over a subagent's open dialog.
+See [Wait ownership](#wait-ownership) for the capture, the rules, the per-edge cost
+(+15us on the hot edge, a read; +22us on a transition; zero with the layer disabled)
+and the two documented seams. Nothing in the golden corpus moved: all 312 cases are
+byte-identical, because the corpus environment configures no state directory and the
+reference implementation the corpus is frozen against is the shell one, which has no
+record to consult. The new behaviour is pinned by assertions in `tests/run.sh` and by
+unit tests instead.
+
+A second pass then fixed what the first one got wrong, and every item is a *lift*
+rather than a tweak: a wait now carries its own epoch (one shared one let unrelated
+dialogs keep a stale wait alive for the whole session, 16 consecutive edges painting
+nothing), an unattributable `?` is retired by an empty `background_tasks` at `Stop`
+instead of holding the tab orange through every idle period, a `UserPromptSubmit` you
+typed retires everything, each read-modify-write holds an `flock` on its own record
+(76 of 400 racing rounds lost a clear without it), the reaper deletes only what it can
+prove is its own, and `doctor` reports whether the directory can be written at all -
+the one failure mode every other line rendered as healthy.
+
 **Not yet built:**
 
+- The fourth glyph: **background work running, main loop free**. `Stop` carries
+  `background_tasks`, so painting it is easy and un-painting it is the problem the
+  record already solves. Half the read exists: `idle` already asks that array whether
+  it is empty, with one needle. The rest of the shape is designed - a reserved `g`
+  line for the ids, a fourth base
+  letter, and the `subagent-stop` edge that is already wired - and deliberately not
+  built here.
+- A **cached session title**. The transcript records carry `aiTitle`, readable from
+  a bounded tail read, and it is the only field that distinguishes five concurrent
+  sessions that all render as `streaming-browser@master`. A reserved `n` line
+  caches it; the cap and the elision then belong to `render::compose`.
 - A compaction *edge*, as opposed to today's guard. `SessionStart` carries
   `"matcher": "startup|resume|clear|fork"`, which leaves out `compact`, and the
   binary refuses a `compact` payload as well; neither of those paints anything

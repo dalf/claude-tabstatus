@@ -65,11 +65,63 @@ impl Payload {
         Payload::from_reader(&mut io::stdin().lock())
     }
 
+    /// The FRONT window only, and then a drain that does not look at what it
+    /// drains.
+    ///
+    /// For the edges whose only reason to read a payload at all is the state layer:
+    /// `session_id` and `agent_id` are both front members, and no edge outside
+    /// [`Edge::reads_payload`](crate::edge::Edge::reads_payload) ever consults the
+    /// tail. That distinction is worth a function because building a tail means
+    /// scanning EVERY byte for the end of the line, while this scans at most
+    /// [`PAYLOAD_PREFIX`] of them - and a `PermissionRequest` for a `Write` carries
+    /// the whole file in `tool_input`. MEASURED, 1 MiB payload, min of 11
+    /// interleaved rounds of 150 execs: 330us to drain, 337us for this, 885us for
+    /// the full window.
+    pub fn read_head() -> Payload {
+        Payload::head_from_reader(&mut io::stdin().lock())
+    }
+
     /// Built from bytes rather than from stdin, so the unit tests in this crate
     /// can exercise the windowing without a process boundary.
     #[cfg(test)]
     pub fn from_bytes(bytes: &[u8]) -> Payload {
         Payload::from_reader(&mut &bytes[..])
+    }
+
+    #[cfg(test)]
+    pub fn head_from_bytes(bytes: &[u8]) -> Payload {
+        Payload::head_from_reader(&mut &bytes[..])
+    }
+
+    fn head_from_reader(r: &mut impl Read) -> Payload {
+        let mut head: Vec<u8> = Vec::with_capacity(1024);
+        let mut buf = [0u8; 65536];
+        let mut done = false;
+        while let Some(n) = read_chunk(r, &mut buf) {
+            if done {
+                continue;
+            }
+            // Bounded to the room LEFT in the window, not to the chunk, so the total
+            // search work is at most PAYLOAD_PREFIX bytes however large the payload
+            // is. That is the whole point of this function.
+            let part = &buf[..(PAYLOAD_PREFIX - head.len()).min(n)];
+            match part.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    head.extend_from_slice(&part[..i]);
+                    done = true;
+                }
+                None => {
+                    head.extend_from_slice(part);
+                    done = head.len() >= PAYLOAD_PREFIX;
+                }
+            }
+        }
+        // As in `from_reader`: a NUL cannot be used to splice a discriminator
+        // together, so they are dropped rather than kept.
+        if head.contains(&0) {
+            head.retain(|&b| b != 0);
+        }
+        Payload { head, tail: Vec::new() }
     }
 
     fn from_reader(r: &mut impl Read) -> Payload {
@@ -149,6 +201,19 @@ impl Payload {
     pub fn head_has_field(&self, field: &[u8]) -> bool {
         has_string_field(&self.head, field)
     }
+
+    /// The VALUE of that member, for the two ids the state layer needs:
+    /// `session_id`, which is what a record is filed under, and `agent_id`, which
+    /// is who owns a wait.
+    ///
+    /// The same shape test as [`Payload::head_has_field`], so the subagent filter
+    /// and the ownership lookup can never disagree about whether an `agent_id` is
+    /// present. The bytes come back raw: a JSON escape inside one would end the
+    /// value early, which is harmless because `state` validates both ids against
+    /// `[A-Za-z0-9_-]` before either reaches a file name.
+    pub fn head_field(&self, field: &[u8]) -> Option<&[u8]> {
+        string_field(&self.head, field)
+    }
 }
 
 /// The `cat >/dev/null` case, for the edges that have no payload test: consume
@@ -200,7 +265,7 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 /// Bytes, like the rest of this module, but as slice steps rather than indices:
 /// every bound is a `strip_prefix` or a slice pattern, so a needle at the very end
 /// of the window is a slice too short to match rather than a read past it.
-fn has_string_field(payload: &[u8], field: &[u8]) -> bool {
+fn string_field<'a>(payload: &'a [u8], field: &[u8]) -> Option<&'a [u8]> {
     let mut needle = Vec::with_capacity(field.len() + 2);
     needle.push(b'"');
     needle.extend_from_slice(field);
@@ -210,13 +275,29 @@ fn has_string_field(payload: &[u8], field: &[u8]) -> bool {
         let after = skip_spaces(&payload[from + k + needle.len()..]);
         if let Some(value) = after.strip_prefix(b":".as_slice()) {
             // A quote that is not immediately closed: a non-empty string.
-            if matches!(skip_spaces(value), [b'"', c, ..] if *c != b'"') {
-                return true;
+            if let [b'"', rest @ ..] = skip_spaces(value) {
+                if matches!(rest, [c, ..] if *c != b'"') {
+                    // An UNTERMINATED value - the window cut it - returns what is
+                    // left rather than nothing, which is exactly what the boolean
+                    // form used to answer. Keeping that answer is the point: the
+                    // stateless subagent filter is built on it and must not
+                    // change. The consequence for ownership is a truncated id,
+                    // which is a wait nobody clears, bounded by the TTL, on a
+                    // payload whose `agent_id` real captures put at byte 760.
+                    return Some(match find(rest, b"\"") {
+                        Some(end) => &rest[..end],
+                        None => rest,
+                    });
+                }
             }
         }
         from += k + 1;
     }
-    false
+    None
+}
+
+fn has_string_field(payload: &[u8], field: &[u8]) -> bool {
+    string_field(payload, field).is_some()
 }
 
 fn skip_spaces(b: &[u8]) -> &[u8] {
@@ -330,6 +411,74 @@ mod tests {
         // The scan must not stop at the first `"agent_id"` that fails the shape.
         let p = br#"{"a":"agent_id","agent_id":"x"}"#;
         assert!(has_string_field(p, b"agent_id"));
+    }
+
+    #[test]
+    fn the_value_comes_back_for_the_ids_the_state_layer_files_a_record_under() {
+        let p = of(br#"{"session_id":"238f2bd3-43a9","agent_id":"aec99e1f","x":1}"#);
+        assert_eq!(p.head_field(b"session_id"), Some(&b"238f2bd3-43a9"[..]));
+        assert_eq!(p.head_field(b"agent_id"), Some(&b"aec99e1f"[..]));
+        assert_eq!(p.head_field(b"no_such_field"), None);
+        // Absent, empty and non-string all read as absent, exactly as the boolean
+        // form does - the state layer and the stateless filter must agree.
+        for line in [
+            &br#"{"agent_id":""}"#[..],
+            &br#"{"agent_id":null}"#[..],
+            &br#"{"agent_id":1}"#[..],
+        ] {
+            assert_eq!(of(line).head_field(b"agent_id"), None);
+            assert!(!of(line).head_has_field(b"agent_id"));
+        }
+    }
+
+    /// The front-only read must answer every question the state layer asks exactly
+    /// as the full read does - that is the whole basis for using it on the edges
+    /// whose only reason to read a payload is the record.
+    #[test]
+    fn the_front_only_read_agrees_about_everything_the_state_layer_asks() {
+        let mut raw = br#"{"session_id":"238f2bd3-43a9","agent_id":"aec99e1f","tool_input":{"content":""#.to_vec();
+        raw.extend(std::iter::repeat_n(b'a', 1 << 20));
+        raw.extend_from_slice(br#""},"notification_type":"idle_prompt"}"#);
+        raw.push(b'\n');
+        let full = Payload::from_bytes(&raw);
+        let front = Payload::head_from_bytes(&raw);
+        for field in [&b"session_id"[..], b"agent_id"] {
+            assert_eq!(full.head_field(field), front.head_field(field));
+            assert_eq!(full.head_has_field(field), front.head_has_field(field));
+        }
+        // And it is the TAIL that it deliberately does not have. `notification_type`
+        // is serialized last, which is exactly why `notify` is not one of the edges
+        // that may use this.
+        assert!(full.has(br#""notification_type":"idle_prompt""#));
+        assert!(!front.has(br#""notification_type":"idle_prompt""#));
+    }
+
+    #[test]
+    fn the_front_only_read_stops_at_the_first_line_and_at_the_window() {
+        // A second line cannot contribute, as in the full read.
+        let p = Payload::head_from_bytes(b"{\"session_id\":\"a\"}\n{\"session_id\":\"b\"}\n");
+        assert_eq!(p.head_field(b"session_id"), Some(&b"a"[..]));
+        // The window is a hard bound, and a NUL is dropped rather than kept.
+        let mut raw = vec![b'x'; PAYLOAD_PREFIX + 99];
+        raw[5] = 0;
+        let p = Payload::head_from_bytes(&raw);
+        assert_eq!(p.head.len(), PAYLOAD_PREFIX - 1);
+        assert!(!p.head.contains(&0));
+        // An empty payload, and one that is a bare newline, are both empty windows.
+        for raw in [&b""[..], b"\n"] {
+            assert_eq!(Payload::head_from_bytes(raw).head, Vec::<u8>::new());
+        }
+    }
+
+    #[test]
+    fn an_unterminated_value_answers_the_same_way_the_boolean_form_did() {
+        // The window cut the value. `true` is what this used to answer, and the
+        // stateless subagent filter is built on it.
+        assert!(has_string_field(br#"{"agent_id":"aec"#, b"agent_id"));
+        assert_eq!(
+            string_field(br#"{"agent_id":"aec"#, b"agent_id"),
+            Some(&b"aec"[..])
+        );
     }
 
     #[test]

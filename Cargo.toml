@@ -2,7 +2,11 @@
 name = "tabstatus"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.74"
+# Raised from 1.74 for `std::fs::File::lock`, stable since 1.89, which is what
+# makes the state layer's read-modify-write atomic without a dependency. The
+# alternative was a bounded compare-and-retry loop, which is more code and only
+# probably correct; a lock that ships in std is neither. Toolchain here: 1.98.1.
+rust-version = "1.89"
 description = "Puts the Claude Code session state into the terminal tab title."
 license = "GPL-3.0-or-later"
 publish = false

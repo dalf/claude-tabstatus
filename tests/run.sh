@@ -15,6 +15,10 @@
 #
 # Every assertion runs the binary through CCTAB_DRY_RUN=1, or with CLAUDE_PID
 # unset, so nothing here can ever write an escape sequence to a real terminal.
+#
+# CLAUDE_PID is NOT unset globally - the headless-guard and pty sections need the
+# ambient one, and removing it costs 34 assertions. The state section, which is the
+# only other part that reads it, pins it per case instead: see the comment there.
 
 here=$(cd -- "$(dirname -- "$0")" && pwd) || exit 1
 repo=$(cd -- "$here/.." && pwd) || exit 1
@@ -38,6 +42,14 @@ trap 'cleanup; exit 130' HUP INT TERM
 # every assertion below would flip. Neutralise the detection here; the
 # glyph-position section sets these explicitly, per case.
 unset KONSOLE_VERSION KONSOLE_DBUS_SESSION TMUX STY CCTAB_GLYPH_POS
+# And the state layer, for two reasons. XDG_RUNTIME_DIR is set in any real login
+# session, so leaving it here would (a) write records into the user's own
+# /run/user/<uid> from a test run and (b) make every assertion below whose stdin
+# carries a `session_id` depend on what an earlier assertion left behind. The
+# state section near the end sets CCTAB_STATE_DIR per case, under $tmp; every
+# other assertion in this file is therefore the STATELESS answer, which is what
+# makes it the byte-for-byte guard it was before the record existed.
+unset XDG_RUNTIME_DIR CCTAB_STATE_DIR
 
 pass=0
 fail=0
@@ -832,7 +844,7 @@ _ncmd=0
 _rows=
 _unknown=
 _badgroup=
-_known=' session-start working waiting idle notify session-end '
+_known=' session-start working waiting idle notify subagent-stop session-end '
 while IFS= read -r _l; do
     case $_l in
     '    "'*'": ['*)
@@ -880,6 +892,7 @@ PostToolUseFailure - working 5
 Notification - notify 5
 Stop - idle 5
 StopFailure - idle 5
+SubagentStop - subagent-stop 5
 SessionEnd - session-end 1'
 # An edge name the script does not implement would be painted `idle` by the
 # fallback in section 3, so a typo there is silent in production.
@@ -913,22 +926,29 @@ $_g
     esac
 done <"$tmp/got.rows"
 check 'hooks.json registers nothing the table does not list' '' "$_extra"
-check 'hooks.json registers exactly ten hooks' '10' \
+check 'hooks.json registers exactly eleven hooks' '11' \
     "$(printf '%s' "$_rows" | wc -l | tr -d ' ')"
 # One command per group, so that a second hook smuggled into an existing group -
 # which the row above would not show - fails here instead.
 check 'every hooks.json group holds exactly one command' '' "$_badgroup"
-# SubagentStop is DELIBERATELY absent: a subagent finishing must not read as the
-# session going idle, and it also fires for the internal compaction summarizer
-# (with an empty agent_type, which no matcher could filter) right before a
-# SessionStart/compact. Pinned by name too, so that adding it has to be a
-# decision and not a diff nobody reads.
-_conf=$(cat "$_hooks")
-check 'hooks.json does not register SubagentStop' 'absent' \
-    "$(case $_conf in *SubagentStop*) printf present ;; *) printf absent ;; esac)"
+# SubagentStop used to be deliberately ABSENT, because a subagent finishing must
+# not read as the session going idle and because it also fires for the internal
+# compaction summarizer (agent_type empty, which no matcher could filter) right
+# before a SessionStart/compact. Both reasons survive; what changed is that they
+# are now enforced by the OWNER test rather than by not registering the hook. The
+# edge paints nothing of its own - with no state directory it is a complete no-op,
+# pinned below - and with one it clears only the wait whose agent_id matches. That
+# is the only signal for a dialog you DECLINED: no hook fires for a denial, so the
+# tool never runs and no PostToolUse ever arrives.
+for _e in subagent-stop; do
+    check "$_e paints nothing at all without a state directory" '' \
+        "$(cd -- "$tmp/repos/plain" \
+           && printf '{"session_id":"s1","agent_id":"a1","hook_event_name":"SubagentStop"}\n' \
+              | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" "$_e")"
+done
 
 # --- exit status ----------------------------------------------------------
-for e in session-start working waiting idle notify session-end no-such-edge; do
+for e in session-start working waiting idle notify subagent-stop session-end no-such-edge; do
     (cd -- "$tmp/repos/plain" && CCTAB_DRY_RUN=1 "$bin" "$e" </dev/null >/dev/null 2>&1)
     check "exit 0 on dry-run edge $e" '0' "$?"
 done
@@ -1170,7 +1190,7 @@ check 'install: refuses an unwritable skills directory' 'yes' \
 check 'install: and settings.json was never written either' '' \
     "$(ls "$_cfg/settings.json" 2>/dev/null)"
 # Installing with no bin/tabstatus is strictly worse than not installing: the env
-# key switches Claude Code's title painting off and all ten hooks then exit 127.
+# key switches Claude Code's title painting off and all eleven hooks then exit 127.
 # It used to WARN and exit 0.
 rm -rf "$_cfg"; mkdir -p "$_cfg"
 _fake=$tmp/fakerepo
@@ -1379,6 +1399,519 @@ check 'doctor names the remedy on the multiplexer line' '1' \
     "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
           TMUX=nonsense "$bin" doctor 2>&1 \
        | grep -c 'If the outer terminal IS Konsole, set CCTAB_TERMINAL=konsole')"
+
+# --- the state layer: wait ownership --------------------------------------
+# Everything above this point is the STATELESS program, because the suite unsets
+# XDG_RUNTIME_DIR and CCTAB_STATE_DIR at the top. This section is the other half:
+# it replays the real capture the record exists for, through the shipped binary,
+# with the clock pinned so the record's bytes can be asserted rather than believed.
+#
+# The sequence, from tests captured under a throwaway config (timings relative to
+# that session's SessionStart):
+#
+#    68.946  Stop               background_tasks=[subagent:running:aec99e]
+#    69.960  PermissionRequest  agent_id=aec99e1f          -> ORANGE
+#    75.983  Notification       permission_prompt, NO agent_id (the 6s backstop)
+#    98.459  SubagentStop       agent_id=a8e90c10, agent_type=""   (a GHOST)
+#   107.496  PostToolUse        agent_id=aec99e1f   (you approved; the tool ran)
+#
+# Stateless, 68.946 painted white over nothing, 69.960 painted orange, and 107.496
+# painted NOTHING - so the tab read orange until the Task returned, which is
+# minutes. Inside tmux that heals itself after CCTAB_TTL_WAITING; in a plain
+# Konsole tab nothing healed it at all.
+#
+# CLAUDE_PID IS PINNED PER CASE here, and that is not cosmetic. The layer reads it
+# to stamp a record's origin, so a suite run from inside a Claude Code session -
+# which is how this project is developed, and the only place a developer would run
+# it - would otherwise have the ambient session's pid land in records the cases
+# below assert byte for byte. `st` sets it EMPTY (config::var_nonempty reads that
+# as absent); `stp` sets one on purpose, for the reaper's origin rule.
+_sd=$tmp/state
+_sid=aec0f2b1-4d31-4e11-9a41-2c7d55e1a900
+_ag=aec99e1f4bda1972b
+_ag2=bbb17c4e9a2d3f001
+_ghost=a8e90c10430da8891
+
+# st <edge> <payload> -- one hook run against the shared record, clock pinned.
+st() {
+    (cd -- "$tmp/repos/plain" && printf '%s\n' "$2" \
+        | HOME=$tmp CCTAB_DRY_RUN=1 CCTAB_STATE_DIR=$_sd CCTAB_NOW=${_now:-1000000} \
+          CLAUDE_PID= "$bin" "$1")
+}
+# rec -- the record as one line, so a check can pin every field at once.
+rec() { tr '\n' '|' <"$_sd/$_sid" 2>/dev/null; }
+# pl <event> [extra] -- a payload with the session id and, optionally, more members
+pl() { printf '{"session_id":"%s","hook_event_name":"%s"%s}' "$_sid" "$1" "${2-}"; }
+# The two shapes of Stop, which is what decides whether a wait the main loop does
+# NOT own may be retired. `background_tasks` holds one entry per live subagent, so
+# an empty array proves nothing outside the main loop is running; a non-empty one -
+# the capture's 68.946 Stop, which lists the agent that raises the dialog a second
+# later - proves the opposite, and an ABSENT one means "I do not know".
+stop_busy() {
+    pl Stop ",\"background_tasks\":[{\"id\":\"$_ag\",\"type\":\"subagent\",\"status\":\"running\"}]"
+}
+stop_quiet() { pl Stop ',"background_tasks":[]'; }
+
+rm -rf "$_sd"
+check 'state: Stop with nothing waiting paints idle and records the base' '⚪ plain@master' \
+    "$(st idle "$(stop_quiet)")"
+# ...and writes NOTHING, because the base it would record is the base a session
+# with no record is already assumed to have. That is `write_if_changed`, and it is
+# what keeps the per-edge cost a READ: the common case never touches the disk.
+check 'state: ...and an idle session with nothing waiting writes no record' 'gone' \
+    "$([ -e "$_sd/$_sid" ] && printf present || printf gone)"
+check 'state: the state directory is created mode 700' '700' \
+    "$(ls -ld "$_sd" | awk '{print substr($1,2,9)}' \
+        | sed 's/rwx/7/;s/r-x/5/;s/---/0/g;s/r--/4/' | tr -d '\n')"
+
+check 'state: a subagent PermissionRequest paints waiting, as it always did' '🟠 plain@master' \
+    "$(st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")")"
+# The epoch is PER WAIT, not one field for the whole list. With one shared epoch
+# every later dialog pushed a stale wait's expiry out with it, so a session raising
+# dialogs more often than the TTL never expired it - and nothing paints while a
+# wait is held, so the tab froze orange for the rest of the session.
+check 'state: ...and the wait is recorded against that agent, with its own epoch' \
+    "cts1|b i|w $_ag:1000000|" "$(rec)"
+
+# The backstop is for the SAME dialog. Recording a second, UNKNOWN owner for it
+# would mean two waits for one dialog and only one of them retirable - so it is
+# only recorded when nothing is waiting at all.
+check 'state: the 6s notification backstop adds no second owner' '🟠 plain@master' \
+    "$(st notify "$(pl Notification ',"notification_type":"permission_prompt"')")"
+check 'state: ...and the record is unchanged' "cts1|b i|w $_ag:1000000|" "$(rec)"
+
+# A main-thread tool call while the dialog is up. Stateless this painted BLUE over
+# the open dialog, once per tool call. The base still moves - main IS working -
+# but the tab keeps the dialog.
+check 'state: a main-thread PostToolUse does not repaint over the dialog' '' \
+    "$(st working "$(pl PostToolUse)")"
+check 'state: ...but the base it would have painted is remembered' \
+    "cts1|b w|w $_ag:1000000|" "$(rec)"
+
+# The ghost. No SubagentStart ever announced a8e90c10, its agent_type is empty,
+# and it fires nine seconds before the user answers. Matching on the OWNER is what
+# stops it un-painting a live dialog.
+check 'state: a SubagentStop for an agent that owns nothing does nothing' '' \
+    "$(st subagent-stop "$(pl SubagentStop ",\"agent_id\":\"$_ghost\"")")"
+check 'state: ...and leaves the record alone' "cts1|b w|w $_ag:1000000|" "$(rec)"
+
+# THE FIX. The subagent's own PostToolUse is the un-paint, and what comes back is
+# the BASE the wait covered up - not a guess at it.
+check 'state: the owning agent PostToolUse clears the wait and restores the base' \
+    '🔵 plain@master' "$(st working "$(pl PostToolUse ",\"agent_id\":\"$_ag\"")")"
+check 'state: ...and nothing is waiting any more' 'cts1|b w|' "$(rec)"
+
+# With nothing waiting, a background subagent's tool call is the ORIGINAL filter,
+# unchanged - and it writes nothing, which is what keeps the hot edge a read.
+_before=$(rec)
+check 'state: a background subagent tool call still paints nothing' '' \
+    "$(st working "$(pl PostToolUse ",\"agent_id\":\"$_ag\"")")"
+check 'state: ...and writes nothing' "$_before" "$(rec)"
+
+# Stop must not paint idle over a dialog that is still up. This is the capture's
+# 68.946/69.960 pair with the order reversed, and it is why the idle nudge matters:
+# this machine's messageIdleNotifThresholdMs is 3000, not the 60000 default. The
+# agent is LISTED in background_tasks, so the main loop has nothing to say about it.
+rm -rf "$_sd"
+st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
+check 'state: Stop paints nothing while a listed agent dialog is outstanding' '' \
+    "$(st idle "$(stop_busy)")"
+check 'state: the 3s idle nudge is guarded the same way' '' \
+    "$(st notify "$(pl Notification ',"notification_type":"idle_prompt"')")"
+# A Stop with NO background_tasks at all is the same answer: absent has to mean "I
+# do not know", or a Claude Code that renamed the member would paint white over
+# every live dialog.
+check 'state: a Stop that does not mention background_tasks retires nothing' '' \
+    "$(st idle "$(pl Stop)")"
+
+# ...but a Stop whose background_tasks is EMPTY proves the agent is gone, whatever
+# hook it failed to fire on the way out. Esc at a subagent's dialog fires NO hook
+# at all - measured, capture s2 - so without this the tab stayed orange for the
+# whole 900s TTL, and outside tmux nothing else decays.
+check 'state: an empty background_tasks at Stop retires an abandoned agent wait' \
+    '⚪ plain@master' "$(st idle "$(stop_quiet)")"
+check 'state: ...and the record no longer holds it' 'cts1|b i|' "$(rec)"
+
+# The OTHER main-thread retirement: you cannot type at the prompt while a modal
+# dialog is up, so a UserPromptSubmit proves the screen is clear whoever owned it.
+# That bounds a stale agent wait to one turn even when no Stop ever arrives - a
+# Ctrl+C mid-tool fires nothing at all, measured on capture s5.
+rm -rf "$_sd"
+st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
+check 'state: a main-thread PostToolUse does not retire an agent wait' '' \
+    "$(st working "$(pl PostToolUse)")"
+# ...and neither does the UserPromptSubmit the PRODUCT injects when an async agent
+# finishes - capture s4, 110.251, prompt "<task-notification>...". With two agents
+# running, the first one's completion would otherwise retire the second one's live
+# dialog, and the injected event is redundant anyway: that agent's own SubagentStop
+# fires 20ms earlier.
+check 'state: an injected task-notification prompt retires nothing' '' \
+    "$(st working "$(pl UserPromptSubmit ',"prompt":"<task-notification>\n<task-id>x</task-id>"')")"
+check 'state: a UserPromptSubmit the USER typed retires every wait' '🔵 plain@master' \
+    "$(st working "$(pl UserPromptSubmit ',"prompt":"carry on"')")"
+check 'state: ...and the record is clean' 'cts1|b w|' "$(rec)"
+
+# ...but a MAIN wait at Stop is stale by construction: the loop could not have
+# stopped while a main-thread dialog blocked it. A rejected ExitPlanMode is
+# exactly that, and it needs no help from background_tasks - this Stop's array is
+# deliberately non-empty to prove so.
+rm -rf "$_sd"
+st waiting "$(pl PreToolUse ',"tool_name":"ExitPlanMode"')" >/dev/null
+check 'state: Stop does clear a stale main-thread wait' '⚪ plain@master' \
+    "$(st idle "$(stop_busy)")"
+
+# A declined dialog: the tool never runs, so no PostToolUse ever comes. The
+# agent's own SubagentStop is the only signal left.
+rm -rf "$_sd"
+st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
+check 'state: a declined dialog is cleared by that agent SubagentStop' '⚪ plain@master' \
+    "$(st subagent-stop "$(pl SubagentStop ",\"agent_id\":\"$_ag\"")")"
+
+# Two dialogs at once. A single owner slot gets this wrong whichever one it keeps:
+# answering the main one must not restore the base while the agent's is still up.
+rm -rf "$_sd"
+st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
+st waiting "$(pl PermissionRequest)" >/dev/null
+check 'state: two overlapping dialogs are both recorded, newest last' \
+    "cts1|b i|w $_ag:1000000 -:1000000|" "$(rec)"
+check 'state: answering the main one keeps the tab orange' '' \
+    "$(st working "$(pl PostToolUse)")"
+check 'state: answering the agent one finally restores the base' '🔵 plain@master' \
+    "$(st working "$(pl PostToolUse ",\"agent_id\":\"$_ag\"")")"
+
+# THE PER-WAIT EPOCH, which is the fix for the worst shape this layer could take:
+# a stale wait that unrelated later dialogs kept alive for ever, freezing the tab
+# orange with nothing able to repaint it.
+rm -rf "$_sd"
+st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
+for _t in 1000002 1000004 1000006 1000008; do
+    _now=$_t st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag2\"")" >/dev/null
+done
+check 'state: an unrelated dialog does not touch another wait epoch' \
+    "cts1|b i|w $_ag:1000000 $_ag2:1000008|" "$(rec)"
+_now=1000009
+check 'state: the stale wait expires on its OWN clock and the fresh one holds' '' \
+    "$(cd -- "$tmp/repos/plain" && printf '%s\n' "$(stop_busy)" \
+        | HOME=$tmp CCTAB_DRY_RUN=1 CCTAB_STATE_DIR=$_sd CCTAB_NOW=$_now \
+          CCTAB_TTL_WAITING=3 CLAUDE_PID= "$bin" idle)"
+# ...and the expiry was PERSISTED, so a later, larger CCTAB_TTL_WAITING cannot
+# resurrect a wait that has already been declared dead.
+check 'state: ...and the expired wait is written out of the record' \
+    "cts1|b i|w $_ag2:1000008|" "$(rec)"
+_now=1000000
+
+# The unattributable `?`. It used to survive Stop AND the 3s nudge, so once the
+# user had dealt with the dialog the tab sat orange through the whole idle period,
+# where the STATELESS binary painted white. All five waiting kinds behaved that
+# way, not the two the README named.
+for _kind in permission_prompt worker_permission_prompt agent_needs_input \
+             elicitation_dialog elicitation_url_dialog; do
+    rm -rf "$_sd"
+    check "state: the $_kind backstop paints waiting against an unknown owner" \
+        '🟠 plain@master' "$(st notify "$(pl Notification ",\"notification_type\":\"$_kind\"")")"
+    check "state: ...and a quiet Stop retires it rather than leaving the tab orange" \
+        '⚪ plain@master' "$(st idle "$(stop_quiet)")"
+done
+# A subagent's own completion retires a lone `?` too: agent_needs_input and
+# worker_permission_prompt are raised BY a subagent and carry no id, so its tool
+# running, or its SubagentStop, is what answers them.
+rm -rf "$_sd"
+st notify "$(pl Notification ',"notification_type":"agent_needs_input"')" >/dev/null
+check 'state: a subagent PostToolUse retires a lone unknown owner' '⚪ plain@master' \
+    "$(st working "$(pl PostToolUse ",\"agent_id\":\"$_ag\"")")"
+rm -rf "$_sd"
+st notify "$(pl Notification ',"notification_type":"worker_permission_prompt"')" >/dev/null
+check 'state: a SubagentStop retires a lone unknown owner' '⚪ plain@master' \
+    "$(st subagent-stop "$(pl SubagentStop ",\"agent_id\":\"$_ag\"")")"
+# And the reverse arrival order - backstop first, which the wait() guard cannot
+# catch - collapses to ONE wait, the attributable one.
+rm -rf "$_sd"
+st notify "$(pl Notification ',"notification_type":"worker_permission_prompt"')" >/dev/null
+st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
+check 'state: an attributable dialog supersedes a lone unknown owner' \
+    "cts1|b i|w $_ag:1000000|" "$(rec)"
+
+# A wait nothing ever clears must not hold the tab orange forever: a subagent
+# killed mid-dialog fires no SubagentStop at all, and this Stop still says it is
+# running. The horizon is the same CCTAB_TTL_WAITING tmux decays an orange title
+# with.
+rm -rf "$_sd"
+st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
+_now=1000900
+check 'state: a wait still inside CCTAB_TTL_WAITING holds the tab' '' \
+    "$(st idle "$(stop_busy)")"
+_now=1000901
+check 'state: a wait past CCTAB_TTL_WAITING has expired' '⚪ plain@master' \
+    "$(st idle "$(stop_busy)")"
+_now=1000000
+# The knob is the tmux one, and one grammar covers both.
+rm -rf "$_sd"
+st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
+_now=1000061
+check 'state: CCTAB_TTL_WAITING moves the horizon' '⚪ plain@master' \
+    "$(cd -- "$tmp/repos/plain" && printf '%s\n' "$(stop_busy)" \
+        | HOME=$tmp CCTAB_DRY_RUN=1 CCTAB_STATE_DIR=$_sd CCTAB_NOW=$_now \
+          CCTAB_TTL_WAITING=60 CLAUDE_PID= "$bin" idle)"
+_now=1000000
+
+# SessionStart starts over - a --resume must not inherit a dialog that is long
+# gone - and it is the reaper: a session killed with SIGKILL fires no SessionEnd,
+# so a stale record is normal rather than exceptional.
+rm -rf "$_sd"
+st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
+mkdir -p "$_sd"
+printf 'cts1\nb i\n' >"$_sd/dead-session-0000"
+touch -d '2 days ago' "$_sd/dead-session-0000" 2>/dev/null \
+    || touch -t 200001010000 "$_sd/dead-session-0000"
+st session-start "$(pl SessionStart ',"source":"resume"')" >/dev/null 2>&1
+check 'state: SessionStart resets the record' 'cts1|b i|' "$(rec)"
+check 'state: SessionStart reaps a record nothing has touched for a day' 'gone' \
+    "$([ -e "$_sd/dead-session-0000" ] && printf present || printf gone)"
+check 'state: SessionStart does not reap a live record' 'present' \
+    "$([ -e "$_sd/$_sid" ] && printf present || printf gone)"
+
+# WHAT THE REAPER MAY NOT TOUCH. CCTAB_STATE_DIR is a documented user knob, so the
+# directory is not always one we created - and `reapable` used to fall back to
+# mtime for anything it could not parse, which deleted a 30-day-old private key out
+# of a directory that had other things in it. The name grammar cannot tell `id_rsa`
+# from a session id, so the rule is now CONTENT: only a record, or a `<id>.<pid>.tmp`,
+# is ever a candidate.
+rm -rf "$_sd"; mkdir -p "$_sd"
+printf 'a shopping list\n' >"$_sd/notes.txt"
+printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\n' >"$_sd/id_rsa"
+printf 'cts2\nb w\n' >"$_sd/from-a-newer-version"
+mkdir -p "$_sd/a-subdir"
+printf 'cts1\nb i\n' >"$_sd/clock-went-backwards"
+for _f in notes.txt id_rsa from-a-newer-version a-subdir; do
+    touch -d '30 days ago' "$_sd/$_f" 2>/dev/null || touch -t 200001010000 "$_sd/$_f"
+done
+# An mtime in the FUTURE used to make a file immortal: duration_since errors for
+# it, and the error read as "not reapable".
+touch -d '+3 days' "$_sd/clock-went-backwards" 2>/dev/null \
+    || touch -t 203001010000 "$_sd/clock-went-backwards"
+st session-start "$(pl SessionStart ',"source":"startup"')" >/dev/null 2>&1
+check 'state: the reaper leaves a file that is not a record of ours, however old' \
+    'notes.txt id_rsa' \
+    "$([ -e "$_sd/notes.txt" ] && printf 'notes.txt '; [ -e "$_sd/id_rsa" ] && printf id_rsa)"
+check 'state: ...and a directory, which remove_file could never have taken' 'present' \
+    "$([ -d "$_sd/a-subdir" ] && printf present || printf gone)"
+check 'state: ...but takes an aged record from a NEWER version of this tool' 'gone' \
+    "$([ -e "$_sd/from-a-newer-version" ] && printf present || printf gone)"
+check 'state: ...and a record whose mtime is in the future is not immortal' 'gone' \
+    "$([ -e "$_sd/clock-went-backwards" ] && printf present || printf gone)"
+
+# The reaper's OTHER rule, and the only one that can PROVE a live session safe.
+# mtime cannot: a session sitting at its prompt touches nothing, so an mtime
+# horizon short enough to be useful would delete a LIVE session's record. So every
+# write stamps the record with ($CLAUDE_PID, that pid's start time), and the reaper
+# unlinks only when that pair no longer names a running process. A hook is a child
+# of $CLAUDE_PID, so that process exists whenever its own hooks fire, and a start
+# time never changes - which is the whole proof.
+#
+# stp <edge> <payload> <pid> -- the same hook run, with a CLAUDE_PID to stamp.
+stp() {
+    (cd -- "$tmp/repos/plain" && printf '%s\n' "$2" \
+        | HOME=$tmp CCTAB_DRY_RUN=1 CCTAB_STATE_DIR=$_sd CCTAB_NOW=${_now:-1000000} \
+          CLAUDE_PID=$3 "$bin" "$1")
+}
+# starttime <pid> -- field 22 of /proc/<pid>/stat, read after the LAST ") ". Field
+# 2 is the executable name in parentheses and may itself contain spaces and
+# parens - measured on this machine, one reads `(npm exec chrome...)` - so the
+# naive `awk '{print $22}'` reads the wrong field for exactly the processes a
+# claude session spawns. The binary parses it the same way.
+starttime() { sed 's/.*) //' "/proc/$1/stat" | cut -d' ' -f20; }
+
+sleep 300 &
+_livepid=$!
+_livest=$(starttime "$_livepid")
+sleep 0 &
+_deadpid=$!
+wait "$_deadpid" 2>/dev/null || :
+
+rm -rf "$_sd"; mkdir -p "$_sd"
+# A live session's record, stamped with a process that IS running, and given an
+# ancient mtime so that the ONLY thing that can keep it is the origin rule.
+printf 'cts1\nb w\np %s %s\n' "$_livepid" "$_livest" >"$_sd/live-session-0001"
+touch -d '2 days ago' "$_sd/live-session-0001" 2>/dev/null \
+    || touch -t 200001010000 "$_sd/live-session-0001"
+# A dead one: that pid has exited, so nothing under it can match.
+printf 'cts1\nb w\np %s %s\n' "$_deadpid" "$_livest" >"$_sd/dead-session-0002"
+# The live pid with a start time that is NOT its own: a RECYCLED pid, which a
+# pid-only rule would have read as alive and kept forever.
+printf 'cts1\nb w\np %s %s\n' "$_livepid" "$((_livest + 1))" >"$_sd/recycled-0003"
+check 'state: the setup dead pid really is gone' 'gone' \
+    "$([ -d "/proc/$_deadpid" ] && printf present || printf gone)"
+stp session-start "$(pl SessionStart ',"source":"startup"')" "$_livepid" >/dev/null 2>&1
+check 'state: the reaper keeps a live session record whatever its mtime says' 'present' \
+    "$([ -e "$_sd/live-session-0001" ] && printf present || printf gone)"
+check 'state: the reaper takes a record whose pid has exited' 'gone' \
+    "$([ -e "$_sd/dead-session-0002" ] && printf present || printf gone)"
+check 'state: the reaper takes a record whose pid was recycled' 'gone' \
+    "$([ -e "$_sd/recycled-0003" ] && printf present || printf gone)"
+check 'state: SessionStart stamps its own origin into the record' \
+    "cts1|b i|p $_livepid $_livest|" "$(rec)"
+# And the stamp is carried by the next painting edge without a second /proc read.
+stp working "$(pl PostToolUse)" "$_livepid" >/dev/null 2>&1
+check 'state: ...and a later edge carries the origin rather than dropping it' \
+    "cts1|b w|p $_livepid $_livest|" "$(rec)"
+# A record that carries NO origin - one written before this field existed, or by a
+# session whose SessionStart never ran - gains one on its next write, so the
+# reaper's liveness proof covers every record this version writes. Without that,
+# an open-but-quiet session could cross the 24h mtime horizon; one such record
+# existed on this machine, for a session that was running.
+printf 'cts1\nb i\n' >"$_sd/$_sid"
+stp working "$(pl PostToolUse)" "$_livepid" >/dev/null 2>&1
+check 'state: a write stamps an origin the record was missing' \
+    "cts1|b w|p $_livepid $_livest|" "$(rec)"
+
+# doctor is how you find out which of the above happened. Read-only, deliberately:
+# the command you run when something is already wrong must not delete the evidence,
+# so it NAMES the stale files the next session-start will take.
+_doc() {
+    (cd -- "$tmp/repos/plain" \
+        && HOME=$tmp CCTAB_DRY_RUN=1 CCTAB_STATE_DIR=$_sd CCTAB_NOW=${_now:-1000000} \
+           CLAUDE_PID= "$bin" doctor </dev/null 2>&1)
+}
+rm -f "$_sd/live-session-0001"
+printf 'cts1\nb w\np %s %s\nw %s:999990\n' "$_livepid" "$_livest" "$_ag" >"$_sd/$_sid"
+printf 'cts1\nb w\np %s %s\n' "$_deadpid" "$_livest" >"$_sd/dead-session-0004"
+check 'doctor: names the record directory and counts what is stale' '1' \
+    "$(_doc | grep -c "^record:    $_sd (2 records, 1 stale)")"
+check 'doctor: says what a record holds' '1' \
+    "$(_doc | grep -c "^ *$_sid: base working, session pid $_livepid live, waiting on 1 ($_ag raised 10s ago)$")"
+check 'doctor: names the stale record and what will take it' '1' \
+    "$(_doc | grep -c "dead-session-0004: .*pid $_deadpid GONE.*STALE.*next session-start reaps it")"
+check 'doctor: does not itself delete the stale record' 'present' \
+    "$([ -e "$_sd/dead-session-0004" ] && printf present || printf gone)"
+check 'doctor: reports a record too big to be one of ours as unreadable' '1' \
+    "$(dd if=/dev/zero of="$_sd/huge-0005" bs=1 count=5000 2>/dev/null
+       _doc | grep -c 'huge-0005: unreadable')"
+# Five broken shapes used to print the same healthy-looking line as an idle
+# record, which made the report the wrong place to look when something was wrong.
+check 'doctor: tells a file that is not a record from a healthy idle one' '1' \
+    "$(printf '\001\002junk' >"$_sd/corrupt-0006"
+       _doc | grep -c "corrupt-0006: not a record in any version's shape")"
+check 'doctor: names a NEWER version record as one it will never reap' '1' \
+    "$(printf 'cts9\nb w\n' >"$_sd/newer-0007"
+       _doc | grep -c 'newer-0007: a NEWER version')"
+check 'doctor: names a file that is not ours at all as one the reaper leaves' '1' \
+    "$(printf 'not mine\n' >"$_sd/theirs.txt"
+       _doc | grep -c 'theirs.txt: .*the reaper leaves it alone')"
+# THE ONE FAILURE MODE EVERY OTHER LINE RENDERS AS HEALTHY: a directory that can be
+# read but not written records no wait at all, so a subagent's PostToolUse finds
+# none to clear and paints nothing - the slice-3 defect, back in silence.
+check 'doctor: reports a state directory that cannot be written' '1' \
+    "$(chmod 500 "$_sd"
+       _doc | grep -c '^ *FAIL not writable - no wait is ever recorded'
+       chmod 700 "$_sd")"
+# "disabled" is the silent answer to almost every question about this layer: a tab
+# behaving exactly as it did before wait ownership existed looks identical to one
+# where it is working. So doctor prints the reason rather than implying it.
+check 'doctor: says the layer is disabled, and why, when there is nowhere to keep a record' '1' \
+    "$( (cd -- "$tmp/repos/plain" && env -u XDG_RUNTIME_DIR -u CCTAB_STATE_DIR \
+           HOME=$tmp CCTAB_DRY_RUN=1 "$bin" doctor </dev/null 2>&1) \
+        | grep -c '^record:    disabled - no CCTAB_STATE_DIR and no XDG_RUNTIME_DIR')"
+kill "$_livepid" 2>/dev/null || :
+
+# uninstall is the other half of the lifecycle, and the records are the other thing
+# an install leaves on the disk. After it the plugin is unlinked, so no hook of any
+# session runs again to write another, and a live session with no record simply
+# paints what it painted before this plugin existed.
+rm -rf "$_sd"; mkdir -p "$_sd"
+printf 'cts1\nb w\nw %s:1000000\n' "$_ag" >"$_sd/$_sid"
+_unc=$tmp/config-records
+_insr() {
+    ( cd -- "$repo" && HOME=$tmp CLAUDE_CONFIG_DIR=$_unc CCTAB_STATE_DIR=$_sd \
+        "$bin" "$@" </dev/null 2>&1 )
+}
+_insr install >/dev/null
+check 'uninstall: says it removed the wait-ownership records' '1' \
+    "$(_insr uninstall | grep -c "^records:  removed $_sd (1 record")"
+check 'uninstall: ...and the directory is actually gone' 'gone' \
+    "$([ -d "$_sd" ] && printf present || printf gone)"
+# ...but it draws the same line the reaper does: a CCTAB_STATE_DIR the user pointed
+# at a shared directory must not be emptied by an uninstaller either.
+mkdir -p "$_sd"
+printf 'cts1\nb w\n' >"$_sd/$_sid"
+printf 'my own notes\n' >"$_sd/notes.txt"
+_insr install >/dev/null
+check 'uninstall: leaves a file that is not a record of ours' '1' \
+    "$(_insr uninstall | grep -c "^records:  removed 1 record(s) from $_sd, which holds other files")"
+check 'uninstall: ...and that file is still there' 'notes.txt' "$(ls -A "$_sd")"
+rm -rf "$_unc" "$_sd"
+
+# The edges that used to only DRAIN stdin - waiting, idle, session-end - now read a
+# window, because the record is filed under the payload's session_id. `waiting` and
+# `session-end` read the FRONT window only: session_id and agent_id are both front
+# members. `idle` is the exception - it reads background_tasks, which a Stop
+# serializes LAST - so it pays for a tail as well, once per turn. Either way it is a
+# bound on the SEARCH, not on the drain: a megabyte of tool_input still has to be
+# read to EOF.
+rm -rf "$_sd"; mkdir -p "$_sd"
+_big=$(awk 'BEGIN{while(i++<1048576)printf "a"}' </dev/null)
+check 'state: a 1 MiB PermissionRequest still finds the session and the owner' '🟠 plain@master' \
+    "$(st waiting "$(printf '{"session_id":"%s","hook_event_name":"PermissionRequest","agent_id":"%s","tool_input":{"content":"%s"}}' \
+        "$_sid" "$_ag" "$_big")")"
+check 'state: ...and the wait was recorded against that agent, not lost' \
+    "cts1|b i|w $_ag:1000000|" "$(rec)"
+check 'state: a 1 MiB Stop with no background_tasks is still refused over that dialog' '' \
+    "$(st idle "$(printf '{"session_id":"%s","hook_event_name":"Stop","blob":"%s"}' "$_sid" "$_big")")"
+# ...and the same payload with an EMPTY background_tasks as its last member does
+# retire it, which is the assertion that the tail window is actually read.
+check 'state: ...but a 1 MiB Stop whose LAST member is an empty array retires it' \
+    '⚪ plain@master' \
+    "$(st idle "$(printf '{"session_id":"%s","hook_event_name":"Stop","blob":"%s","background_tasks":[]}' \
+        "$_sid" "$_big")")"
+unset _big
+
+rm -rf "$_sd"; mkdir -p "$_sd"
+st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
+st session-start "$(pl SessionStart ',"source":"resume"')" >/dev/null 2>&1
+
+# A mid-turn compaction re-fires SessionStart. It paints nothing, and it must
+# reset nothing either.
+st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
+st session-start "$(pl SessionStart ',"source":"compact"')" >/dev/null 2>&1
+check 'state: a compaction SessionStart resets nothing' "cts1|b i|w $_ag:1000000|" "$(rec)"
+check 'state: SessionEnd removes the record' 'gone' \
+    "$(st session-end "$(pl SessionEnd)" >/dev/null 2>&1
+       [ -e "$_sd/$_sid" ] && printf present || printf gone)"
+
+# The session id names a FILE, and it arrives from the payload.
+rm -rf "$_sd"
+check 'state: a session_id that is not [A-Za-z0-9_-] writes nothing' '⚪ plain@master' \
+    "$(st idle '{"session_id":"../../../etc/x","hook_event_name":"Stop"}')"
+check 'state: ...and left no file anywhere' '0' \
+    "$(find "$_sd" -type f 2>/dev/null | wc -l | tr -d ' ')"
+check 'state: a payload with no session_id is the stateless answer' '⚪ plain@master' \
+    "$(st idle '{"hook_event_name":"Stop"}')"
+check 'state: ...and still left no file' '0' \
+    "$(find "$_sd" -type f 2>/dev/null | wc -l | tr -d ' ')"
+# A record that is not ours is ignored rather than misread, in both directions:
+# a future tag, and a future base letter this version cannot paint.
+rm -rf "$_sd"; mkdir -p "$_sd"
+printf 'cts2\nb w\nw %s:1000000\n' "$_ag" >"$_sd/$_sid"
+check 'state: a record with a newer tag is ignored, not misread' '⚪ plain@master' \
+    "$(st idle "$(pl Stop)")"
+printf 'cts1\nb p\ng %s\nn 5 a session title\nw %s:1000000\n' "$_ag" "$_ag" >"$_sd/$_sid"
+check 'state: a reserved key is skipped and an unknown base reads as idle' '' \
+    "$(st idle "$(pl Stop)")"
+# The wait it carried was honoured - that is why nothing painted - and because
+# honouring it changed nothing, the record was not rewritten, so the `g` and `n`
+# lines a NEWER version wrote are still there. An older binary passing through a
+# newer record leaves it intact unless it has something to say.
+check 'state: ...and a record it did not change is left byte for byte' \
+    "cts1|b p|g $_ag|n 5 a session title|w $_ag:1000000|" "$(rec)"
+# A record in the older SINGLE-EPOCH `w <epoch> <owner>` shape degrades to
+# "nothing waiting" rather than to a wait with an invented clock, which is the safe
+# direction across an upgrade: a spurious repaint self-corrects, a phantom wait
+# does not.
+printf 'cts1\nb w\nw 1000000 %s\n' "$_ag" >"$_sd/$_sid"
+check 'state: a wait in the older single-epoch shape is dropped, not misread' \
+    '⚪ plain@master' "$(st idle "$(pl Stop)")"
+
+unset _now
+rm -rf "$_sd"
 
 # --- tmux ------------------------------------------------------------------
 # Inside tmux the OSC 0 the plugin emits never reaches the outer terminal: tmux
