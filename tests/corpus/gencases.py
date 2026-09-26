@@ -581,7 +581,8 @@ for name, extra in (("konsole", {"KONSOLE_VERSION": KV}),
                     ("konsole-dbus", {"KONSOLE_DBUS_SESSION": KDS}),
                     ("plain", {}),
                     ("konsole-in-tmux", {"KONSOLE_VERSION": KV,
-                                         "TMUX": "/tmp/t,1,0"}),
+                                         "TMUX": "/tmp/t,1,0",
+                                         "CCTAB_NOW": "1700000000"}),
                     ("konsole-in-screen", {"KONSOLE_VERSION": KV,
                                            "STY": "1.pts-0"})):
     for e in ("session-start", "session-end"):
@@ -597,6 +598,82 @@ C("pty-session-start-compact-emits-nothing", ["session-start"],
 C("pty-working-does-not-touch-the-pty", ["working"],
   env=E(CCTAB_DRY_RUN=None, CLAUDE_PID="@@PID_PTY@@", KONSOLE_VERSION=KV),
   mode="pty", note="normal edges go to stdout, never to the pty")
+
+# ===========================================================================
+# 14. tmux: inside a tmux server the OSC 0 payload is a RECORD, not a title
+# ===========================================================================
+# The record is `<location> ct1 <state> <epoch>`, appended in place of the glyph,
+# and the glyph comes back out of a server option that SessionStart wrote. Only
+# the EMITTED bytes change: CCTAB_DRY_RUN still prints the tab title, which is
+# what keeps the eight konsole-*-tmux* cases in section 3 byte-identical and is
+# the regression those cases now guard.
+#
+# CCTAB_NOW pins the epoch. Without it every case here would carry a real clock.
+# The oracle shell knows nothing about tmux, so each case whose answer the record
+# changes is listed in refreeze_fixed.py's FIXED table and re-recorded from the
+# binary; the ones the oracle already agrees with are frozen from it like any
+# other case, and those are the more valuable half - they pin what must NOT
+# change.
+TMX = "/tmp/tmux-1000/default,1234,0"
+NOW = "1700000000"
+for e in ("working", "waiting", "idle"):
+    C("tmux-record-" + e, [e], env=E(CCTAB_DRY_RUN=None, TMUX=TMX, CCTAB_NOW=NOW),
+      note="the state travels as a letter, because a glyph cannot be sliced back "
+           "out of a title: #{=1:} counts COLUMNS and returns empty for an emoji")
+C("tmux-record-without-a-pane", ["working"],
+  env=E(CCTAB_DRY_RUN=None, TMUX=TMX, TMUX_PANE=None, CCTAB_NOW=NOW),
+  note="$TMUX_PANE only targets the cold-path commands; the record needs none")
+C("tmux-record-with-an-ssh-prefix", ["waiting"],
+  env=E(CCTAB_DRY_RUN=None, TMUX=TMX, CCTAB_NOW=NOW, SSH_CONNECTION="1 2 3 4",
+        CCTAB_HOST="srv"),
+  note="the record carries the location the tab would have shown, prefix and all")
+C("tmux-record-is-not-affected-by-glyph-pos", ["working"],
+  env=E(CCTAB_DRY_RUN=None, TMUX=TMX, CCTAB_NOW=NOW, CCTAB_GLYPH_POS="suffix"),
+  note="the glyph is gone from the record, so its position cannot reach it - "
+       "inside tmux CCTAB_GLYPH_POS only picks which end of the TAB the strip is on")
+C("tmux-record-ignores-a-glyph-override", ["idle"],
+  env=E(CCTAB_DRY_RUN=None, TMUX=TMX, CCTAB_NOW=NOW, CCTAB_GLYPH_IDLE="[..]"),
+  note="the override reaches the tab through a tmux option, never through the record")
+C("tmux-dry-run-is-still-the-title", ["idle"], env=E(TMUX=TMX, CCTAB_NOW=NOW),
+  note="THE guard: move the record into render::compose and this case plus the "
+       "eight in section 3 all flip, and all nine start carrying a real clock")
+C("tmux-kill-switch", ["working"],
+  env=E(CCTAB_DRY_RUN=None, TMUX=TMX, CCTAB_NO_TMUX="1", CCTAB_NOW=NOW),
+  note="CCTAB_NO_TMUX=1 backs the whole slice out of the way")
+for bad in ("nonsense", "/tmp/s,1", "/tmp/s,1,0,2", "relative,1,0", "/tmp/s,x,0"):
+    C("tmux-not-a-tmux-env-%s" % bad.replace("/", "").replace(",", "-"),
+      ["working"], env=E(CCTAB_DRY_RUN=None, TMUX=bad, CCTAB_NOW=NOW),
+      note="$TMUX must parse as <absolute socket>,<pid>,<session>. The test is "
+           "syntactic and never stats the socket, so this corpus cannot depend "
+           "on which files exist on the machine replaying it")
+C("tmux-sty-only-is-untagged", ["working"],
+  env=E(CCTAB_DRY_RUN=None, STY="1234.pts-0.host", CCTAB_NOW=NOW),
+  note="screen has no server-side arithmetic and no strftime in its format, so "
+       "there is no decay to buy and it gets nothing")
+C("tmux-and-sty-together-is-tmux", ["working"],
+  env=E(CCTAB_DRY_RUN=None, TMUX=TMX, STY="1234.pts-0.host", CCTAB_NOW=NOW),
+  note="tmux-inside-screen is the plausible order, and then the record is right")
+C("tmux-terminal-override-konsole", ["idle"],
+  env=E(TMUX=TMX, CCTAB_TERMINAL="konsole"),
+  note="KONSOLE_* does not survive ssh, so inside tmux this is the only honest "
+       "signal - and it puts the strip on the end Konsole does not elide")
+C("tmux-terminal-override-is-not-konsole", ["idle"],
+  env=E(KONSOLE_VERSION=KV, CCTAB_TERMINAL="wezterm"),
+  note="any other value says explicitly NOT Konsole, which is how a leaked "
+       "KONSOLE_* is turned off")
+C("tmux-terminal-override-konsole-mixed-case", ["idle"],
+  env=E(TMUX=TMX, CCTAB_TERMINAL="Konsole"),
+  note="the name is matched ASCII-case-insensitively: a byte compare made "
+       "CCTAB_TERMINAL=Konsole mean explicitly NOT Konsole and turned the arming "
+       "and the suffix layout OFF, the opposite of what was typed")
+C("pty-session-start-tmux-arms-no-pane", ["session-start"],
+  env=E(CCTAB_DRY_RUN=None, CLAUDE_PID="@@PID_PTY@@", TMUX="/tmp/t,1,0",
+        CCTAB_TERMINAL="konsole", CCTAB_NOW=NOW), mode="pty",
+  stdin=sstart("startup"),
+  note="inside tmux the OSC 50 does NOT go to our own pane - it goes to the "
+       "attached client's pty, which a dead socket names none of. The pty sees "
+       "the record and nothing else, and stderr stays empty even though the "
+       "tmux child failed to connect")
 
 # ===========================================================================
 # run every case against the reference implementation

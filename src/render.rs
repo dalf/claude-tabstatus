@@ -18,15 +18,29 @@ use crate::edge::Paint;
 use crate::location::{self, Place};
 use crate::text;
 
+/// One location walk, two answers.
+///
+/// Both come out of the same pipeline because there is exactly one caller that
+/// wants each - the tab title outside tmux, the record inside it - and walking
+/// twice would double the only part of this binary that touches the filesystem.
+pub struct Composed {
+    /// The location alone, after the cap, the ssh prefix and the JSON-safety
+    /// pass. No glyph: inside tmux the glyph is not in the record at all.
+    pub place: String,
+    /// The glyph and the location, composed - what paints a tab.
+    pub title: String,
+}
+
 /// Where this session is, painted: the location walk, the length policy, the ssh
 /// prefix, the JSON-safety pass and the glyph, in the one order that is correct.
-pub fn compose(paint: Paint, cfg: &Config) -> String {
+pub fn compose(paint: Paint, cfg: &Config) -> Composed {
     let cwd = location::cwd(cfg);
     let place = location::place(&cwd, cfg);
     let place = apply_length_cap(place, cfg);
     let place = apply_ssh_prefix(place, cfg);
     let place = sanitize(place, cfg);
-    title(paint, &place, cfg)
+    let title = title(paint, &place, cfg);
+    Composed { place, title }
 }
 
 /// A tab is narrow: Konsole gives one roughly 49-60 columns and elides from the

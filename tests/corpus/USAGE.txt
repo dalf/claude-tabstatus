@@ -4,7 +4,7 @@ claude-tabstatus golden corpus
 What this is
 ------------
 A frozen, machine-readable record of what scripts/tabstatus.sh DOES, so the Rust
-port can be proven byte-identical instead of believed to be. 292 cases.
+port can be proven byte-identical instead of believed to be. 312 cases.
 
     sh mkfixtures.sh                     rebuild the fixture tree from scratch
     sh replay.sh <target>                replay every case against <target>
@@ -16,7 +16,7 @@ is a binary. That is the only difference between replaying the shell and
 replaying the port.
 
     sh replay.sh /home/alexandre/code/claude-tabstatus/bin/tabstatus
-      -> 292 passed, 0 failed, 0 diverged as expected
+      -> 312 passed, 0 failed, 0 diverged as expected
 
 The shell implementation no longer exists as scripts/tabstatus.sh: the binary
 took over hooks.json and the script was deleted. The byte-identical copy that
@@ -40,7 +40,8 @@ on Linux with /proc. That is the production invocation: hooks.json runs
 `sh "${CLAUDE_PLUGIN_ROOT}/scripts/tabstatus.sh" <edge>`.
 
 CCTAB_REPLAY_SH=/path/to/dash sh replay.sh <script.sh> replays a SCRIPT under
-another interpreter. Under dash, exactly 2 of the 292 cases differ from bash,
+another interpreter. Under dash, exactly 2 of the then-292 cases differed from
+bash,
 and both are already flagged `diverge` - which is the measured extent of the
 count-unit problem (README limitations 3 and 4).
 
@@ -262,3 +263,76 @@ The locale note above is obsolete, and worth recording as closed: the binary
 does not call setlocale and does not read LC_ALL, LC_CTYPE or LANG at all, so an
 uninstalled UTF-8 locale name - the one measured non-byte-identity of the pure
 port - can no longer change a title.
+
+
+Amendment, the tmux slice
+-------------------------
+TWENTY cases were added and ONE pre-existing case was re-recorded, taking the
+corpus to 312. Inside a tmux server the OSC 0 payload stops being a tab title:
+tmux stores it as pane_title and emits a title of its OWN, computed from
+set-titles-string, which SessionStart installs. So the payload becomes the record
+that format reads back,
+
+    <location> ct1 <state> <epoch>          state = w | a | i
+
+and the glyph - which cannot be sliced back out of a title, because #{=1:} counts
+COLUMNS and returns EMPTY for a width-2 emoji - travels as a state LETTER whose
+glyph the format looks up in a tmux option SessionStart wrote.
+
+THE ONE DIVERGENCE. pty-session-start-konsole-in-tmux:
+
+    '\x1b]0;<white> plain@master\x07'  ->  '\x1b]0;plain@master ct1 i 1700000000\x07'
+
+Its env gained CCTAB_NOW=1700000000, which pins the epoch; without that the case
+would carry a real clock and stop being reproducible. Every other pre-existing
+case is BYTE-IDENTICAL, the eight dry-run konsole-*-tmux* cases included, because
+the record is attached on the EMITTING path and never in render::compose. Those
+eight, plus the new tmux-dry-run-is-still-the-title, are now the regression test
+for that: move the record into render::compose and all nine flip AND start
+carrying an unpinnable clock.
+
+pty-session-end-konsole-in-tmux gained CCTAB_NOW too and its EXPECTATION did not
+move - which is the other thing this slice had to get right. `tmux set-option`
+against that case's fake socket exits 1 with `error connecting to /tmp/t (No such
+file or directory)` on stderr in about 4ms, and every case in this corpus expects
+EMPTY stderr, so both pty-in-tmux cases are the regression test for redirecting
+the SessionStart child's stdout AND stderr to /dev/null.
+
+THE TWENTY NEW CASES are section 14 of gencases.py. EIGHT of them are frozen from
+the SHELL oracle like any other case, because the oracle already agrees: those are
+the more valuable half, since they pin what must NOT change - the kill switch, the
+five malformed $TMUX shapes, screen-only, and the dry run
+(tmux-dry-run-is-still-the-title, tmux-kill-switch, the five
+tmux-not-a-tmux-env-*, tmux-sty-only-is-untagged).
+
+The other TWELVE are in refreeze_fixed.py's FIXED table under fix-f, because the
+oracle knows nothing about any of it:
+
+    tmux-record-working / -waiting / -idle
+    tmux-record-without-a-pane
+    tmux-record-with-an-ssh-prefix
+    tmux-record-is-not-affected-by-glyph-pos
+    tmux-record-ignores-a-glyph-override
+    tmux-and-sty-together-is-tmux
+    tmux-terminal-override-konsole
+    tmux-terminal-override-konsole-mixed-case
+    tmux-terminal-override-is-not-konsole
+    pty-session-start-tmux-arms-no-pane
+
+plus the one pre-existing case above, which makes THIRTEEN entries in that table.
+
+THE NAMING TRAP IN THAT LIST. The three tmux-terminal-override-* cases are
+CCTAB_TERMINAL cases, not tmux cases, and tmux-terminal-override-is-not-konsole
+carries NEITHER $TMUX NOR $STY. It is the one behaviour delta in this slice that is
+not gated on being inside a multiplexer, because CCTAB_TERMINAL is consulted
+before the TMUX/STY test - deliberately, since KONSOLE_* does not survive an ssh
+and there is otherwise nothing to detect. The slice's invariant is therefore "no
+PRE-EXISTING non-tmux case moves", which holds: measured, base-vs-new over every
+case with TMUX and STY stripped differs in nothing once CCTAB_TERMINAL is out of
+the environment, and 12,500 randomised paint inputs with TMUX and STY never set
+found zero byte differences.
+
+Not in the corpus, because it needs a tmux server: what the format RENDERS, the
+decay itself, the save and restore, the re-arm hook, and doctor's report. Those
+are the tmux section of tests/run.sh - 81 assertions - driven against a private
+`tmux -L cctabprobe -f /dev/null` that is killed afterwards.

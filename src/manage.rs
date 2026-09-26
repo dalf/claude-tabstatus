@@ -24,7 +24,7 @@
 use crate::settings::{self, Outcome};
 use crate::config::{self, Config, Terminal};
 use crate::edge::{Glyph, Paint};
-use crate::{json, render};
+use crate::{json, render, tmux};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
@@ -64,6 +64,20 @@ pub enum Subcommand {
         restore_backup: bool,
     },
     Doctor,
+    /// Print the two tmux format strings SessionStart would install. The test
+    /// suite drives a private tmux server with EXACTLY the product's string
+    /// rather than a copy of it, and a user who would rather pin the format in
+    /// `~/.tmux.conf` than have it set at runtime can paste these two lines.
+    TmuxFormat,
+    /// `tmux-arm <tty>` - write Konsole's per-tab arming to ONE terminal. Invoked
+    /// by the `client-attached` hook SessionStart installs, never by a hook event
+    /// and never by hand in normal use: tmux substitutes the attaching client's
+    /// pty, so a reattach - closing the laptop and coming back - lands in an armed
+    /// tab instead of one governed by Konsole's `RemoteTabTitleFormat`.
+    ///
+    /// The argument is `None` only when a human typed the verb with nothing after
+    /// it; the guard on the path itself is `emit::tty_write`.
+    TmuxArm(Option<OsString>),
     Version,
     Help,
     /// A verb this half owns, given an option that verb does not accept. It
@@ -89,6 +103,8 @@ impl Subcommand {
             // These three take no options and IGNORE any argument given, which is
             // what they have always done: `doctor --force` runs doctor.
             b"doctor" => Subcommand::Doctor,
+            b"tmux-format" => Subcommand::TmuxFormat,
+            b"tmux-arm" => Subcommand::TmuxArm(rest.first().cloned()),
             b"version" | b"--version" | b"-V" => Subcommand::Version,
             b"help" | b"--help" | b"-h" => Subcommand::Help,
             _ => return None,
@@ -106,6 +122,22 @@ impl Subcommand {
                 restore_backup,
             } => with_ctx(|c| uninstall(c, force, restore_backup)),
             Subcommand::Doctor => with_ctx(doctor),
+            Subcommand::TmuxFormat => {
+                for line in tmux::format_lines(&Config::from_env()) {
+                    say(&line);
+                }
+                0
+            }
+            Subcommand::TmuxArm(tty) => match tty {
+                Some(t) => {
+                    tmux::arm_tty(&t);
+                    0
+                }
+                None => {
+                    fail("tmux-arm needs the pty to arm, e.g. /dev/pts/3");
+                    1
+                }
+            },
             Subcommand::Version => {
                 version();
                 0
@@ -196,6 +228,9 @@ fn usage() {
         "      --force                  remove the env key even with no state record\n",
         "      --restore-backup         roll settings.json back to the pre-install copy\n",
         "  tabstatus doctor             report what is installed and what would paint\n",
+        "  tabstatus tmux-format        print the two tmux format strings we install\n",
+        "  tabstatus tmux-arm <tty>     re-arm one Konsole tab; tmux's client-attached\n",
+        "                               hook runs this, so a reattach is armed again\n",
         "  tabstatus version\n",
         "\n",
         "Hook edges, invoked from hooks/hooks.json rather than by hand:\n",
@@ -934,6 +969,12 @@ fn uninstall(c: &Ctx, force: bool, restore_backup: bool) -> Result<(), String> {
     remove_env_key(c, &prior, force, restore_backup)?;
     unlink_the_plugin(c, &prior)?;
     remove_state(c)?;
+    // The tmux server's own set-titles pair, which SessionStart saved aside. Only
+    // uninstall restores it: the options are server-wide, so a SessionEnd doing it
+    // would unpaint the other claude windows still running.
+    for line in tmux::uninstall() {
+        say(&line);
+    }
 
     say("");
     say("Done. Start a NEW Claude Code session for the change to take effect.");
@@ -1170,6 +1211,7 @@ fn doctor(c: &Ctx) -> Result<(), String> {
     report_env_key(c)?;
     report_state(c);
     report_runtime();
+    report_tmux();
     report_title();
     Ok(())
 }
@@ -1296,20 +1338,47 @@ fn report_runtime() {
         ""
     };
     let konsole = Terminal::detect() == Terminal::Konsole;
+    // The REASON matters more than the answer, because there are now three of
+    // them and they disagree: an explicit CCTAB_TERMINAL, inherited KONSOLE_*,
+    // and a multiplexer that makes the inherited kind meaningless.
+    let override_ = config::var_nonempty("CCTAB_TERMINAL");
     say(&format!(
         "terminal:  {}",
-        if konsole {
-            "Konsole (KONSOLE_* in the environment, no multiplexer)"
-        } else if konsole_vars && !mux.is_empty() {
-            "inside a multiplexer, so KONSOLE_* is ignored"
-        } else if konsole_vars {
-            "KONSOLE_* set"
-        } else {
-            "not Konsole (no KONSOLE_VERSION, no KONSOLE_DBUS_SESSION)"
+        match (&override_, konsole, konsole_vars, mux.is_empty()) {
+            (Some(v), true, _, _) => format!(
+                "Konsole, from CCTAB_TERMINAL={} - the only signal that survives ssh",
+                String::from_utf8_lossy(v.as_bytes())
+            ),
+            (Some(v), false, _, _) => format!(
+                "not Konsole: CCTAB_TERMINAL={} says so explicitly",
+                String::from_utf8_lossy(v.as_bytes())
+            ),
+            (None, true, _, _) => "Konsole (KONSOLE_* in the environment, no multiplexer)".to_owned(),
+            (None, false, true, false) =>
+                "inside a multiplexer, so the inherited KONSOLE_* is ignored - set \
+                 CCTAB_TERMINAL=konsole if the outer terminal really is Konsole"
+                    .to_owned(),
+            (None, false, true, true) => "KONSOLE_* set".to_owned(),
+            (None, false, false, _) =>
+                "not Konsole (no CCTAB_TERMINAL, no KONSOLE_VERSION, no \
+                 KONSOLE_DBUS_SESSION)"
+                    .to_owned(),
         }
     ));
     if !mux.is_empty() {
-        say(&format!("           multiplexer: {}, so no OSC 50 arming is sent", mux));
+        say(&format!(
+            "           multiplexer: {}, so KONSOLE_* says nothing about the outer \
+             terminal",
+            mux
+        ));
+        if !konsole {
+            say(
+                "           If the outer terminal IS Konsole, set \
+                 CCTAB_TERMINAL=konsole: it moves the strip to the end",
+            );
+            say("           Konsole does not elide, and arms the tab so the title \
+                 shows there at all.");
+        }
     }
     let pos = config::var_nonempty("CCTAB_GLYPH_POS");
     let implied: &str = if pos.is_some() {
@@ -1337,10 +1406,23 @@ fn report_runtime() {
     }
 }
 
+/// Inside tmux or not, the socket, the pane, whether the decay's clock is running,
+/// whether the outer terminal can be given a title at all, and whose
+/// set-titles-string is installed.
+///
+/// Two tmux invocations, both read-only, both on a cold path. Nothing here is a
+/// copy of what the runtime half decides: [`tmux::report`] is in the module that
+/// decides it.
+fn report_tmux() {
+    for line in tmux::report(&Config::from_env()) {
+        say(&line);
+    }
+}
+
 /// The runtime half's own pipeline, CALLED rather than copied, so this line cannot
 /// drift from what actually paints.
 fn report_title() {
-    let title = render::compose(Paint::Line(Glyph::Idle), &Config::from_env());
+    let title = render::compose(Paint::Line(Glyph::Idle), &Config::from_env()).title;
     let mut line = b"title:     ".to_vec();
     line.extend_from_slice(title.as_bytes());
     line.push(b'\n');

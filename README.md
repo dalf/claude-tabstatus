@@ -294,10 +294,303 @@ Konsole's default tab title** and nothing survives closing the tab.
 
 OSC 50 means "set font" in xterm and is unrecognised in most other terminals,
 so it is sent only when `KONSOLE_VERSION` or `KONSOLE_DBUS_SESSION` is in the
-environment and the session is not inside tmux or screen.
+environment and the session is not inside tmux or screen - or when
+`CCTAB_TERMINAL=konsole` says so explicitly, which is the only signal that
+survives an ssh. Inside tmux the arming goes to the attached tmux client's pty
+instead of to our own pane; see [tmux](#tmux).
 
 **Windows Terminal needs no configuration**, and neither does any other
 terminal that honours a plain OSC 0 title.
+
+## tmux
+
+Inside tmux the tab stops being a latch and becomes **a function of time**.
+
+An OSC 0 written inside a tmux pane never reaches the outer terminal. tmux
+stores it as that pane's `pane_title` and emits a title of its *own*, computed
+from `set-titles-string`, and it recomputes that title on a timer. `%s` - the
+epoch - is available inside a tmux format, so if the paint carries the moment it
+happened, the format can render the live glyph while the paint is fresh, the idle
+glyph once it is stale, and nothing at all once it is old. **No process runs, no
+hook fires and nothing is notified**; the only input that moved is tmux's own
+clock.
+
+That is worth much more than tmux convenience. The wrong titles in [Known
+limitations](#known-limitations) are all the same shape - an edge that paints
+with no matching un-paint. Inside tmux every one of them heals itself.
+
+So inside tmux the payload the plugin emits stops being a tab title and becomes a
+**record**:
+
+```text
+<location> ct1 <state> <epoch>          state = w (working) | a (waiting) | i (idle)
+~/code/one ct1 w 1790443548
+```
+
+The glyph is not in it. `#{=1:}` counts *columns* and returns the empty string
+for a width-2 emoji, so a glyph cannot be sliced back out of a title at all; the
+glyph's position already varies with `CCTAB_GLYPH_POS`; and leaving it in would
+paint the current pane's glyph twice, once in the strip and once in the label. A
+state *letter* is one ASCII column, and the glyph it stands for is looked up in a
+server option the same `SessionStart` wrote.
+
+What the outer tab then shows is one cell per claude **pane** of the attached
+session, then where you are:
+
+```text
+🔵🟠⚪ ~/code/one      three claudes: one working, one waiting for you, one idle
+⚪🟠⚪ ~/code/one      the first one has gone quiet past its TTL
+🟠⚪ ~/code/one        and then dropped out of the strip entirely
+🔵🟠⚪ t:2:shell       looking at a plain shell, so tmux's own label
+t:0:w0                 no claude anywhere on the server
+```
+
+A window's non-active panes count too - the loop is `#{W:#{P:…}}` and not
+`#{W:…}`, because `#{pane_title}` inside a window loop reads only that window's
+*active* pane, so two claudes split in one window would otherwise show one cell.
+The session loop `#{S:…}` is deliberately absent: one terminal tab shows one
+attached session, and looping every session would put another tab's claudes into
+this tab's title.
+
+### What is configured at runtime
+
+`SessionStart` does it, in **one** `tmux` invocation, so you need no
+`~/.tmux.conf` edit:
+
+```text
+set -s @cctab_gw/@cctab_ga/@cctab_gi     the three glyphs
+set -s @cctab_tw/@cctab_ta/@cctab_tg     the three TTLs, in seconds
+set -s @cctab_title                      the generated strip-and-label format
+set -s @cctab_string                     the set-titles-string we installed
+set -g set-titles on
+set -g set-titles-string '#{s|^ ||:#{T:@cctab_title}}'
+```
+
+In Konsole mode only, two more - this binary's path, and the hook that re-arms a
+reattached tab with it:
+
+```text
+set -s @cctab_exe                        this binary, for the hook to run
+set-hook -t <our session> 'client-attached[1971]' \
+    'run-shell -b "'\''#{@cctab_exe}'\''  tmux-arm '\''#{client_tty}'\''"'
+```
+
+`tabstatus tmux-format` prints the last two lines' values, if you would rather
+pin them in your own config than have them set at runtime.
+
+The glyphs and the TTLs travel as *options* rather than as text spliced into the
+format, because an option's value is substituted **literally**: measured,
+`#{host}` and `%H` reach the tab intact through `#{@opt}`, where the same bytes
+written into the format itself would have been expanded. That makes a hostile
+`CCTAB_GLYPH_*` inert. A pane title is never re-expanded either, so a path
+holding `#{host}`, `#(…)`, `}`, `,`, `|` or `:` arrives as itself - and `#(…)`
+is not a command-execution vector: tmux defangs it to `_(` when it *stores* the
+title. (`select-pane -T`, which this plugin never uses, expands its argument at
+set time and must never carry a location.)
+
+**The hot path execs nothing.** Only `SessionStart` runs `tmux`, and `SessionEnd`
+only in Konsole mode. Measured here: one `tmux set-option` costs 2.84ms against a
+0.37ms fork floor, and the whole twelve-command `SessionStart` batch costs 3.1ms
+end to end - thirteen commands and 4.9ms in Konsole mode, where it also lists the
+clients and writes the arming. The cost is the fork and the socket round trip, not
+the commands, which is why batching is free and why a per-tool-call `tmux`
+invocation would have been a tenfold regression on a binary that runs in 370µs.
+
+### What you must have on
+
+| setting | why |
+|---|---|
+| `status on` (tmux's default) | **painting** still works without it - measured, a paint reached the outer terminal in 4ms with `status off` - but the **decay** stops, and a stale glyph then survives until the next paint |
+| `status-interval > 0` (default `15`) | this is the decay clock, and it is needed *independently*: measured, `status on` with `status-interval 0` never decays either |
+| an outer terminal tmux grants the `title` feature | else tmux emits no OSC 0 at all. Informational rather than a gate on a current tmux: measured on 3.7c, `linux`, `vt220` and `vt100` all reported `title` and all got the OSC 0, although `terminal-features` lists only `xterm*` and `screen*`; only `TERM=dumb` failed, and it cannot attach at all. On an older tmux the remedy is `set -as terminal-features ",$TERM:title"` |
+
+**When does the flip land?** `#{e|>|:age,ttl}` is strictly greater over *integer*
+seconds and the record's epoch is truncated to the second, so the earliest
+possible flip is **TTL + 1s**, plus up to one `status-interval` on top. Measured
+with `status-interval 1` and `CCTAB_TTL_WORKING=5` / `CCTAB_TTL_GONE=12`: white at
++6.01s, gone at +13.02s. Irrelevant at the shipped defaults, and the reason short
+TTLs look off by one. `#{e|>=|:}` does exist on 3.7c and would move the flip one
+second earlier, which is not worth a change to a format string two tests pin.
+
+`SessionStart` does **not** set any of them. Turning the status line on would run
+a user's `#(…)` in `status-right` on our schedule, and guessing at somebody
+else's terminal features is not ours to do. `tabstatus doctor` reports all three
+with the one-line remedy:
+
+```text
+tmux:      OK   tmux 3.7c on /tmp/tmux-1000/default, pane %3
+           decay: OK   status on, status-interval 15s - the tab re-renders on that timer
+           title: OK   set-titles-string is the one SessionStart installed
+           client: /dev/pts/3 xterm-256color HASTITLE
+           konsole: off  set CCTAB_TERMINAL=konsole when the outer terminal is Konsole
+           ttl: working 1200s, waiting 900s, gone 3600s (0 = never)
+```
+
+In Konsole mode it also reports the re-arm hook, and it warns when the strip on
+the server is on the other end from the one this session would install:
+
+```text
+           arm: OK   client-attached re-arms this tab's Konsole format on every reattach
+           layout: WARN the server has the strip last, but this session would install it first
+```
+
+### The TTLs
+
+```sh
+CCTAB_TTL_WORKING=1200   # blue decays to white after 20 min; 0 = never
+CCTAB_TTL_WAITING=900    # orange decays to white after 15 min; 0 = never
+CCTAB_TTL_GONE=3600      # any cell disappears after 1 h;      0 = never
+```
+
+`CCTAB_TTL_WORKING` is **measured**, not guessed. `working` is repainted by
+`UserPromptSubmit`, `PostToolUse` and `PostToolUseFailure` only, so during one
+long tool call nothing paints at all. Over the 91 most recent real transcripts on
+this machine - 7709 within-turn gaps between two successive `working` paints:
+
+| p50 | p95 | p99 | p99.9 | max | over 300s | over 1200s |
+|---|---|---|---|---|---|---|
+| 9.9s | 77s | 173s | 646s | 27751s | 39 (0.51%) | 4 (0.05%) |
+
+`300` - the first default - whitened a genuinely working tab about once in every
+200 gaps, which is the *damaging* direction: "finished, come back" about a build
+that is still running. `1200` covers 99.95% of them, and the four above it are
+3343s, 5677s, 23700s and 27751s - sessions resumed the next day rather than a tool
+call still going. A lingering blue is the cheap lie: the next paint corrects it in
+seconds, and the 3600s disappear horizon still catches a genuinely stuck one.
+
+`working` is repainted by every tool call, so its TTL only has to outlast the
+longest ordinary gap between two paints - one long tool call, one long thinking
+phase - and decaying sooner would lie in the "it finished" direction. `waiting`
+is a *summons*: it gets exactly one paint and is never refreshed, so it has to
+survive a coffee break. `idle` needs no TTL of its own, because white is already
+what the other two decay *into*. The disappear horizon is shared: once a cell has
+whitened it says the same thing whatever it decayed from, so what it decayed from
+is no reason for it to linger longer.
+
+They are server-wide, so the last `SessionStart` on a server wins for every
+window on it. So are `CCTAB_TERMINAL` and `CCTAB_GLYPH_POS`, which decide the
+*layout*: a plain `SessionStart` after a `CCTAB_TERMINAL=konsole` one flips the
+strip back to the elided end while the Konsole arming stays in force. Set them the
+same for every claude on one tmux server - `doctor`'s `layout: WARN` line is there
+because the `title: OK` test cannot catch it (the same `SessionStart` rewrites
+`@cctab_string`, so those two always agree).
+
+### Save and restore
+
+`SessionStart` copies your own `set-titles` and `set-titles-string` into
+`@cctab_prev_titles` / `@cctab_prev_string` **before** it overwrites them, and
+only if nothing is saved yet - so a second claude starting later cannot record
+*our* string as yours. tmux serialises commands on one event loop, so the save
+and the install are one atomic batch; measured, thirty concurrent `SessionStart`s
+left the saved value intact.
+
+A saved string that points at `@cctab_title` is **not** put back, and uninstall
+says so instead of claiming a restore. That is not hypothetical: pinning the pair
+from `tabstatus tmux-format` into your own `~/.tmux.conf` - which this README
+invites two sections up - means the first `SessionStart` saves *our* string as
+yours, and restoring it after `@cctab_title` has been unset renders the empty
+string, leaving the tab title permanently blank until the server restarts. The
+test is the whole `@cctab_` namespace, because a server whose last `SessionStart`
+used the other glyph position holds a different string of ours pointing at the
+same option.
+
+`tabstatus uninstall` is the **only** thing that puts them back, and it says what
+it restored. It also counts the other claude panes in the session and warns that
+their tab cells stop updating, since the options it removes are server-wide. `SessionEnd` deliberately does not: the options are server-wide, and
+another claude window may still be painting through them. If the saved value was
+tmux's own compiled-in default, the option is left *unset* rather than pinned to
+a string a later tmux may change. Run from outside tmux, uninstall says it could
+not restore rather than claiming it did. A tmux server restart loses the
+installed format and the saved values together, which is self-consistent:
+nothing to restore, nothing left behind.
+
+### Konsole over ssh
+
+`KONSOLE_*` does not survive an ssh, so in the topology this exists for - Konsole
+→ ssh → tmux → claude - there is nothing to detect. `CCTAB_TERMINAL=konsole`
+says it explicitly, and then the OSC 50 arming goes to **each attached client's
+pty**, named by `tmux list-clients -F '#{client_tty}'`, never to our own pane
+(where tmux would swallow it). The strip also moves to the end Konsole does not
+elide.
+
+That route was chosen over `allow-passthrough`, which does work - `on` passes the
+active pane, `all` also passes background windows, every inner ESC has to be
+doubled - but turning it on lets any program in any pane write arbitrary bytes to
+your terminal, which is not a decision a tab-title plugin should be taking for
+you. `CCTAB_TERMINAL` also works outside tmux, which is the same fix for a plain
+ssh out of a Konsole tab.
+
+**A reattach is re-armed.** The arming goes to the ptys `list-clients` names, so
+an arming sent while *detached* reaches nobody, and on reattach tmux replays the
+title but never the arming - measured, a reattached tab was governed by
+`RemoteTabTitleFormat=(%u) %H` again and the glyph was invisible. "Close the
+laptop while Claude keeps working" is exactly this topology, so in Konsole mode
+`SessionStart` also installs a `client-attached[1971]` hook that runs
+`tabstatus tmux-arm` with the attaching client's pty. Measured on a reattach: the
+new terminal receives `CSI 22;0;0t`, the current title, and the OSC 50 arming 1ms
+later. The hook is set on *our session*, not globally, so a tab whose tmux session
+holds no claude is never armed; it is removed with the restore at the last
+`SessionEnd`, and by `uninstall`.
+
+The path travels in `@cctab_exe` rather than inside the hook's text, because a
+hook value is parsed when it is *set*: measured, `$rd` inside tmux's double quotes
+is expanded there, so a path holding `$` would lose a piece of itself. An option's
+value is substituted literally instead - measured, a path holding `#`, `#{host}`,
+`%Y` and a space arrived byte for byte. A path holding a single quote has no
+representation inside the hook's shell quoting and drops the re-arm, keeping
+everything else.
+
+The restore is sent only when no *other* claude pane is left in the session,
+because the arming is per tab and inside tmux one tab holds every window. Our own
+pane is excluded from that count rather than relied on to have been cleared
+already.
+
+### Anything else that writes a title
+
+A shell prompt, `vim` or `ssh` setting the pane title overwrites the record, and
+that pane's cell disappears until the next paint. Conversely a pane title that
+*ends in* a well-formed record forges a cell - harmless, and the price of using
+the title as the carrier instead of a tmux option, which would have cost 2.84ms
+on every tool call.
+
+**If your tab shows `~/code/one ct1 w 1790…`,** the carrier has become visible:
+something replaced our `set-titles-string` while `set-titles` stayed on, and
+tmux's own default string contains `#T`. A `tmux source-file ~/.tmux.conf` after
+`SessionStart` does it, so does `uninstall` while another claude is still
+painting, and so does a claude that was SIGKILLed on a server whose config sets
+`set-titles on`. Nothing re-arms in band - `doctor` says `title: WARN
+set-titles-string is not ours any more` - so start a new claude session, or
+`/clear`, either of which re-runs `SessionStart`.
+
+### Deliberately not built
+
+- **The tmux status line.** A glyph per window in `window-status-format` uses
+  exactly this carrier and the cell expression drops into it unchanged, but the
+  target here is the *tab*, and the status line is your real estate.
+- **A fourth glyph for background work**, and **OSC 9;4 progress**.
+- **A per-session policy.** The options are server-wide; per-session glyphs or
+  TTLs would need the deadlines carried in the record instead.
+- **Re-arming a server that lost our OPTIONS** some other way than a restart
+  (which takes its panes with it). Nothing re-runs `SessionStart`, and putting a
+  `tmux` invocation on the hot path to check is exactly the cost this design
+  refuses. The `client-attached` hook is now installed in Konsole mode, for the
+  Konsole *arming* only; re-checking the options from it is the remaining seam,
+  and `doctor` is the manual answer.
+- **screen.** `$STY` gets nothing: screen's title machinery has no arithmetic
+  and no strftime in its format, so there is no decay to buy. When both `$TMUX`
+  and `$STY` are set, tmux wins - tmux-inside-screen is the plausible order, and
+  then the record is right.
+- **Nested tmux.** The inner server owns `$TMUX`, so that is the one configured,
+  which is correct. With our own string installed on the OUTER server too, the
+  concrete answer is measured and worse than "it depends": the inner tmux re-emits
+  its own *rendered* title into the outer pane's `pane_title`, which no longer
+  matches the record pattern, so the outer tab loses that window's cell entirely
+  and its label falls back to `session:index:window`. The inner tmux's own tab - if
+  it has one - is the one that paints. `doctor` cannot see an outer server from
+  inside and does not claim to.
+
+`CCTAB_NO_TMUX=1` backs the whole of this out of the way: no record, no `tmux`
+invocation, no arming.
 
 ## Known limitations
 
@@ -375,6 +668,10 @@ terminal that honours a plain OSC 0 title.
   server that was first started under Konsole. `$TMUX` and `$STY` take the
   multiplexer case out; the launched-from-Konsole case would still misfire, and
   in xterm OSC 50 sets the font rather than being ignored.
+
+  `CCTAB_TERMINAL=konsole` is the explicit answer, and `CCTAB_TERMINAL=<anything
+  else>` is how a leaked `KONSOLE_*` is turned off. It is also the only way to
+  know, over ssh or inside tmux, that the tab at the far end is Konsole's.
 - **`session-start` and `session-end` are Linux-only.** They resolve the pty
   through `/proc/$CLAUDE_PID/fd/1`, which macOS and Git Bash do not have, so on
   those platforms Konsole arming does not happen (fine, they are not Konsole)
@@ -451,6 +748,10 @@ set the override in the remote shell:
 CCTAB_GLYPH_POS=suffix   # last; what Konsole is given automatically
 CCTAB_GLYPH_POS=prefix   # first; the default when the terminal is unknown
 CCTAB_GLYPH_POS=both     # both ends, immune to either, costs two columns
+
+Inside tmux it picks which end of the tab the glyph STRIP goes on, and `both` is
+not doubled there: a strip is not a marker, and six cells at each end is the
+whole tab.
 ```
 
 An unrecognised value falls back to `prefix`.
@@ -507,6 +808,32 @@ everything from the first dot, so `srv.example.com` still renders as `srv:`,
 unless the name is all digits and dots, where `192.168.1.5` would otherwise
 become `192:`. It is still only used when `SSH_CONNECTION` or `SSH_TTY` says this
 is an ssh session, so exporting it globally is safe.
+
+
+## Environment
+
+Everything the runtime half reads, in one place:
+
+| variable | default | what it does |
+|---|---|---|
+| `CCTAB_GLYPH_WORKING` / `_WAITING` / `_IDLE` | 🔵 / 🟠 / ⚪ | the three glyphs; empty drops the glyph and its space |
+| `CCTAB_GLYPH_POS` | terminal-dependent | `prefix`, `suffix` or `both`; inside tmux, which end the strip goes on |
+| `CCTAB_MAX_LOCATION` | `32` | characters before the location elides; `0` = no limit |
+| `CCTAB_MAX_HOST` | `16` | characters for the ssh host prefix; `0` = no limit |
+| `CCTAB_ELLIPSIS` | `…` | the elision marker |
+| `CCTAB_HOST` | `/proc`'s hostname | the ssh prefix, instead of this machine's name |
+| `CCTAB_TERMINAL` | unset | `konsole` (matched case-insensitively) arms Konsole's per-tab format even over ssh or inside tmux, and moves the strip to the end Konsole does not elide; any other value says explicitly NOT Konsole. **The one knob here that changes what paints outside tmux as well as in.** |
+| `CCTAB_TTL_WORKING` | `1200` | seconds before 🔵 decays to ⚪ in a tmux tab; `0` = never |
+| `CCTAB_TTL_WAITING` | `900` | seconds before 🟠 decays to ⚪; `0` = never |
+| `CCTAB_TTL_GONE` | `3600` | seconds before a cell leaves the tmux strip; `0` = never |
+| `CCTAB_NO_TMUX` | unset | set to anything: no record, no `tmux` invocation, no arming |
+| `CCTAB_DRY_RUN` | unset | `1` prints the computed tab title and emits nothing |
+| `CCTAB_NOW` | unset | test only: pins the epoch the tmux record carries |
+
+`CLAUDE_PID` is exported into every hook subprocess and is how `session-start`
+and `session-end` find the pty. `TMUX`, `TMUX_PANE`, `STY`, `KONSOLE_VERSION`,
+`KONSOLE_DBUS_SESSION`, `SSH_CONNECTION`, `SSH_TTY`, `HOME`, `PWD`, `HOSTNAME`
+and `GIT_DIR` are read as they are.
 
 ## Build
 
@@ -566,7 +893,7 @@ sh tests/run.sh
 CCTAB_TEST_BIN=target/release/tabstatus sh tests/run.sh   # a build you just made
 ```
 
-279 assertions, and what they drive is `bin/tabstatus` - the same binary
+371 assertions, and what they drive is `bin/tabstatus` - the same binary
 `hooks/hooks.json` invokes, so a stale committed binary fails here rather than in
 somebody's tab. The suite used to run the shell implementation under three shells
 in four locales, because its answer depended on both; a binary has no
@@ -582,8 +909,17 @@ all - that `repair` answers differently from `String::from_utf8_lossy` on a
 truncated sequence, for one.
 
 ```sh
-cargo test   # 101 tests, beside the 279 assertions and the 292 corpus cases
+cargo test   # 112 tests, beside the 371 assertions and the 312 corpus cases
 ```
+
+Eighty-one of the assertions are the tmux section, and they drive a PRIVATE
+tmux server - `tmux -L cctabprobe -f /dev/null`, killed afterwards, with no
+client ever attached, so no pty is touched and the user's own server is never
+listed, configured or killed. They are SKIPPED, never failed, where there is no
+`tmux` binary. What they cannot see is tmux re-EMITTING the title to an attached
+client, which needs a pty this suite cannot allocate; what they do assert is the
+whole of the server side, including that re-rendering the same paint after a wait
+gives a different answer with no process running and no hook firing.
 
 Two of the assertions exist only to guard the committed binaries: `bin/` carries
 a digest of the `src/*.rs` and `Cargo.toml` it was built from, and the suite
@@ -637,7 +973,7 @@ Two things the suite deliberately does not assert. The real emitting path of
 `session-start` and `session-end` needs an allocated pty, which would cost a
 dependency; it is checked by hand instead - 82 bytes for a startup, the OSC 50
 arming pair of [Konsole](#konsole) followed by the idle title, and 0 bytes for a
-compaction - and by the 292-case golden corpus in
+compaction - and by the 312-case golden corpus in
 [`tests/corpus/`](tests/corpus/), which replays every edge over a freshly
 allocated pty and compares bytes. And the belt is pinned at its real reach rather than a wished-for
 one: `{"source": "compact"}` on one line is caught, the same payload
@@ -646,7 +982,7 @@ pretty-printed over three lines is not, because only the first line is read.
 ### The golden corpus
 
 ```sh
-sh tests/corpus/replay.sh bin/tabstatus     # 292 passed, 0 failed
+sh tests/corpus/replay.sh bin/tabstatus     # 312 passed, 0 failed
 ```
 
 `tests/corpus/cases.jsonl` is the frozen, byte-level record of what the POSIX sh
@@ -728,6 +1064,16 @@ the pre-refactor binary, and 101 new in-crate unit tests. Two defects were found
 and deliberately NOT fixed, because mixing a fix into this slice would have cost
 the proof - they are the two below.
 
+Built in slice 6: tmux. Inside a tmux server the tab title becomes a function of
+time - one cell per claude pane, decaying on tmux's own clock - so every one of
+the "paints with no matching un-paint" defects above heals itself there. The
+payload becomes a record, `SessionStart` configures the server in one invocation
+and saves what it replaced, `uninstall` puts it back, and the hot path execs
+nothing at all. Exactly one golden-corpus case changed - the
+session-start-inside-tmux pty case, whose payload is now the record - and
+nineteen were added; every case where `$TMUX` is unset is byte-identical, and so
+is every dry run whatever `$TMUX` says. See [tmux](#tmux).
+
 **Known defects, reproduced and deferred.** Both predate the Rust port, both are
 reproduced by the current binary, and both belong to a slice that is allowed to
 change behaviour:
@@ -752,7 +1098,6 @@ change behaviour:
 
 **Not yet built:**
 
-- A tmux branch, for when the session is inside tmux rather than a bare tab.
 - A compaction *edge*, as opposed to today's guard. `SessionStart` carries
   `"matcher": "startup|resume|clear|fork"`, which leaves out `compact`, and the
   binary refuses a `compact` payload as well; neither of those paints anything

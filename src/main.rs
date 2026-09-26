@@ -28,7 +28,7 @@
 //! to change behaviour. `panic = "abort"` is in the release profile, so nothing
 //! here indexes or unwraps.
 //!
-//! `tests/corpus/` is the behaviour specification: 292 reproducible cases pinning
+//! `tests/corpus/` is the behaviour specification: 312 reproducible cases pinning
 //! argv, environment, cwd and stdin to exact stdout bytes and an exit code, with
 //! `tests/oracle/tabstatus.sh` retained so any of them can be re-derived rather
 //! than trusted.
@@ -44,6 +44,7 @@ mod payload;
 mod render;
 mod settings;
 mod text;
+mod tmux;
 
 use config::Config;
 use edge::{Edge, Paint};
@@ -103,14 +104,37 @@ fn paint(edge: Edge) -> io::Result<()> {
     };
 
     let cfg = Config::from_env();
-    let title = render::compose(paint, &cfg);
+    let composed = render::compose(paint, &cfg);
 
+    // Dry run prints the TAB TITLE whatever else is true, so it stays the way to
+    // see what a directory would paint - and so the golden corpus's dry-run cases
+    // are unchanged by anything below.
     if cfg.dry_run {
-        return emit::dry_run(&title);
+        return emit::dry_run(&composed.title);
     }
+
+    // Inside tmux an OSC 0 emitted in a pane never reaches the outer terminal: it
+    // sets `pane_title`, and tmux re-emits a title of its OWN. So inside tmux the
+    // same sequence stops being a tab title and becomes the record
+    // `tmux::title_format` reads back - the ONE branch tmux puts on the hot path,
+    // and it execs nothing.
+    let payload = match cfg.tmux {
+        Some(_) => tmux::carrier(paint, &composed.place),
+        None => composed.title,
+    };
     match paint {
-        Paint::SessionStart => emit::session_start(&title, &cfg),
-        Paint::SessionEnd => emit::session_end(&cfg),
-        Paint::Line(_) => emit::json_line(&title),
+        Paint::SessionStart => {
+            // Before the first title lands, for the same reason the Konsole
+            // arming precedes it: a tab painted before it can show the paint.
+            tmux::session_start(&cfg);
+            tmux::arm_konsole(&cfg);
+            emit::session_start(&payload, &cfg)
+        }
+        Paint::SessionEnd => {
+            let r = emit::session_end(&cfg);
+            tmux::session_end(&cfg);
+            r
+        }
+        Paint::Line(_) => emit::json_line(&payload),
     }
 }

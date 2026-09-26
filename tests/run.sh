@@ -1331,6 +1331,494 @@ else
     printf 'SKIP  real-git cross-check (no git binary)\n'
 fi
 
+# --- CCTAB_TERMINAL --------------------------------------------------------
+# `KONSOLE_*` is inherited environment and does not survive an ssh, so over ssh
+# or inside tmux there is nothing to detect. This says it explicitly, and any
+# other value says explicitly NOT Konsole - which is how a leaked `KONSOLE_*`
+# from a locally launched xterm is turned off.
+check 'CCTAB_TERMINAL=konsole picks the Konsole glyph position' '~/plaindir ⚪' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CCTAB_TERMINAL=konsole CCTAB_DRY_RUN=1 \
+          "$bin" idle </dev/null)"
+check 'CCTAB_TERMINAL=konsole survives a multiplexer' '~/plaindir ⚪' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CCTAB_TERMINAL=konsole TMUX=nonsense \
+          CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+check 'any other value says explicitly NOT Konsole' '⚪ ~/plaindir' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp KONSOLE_VERSION=260801 \
+          CCTAB_TERMINAL=wezterm CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+# A byte compare made CCTAB_TERMINAL=Konsole mean "explicitly NOT Konsole" and
+# silently turned the arming and the suffix layout off - the opposite of what was
+# typed. ASCII case-insensitive, and still exact: konsol and konsolex are not it.
+check 'CCTAB_TERMINAL=Konsole is Konsole' '~/plaindir ⚪' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CCTAB_TERMINAL=Konsole CCTAB_DRY_RUN=1 \
+          "$bin" idle </dev/null)"
+check 'CCTAB_TERMINAL=KONSOLE is Konsole' '~/plaindir ⚪' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CCTAB_TERMINAL=KONSOLE CCTAB_DRY_RUN=1 \
+          "$bin" idle </dev/null)"
+check 'a near miss is still NOT Konsole' '⚪ ~/plaindir' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp KONSOLE_VERSION=260801 \
+          CCTAB_TERMINAL=konsolex CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+check 'an empty CCTAB_TERMINAL is unset' '⚪ ~/plaindir' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CCTAB_TERMINAL= CCTAB_DRY_RUN=1 \
+          "$bin" idle </dev/null)"
+check 'doctor names CCTAB_TERMINAL as the reason' '1' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          CCTAB_TERMINAL=konsole "$bin" doctor 2>&1 \
+       | grep -c '^terminal: *Konsole, from CCTAB_TERMINAL=konsole')"
+check 'doctor names it when it says NOT Konsole too' '1' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          KONSOLE_VERSION=260801 CCTAB_TERMINAL=wezterm "$bin" doctor 2>&1 \
+       | grep -c '^terminal: *not Konsole: CCTAB_TERMINAL=wezterm')"
+check 'doctor points at it when a multiplexer hides KONSOLE_*' '1' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          KONSOLE_VERSION=260801 TMUX=nonsense "$bin" doctor 2>&1 \
+       | grep -c 'set CCTAB_TERMINAL=konsole if the outer terminal really is Konsole')"
+# The likeliest misconfiguration in the topology this slice exists for is a
+# Konsole tab that ssh'ed into a tmux, where nothing can be detected: doctor has
+# to name the remedy, not just the problem.
+check 'doctor names the remedy on the multiplexer line' '1' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          TMUX=nonsense "$bin" doctor 2>&1 \
+       | grep -c 'If the outer terminal IS Konsole, set CCTAB_TERMINAL=konsole')"
+
+# --- tmux ------------------------------------------------------------------
+# Inside tmux the OSC 0 the plugin emits never reaches the outer terminal: tmux
+# stores it as `pane_title` and emits a title of its OWN, computed from
+# `set-titles-string`. So inside tmux that OSC 0 stops being a tab title and
+# becomes a RECORD - `<location> ct1 <state> <epoch>` - and the format
+# SessionStart installs turns the records of every claude pane into a strip of
+# glyphs that DECAYS: the painted glyph while fresh, the idle glyph once stale,
+# nothing at all once old. Nothing has to fire for the tab to stop lying, which
+# is what makes an abandoned dialog, a local slash command and Ctrl+C heal
+# themselves.
+#
+# Everything below drives a PRIVATE server, `tmux -L cctabprobe -f /dev/null`,
+# and kills it afterwards. The user's own server is never listed, attached,
+# configured or killed, `-f /dev/null` means no ~/.tmux.conf is read, and no
+# client is ever attached, so no pty is touched.
+#
+# WHAT THIS CANNOT SEE: tmux RE-EMITTING the title to an attached client. That
+# needs a pty, which this suite cannot allocate (the corpus can, and does, for
+# the two direct-write edges). What is asserted instead is the whole of the
+# server side: that the format is a function of the clock, that re-rendering it
+# after a wait gives a different answer with no process running and no hook
+# firing, and that the two settings tmux re-renders ON are in force.
+ts=cctabprobe
+tmux_gone() { tmux -L "$ts" kill-server 2>/dev/null; }
+if ! command -v tmux >/dev/null 2>&1; then
+    printf 'SKIP  tmux section (no tmux binary on PATH)\n'
+else
+    # Fold the probe server into the existing cleanup, so a failure below cannot
+    # leave a server running.
+    cleanup() { tmux_gone; rm -rf "$tmp"; }
+    tmux_gone
+    tsock=/tmp/tmux-$(id -u)/$ts
+    mkdir -p "$tmp/code/one" "$tmp/code/two" "$tmp/plain"
+    # tm <args> -- a command on the private server
+    tm() { tmux -L "$ts" -f /dev/null "$@"; }
+    # trec <edge> <cwd> <epoch> -- the record the binary emits inside tmux,
+    # taken from the binary's OWN hook line so the test and the product cannot
+    # drift apart.
+    trec() {
+        (cd -- "$2" && HOME=$tmp TMUX="$tsock,1,0" TMUX_PANE=%0 CCTAB_NOW=$3 \
+            "$bin" "$1" </dev/null) \
+            | sed 's/.*terminalSequence":"\\u001b]0;//; s/\\u0007".*//'
+    }
+    # tput_title <pane> <record> -- write the record from INSIDE the pane, which
+    # is the only route that reaches pane_title, and wait for it to land.
+    tput_title() {
+        tm send-keys -t "$1" "printf '\\033]0;$2\\a'" Enter
+        _i=0
+        while [ "$_i" -lt 60 ]; do
+            [ "$(tm display-message -p -t "$1" '#{pane_title}')" = "$2" ] && return 0
+            sleep 0.1 2>/dev/null || sleep 1
+            _i=$((_i + 1))
+        done
+        return 1
+    }
+    # tsession_start <cwd> [env...] -- the real SessionStart edge, against the
+    # private server. CLAUDE_PID is unset, so no pty is written.
+    tsession_start() {
+        _d=$1
+        shift
+        (cd -- "$_d" && env HOME=$tmp TMUX="$tsock,1,0" TMUX_PANE=%0 "$@" \
+            "$bin" session-start </dev/null >/dev/null 2>&1)
+    }
+    # trender [pane] -- what tmux would send the outer terminal right now
+    trender() {
+        tm display-message -p -t "${1:-t:w0.0}" "$tsts"
+    }
+
+    tmux -V >/dev/null 2>&1
+    tm new-session -d -s t -n w0 -x 200 -y 50 /bin/sh
+    # A user who already has both of these set, so the save and restore have
+    # something real to preserve.
+    TUSER='MY OWN #{pane_title} TITLE'
+    tm set -g set-titles-string "$TUSER"
+    tm set -g set-titles off
+    tm set -g status on
+    tm set -g status-interval 1
+
+    # The product prints the two strings it installs, so this suite drives the
+    # server with EXACTLY the product's format and not a copy of it.
+    tsts=$(env -u TMUX "$bin" tmux-format | sed -n 1p)
+    tfmt=$(env -u TMUX "$bin" tmux-format | sed -n 2p)
+    check 'tmux-format prints the prefix trim'  '#{s|^ ||:#{T:@cctab_title}}' "$tsts"
+    check 'tmux-format suffix swaps the trim'   '#{s| $||:#{T:@cctab_title}}' \
+        "$(env -u TMUX CCTAB_GLYPH_POS=suffix "$bin" tmux-format | sed -n 1p)"
+    check 'the format is one strip and one label' '1' \
+        "$(printf '%s' "$tfmt" | grep -c '#{W:#{P:')"
+
+    tsession_start "$tmp/code/one"
+    check 'session-start installs our set-titles-string' "$tsts" \
+        "$(tm show -gv set-titles-string)"
+    check 'session-start installs the generated format' "$tfmt" \
+        "$(tm display-message -p '#{@cctab_title}')"
+    check 'session-start turns set-titles on' 'on' "$(tm show -gv set-titles)"
+    check 'session-start writes the three glyphs' '🔵|🟠|⚪' \
+        "$(tm display-message -p '#{@cctab_gw}|#{@cctab_ga}|#{@cctab_gi}')"
+    check 'session-start writes the three TTLs' '1200|900|3600' \
+        "$(tm display-message -p '#{@cctab_tw}|#{@cctab_ta}|#{@cctab_tg}')"
+    check 'session-start saves the string it replaced' "$TUSER" \
+        "$(tm display-message -p '#{@cctab_prev_string}')"
+    check 'session-start saves set-titles as it found it' '0' \
+        "$(tm display-message -p '#{@cctab_prev_titles}')"
+    # The save is guarded, so a second claude cannot record OUR string as the
+    # user's - the defect that would make uninstall install our own format.
+    tsession_start "$tmp/code/two"
+    check 'a second session-start does not clobber the save' "$TUSER" \
+        "$(tm display-message -p '#{@cctab_prev_string}')"
+    check 'the TTLs are configurable' '5|6|7' \
+        "$(tsession_start "$tmp/code/one" CCTAB_TTL_WORKING=5 CCTAB_TTL_WAITING=6 \
+              CCTAB_TTL_GONE=7
+           tm display-message -p '#{@cctab_tw}|#{@cctab_ta}|#{@cctab_tg}')"
+    check 'TTL 0 is a deadline no age can reach' '2147483647' \
+        "$(tsession_start "$tmp/code/one" CCTAB_TTL_GONE=0
+           tm display-message -p '#{@cctab_tg}')"
+    tsession_start "$tmp/code/one"
+
+    # The record itself, which is what the format reads back.
+    check 'the working record names the state' "~/code/one ct1 w 1700000000" \
+        "$(trec working "$tmp/code/one" 1700000000)"
+    check 'the waiting record names the state' "~/code/two ct1 a 1700000000" \
+        "$(trec waiting "$tmp/code/two" 1700000000)"
+    check 'the idle record names the state' "~/plain ct1 i 1700000000" \
+        "$(trec idle "$tmp/plain" 1700000000)"
+    check 'outside tmux nothing is tagged' \
+        '{"terminalSequence":"\u001b]0;🔵 ~/plain\u0007","suppressOutput":true}' \
+        "$(cd -- "$tmp/plain" && HOME=$tmp "$bin" working </dev/null)"
+
+    # A cell per claude PANE - `#{W:#{P:}}` and not `#{W:}`, because
+    # `#{pane_title}` inside a window loop reads only that window's ACTIVE pane,
+    # so two claudes split in one window would show one cell.
+    tm new-window -d -t t -n w1 /bin/sh
+    tm split-window -d -t t:w1 /bin/sh
+    tm new-window -d -t t -n shell /bin/sh
+    tnow=$(tm display-message -p '%s')
+    tput_title t:w0.0 "$(trec working "$tmp/code/one" "$tnow")"
+    tput_title t:w1.0 "$(trec waiting "$tmp/code/two" "$tnow")"
+    tput_title t:w1.1 "$(trec idle "$tmp/plain" "$tnow")"
+    check 'a cell per claude pane, in window then pane order' \
+        '🔵🟠⚪ ~/code/one' "$(trender)"
+    check 'a plain shell contributes no cell' '🔵🟠⚪ t:2:shell' "$(trender t:shell.0)"
+
+    # The decay, by backdating the record the binary itself produced. 1300s is
+    # past the 1200s working TTL and short of the 3600s disappear horizon; the
+    # flip itself is strictly-greater over integer seconds, so the earliest
+    # possible one is TTL+1s.
+    tput_title t:w0.0 "$(trec working "$tmp/code/one" $((tnow - 1300)))"
+    check 'working past its TTL decays to the idle glyph' '⚪🟠⚪ ~/code/one' "$(trender)"
+    tput_title t:w0.0 "$(trec working "$tmp/code/one" $((tnow - 4000)))"
+    check 'past the disappear horizon the cell is gone' '🟠⚪ ~/code/one' "$(trender)"
+    tput_title t:w1.0 "$(trec waiting "$tmp/code/two" $((tnow - 400)))"
+    check 'waiting is a summons and survives a coffee break' '🟠⚪ ~/code/one' \
+        "$(trender)"
+    tput_title t:w1.0 "$(trec waiting "$tmp/code/two" $((tnow - 1000)))"
+    check 'waiting past its own TTL decays too' '⚪⚪ ~/code/one' "$(trender)"
+
+    # THE POINT OF THE SLICE: the title changes because time passed. No process
+    # is running, no hook fires, nothing is notified - the only input that moved
+    # is the clock tmux reads for itself.
+    tsession_start "$tmp/code/one" CCTAB_TTL_WORKING=2 CCTAB_TTL_GONE=600
+    for _p in t:w0.0 t:w1.0 t:w1.1; do tput_title "$_p" ''; done
+    tput_title t:w0.0 "$(trec working "$tmp/code/one" "$(tm display-message -p '%s')")"
+    tfresh=$(trender)
+    sleep 3
+    tstale=$(trender)
+    check 'a fresh paint renders the working glyph' '🔵 ~/code/one' "$tfresh"
+    check 'the SAME paint renders white three seconds later' '⚪ ~/code/one' "$tstale"
+    check 'and the decay ran with nothing running' 'changed' \
+        "$([ "$tfresh" != "$tstale" ] && echo changed || echo 'the same')"
+    # The clock that re-renders it. Without these two the flip above still
+    # happens on demand, but tmux never re-emits it to the terminal on its own -
+    # measured: with status off the title is re-evaluated once, about five
+    # seconds after a client attaches, and then never again.
+    check 'the decay clock is status plus status-interval' 'on|1' \
+        "$(tm display-message -p '#{status}|#{status-interval}')"
+
+    # Session end clears the record, which is what removes the cell, and with no
+    # claude left the tab falls back to a tmux-shaped label rather than blanking.
+    for _p in t:w0.0 t:w1.0 t:w1.1; do tput_title "$_p" ''; done
+    check 'with no claude anywhere the label stands alone' 't:0:w0' "$(trender)"
+
+    # No tmux invocation on the hot path. This is the assertion, not the timing:
+    # one `tmux set-option` costs 2.84ms against a 0.37ms fork floor, so a hot
+    # edge that touched the server would be a tenfold regression on a binary that
+    # runs in 370us. If it ever does exec, it will configure the server, and the
+    # server says so.
+    check 'the hot edges exec no tmux at all' 'off|' \
+        "$(tm set -g set-titles off
+           tm set -su @cctab_title 2>/dev/null
+           for _e in working waiting idle notify; do
+               (cd -- "$tmp/plain" && HOME=$tmp TMUX="$tsock,1,0" TMUX_PANE=%0 \
+                   "$bin" "$_e" </dev/null >/dev/null 2>&1)
+           done
+           printf '%s|%s' "$(tm show -gv set-titles)" \
+               "$(tm display-message -p '#{@cctab_title}')")"
+    tsession_start "$tmp/code/one"
+
+    # The suffix layout is the same two pieces the other way round, for a tab that
+    # elides from the LEFT.
+    tput_title t:w0.0 "$(trec working "$tmp/code/one" "$(tm display-message -p '%s')")"
+    check 'the prefix layout puts the strip first' '🔵 ~/code/one' "$(trender)"
+    check 'the suffix layout puts the strip last' '~/code/one 🔵' \
+        "$(tsession_start "$tmp/code/one" CCTAB_GLYPH_POS=suffix
+           tm display-message -p -t t:w0.0 "$(env -u TMUX CCTAB_GLYPH_POS=suffix \
+               "$bin" tmux-format | sed -n 1p)")"
+    tsession_start "$tmp/code/one"
+
+    # Konsole, inside tmux: the arming goes to the attached CLIENT's pty, never
+    # to our own pane, and with no client attached there is nothing to write and
+    # nothing to fail. The strip also moves to the end Konsole does not elide.
+    check 'CCTAB_TERMINAL=konsole moves the strip to the suffix end' \
+        '#{s| $||:#{T:@cctab_title}}' \
+        "$(tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+           tm show -gv set-titles-string)"
+    check 'and session-end with no client attached is inert' '0' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp TMUX="$tsock,1,0" TMUX_PANE=%0 \
+              CCTAB_TERMINAL=konsole "$bin" session-end </dev/null >/dev/null 2>&1
+           echo $?)"
+
+    # THE RE-ARM. SessionStart's arming goes to the ptys `list-clients` names, so
+    # an arming sent while DETACHED reaches nobody, and on reattach tmux replays
+    # the TITLE but never the arming - measured with a real pty, the reattached
+    # terminal was governed by Konsole's RemoteTabTitleFormat again and the glyph
+    # was invisible. "Close the laptop while Claude keeps working" is the whole
+    # point of the topology, so the server itself re-arms, from a session hook.
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check 'konsole mode installs the client-attached hook' \
+        "run-shell -b \"'#{@cctab_exe}' tmux-arm '#{client_tty}'\"" \
+        "$(tm display-message -p -t t:w0.0 '#{client-attached[1971]}')"
+    # The path is an OPTION and not text inside the hook: a hook value is parsed
+    # when it is SET, and measured, `$rd` inside tmux's double quotes is expanded
+    # there - a path holding `$` would lose a piece of itself. An option's value is
+    # substituted literally.
+    check 'and the binary travels as an option the hook expands' 'executable' \
+        "$([ -x "$(tm display-message -p '#{@cctab_exe}')" ] && echo executable \
+            || echo "[$(tm display-message -p '#{@cctab_exe}')]")"
+    check 'the hook is scoped to our session, not the server' '' \
+        "$(tm show-hooks -g | grep 'client-attached\[1971\]')"
+    # Not Konsole takes it back off: the layout and the TTLs are already
+    # last-SessionStart-wins, and an arming in force while the strip moved back to
+    # the end Konsole elides is worse than either.
+    tsession_start "$tmp/code/one"
+    check 'a later plain session-start removes the hook again' '' \
+        "$(tm display-message -p -t t:w0.0 '#{client-attached[1971]}')"
+    # A user's own hooks live in the same array, and a BARE `set-hook -g
+    # client-attached` replaces the WHOLE of it - measured. Ours is one index.
+    tm set-hook -ga client-attached 'run-shell -b "true"'
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check "a user's own client-attached hook survives ours" '1' \
+        "$(tm show-hooks -g | grep -c 'client-attached\[0\]')"
+    tm set-hook -gu client-attached
+
+    # uninstall is the ONLY thing that puts the user's own pair back: the options
+    # are server-wide, so a SessionEnd doing it would unpaint the other claude
+    # windows still running.
+    tsession_start "$tmp/code/one"
+    tucfg=$tmp/tmuxcfg
+    mkdir -p "$tucfg"
+    (cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+        TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" uninstall --force) >"$tmp/unin.txt" 2>&1
+    check 'uninstall restores the string SessionStart replaced' "$TUSER" \
+        "$(tm show -gv set-titles-string)"
+    check 'uninstall restores set-titles as it was found' 'off' \
+        "$(tm show -gv set-titles)"
+    check 'uninstall says what it restored' '1' \
+        "$(grep -c '^tmux:.*restored' "$tmp/unin.txt")"
+    check 'uninstall leaves none of our options behind' '' \
+        "$(tm display-message -p \
+            '#{@cctab_gw}#{@cctab_ga}#{@cctab_gi}#{@cctab_tw}#{@cctab_ta}#{@cctab_tg}#{@cctab_title}#{@cctab_string}#{@cctab_saved}#{@cctab_prev_string}#{@cctab_prev_titles}')"
+    # THE SHARPEST WAY TO GET UNINSTALL WRONG: on a server no SessionStart has
+    # ever reached, there is nothing of ours to put back, and a blind
+    # `set -gu set-titles-string` would silently unset a string the user had set
+    # themselves. The save flag is what decides, and nothing would report it if it
+    # did not.
+    # The uninstall above removed every option of ours, so the server is already
+    # in the "no SessionStart ever reached me" state. Give it the user's pair back
+    # and ask again.
+    tm set -g set-titles-string "$TUSER"
+    tm set -g set-titles on
+    (cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+        TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" uninstall --force) >"$tmp/unin2.txt" 2>&1
+    check 'uninstall leaves a string that was never ours alone' "$TUSER" \
+        "$(tm show -gv set-titles-string)"
+    check 'and leaves set-titles alone too' 'on' "$(tm show -gv set-titles)"
+    check 'and says so rather than claiming a restore' '1' \
+        "$(grep -c '^tmux:.*not ours to change' "$tmp/unin2.txt")"
+
+    # THE OTHER SHARP WAY TO GET UNINSTALL WRONG: a saved string that POINTS AT our
+    # own option. Pinning the pair from `tabstatus tmux-format` into ~/.tmux.conf -
+    # which this README invites - means the first SessionStart saves OURS as the
+    # user's, and putting it back after @cctab_title has been unset renders the
+    # EMPTY string: a permanently blank tab title, reported as "restored".
+    tm set -g set-titles-string "$tsts"
+    tm set -g set-titles on
+    tsession_start "$tmp/code/one"
+    check 'the save really did record our own string' "$tsts" \
+        "$(tm display-message -p '#{@cctab_prev_string}')"
+    (cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+        TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" uninstall --force) >"$tmp/unin3.txt" 2>&1
+    check 'uninstall does not put back a saved string of our own' '1' \
+        "$(grep -c 'was one of OURS' "$tmp/unin3.txt")"
+    check 'and set-titles-string is left at tmux own default' 'default' \
+        "$([ "$(tm show -gv set-titles-string)" = "$tsts" ] && echo ours || echo default)"
+    check 'so the tab title is not blank' 'renders' \
+        "$([ -n "$(tm display-message -p -t t:w0.0 \
+             "$(tm show -gv set-titles-string)")" ] && echo renders || echo blank)"
+
+    # uninstall stops every claude window on this server, not just this one, and
+    # has to say so: their records stay in their pane titles and then show up raw
+    # in whatever title the restored string renders.
+    tsession_start "$tmp/code/one"
+    tput_title t:w1.0 "$(trec waiting "$tmp/code/two" "$(tm display-message -p '%s')")"
+    (cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+        TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" uninstall --force) >"$tmp/unin4.txt" 2>&1
+    check 'uninstall warns that other claude panes stop updating' '1' \
+        "$(grep -c 'other claude pane' "$tmp/unin4.txt")"
+    tput_title t:w1.0 ''
+
+    # Outside tmux it cannot restore anything, and says so rather than claiming
+    # success.
+    check 'uninstall outside tmux says it could not restore' '1' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              env -u TMUX -u TMUX_PANE "$bin" uninstall --force 2>&1 \
+           | grep -c 'not inside tmux')"
+
+    # doctor, which is the one command whose job is to explain a tmux that is not
+    # cooperating.
+    tsession_start "$tmp/code/one"
+    tdoc=$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+        TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" doctor 2>&1)
+    check 'doctor reports the server it is inside' '1' \
+        "$(printf '%s\n' "$tdoc" | grep -c "^tmux: *OK .*$tsock, pane %0")"
+    check 'doctor reports the decay clock as OK' '1' \
+        "$(printf '%s\n' "$tdoc" | grep -c 'decay: OK')"
+    check 'doctor recognises its own set-titles-string' '1' \
+        "$(printf '%s\n' "$tdoc" | grep -c 'title: OK')"
+    check 'doctor reports the TTLs in force' '1' \
+        "$(printf '%s\n' "$tdoc" | grep -c 'ttl: working 1200s, waiting 900s, gone 3600s')"
+    # `0` is a deadline no age can reach, and doctor must say so in words: it used
+    # to print the internal 2147483647 on a line whose own legend says 0 = never.
+    check 'doctor says never rather than the sentinel' '1' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 CCTAB_TTL_WORKING=0 "$bin" doctor 2>&1 \
+           | grep -c 'ttl: working never, waiting 900s')"
+    tm set -g status off
+    tm set -g status-interval 0
+    check 'doctor warns loudly when the decay cannot tick' '1' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" doctor 2>&1 \
+           | grep -c 'decay: WARN status off, status-interval 0')"
+    check 'doctor names the remedy' '1' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" doctor 2>&1 \
+           | grep -c 'set -g status on ; set -g status-interval 5')"
+    tm set -g set-titles off
+    check 'doctor catches a set-titles that is off' '1' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" doctor 2>&1 \
+           | grep -c 'title: FAIL set-titles is off')"
+    # And it blames the right thing. With OUR save in place a session-local
+    # override is the explanation and `set -u set-titles` is the remedy; on a server
+    # no SessionStart has reached, the same branch used to prescribe that no-op.
+    check 'doctor blames a session-local override when we did install' '1' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" doctor 2>&1 \
+           | grep -c 'a session-local `set-titles off` is beating that')"
+    check 'and blames tmux own default when no SessionStart has run here' '1' \
+        "$(tm set -su @cctab_saved
+           cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" doctor 2>&1 \
+           | grep -c 'No SessionStart has configured this server')"
+    tm set -g set-titles on
+
+    # doctor on the re-arm hook, in Konsole mode only - the one place a user can
+    # see whether a reattach will be armed.
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check 'doctor reports the re-arm hook as OK' '1' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 CCTAB_TERMINAL=konsole "$bin" doctor 2>&1 \
+           | grep -c 'arm: OK')"
+    check 'and warns, with the remedy, when the hook is gone' '1' \
+        "$(tm set-hook -u -t t:w0.0 'client-attached[1971]'
+           cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 CCTAB_TERMINAL=konsole "$bin" doctor 2>&1 \
+           | grep -c 'arm: WARN no client-attached hook')"
+    check 'and says nothing about arming outside konsole mode' '0' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" doctor 2>&1 | grep -c 'arm:')"
+    # The LAYOUT is server-wide too, and `title: OK` can never catch a drift: the
+    # SessionStart that changed the layout rewrote @cctab_string in the same batch,
+    # so those two always agree. The server is on suffix here, from the konsole
+    # SessionStart above, and this session would install prefix.
+    check 'doctor catches a layout the server does not have' '1' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" doctor 2>&1 \
+           | grep -c 'layout: WARN the server has the strip last')"
+    check 'and says nothing when the layouts agree' '0' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 CCTAB_TERMINAL=konsole "$bin" doctor 2>&1 \
+           | grep -c 'layout:')"
+    tsession_start "$tmp/code/one"
+    # A missing tmux(1) and a socket that is gone took the same FAIL branch and the
+    # same hedged sentence, although one is fixed by installing tmux and the other
+    # by unsetting a stale exported $TMUX.
+    check 'doctor names a missing tmux binary' '1' \
+        "$(mkdir -p "$tmp/nobin"
+           cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg PATH=$tmp/nobin \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" doctor 2>&1 \
+           | grep -c 'tmux(1) is not on PATH')"
+    check 'and names a socket that is gone as the other thing' '1' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tmp/no-such-socket,1,0" TMUX_PANE=%0 "$bin" doctor 2>&1 \
+           | grep -c 'the socket it names is gone')"
+    # And the three shapes that are NOT a tmux server, each of which must leave
+    # the paint path exactly as it is outside tmux.
+    for _t in nonsense /tmp/s,1 /tmp/s,1,0,2 relative,1,0 /tmp/s,x,0; do
+        check "TMUX=$_t is not a tmux server" '🔵 ~/plain' \
+            "$(cd -- "$tmp/plain" && HOME=$tmp TMUX=$_t CCTAB_DRY_RUN=1 \
+                  "$bin" working </dev/null)"
+        check "TMUX=$_t emits an untagged title" \
+            '{"terminalSequence":"\u001b]0;🔵 ~/plain\u0007","suppressOutput":true}' \
+            "$(cd -- "$tmp/plain" && HOME=$tmp TMUX=$_t "$bin" working </dev/null)"
+    done
+    check 'CCTAB_NO_TMUX backs the whole slice out' \
+        '{"terminalSequence":"\u001b]0;🔵 ~/plain\u0007","suppressOutput":true}' \
+        "$(cd -- "$tmp/plain" && HOME=$tmp TMUX="$tsock,1,0" CCTAB_NO_TMUX=1 \
+              "$bin" working </dev/null)"
+    check 'and then execs no tmux at all' 'off' \
+        "$(tm set -g set-titles off
+           cd -- "$tmp/plain" && HOME=$tmp TMUX="$tsock,1,0" TMUX_PANE=%0 \
+              CCTAB_NO_TMUX=1 "$bin" session-start </dev/null >/dev/null 2>&1
+           tm show -gv set-titles)"
+    check 'screen gets nothing, deliberately' \
+        '{"terminalSequence":"\u001b]0;🔵 ~/plain\u0007","suppressOutput":true}' \
+        "$(cd -- "$tmp/plain" && HOME=$tmp STY=1234.pts-0.host "$bin" working </dev/null)"
+
+    tmux_gone
+    printf 'tmux section: private server %s, killed.\n' "$tsock"
+fi
+
 # --- summary --------------------------------------------------------------
 printf '\n----------------------------------------\n'
 printf '%d passed, %d failed\n' "$pass" "$fail"

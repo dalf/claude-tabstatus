@@ -62,6 +62,45 @@ FIXED = {
     # (b) a background subagent's PostToolUse no longer repaints working.
     "stdin-subagent-posttooluse":
         "fix-b: a payload carrying agent_id paints nothing on the working edge",
+    # (f) tmux. Inside a tmux server the OSC 0 payload stops being a tab title:
+    # tmux stores it as pane_title and emits a title of its OWN, computed from
+    # set-titles-string, which SessionStart installs. So the payload becomes the
+    # record that format reads back - `<location> ct1 <state> <epoch>` - and the
+    # glyph, which cannot be sliced back out of a title (#{=1:} counts COLUMNS and
+    # returns EMPTY for a width-2 emoji), travels as a state LETTER instead.
+    #
+    # The oracle shell knows nothing about any of this, so every case below is
+    # re-recorded from the binary. ONE of them is pre-existing and is therefore
+    # the slice's only corpus divergence; the rest are new. Every case where TMUX
+    # is unset, and every dry-run case whatever TMUX says, is untouched - the
+    # record is attached on the EMITTING path and never in render::compose.
+    "pty-session-start-konsole-in-tmux":
+        "fix-f: the ONE pre-existing divergence - inside tmux the pty gets the "
+        "record, not a glyph, and CCTAB_NOW pins its epoch",
+    "tmux-record-working":
+        "fix-f: the record carries the state as a letter",
+    "tmux-record-waiting":
+        "fix-f: the record carries the state as a letter",
+    "tmux-record-idle":
+        "fix-f: the record carries the state as a letter",
+    "tmux-record-without-a-pane":
+        "fix-f: the record needs no $TMUX_PANE",
+    "tmux-record-with-an-ssh-prefix":
+        "fix-f: the record carries the location the tab would have shown",
+    "tmux-record-is-not-affected-by-glyph-pos":
+        "fix-f: no glyph in the record, so no position in it either",
+    "tmux-record-ignores-a-glyph-override":
+        "fix-f: an override reaches the tab through a tmux option, not the record",
+    "tmux-and-sty-together-is-tmux":
+        "fix-f: tmux wins when both are set",
+    "tmux-terminal-override-konsole":
+        "fix-f: CCTAB_TERMINAL=konsole is the only Konsole signal that survives ssh",
+    "tmux-terminal-override-is-not-konsole":
+        "fix-f: any other CCTAB_TERMINAL value says explicitly NOT Konsole",
+    "tmux-terminal-override-konsole-mixed-case":
+        "fix-f: CCTAB_TERMINAL is matched case-insensitively",
+    "pty-session-start-tmux-arms-no-pane":
+        "fix-f: inside tmux the OSC 50 goes to the client's pty, never to our pane",
 }
 
 # Cases whose `diverge` flag became vestigial: the limitation they were named

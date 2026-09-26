@@ -74,10 +74,22 @@ fn escape_into(out: &mut String, s: &str) {
     }
 }
 
+/// Konsole's per-tab title format, set to "the title the shell sent" and back to
+/// Konsole's COMPILED-IN defaults. Named here rather than spelled at each use,
+/// because inside tmux the same two byte strings go to a tmux CLIENT's pty
+/// instead of to this pane - and an arming with no matching restore is this
+/// project's named defect.
+///
+/// SEAM: TabColor=#RRGGBB rides in this same property list - and whoever adds it
+/// must add TabColor=#000000 to the restore, or the colour outlives the session.
+pub const KONSOLE_ARM: &[u8] = b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07";
+pub const KONSOLE_RESTORE: &[u8] =
+    b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07";
+
 /// Arm this tab and paint it, in one write.
 pub fn session_start(title: &str, cfg: &Config) -> io::Result<()> {
     let mut out: Vec<u8> = Vec::with_capacity(title.len() + 96);
-    if cfg.terminal == Terminal::Konsole {
+    if cfg.terminal == Terminal::Konsole && cfg.tmux.is_none() {
         // %w makes the OSC 0 payload the entire tab text. Under Konsole's stock
         // formats an OSC 0 title is invisible in the tab, which is why Claude's
         // own title never shows up there. Konsole applies profile properties per
@@ -85,10 +97,10 @@ pub fn session_start(title: &str, cfg: &Config) -> io::Result<()> {
         // writes them to disk, so every other tab keeps its default title by
         // construction.
         //
-        // SEAM: TabColor=#RRGGBB rides in this same OSC 50 property list - and
-        // whoever adds it must also add TabColor=#000000 to the restore list in
-        // `session_end`, or the colour outlives the session.
-        out.extend_from_slice(b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07");
+        // Inside tmux this pane is not the tab, so the sequence would be
+        // swallowed; `tmux::arm_konsole` writes it to the attached client's pty
+        // instead, which is why the Konsole test above also asks for no tmux.
+        out.extend_from_slice(KONSOLE_ARM);
     }
     // The arming has to precede the title, or the tab is painted before it can
     // show what was painted.
@@ -101,16 +113,35 @@ pub fn session_start(title: &str, cfg: &Config) -> io::Result<()> {
 /// Restore the tab and blank its title, in one write.
 pub fn session_end(cfg: &Config) -> io::Result<()> {
     let mut out: Vec<u8> = Vec::with_capacity(96);
-    if cfg.terminal == Terminal::Konsole {
+    if cfg.terminal == Terminal::Konsole && cfg.tmux.is_none() {
         // We own restore: with the built-in terminal title disabled - which the
         // installer does, otherwise it repaints over ours every 960ms - Claude
         // Code no longer clears the title on exit either. The two formats below
         // are Konsole's COMPILED-IN defaults, not whatever a customized profile
         // had, because that is all we can know.
-        out.extend_from_slice(b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07");
+        out.extend_from_slice(KONSOLE_RESTORE);
     }
     out.extend_from_slice(b"\x1b]0;\x07");
     write_pty(cfg, &out)
+}
+
+/// Write to a pty NAMED BY tmux - an attached client's terminal - under the same
+/// guard [`session_tty`] applies to fd 1: under /dev/pts or /dev/tty, a character
+/// device, and writable. A failure is nothing to report: the client may have
+/// detached between the listing and the write.
+pub fn tty_write(path: &Path, bytes: &[u8]) {
+    // A byte prefix, not `Path::starts_with`, for the reason `session_tty` gives:
+    // /dev/ttyS0 is a single component.
+    let name = path.as_os_str().as_bytes();
+    if !(name.starts_with(b"/dev/pts/") || name.starts_with(b"/dev/tty")) {
+        return;
+    }
+    if !path.metadata().is_ok_and(|m| m.file_type().is_char_device()) {
+        return;
+    }
+    if let Ok(mut f) = OpenOptions::new().write(true).open(path) {
+        let _ = f.write_all(bytes);
+    }
 }
 
 fn write_pty(cfg: &Config, bytes: &[u8]) -> io::Result<()> {

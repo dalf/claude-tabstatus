@@ -18,6 +18,7 @@
 
 use crate::edge::Glyph;
 use crate::text;
+use crate::tmux::Tmux;
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
@@ -49,6 +50,18 @@ fn var_or(key: &str, default: &str) -> String {
 /// child launched from a Konsole shell, and into every pane of a tmux server that
 /// was first started under Konsole, so inside a multiplexer those variables say
 /// nothing about the terminal actually drawing the tab.
+///
+/// `CCTAB_TERMINAL` overrides all of it, and is the only honest signal in the
+/// topology this exists for: ssh does not forward `KONSOLE_*`, so a session
+/// reached over ssh from a Konsole tab - inside tmux or not - has nothing to
+/// detect. `konsole` names it; any other value says explicitly that it is NOT
+/// Konsole, which is how a false positive from a leaked `KONSOLE_*` is turned off.
+///
+/// It is the one knob in this file that changes what paints OUTSIDE tmux as well
+/// as in, which is why it is opt-in and why the name is matched case-INSENSITIVELY
+/// (ASCII): a byte compare made `CCTAB_TERMINAL=Konsole` mean "explicitly not
+/// Konsole" and silently turned the arming and the suffix layout OFF - the exact
+/// opposite of what the user typed.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Terminal {
     Konsole,
@@ -56,7 +69,20 @@ pub enum Terminal {
 }
 
 impl Terminal {
+    /// What `CCTAB_TERMINAL` says, or `None` when it says nothing.
+    fn from_override(raw: Option<&OsStr>) -> Option<Terminal> {
+        let v = raw.map(OsStr::as_bytes)?;
+        Some(if v.eq_ignore_ascii_case(b"konsole") {
+            Terminal::Konsole
+        } else {
+            Terminal::Unknown
+        })
+    }
+
     pub fn detect() -> Terminal {
+        if let Some(t) = Terminal::from_override(var_nonempty("CCTAB_TERMINAL").as_deref()) {
+            return t;
+        }
         if !flag("TMUX")
             && !flag("STY")
             && (flag("KONSOLE_VERSION") || flag("KONSOLE_DBUS_SESSION"))
@@ -169,6 +195,10 @@ pub struct Config {
     pub pwd: Option<OsString>,
     pub git_dir: Option<OsString>,
     pub claude_pid: Option<OsString>,
+    /// The tmux server this session runs inside, when there is one. It decides
+    /// ONE thing on the paint path - whether the OSC 0 carries a tab title or a
+    /// record - and everything else it is used for is a cold path.
+    pub tmux: Option<Tmux>,
 }
 
 impl Config {
@@ -199,6 +229,7 @@ impl Config {
             pwd: var("PWD"),
             git_dir: var_nonempty("GIT_DIR"),
             claude_pid: var_nonempty("CLAUDE_PID"),
+            tmux: Tmux::detect(),
         }
     }
 
@@ -223,6 +254,7 @@ impl Config {
             pwd: None,
             git_dir: None,
             claude_pid: None,
+            tmux: None,
         }
     }
 
@@ -264,6 +296,20 @@ mod tests {
 
     fn cap(raw: Option<&str>, default: usize, floor: usize) -> Cap {
         Cap::parse(raw.map(OsStr::new), default, floor)
+    }
+
+    #[test]
+    fn the_terminal_override_names_konsole_in_any_case() {
+        let t = |v: Option<&str>| Terminal::from_override(v.map(OsStr::new));
+        for yes in ["konsole", "Konsole", "KONSOLE", "kOnSoLe"] {
+            assert!(matches!(t(Some(yes)), Some(Terminal::Konsole)), "{yes}");
+        }
+        // Anything else is an explicit NOT Konsole, which is what turns a leaked
+        // KONSOLE_* off; only absence leaves the detection to the environment.
+        for no in ["wezterm", "konsol", "konsolex", "xterm", " konsole"] {
+            assert!(matches!(t(Some(no)), Some(Terminal::Unknown)), "{no}");
+        }
+        assert!(t(None).is_none());
     }
 
     #[test]
