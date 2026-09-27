@@ -147,7 +147,7 @@ mod tests {
     #[test]
     fn the_embedded_hooks_invoke_the_path_a_generated_tree_provides() {
         let n = HOOKS_JSON.matches("${CLAUDE_PLUGIN_ROOT}/bin/tabstatus").count();
-        assert_eq!(n, 11, "eleven hook edges, all through the plugin root");
+        assert_eq!(n, 13, "thirteen hook edges, all through the plugin root");
     }
 
     #[test]

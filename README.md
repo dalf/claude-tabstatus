@@ -36,6 +36,8 @@ Three states, and the hook events that paint them:
 | `Stop` | | ⚪ idle |
 | `StopFailure` | | ⚪ idle |
 | `SubagentStop` | | *nothing*, unless that agent owned the wait |
+| `Elicitation` | form/URL request | 🟠 waiting; duplicate completed requests stay silent |
+| `ElicitationResult` | matching server and request ID, `accept`, `decline`, or `cancel` | restores the base only when no other wait remains |
 | `SessionEnd` | | clears the title, restores the tab |
 
 The `SessionStart` and `PreToolUse` scopes are hook *matchers*, so those hooks
@@ -190,11 +192,13 @@ The rules, in full:
 |---|---|---|
 | `waiting` | adds this owner (`agent_id`, or the main loop), with its own epoch | 🟠 always |
 | `waiting` from a permission/input `Notification` | adds an unknown permission owner `?` unless a permission wait already exists; an owned permission wait replaces that anonymous permission backstop | 🟠 always |
-| `waiting` from an MCP `Notification` | adds an anonymous elicitation wait `?!`, independently of permission waits | 🟠 always |
-| `working`, a `PostToolUse` on the main thread | base ← `w`; clears the main and unknown waits | the base, or nothing if a wait remains |
+| `waiting` from an MCP `Notification` | adds an anonymous backstop `?!`; a complete server/request identity instead shares its direct wait | 🟠 unless an identified request has already completed |
+| `elicitation` | adds a wait keyed by server/request ID, or an anonymous direct wait | 🟠 unless that key has already completed |
+| `elicitation-result` | removes only the matching server/request wait for a recognized response | the base if that emptied the set, else nothing |
+| `working`, a `PostToolUse` on the main thread | base ← `w`; clears main and anonymous notification waits, preserving direct elicitations | the base, or nothing if a wait remains |
 | `working`, a `UserPromptSubmit` **you typed** | base ← `w`; clears **every** wait | the base |
 | `working`, a subagent | clears only the wait it owns; base untouched | the base if that emptied the set, else nothing |
-| `idle` | base ← `i`; clears a main wait, and **every** wait when `background_tasks` is `[]` | ⚪, or nothing if a wait remains |
+| `idle` | base ← `i`; clears a main wait, and remaining permission/notification waits when `background_tasks` is `[]`; direct elicitations remain | ⚪, or nothing if a wait remains |
 | `subagent-stop` | clears only the wait it owns | the base if that emptied the set, else nothing |
 | `session-start` | resets the record, and reaps | ⚪ as before |
 | `session-end` | removes the record | clears the title |
@@ -233,9 +237,9 @@ The retirement conditions include ownership evidence and stale-wait recovery:
 | what retires it | evidence or recovery policy |
 |---|---|
 | the known owner's own completion | that agent's `PostToolUse`, or its `SubagentStop` when you declined and no tool ever ran; an arbitrary agent never owns an anonymous wait |
-| main-thread tool progress | preserves the existing recovery policy for main and anonymous waits; this does not correlate an MCP response |
+| main-thread tool progress | preserves recovery for main and anonymous notification waits; direct elicitation waits remain |
 | a `UserPromptSubmit` you typed | a modal dialog and a usable prompt cannot both be on screen |
-| `background_tasks` empty at `Stop` | preserves the existing recovery policy when no background tasks remain; this does not correlate an MCP response |
+| `background_tasks` empty at `Stop` | recovers permission and notification waits when no background tasks remain; direct elicitation waits remain |
 | its own expiry | `CCTAB_TTL_WAITING`, **per wait** |
 
 The recovery paths exist because the captures are emphatic that *abandoning* a dialog
@@ -248,8 +252,65 @@ Notification-only waits carry no request identity. An unrelated subagent's
 even when there is only one wait. Injected or missing-content `UserPromptSubmit`
 events also preserve anonymous waits. MCP notifications retain separate provenance
 so a permission request cannot replace them, and a matching subagent permission completion
-leaves the MCP wait standing. Both MCP notification kinds share one anonymous slot;
-matching individual MCP responses remains [issue #9](https://github.com/dalf/claude-tabstatus/issues/9).
+leaves the MCP wait standing. Both identity-free MCP notification kinds share one
+anonymous backstop slot, separate from direct elicitation requests.
+
+### Direct MCP elicitation
+
+`Elicitation` and `ElicitationResult` are registered without a server matcher.
+They observe requests and responses and emit only the existing title protocol;
+they never answer forms, replace responses, change permission decisions, or exit
+with a blocking status. Message text, form answers, requested schemas, credentials,
+and authentication URLs are skipped and never persisted.
+
+The identity is `(session_id, mcp_server_name, elicitation_id)`. Server and request
+IDs must each be nonempty, at most 64 UTF-8 bytes, and contain no control characters.
+They are stored whole using an unambiguous encoding, never truncated. Form and URL
+modes are supported; an absent mode is supported too. Unsupported modes and malformed
+JSON are silent no-ops. A valid result with `accept`, `decline`, or `cancel` removes
+only its matching wait. The visible title comes from the remaining waits and the
+current working/idle base, so answering request A cannot hide request B or a
+permission dialog.
+
+Requests without a usable server/ID pair share one anonymous **direct** wait.
+Repeated anonymous direct requests keep that aggregate's first-observed clock.
+An uncorrelated result clears nothing, even if server and mode match the only
+pending request. Direct waits survive main-thread tool progress, a quiet `Stop`,
+and unrelated agent completion. A new human prompt, per-wait `CCTAB_TTL_WAITING`
+expiry, or session reset/end recovers them. Expiry is processed on subsequent
+events; no daemon repaints an otherwise quiet terminal. Setting the TTL to `0`
+disables expiry, leaving prompt/session recovery available.
+
+The state retains up to eight completion keys as tombstones, with the same TTL.
+This makes repeated starts/results and a result arriving before its start
+idempotent while the key is retained. Duplicate events do not extend their clocks.
+Reusing a completed ID in the same server/session during that retention period is
+treated as a duplicate. A key evicted from the bounded history or expired from it
+can be observed as a new request again.
+
+Notifications coalesce with a direct request **only** when they carry the same
+complete server/ID pair. Identity-free notifications stay independent, whether
+they arrive before or after a direct event. Claude Code 2.1.274's notification
+construction omits those identifiers, so there is no reliable way to distinguish
+a delayed duplicate from a new independent dialog. Such a notification can raise
+the anonymous backstop again after a direct result; main progress, a quiet `Stop`,
+a human prompt, expiry, or session cleanup recovers it. Suppressing it solely
+because another request is known would hide independent dialogs.
+
+At most eight individual waits are retained. Further requests add one aggregate
+overflow wait rather than evicting an unrelated wait; it survives individual
+completions and uses prompt/session recovery or its own expiry. Further overflow
+does not refresh that clock. Pending state and completion history fit within an
+8 KiB record. Concurrent creation and updates use the session record lock.
+
+Validation evidence, version information, and the distinction between synthetic
+replays and live captures are recorded in
+[elicitation evidence](https://github.com/dalf/claude-tabstatus/issues/9#issuecomment-5854485979). The input schema follows the
+[official hook reference](https://code.claude.com/docs/en/hooks#elicitationresult).
+Both events are present in the inspected Claude Code 2.1.274 executable; earlier
+versions and live interactive delivery have not been validated for this feature.
+Without usable persistence, requests can still paint waiting, but results stay
+silent because they cannot prove what is outstanding.
 
 "Absent" is not "empty", and that asymmetry is deliberate in both directions. A
 `Notification` carries no `background_tasks` at all, and a Claude Code that renamed
@@ -344,31 +405,34 @@ Two details of the lock are load-bearing. It is taken on the record path, and
 because `write_if_changed` renames over that path the inode can change under a
 waiter - which would leave it holding an exclusive lock on an unlinked inode while a
 third hook held the new one - so after locking it checks that it holds the inode the
-path names *now*, and retries when it does not. And it does **not** create the file:
-with no record there is nothing to lock, but a record that does not exist also holds
-no wait, so the update that can still be lost there is a first wait or a base, never
-a clear. `std::fs::File::lock` ships in std (1.89), so this costs no dependency; it
+path names *now*, and retries when it does not. Creation-capable edges atomically
+create the record before locking, so concurrent first requests and results are
+serialized too. Unrelated agent events still create no file. If a lock cannot be
+obtained, the hook makes no unlocked state change. `std::fs::File::lock` ships in
+std (1.89), so this costs no dependency; it
 is the reason `rust-version` moved from 1.74 to 1.89.
 
 ```text
-cts2                                           the tag: version 2 of the wire
+cts3                                           the tag: version 3 of the wire
 b i                                            base = w | a | i
 p 3709427 84460384                             the session's (pid, start time)
 w aec99e1f4bda1972b:1790380630 -:1790380631    one wait per word: owner, then epoch
 ```
 
 `-` is the main loop, `?` an unknown permission/input owner, and `?!` an anonymous
-MCP elicitation owner. An `agent_id` is
+MCP notification backstop. `!?` is an anonymous direct request, `!+` an overflow
+aggregate, and `!<hex-server>.<hex-request>` an identified request. The optional
+`e` line holds completed request keys with their completion epochs. An `agent_id` is
 accepted only as `[A-Za-z0-9_-]{1,64}` - the same test that stops a `session_id`
 from choosing the path it is filed under. Unknown keys are **skipped**, and a base
 letter this version cannot paint reads as idle, so a newer version's record
 degrades rather than being misread; and a record this version did not *change* is
 not rewritten, so it keeps the fields it did not understand.
 
-Version 1 (`cts1`) records remain readable and become `cts2` on the next state
-change. Their `?` waits lack provenance and retain the permission-backstop
+Version 1 (`cts1`) and version 2 (`cts2`) records remain readable and become `cts3`
+on the next state change. Version 1 `?` waits lack provenance and retain the permission-backstop
 deduplication policy; the original notification kind cannot be recovered.
-Older binaries cannot read `cts2` records and may overwrite them on a state
+Older binaries cannot read `cts3` records and may overwrite them on a state
 transition. Use the updated binary for all hooks; mixed versions do not preserve
 the new wait policy.
 
@@ -739,11 +803,11 @@ pruned:   hooks/extra.json (generated by an older version)
 
 A re-install whose binary is **byte-identical** to the running one skips the copy
 and says `unchanged - identical bytes`, so a no-op install genuinely does not
-disturb live wiring rather than renaming a fresh inode over a file eleven hooks
+disturb live wiring rather than renaming a fresh inode over a file thirteen hooks
 are executing for no reason at all. Before any copy becomes that file, `install`
 **execs it** and refuses if it does not answer with the expected version - which
 turns a `noexec` mount and a lost exec bit into one refusal at install time
-instead of eleven hooks failing silently in every later session. It does *not*
+instead of thirteen hooks failing silently in every later session. It does *not*
 cover a wrong architecture and does not claim to: the copy is
 `std::env::current_exe`, so it is by construction the same architecture as the
 process running the check.
@@ -1412,16 +1476,10 @@ invocation, no arming.
   cannot correct it either: that notifier is gated on no dialog being on screen.
   A white tab over one of those modals is the boundary of what hooks can see,
   not a bug.
-- **MCP elicitation is backstop-only.** A server asking the user its own
-  question has real-time events, `Elicitation` and `ElicitationResult`, and this
-  plugin registers neither (see [Not yet built](#slices)), so the tab turns
-  orange only when the `elicitation_dialog` notification arrives about 6s later,
-  and only if you have not touched the keyboard in the meantime.
-  The anonymous wait survives unrelated subagent activity and coexists with
-  permission waits. Main-thread tool progress, a quiet `Stop`, a new human prompt,
-  expiry, or a session reset can still retire it as recovery; none is a correlated
-  MCP result. Direct request/result matching is tracked in
-  [issue #9](https://github.com/dalf/claude-tabstatus/issues/9).
+- **MCP requests without IDs cannot be matched to responses.** Direct hooks
+  paint waiting immediately, but an anonymous result clears nothing. Recovery
+  and the ambiguity of identity-free notifications are described under
+  [Direct MCP elicitation](#direct-mcp-elicitation).
 - **Konsole repaints the tab on a ~2s tick**, not when the title arrives, so
   the dot trails the actual state change by up to about two seconds. That, not
   the ~2ms hook, is the responsiveness ceiling.
@@ -1709,7 +1767,7 @@ bin/tabstatus install
 
 `install` **refuses** when `bin/tabstatus` is missing, and says the same thing.
 That refusal is not pedantry: the env key it would write switches Claude Code's
-own title painting off, and all eleven hooks would then resolve to a command that
+own title painting off, and all thirteen hooks would then resolve to a command that
 exits 127 - a tab nothing paints at all, which is strictly worse than no install.
 `install --force` overrides it for the case where you are about to build.
 The first build needs registry access (or a populated Cargo cache). Once cached,
@@ -1827,7 +1885,7 @@ crash, it just overwrites a correct state with a wrong one a minute later.
 `hooks/hooks.json` is asserted as a **table**, not as a bag of strings. The
 suite parses it into one `event matcher edge timeout` row per registered hook
 and checks that against the table above in both directions: every row is
-present, nothing else is registered, eleven hooks exactly, one command per group,
+present, nothing else is registered, thirteen hooks exactly, one command per group,
 and no edge name the binary does not implement (an
 unknown edge falls back to idle, so a typo there would silently paint the wrong
 state on every notification). Presence checks alone are not enough, and that is
@@ -2014,12 +2072,6 @@ the one failure mode every other line rendered as healthy.
   while a compaction runs mid-turn. A tab that said so would be better, and the
   place for it is a second `SessionStart` group with `"matcher": "compact"` (or
   the first-class `PreCompact` / `PostCompact` events).
-- The `Elicitation` and `ElicitationResult` events. An MCP server asking the
-  user is a true waiting state, and today it is covered only by the
-  `elicitation_dialog` notification kinds, which no session here has been able to
-  reproduce. Registering the events directly would be the real signal; their
-  match query is the MCP server name, not the kind, so they would go in
-  unmatched.
 - Konsole `TabColor`, which rides on the same OSC 50 property list as the
   arming and would let the tab itself carry the colour. Whoever adds it also
   has to add `TabColor=#000000` to the `SessionEnd` list, or the colour

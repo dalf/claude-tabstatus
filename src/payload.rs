@@ -10,6 +10,10 @@ use std::io::{self, Read};
 /// drained to EOF so the hook writer does not encounter a closed pipe.
 pub const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
+/// Identity metadata is retained whole or not at all; truncated keys could
+/// correlate two unrelated requests. This bounds each persisted component.
+pub const MAX_ELICITATION_ID_BYTES: usize = 64;
+
 #[derive(Debug, Default)]
 pub struct Payload {
     session_id: Option<String>,
@@ -19,6 +23,10 @@ pub struct Payload {
     hook_event_name: Option<String>,
     prompt_first: Option<char>,
     background_tasks_empty: Option<bool>,
+    mcp_server_name: Option<String>,
+    elicitation_id: Option<String>,
+    mode: Option<String>,
+    action: Option<String>,
 }
 
 impl Payload {
@@ -86,6 +94,22 @@ impl Payload {
     pub fn background_tasks_empty(&self) -> Option<bool> {
         self.background_tasks_empty
     }
+    pub fn mcp_server_name(&self) -> Option<&str> {
+        self.mcp_server_name.as_deref()
+    }
+    pub fn elicitation_id(&self) -> Option<&str> {
+        self.elicitation_id.as_deref()
+    }
+    pub fn mode(&self) -> Option<&str> {
+        self.mode.as_deref()
+    }
+    pub fn action(&self) -> Option<&str> {
+        self.action.as_deref()
+    }
+
+    pub fn elicitation_mode_supported(&self) -> bool {
+        matches!(self.mode(), None | Some("form" | "url"))
+    }
 }
 
 fn nonempty(s: Option<&str>) -> Option<&str> {
@@ -107,6 +131,10 @@ enum Field {
     Event,
     Prompt,
     Background,
+    McpServer,
+    ElicitationId,
+    Mode,
+    Action,
     Other,
 }
 impl Field {
@@ -119,6 +147,10 @@ impl Field {
             Self::Event => "hook_event_name",
             Self::Prompt => "prompt",
             Self::Background => "background_tasks",
+            Self::McpServer => "mcp_server_name",
+            Self::ElicitationId => "elicitation_id",
+            Self::Mode => "mode",
+            Self::Action => "action",
             Self::Other => "unknown",
         }
     }
@@ -140,6 +172,10 @@ impl<'de> Deserialize<'de> for Field {
                     "hook_event_name" => Field::Event,
                     "prompt" => Field::Prompt,
                     "background_tasks" => Field::Background,
+                    "mcp_server_name" => Field::McpServer,
+                    "elicitation_id" => Field::ElicitationId,
+                    "mode" => Field::Mode,
+                    "action" => Field::Action,
                     _ => Field::Other,
                 })
             }
@@ -158,7 +194,7 @@ impl<'de> Deserialize<'de> for Payload {
             }
             fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<Payload, M::Error> {
                 let mut p = Payload::empty();
-                let mut seen = 0u8;
+                let mut seen = 0u16;
                 while let Some(field) = map.next_key::<Field>()? {
                     if matches!(field, Field::Other) {
                         map.next_value::<IgnoredAny>()?;
@@ -183,6 +219,14 @@ impl<'de> Deserialize<'de> for Payload {
                             p.background_tasks_empty =
                                 map.next_value::<Option<EmptyArray>>()?.map(|a| a.0)
                         }
+                        Field::McpServer => {
+                            p.mcp_server_name = map.next_value::<Option<Identity>>()?.and_then(|s| s.0)
+                        }
+                        Field::ElicitationId => {
+                            p.elicitation_id = map.next_value::<Option<Identity>>()?.and_then(|s| s.0)
+                        }
+                        Field::Mode => p.mode = map.next_value()?,
+                        Field::Action => p.action = map.next_value()?,
                         Field::Other => unreachable!(),
                     }
                 }
@@ -190,6 +234,26 @@ impl<'de> Deserialize<'de> for Payload {
             }
         }
         d.deserialize_map(Metadata)
+    }
+}
+
+struct Identity(Option<String>);
+impl<'de> Deserialize<'de> for Identity {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Bounded;
+        impl Visitor<'_> for Bounded {
+            type Value = Identity;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an elicitation identity string")
+            }
+            fn visit_str<E: de::Error>(self, s: &str) -> Result<Identity, E> {
+                let valid = !s.is_empty()
+                    && s.len() <= MAX_ELICITATION_ID_BYTES
+                    && !s.chars().any(char::is_control);
+                Ok(Identity(valid.then(|| s.to_owned())))
+            }
+        }
+        d.deserialize_str(Bounded)
     }
 }
 
@@ -299,6 +363,10 @@ mod tests {
             "hook_event_name",
             "prompt",
             "background_tasks",
+            "mcp_server_name",
+            "elicitation_id",
+            "mode",
+            "action",
         ] {
             for value in ["0", "true", "{}"] {
                 assert!(
@@ -317,6 +385,26 @@ mod tests {
         assert!(Payload::from_bytes(br#"{"background_tasks":"[]"}"#).is_err());
         // Unknown keys never influence a decision; duplicate unknowns are allowed.
         parse(r#"{"x":1,"x":2}"#);
+    }
+    #[test]
+    fn elicitation_metadata_is_top_level_and_identity_is_never_truncated() {
+        let p = parse(r#"{"content":{"mcp_server_name":"nested","elicitation_id":"nested","action":"accept","mode":"url"},"mcp_server_name":"s\\name","elicitation_id":"id\u0031","action":"decline"}"#);
+        assert_eq!(p.mcp_server_name(), Some("s\\name"));
+        assert_eq!(p.elicitation_id(), Some("id1"));
+        assert_eq!(p.action(), Some("decline"));
+        assert_eq!(p.mode(), None);
+        assert!(p.elicitation_mode_supported());
+        for id in ["x".repeat(64), "é".repeat(32)] {
+            let p = parse(&serde_json::json!({"mcp_server_name":id, "elicitation_id":id}).to_string());
+            assert_eq!(p.mcp_server_name(), Some(id.as_str()));
+            assert_eq!(p.elicitation_id(), Some(id.as_str()));
+        }
+        for id in [String::new(), "x".repeat(65), "é".repeat(33), "a\nb".into(), "\u{85}".into()] {
+            let p = parse(&serde_json::json!({"mcp_server_name":id, "elicitation_id":id}).to_string());
+            assert_eq!(p.mcp_server_name(), None);
+            assert_eq!(p.elicitation_id(), None);
+        }
+        assert!(Payload::from_bytes(br#"{"elicitation_id":"a","elicitation\u005fid":"b"}"#).is_err());
     }
     #[test]
     fn only_empty_stdin_is_the_manual_exception() {

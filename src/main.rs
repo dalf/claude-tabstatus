@@ -4,7 +4,7 @@
 //!     tabstatus <edge>
 //!
 //! Edges:  session-start | working | waiting | idle | notify | subagent-stop
-//!         | session-end
+//!         | session-end | elicitation | elicitation-result
 //!
 //! The first five paint; `notify` decides between idle, waiting and painting
 //! nothing at all by looking at the notification kind, and session-end unpaints.

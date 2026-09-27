@@ -68,7 +68,8 @@ class HookInputTests(unittest.TestCase):
         stale.write_bytes(b"cts1\nb i\n")
         os.utime(stale, (1, 1))
         before = self.snapshot()
-        for edge in ["working", "waiting", "idle", "notify", "session-start", "session-end", "subagent-stop", "unknown"]:
+        for edge in ["working", "waiting", "idle", "notify", "session-start", "session-end",
+                     "subagent-stop", "elicitation", "elicitation-result", "unknown"]:
             for data in bad:
                 with self.subTest(edge=edge, preview=data[:100]):
                     self.assertEqual(self.run_hook(edge, data), b"")

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "provenance": "synthetic-contract-scenarios-not-live-captures",
+  "claude_code_reference_version": "2.1.274",
+  "notes": "Constructed from the hook contract and implementation policy. These fixtures do not establish real server event timing, delivery ordering, or live hook compatibility.",
+  "scenarios": [
+    {
+      "name": "two-requests",
+      "events": [
+        {"edge": "working", "payload": {"hook_event_name": "UserPromptSubmit", "prompt": "go"}, "paint": "WORKING"},
+        {"edge": "elicitation", "payload": {"mcp_server_name": "fixture", "elicitation_id": "one", "mode": "form"}, "paint": "WAITING"},
+        {"edge": "elicitation", "payload": {"mcp_server_name": "fixture", "elicitation_id": "two", "mode": "url"}, "paint": "WAITING"},
+        {"edge": "elicitation-result", "payload": {"mcp_server_name": "fixture", "elicitation_id": "one", "action": "decline"}, "paint": ""},
+        {"edge": "elicitation-result", "payload": {"mcp_server_name": "fixture", "elicitation_id": "two", "action": "cancel"}, "paint": "WORKING"}
+      ]
+    },
+    {
+      "name": "result-first",
+      "events": [
+        {"edge": "elicitation-result", "payload": {"mcp_server_name": "fixture", "elicitation_id": "one", "action": "accept"}, "paint": ""},
+        {"edge": "elicitation", "payload": {"mcp_server_name": "fixture", "elicitation_id": "one", "mode": "form"}, "paint": ""},
+        {"edge": "notify", "payload": {"notification_type": "elicitation_dialog", "mcp_server_name": "fixture", "elicitation_id": "one"}, "paint": ""}
+      ]
+    }
+  ]
+}

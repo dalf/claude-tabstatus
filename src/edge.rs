@@ -22,6 +22,10 @@ pub enum Edge {
     /// and exists only for the state layer, which uses it to clear a wait that
     /// agent owned.
     SubagentStop,
+    /// Observes an MCP request; never supplies an answer or permission decision.
+    Elicitation,
+    /// Retires only a request identified by persisted state.
+    ElicitationResult,
     /// No argument, or a word this version does not know.
     Unknown,
 }
@@ -70,6 +74,8 @@ impl Edge {
             Some(b"notify") => Edge::Notify,
             Some(b"session-end") => Edge::SessionEnd,
             Some(b"subagent-stop") => Edge::SubagentStop,
+            Some(b"elicitation") => Edge::Elicitation,
+            Some(b"elicitation-result") => Edge::ElicitationResult,
             // An edge a later `hooks.json` adds, or no argument at all. Both
             // paint the IDLE form rather than nothing: a tab that keeps painting
             // is the forward-compatible choice, and it is pinned by the tests.
@@ -83,6 +89,7 @@ impl Edge {
         matches!(
             self,
             Edge::Notify | Edge::SessionStart | Edge::Working | Edge::SubagentStop
+                | Edge::Elicitation | Edge::ElicitationResult
         )
     }
 
@@ -107,6 +114,14 @@ impl Edge {
                 Some(Paint::Line(Glyph::Working))
             }
             Edge::Waiting => Some(Paint::Line(Glyph::Waiting)),
+            Edge::Elicitation => {
+                (payload.hook_event_name() == Some("Elicitation")
+                    && payload.elicitation_mode_supported())
+                    .then_some(Paint::Line(Glyph::Waiting))
+            }
+            // Without a persisted request there is nothing a response can
+            // safely retire. In particular, do not blindly paint working.
+            Edge::ElicitationResult => None,
             Edge::Idle | Edge::Unknown => Some(Paint::Line(Glyph::Idle)),
             Edge::Notify => match Notification::detect(payload) {
                 Notification::IdlePrompt => Some(Paint::Line(Glyph::Idle)),
@@ -190,6 +205,8 @@ mod tests {
         assert_eq!(edge("notify"), Edge::Notify);
         assert_eq!(edge("session-end"), Edge::SessionEnd);
         assert_eq!(edge("subagent-stop"), Edge::SubagentStop);
+        assert_eq!(edge("elicitation"), Edge::Elicitation);
+        assert_eq!(edge("elicitation-result"), Edge::ElicitationResult);
     }
 
     #[test]
@@ -214,6 +231,8 @@ mod tests {
         assert!(Edge::SessionStart.reads_payload());
         assert!(Edge::Working.reads_payload());
         assert!(Edge::SubagentStop.reads_payload());
+        assert!(Edge::Elicitation.reads_payload());
+        assert!(Edge::ElicitationResult.reads_payload());
         assert!(!Edge::Waiting.reads_payload());
         assert!(!Edge::Idle.reads_payload());
         assert!(!Edge::SessionEnd.reads_payload());
@@ -247,6 +266,19 @@ mod tests {
         let p = payload(br#"{"agent_id":"abc","hook_event_name":"SubagentStop"}"#);
         assert_eq!(Edge::SubagentStop.resolve(&p), None);
         assert_eq!(Edge::SubagentStop.resolve(&Payload::empty()), None);
+    }
+
+    #[test]
+    fn stateless_elicitation_observes_requests_but_cannot_resolve_them() {
+        for mode in [None, Some("form"), Some("url")] {
+            let p = payload(serde_json::json!({"hook_event_name":"Elicitation","mode":mode}).to_string().as_bytes());
+            assert_eq!(Edge::Elicitation.resolve(&p), Some(Paint::Line(Glyph::Waiting)));
+            assert_eq!(Edge::ElicitationResult.resolve(&p), None);
+        }
+        for p in [Payload::empty(), payload(br#"{"hook_event_name":"Elicitation","mode":"unknown"}"#), payload(br#"{"hook_event_name":"ElicitationResult","action":"accept"}"#)] {
+            assert_eq!(Edge::Elicitation.resolve(&p), None);
+            assert_eq!(Edge::ElicitationResult.resolve(&p), None);
+        }
     }
 
     #[test]
