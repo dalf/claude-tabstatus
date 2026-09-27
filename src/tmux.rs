@@ -680,8 +680,8 @@ fn capture(mut c: Command) -> Result<String, Fail> {
 // --- uninstall ---------------------------------------------------------------
 
 /// Restore tracked windows across the whole server, including other sessions
-/// and linked windows. Values travel as argv or format expansions, never as
-/// interpolated user text in tmux command strings.
+/// and linked windows. Saved values remain inside tmux and travel through format
+/// expansions, never diagnostic stdout or interpolated command strings.
 fn restore_window_status() -> Result<Vec<String>, Fail> {
     let mut list = Command::new("tmux");
     list.args(["list-windows", "-a", "-F", "#{window_id}"]);
@@ -692,8 +692,9 @@ fn restore_window_status() -> Result<Vec<String>, Fail> {
     for id in ids {
         let target = Tmux { pane: Some(OsString::from(&id)) };
         for f in &WINDOW_FORMATS {
-            // The raw previous value goes last, preserving embedded/trailing
-            // newlines. Read the current raw value separately for the same reason.
+            // The previous value goes last, preserving embedded/trailing
+            // newlines. These reads inspect ownership only: tmux 3.4 escapes
+            // dollar signs in diagnostic stdout, so they cannot restore bytes.
             let fields = ask(&target, &[
                 &format!("#{{{}}}", f.saved),
                 &format!("#{{{}}}", f.local),
@@ -720,7 +721,8 @@ fn restore_window_status() -> Result<Vec<String>, Fail> {
                 }
                 c.arg("set");
                 if fields[1] == "1" {
-                    c.args(["-w", "-t", &id, "--", f.option, &fields[2]]);
+                    c.args(["-Fw", "-t", &id, "--", f.option,
+                        &format!("#{{{}}}", f.previous)]);
                 } else {
                     c.args(["-wu", "-t", &id, "--", f.option]);
                 }
@@ -851,9 +853,14 @@ pub fn uninstall() -> Vec<String> {
     drop_hook(&t);
 
     // Ours come off whatever happens: they are our own namespace, and an orphaned
-    // @cctab_title is exactly what would make a later doctor lie.
+    // @cctab_title is exactly what would make a later doctor lie. Keep the saved
+    // title until the final batch so restoration never reimports diagnostic
+    // stdout (tmux 3.4 escapes dollar signs there).
     let mut c = Command::new("tmux");
     for o in OURS {
+        if flag == "1" && o == OPT_PREV_STRING {
+            continue;
+        }
         if c.get_args().next().is_some() {
             c.arg(";");
         }
@@ -918,9 +925,15 @@ pub fn uninstall() -> Vec<String> {
         if !restored.is_empty() {
             c.arg(";");
         }
-        c.arg("set").arg("-g").arg("set-titles-string").arg(prev_string);
+        c.arg("set").arg("-Fg").arg("set-titles-string")
+            .arg(format!("#{{{OPT_PREV_STRING}}}"));
         restored.push("set-titles-string".to_owned());
     }
+    if c.get_args().next().is_some() {
+        c.arg(";");
+    }
+    c.args(["set", "-su", "--", OPT_PREV_STRING]);
+    run(c);
     match (restored.is_empty(), ours_saved) {
         (true, false) => out.push(
             "tmux:     restored - set-titles and set-titles-string had been at \
@@ -935,7 +948,6 @@ pub fn uninstall() -> Vec<String> {
                 .to_owned(),
         ),
         (false, _) => {
-            run(c);
             out.push(format!("tmux:     restored {}", restored.join(" and ")));
         }
     }

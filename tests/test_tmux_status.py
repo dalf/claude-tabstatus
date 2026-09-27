@@ -2,6 +2,7 @@
 """Real tmux window-status and restoration regressions on private servers.
 
 CCTAB_TEST_BIN=/path/to/tabstatus python3 tests/test_tmux_status.py
+CCTAB_TEST_TMUX=/path/to/tmux selects another tmux build for every invocation.
 Every test owns a unique socket, isolated HOME and disposable shell panes.
 """
 import fcntl
@@ -23,6 +24,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("CCTAB_TEST_BIN", ROOT / "bin/tabstatus")).resolve()
+TMUX_OVERRIDE = os.environ.get("CCTAB_TEST_TMUX")
 FORMATS = ("window-status-format", "window-status-current-format")
 # Exact rounded-pill formats from the reported display regression. The glyph
 # belongs inside the colored body, alongside the existing index and label.
@@ -66,7 +68,7 @@ def terminal_text_and_backgrounds(data):
     return "".join(text), backgrounds
 
 
-@unittest.skipUnless(shutil.which("tmux"), "tmux is required for window-status integration tests")
+@unittest.skipUnless(TMUX_OVERRIDE or shutil.which("tmux"), "tmux is required for window-status integration tests")
 class TmuxStatusTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="cctab-tmux-status-")
@@ -75,7 +77,15 @@ class TmuxStatusTests(unittest.TestCase):
         self.socket = self.root / "tmux.sock"
         self.env = {"PATH": "/usr/bin:/bin", "HOME": str(self.root),
                     "TERM": "xterm-256color", "LC_ALL": "C.UTF-8", "PS1": ""}
-        self.base = ["tmux", "-S", str(self.socket), "-f", "/dev/null"]
+        tmux = "tmux"
+        if TMUX_OVERRIDE:
+            selected = Path(TMUX_OVERRIDE)
+            self.assertTrue(selected.is_absolute(), "CCTAB_TEST_TMUX must be an absolute executable path")
+            self.assertTrue(selected.is_file() and os.access(selected, os.X_OK),
+                            "CCTAB_TEST_TMUX must name an executable file")
+            tmux = str(selected)
+            self.env["PATH"] = str(selected.parent) + os.pathsep + self.env["PATH"]
+        self.base = [tmux, "-S", str(self.socket), "-f", "/dev/null"]
         self.addCleanup(lambda: subprocess.run(self.base + ["kill-server"], env=self.env,
                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                               timeout=10))
@@ -267,9 +277,10 @@ class TmuxStatusTests(unittest.TestCase):
         self.tm("set", "-w", "-t", self.pane, FORMATS[0], raw)
         self.tm("set", "-w", "-t", self.pane, FORMATS[1], "")
         before = self.formats(self.pane)
+        label = self.rendered(self.pane)
         self.start()
         self.publish(self.pane)
-        self.assertEqual(self.rendered(self.pane), "🔵 quote \" slash \\ literal $HOME\n0:current #[bold]\n")
+        self.assertEqual(self.rendered(self.pane), "🔵 " + label)
         self.uninstall()
         self.assertEqual(self.formats(self.pane), before)
 
@@ -280,6 +291,44 @@ class TmuxStatusTests(unittest.TestCase):
         self.uninstall()
         self.assertEqual(self.formats(self.pane), before)
 
+    def test_dollar_and_backslash_literals_survive_copy_render_and_restore(self):
+        raw = r'$HOME ${HOME} \$HOME \${HOME} \\ ${CCTAB_UNSET_LITERAL} "quoted" #W'
+        for option in FORMATS:
+            self.tm("set", "-w", "-t", self.pane, option, raw)
+        self.tm("set", "-w", "-t", self.pane, "@test_expected_format", raw)
+        before = self.formats(self.pane)
+        labels = tuple(self.rendered(self.pane, current) for current in (False, True))
+        self.start()
+        for index, saved in enumerate(("@cctab_prev_window_format", "@cctab_prev_window_current")):
+            # tmux 3.4 escapes dollar signs in CLI output. Compare exact outputs
+            # under the same version and also compare real values inside tmux;
+            # never normalize away a slash that might be actual corruption.
+            self.assertEqual(self.tm("show-options", "-wqv", "-t", self.pane, saved), before[index][1])
+            self.assertEqual(self.tm("display-message", "-p", "-t", self.pane,
+                                     "#{==:#{" + saved + "},#{@test_expected_format}}"), "1")
+        self.publish(self.pane)
+        for current in (False, True):
+            self.assertEqual(self.rendered(self.pane, current), "🔵 " + labels[int(current)])
+        self.uninstall()
+        self.assertEqual(self.formats(self.pane), before)
+        for option in FORMATS:
+            self.assertEqual(self.tm("display-message", "-p", "-t", self.pane,
+                                     "#{==:#{" + option + "},#{@test_expected_format}}"), "1")
+
+    def test_outer_title_dollar_and_backslash_literals_restore_without_extra_escaping(self):
+        raw = r'outer "$HOME" ${HOME} \$HOME \\ #{pane_title}'
+        self.tm("set", "-g", "set-titles-string", raw)
+        self.tm("set", "-s", "@test_expected_outer", raw)
+        before = self.tm("show-options", "-gv", "set-titles-string")
+        self.start()
+        self.assertEqual(self.tm("show-options", "-sqv", "@cctab_prev_string"), before)
+        self.assertEqual(self.tm("display-message", "-p", "-t", self.pane,
+                                 "#{==:#{@cctab_prev_string},#{@test_expected_outer}}"), "1")
+        self.uninstall()
+        self.assertEqual(self.tm("show-options", "-gv", "set-titles-string"), before)
+        self.assertEqual(self.tm("display-message", "-p", "-t", self.pane,
+                                 "#{==:#{set-titles-string},#{@test_expected_outer}}"), "1")
+
     def test_nested_formats_and_shell_literals_are_saved_without_interpretation(self):
         raw = ('100% #{?window_active,ACTIVE,#{?window_bell_flag,BELL,quiet}} '
                '#I:#W#F ; `` $() $HOME')
@@ -288,7 +337,7 @@ class TmuxStatusTests(unittest.TestCase):
         label = self.rendered(self.pane)
         self.start()
         self.assertEqual(self.tm("show-options", "-wqv", "-t", self.pane,
-                                 "@cctab_prev_window_format"), raw)
+                                 "@cctab_prev_window_format"), before[0][1])
         self.publish(self.pane)
         self.assertEqual(self.rendered(self.pane), "🔵 " + label)
         self.uninstall()
