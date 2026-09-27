@@ -475,6 +475,9 @@ there is nothing to reinstall.
 The build step is temporary: binaries are not committed, and will ship as
 GitHub release assets so that installing needs no toolchain.
 
+On a machine with no checkout - a remote VM reached over ssh - copy **one file**
+and run it: see [Remote install](#remote-install-one-file-no-checkout).
+
 **No dependencies.** `bin/tabstatus` is a single binary - one executable, zero
 crates, nothing linked but libc - and it is both the hook and the installer. There is no `jq`, no Python, and no shell script left in the runtime
 path. Building it needs cargo; running it needs nothing. [Build](#build) covers
@@ -544,6 +547,160 @@ That line exists because "disabled" is the silent answer to almost every questio
 this layer can raise: a tab behaving exactly as it did before wait ownership is
 indistinguishable from a layer that is working correctly.
 
+### Remote install: one file, no checkout
+
+Claude Code will not load a plugin that is not a directory holding
+`.claude-plugin/plugin.json` and `hooks/hooks.json`, so deploying used to mean
+shipping a tree. The two manifests are 3.2 KB between them, so they are compiled
+**into** the binary with `include_str!` and `standalone` writes them back out:
+
+```sh
+scp -C bin/tabstatus-x86_64-unknown-linux-musl vm:~/tabstatus
+ssh vm 'chmod +x ~/tabstatus && ~/tabstatus standalone && ~/tabstatus doctor'
+```
+
+`-C`, because `scp` does not compress by default and one file is not automatically
+fewer bytes than the tarball it replaces: the raw binary is 635 KB against the old
+four-entry tarball's 303 KB, and `gzip -9` of it is 314 KB. The whole wire cost of
+shipping one file instead of a tree is about 11 KB, with the flag. Without it, 2.1x.
+
+That is the whole install. `standalone` materialises
+
+```text
+~/.local/share/claude-tabstatus/
+    .claude-plugin/plugin.json      the copy compiled in
+    hooks/hooks.json                the copy compiled in
+    bin/tabstatus                   a copy of the binary you just ran
+    .tabstatus-generated            the marker: version, target triple, file list
+```
+
+then runs the ordinary `install` against it - the same three writes, the same
+preflight, the same output. The tree goes in `$XDG_DATA_HOME/claude-tabstatus`,
+or `$HOME/.local/share/claude-tabstatus`; `standalone <dir>` puts it anywhere
+else. Then start a **new** Claude Code session, as ever.
+
+`doctor` and `uninstall` find that tree again from **`<config>/skills/claude-tabstatus`**,
+the symlink `install` itself wrote, before falling back to the default path. That
+record is what makes `<dir>` a real option rather than one that quietly costs you
+both commands - and it is also what makes them work when the default path *moves*,
+because `XDG_DATA_HOME` is set in an interactive shell and not in `ssh vm '...'`.
+The link is followed even when it dangles: a tree deleted by hand leaves a live env
+key and a state file behind it, and that is exactly the broken config `doctor` exists
+to explain and `uninstall` has to clean up.
+
+`include_str!` rather than a crate. It is a std macro, it costs no dependency,
+and it is the direct analogue of Go's `//go:embed`: the JSON becomes a rustc
+build **input**, so a `cargo build` binary cannot carry a copy that disagrees
+with the tree it was built from. `rust-embed` and `include_dir` solve a different
+problem - globbing an asset tree and iterating it at runtime - and both are
+proc-macro crates. Two `include_str!` lines execute nothing at build time.
+
+**Two copies of a tracked file can drift, so which one wins is decided by
+location, not by age.** In a checkout the *file* is the truth and the binary is
+the stale thing; in a generated tree the *binary* is the truth and the tree is
+the stale thing. `install` never reads the embedded copies and never writes a
+manifest, so **no install path can touch a tracked file** - running `install` in
+a checkout does exactly what it always did. `standalone` is the only verb that
+writes a manifest, and only into a directory that is absent, empty, or already
+carries `.tabstatus-generated`. Anything else is refused by name:
+
+```text
+error: /home/me/notes already exists, is not empty, and carries no
+       .tabstatus-generated - so it was not written by `tabstatus standalone` and
+       is not ours to overwrite. If it is a checkout, run `tabstatus install`
+       there. If it is nothing you need, remove it - `rm -rf /home/me/notes` - and
+       re-run. Otherwise pass a different directory. Nothing has been changed.
+```
+
+A directory with a `.git` in it is refused a second time, even if a marker
+appears there, and a target under `<config>/skills/` is refused too, because
+`install` would then be asked to symlink a directory to itself. A path that exists
+and is *not a readable directory* is a fourth named refusal rather than an errno
+from `create_dir_all` three lines later.
+
+**The marker is written first, before either manifest and before the binary copy.**
+It is the only evidence of ownership the refusal above accepts, so a run killed in
+that window - ENOSPC during the 635 KB copy on a small VM, a dropped ssh, an OOM -
+must not leave a populated directory with no marker in it: that shape was classified
+as somebody else's and refused *forever*, on exactly the machine this verb exists
+for, and only `rm -rf` recovered it. One write, before the files, makes every partial
+state re-enterable by construction. `read_marker` already tolerates a marker it
+cannot parse and a stale file list, so the early write costs nothing.
+
+Inside a tree it does own, `standalone` rewrites **every** generated file
+unconditionally and prunes the ones an older version generated. The alternative -
+"leave what is already there" - is the upgrade that silently does nothing: a
+release adding a twelfth hook edge would install cleanly against an old
+`hooks.json` and that edge would never fire. A file whose bytes changed is
+overwritten *and named*, because a silent revert is the bug even where
+overwriting is right:
+
+```text
+wrote:    hooks/hooks.json (2842 bytes, REPLACED, was 2851 bytes)
+pruned:   hooks/extra.json (generated by an older version)
+```
+
+Upgrading is the same two commands: `scp -C` the newer binary over `~/tabstatus`,
+run `~/tabstatus standalone`, start a new session. Before it installs anything,
+`standalone` **execs the copy it just made** and refuses if it does not answer with
+the expected version - which turns a `noexec` mount and a lost exec bit into one
+refusal at install time instead of eleven hooks failing silently in every later
+session. It does *not* cover a wrong architecture and does not claim to: the copy is
+`std::env::current_exe`, so it is by construction the same architecture as the
+process running the check.
+
+`doctor` states which mode it is in, so its remedies are unambiguous:
+
+```text
+mode:      standalone - .tabstatus-generated says this tree was materialised from a binary,
+           so the BINARY is the truth here
+           generated by tabstatus 0.1.0 (x86_64-unknown-linux-musl)
+           tree binary: identical to the one running
+embedded:  OK   .claude-plugin/plugin.json matches the copy compiled in
+embedded:  WARN hooks/hooks.json differs from the copy compiled in (2842 vs 2851 bytes)
+           this tree was generated, so the BINARY is the truth: refresh it with
+           `tabstatus standalone`
+```
+
+Two byte counts are the detail that makes that line actionable without a diff -
+except when they are the same number, which is the commonest case of all: 0.1.0 and
+0.2.0 are the same length, so a plain version bump makes `plugin.json` differ at
+identical size. That reads as `same 438 bytes, different content` rather than
+`(438 vs 438 bytes)`, which would look like a bug in the report rather than the
+answer. `standalone` says it the same way: `REPLACED - same 438 bytes, different
+content`.
+
+and in a checkout the same comparison gets the opposite advice - `this is a
+checkout, so the FILE is the truth: rebuild with sh scripts/build.sh`. It is a
+`WARN`, never a `FAIL`: a mid-edit `hooks/hooks.json` is a normal working-tree
+state and the command people run daily must not cry wolf over it. The one way to
+get a genuinely stale tree is to `scp` a newer binary straight over
+`<tree>/bin/tabstatus` and skip `standalone`; that is what the `tree binary:`
+line catches, and `doctor` also compares the marker's target triple against the
+running one, which covers a tree materialised by one architecture and later run
+by another.
+
+**The binary is `x86_64-unknown-linux-musl`.** On an aarch64 machine it fails at
+`exec` with the kernel's own *Exec format error* before a line of this program
+runs, so nothing in it can improve that message. The fix is an
+`aarch64-unknown-linux-musl` entry in `scripts/build.sh`'s `TARGETS`; until then,
+check `uname -m` on the VM first.
+
+Three layers keep the embedded copies honest, and the worst outcome - a stale
+embedded `hooks.json` silently disagreeing with the repo - is caught by all
+three:
+
+| layer | catches | where it fires |
+|---|---|---|
+| rustc's rebuild dependency | any build from an edited manifest | `cargo build` recompiles; both JSON files appear in `target/<triple>/release/tabstatus.d` |
+| `bin/sources.sha256` | a **prebuilt** binary gone stale against an edited manifest, with nobody rebuilding | `sh tests/run.sh`, which recomputes the manifest |
+| `tabstatus print-embedded <plugin\|hooks>` | the bytes themselves, in either direction | `sh tests/run.sh` diffs it against the file; `doctor` reports it on a machine with no source tree |
+
+`print-embedded` writes the embedded bytes to stdout verbatim and nothing else -
+no trailing newline of its own - so `tabstatus print-embedded hooks | diff -
+hooks/hooks.json` is empty exactly when the two agree. It needs no hasher, which
+is why the zero-dependency claim stays trivially true.
+
 ### install and uninstall are ordered, both ways
 
 `install` writes `settings.json` **first** and the plugin symlink **last**;
@@ -565,7 +722,22 @@ key Claude Code never reads.
 ~/code/claude-tabstatus/bin/tabstatus uninstall
 ~/code/claude-tabstatus/bin/tabstatus uninstall --force            # no state record: remove anyway
 ~/code/claude-tabstatus/bin/tabstatus uninstall --restore-backup   # roll settings.json back wholesale
+~/tabstatus uninstall --purge-tree                                # also delete a generated tree
 ```
+
+`--purge-tree` exists only for a [remote install](#remote-install-one-file-no-checkout):
+it removes the materialised tree itself, and it is accepted only for a directory
+carrying `.tabstatus-generated`. Against a checkout it is refused in the preflight,
+before anything is undone - your source is not the uninstaller's to delete. The
+default leaves the tree alone and *names* it, because a whole plugin directory left
+in `~/.local/share` is not something to find by accident.
+
+It is `remove_dir_all`, so it also takes files `standalone` deliberately *does not*
+touch - prune only ever removes what the marker lists, so a few refresh runs teach
+you by behaviour that your own files are safe in that directory. Under a flag with
+`purge` in its name that is defensible; doing it silently is not, so the report names
+them: `removed the generated tree <path> (2 files it did not generate went with it:
+NOTES.txt, commands/mine.md)`.
 
 The uninstaller is an undo, not a delete: it puts back whatever
 `claude-tabstatus.state` says was there before. If you had already set
@@ -1204,6 +1376,10 @@ Everything the runtime half reads, in one place:
 | `CCTAB_STATE_DIR` | `$XDG_RUNTIME_DIR/claude-tabstatus` | where the per-session wait record lives. Unset **and** no `XDG_RUNTIME_DIR` means no record at all, and every edge falls back to the stateless answer. **Use a dedicated directory:** `session-start` reaps in it. It deletes only files it can prove are its own records ([wait ownership](#wait-ownership)), but it is still the wrong place to keep anything else |
 | `CCTAB_NOW` | unset | test only: pins the epoch the tmux record and the state record carry |
 
+`XDG_DATA_HOME` is read by `standalone` alone, for where the generated tree goes -
+`$XDG_DATA_HOME/claude-tabstatus`, falling back to `$HOME/.local/share/claude-tabstatus`.
+The runtime half never looks at it.
+
 `CLAUDE_PID` is exported into every hook subprocess and is how `session-start`
 and `session-end` find the pty. `XDG_RUNTIME_DIR` is read for the state
 directory - deliberately with no `$HOME` fallback, because that would put a record
@@ -1298,7 +1474,7 @@ sh tests/run.sh
 CCTAB_TEST_BIN=target/release/tabstatus sh tests/run.sh   # a build you just made
 ```
 
-463 assertions, and what they drive is `bin/tabstatus` - the same binary
+513 assertions, and what they drive is `bin/tabstatus` - the same binary
 `hooks/hooks.json` invokes, so a stale committed binary fails here rather than in
 somebody's tab. The suite used to run the shell implementation under three shells
 in four locales, because its answer depended on both; a binary has no
@@ -1314,7 +1490,7 @@ all - that `repair` answers differently from `String::from_utf8_lossy` on a
 truncated sequence, for one.
 
 ```sh
-cargo test   # 150 tests, beside the 463 assertions and the 312 corpus cases
+cargo test   # 163 tests, beside the 513 assertions and the 312 corpus cases
 ```
 
 The state section pins `CLAUDE_PID` per case rather than inheriting it, and that is
@@ -1324,6 +1500,19 @@ is developed, and the only place a developer would run it - the ambient session'
 used to land in records two cases assert byte for byte, and the declared gate was RED
 in the one environment it is actually invoked from. It is not unset globally, because
 the headless-guard and pty sections need the ambient one.
+
+The standalone section performs a **real** install: it drops a bare copy of the
+binary in a directory with no plugin tree above it - the shape of a binary scp'd to
+a VM - and runs `standalone`, `doctor`, the refusals, a refresh and
+`uninstall --purge-tree` against it. It pins four variables, and the fourth is the
+one that catches people out. `HOME`, `CLAUDE_CONFIG_DIR` and `XDG_DATA_HOME` are
+what the installer reads, but `state::purge` resolves the record directory from
+`XDG_RUNTIME_DIR` / `CCTAB_STATE_DIR` **alone**, so an `uninstall` with only the
+first three redirected deletes the *real* wait records of whoever is running it.
+Harmless and self-healing - a session with no record degrades to the stateless
+answer and the next edge writes another - but any script or session exercising
+`uninstall` should redirect `CCTAB_STATE_DIR` as well, exactly as this suite does
+per case.
 
 Eighty-one of the assertions are the tmux section, and they drive a PRIVATE
 tmux server - `tmux -L cctabprobe -f /dev/null`, killed afterwards, with no

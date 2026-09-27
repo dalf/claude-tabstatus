@@ -1291,7 +1291,7 @@ check 'bin/tabstatus exists and is executable' 'yes' \
     "$([ -x "$repo/bin/tabstatus" ] && printf yes)"
 check 'bin/tabstatus resolves to a committed platform binary' 'yes' \
     "$(_t=$(readlink "$repo/bin/tabstatus") && [ -f "$repo/bin/$_t" ] && printf yes)"
-_sources="Cargo.toml $(cd -- "$repo" && ls src/*.rs | sort)"
+_sources="Cargo.toml .claude-plugin/plugin.json hooks/hooks.json $(cd -- "$repo" && ls src/*.rs | sort)"
 if command -v sha256sum >/dev/null 2>&1 && [ -f "$repo/bin/sources.sha256" ]; then
     check 'the committed binaries are not stale (sha256 of src/ and Cargo.toml)' '' \
         "$(cd -- "$repo" && sha256sum $_sources | diff - bin/sources.sha256)"
@@ -1307,6 +1307,356 @@ fi
 check 'bin/tabstatus reports the version in Cargo.toml' \
     "$(sed -n 's/^version = "\(.*\)"/\1/p' "$repo/Cargo.toml" | head -1)" \
     "$("$repo/bin/tabstatus" version </dev/null | awk '{print $2}')"
+
+# --- the embedded manifests -----------------------------------------------
+# src/embedded.rs compiles .claude-plugin/plugin.json and hooks/hooks.json into the
+# binary with include_str!, so `tabstatus standalone` can write a plugin tree on a
+# machine that has no checkout. Two copies of a version-controlled file can drift,
+# and a stale embedded hooks.json silently disagreeing with the repo is the worst
+# outcome that change could have, so it is guarded in three places:
+#
+#   1. rustc tracks both files as build inputs (they appear in
+#      target/<triple>/release/tabstatus.d), so editing only the JSON forces a
+#      recompile. That closes the whole class for anyone who builds.
+#   2. the source manifest checked just above now LISTS both files, which closes
+#      what (1) cannot: a PREBUILT binary - one already in bin/, or uploaded as a
+#      release asset - going stale against an edited manifest with nobody building.
+#   3. these assertions, which are the only ones that compare actual BYTES rather
+#      than a digest, and the only ones that would still work on a machine with no
+#      source tree, because `print-embedded` needs nothing but the binary.
+check 'print-embedded hooks is byte-for-byte hooks/hooks.json' '' \
+    "$("$bin" print-embedded hooks </dev/null | diff - "$repo/hooks/hooks.json")"
+check 'print-embedded plugin is byte-for-byte .claude-plugin/plugin.json' '' \
+    "$("$bin" print-embedded plugin </dev/null | diff - "$repo/.claude-plugin/plugin.json")"
+# The diff above would also pass if BOTH sides gained a trailing newline, because
+# `$(...)` strips them. Compare the byte counts too, so it cannot.
+check 'print-embedded writes exactly the bytes of the file, no more' \
+    "$(wc -c <"$repo/hooks/hooks.json")" \
+    "$("$bin" print-embedded hooks </dev/null | wc -c)"
+check 'print-embedded accepts the long path spelling too' '' \
+    "$("$bin" print-embedded hooks/hooks.json </dev/null | diff - "$repo/hooks/hooks.json")"
+check 'print-embedded names the alternatives for an unknown file' 'yes' \
+    "$("$bin" print-embedded settings.json </dev/null 2>&1 | grep -q 'the names are: plugin | hooks' && printf yes)"
+check 'print-embedded exits 1 on an unknown file' '1' \
+    "$("$bin" print-embedded settings.json </dev/null >/dev/null 2>&1; printf %s $?)"
+check 'print-embedded with no name says what it needs' '1' \
+    "$("$bin" print-embedded </dev/null >/dev/null 2>&1; printf %s $?)"
+# print-embedded is a subcommand, so it must not paint and must not read stdin.
+check 'print-embedded never paints' '' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CCTAB_DRY_RUN=1 "$bin" print-embedded hooks </dev/null | grep '^⚪')"
+
+# --- standalone: the whole remote install, into a throwaway tree ------------
+# Everything below runs a BARE copy of the binary - one with no plugin tree above
+# it, which is the shape of a binary scp'd to a VM - and pins four variables:
+# HOME, CLAUDE_CONFIG_DIR and XDG_DATA_HOME are what the installer reads, and
+# CCTAB_STATE_DIR is the one that is NOT derived from them. state::purge resolves
+# the record directory from XDG_RUNTIME_DIR/CCTAB_STATE_DIR alone, so an uninstall
+# with only HOME and CLAUDE_CONFIG_DIR redirected would delete the REAL session
+# records of whoever is running this suite. Both are unset at the top of this file;
+# CCTAB_STATE_DIR is pinned here as well so that stays true if that ever changes.
+_sahome=$tmp/sa-home
+_sacfg=$tmp/sa-config
+_sadata=$tmp/sa-data
+_satree=$_sadata/claude-tabstatus
+_sabin=$tmp/sa-drop/tabstatus
+mkdir -p "$tmp/sa-drop" "$_sahome" "$tmp/sa-state"
+# -L: $bin is a symlink into bin/, and what a VM gets is a real file.
+cp -L "$bin" "$_sabin" && chmod 755 "$_sabin"
+_sa() {
+    ( HOME=$_sahome CLAUDE_CONFIG_DIR=$_sacfg XDG_DATA_HOME=$_sadata \
+      CCTAB_STATE_DIR=$tmp/sa-state "$_sabin" "$@" </dev/null 2>&1 )
+}
+printf 'standalone section: tree %s, config %s\n' "$_satree" "$_sacfg"
+# The repo's own manifests, saved so the LAST assertion of this section can prove
+# that nothing here wrote a tracked file.
+cp "$repo/hooks/hooks.json" "$tmp/sa-repo-hooks.json"
+cp "$repo/.claude-plugin/plugin.json" "$tmp/sa-repo-plugin.json"
+
+_saout=$(_sa standalone)
+check 'standalone: says which mode it is in and why' 'yes' \
+    "$(printf '%s' "$_saout" | grep -q '^mode:     standalone - no checkout above the running binary' && printf yes)"
+check 'standalone: wrote hooks.json byte-for-byte' '' \
+    "$(diff "$repo/hooks/hooks.json" "$_satree/hooks/hooks.json")"
+check 'standalone: wrote plugin.json byte-for-byte' '' \
+    "$(diff "$repo/.claude-plugin/plugin.json" "$_satree/.claude-plugin/plugin.json")"
+check 'standalone: copied the running binary in, mode 755' '755' \
+    "$(stat -c %a "$_satree/bin/tabstatus" 2>/dev/null || printf 755)"
+check 'standalone: and the copy is the same bytes' '' "$(cmp "$_sabin" "$_satree/bin/tabstatus" 2>&1)"
+check 'standalone: ran the copy it made before installing anything' 'yes' \
+    "$(printf '%s' "$_saout" | grep -q "^verify:   tabstatus $("$bin" version | awk '{print $2}')" && printf yes)"
+check 'standalone: left a marker naming the three files it generated' 'yes' \
+    "$(printf '%s' "$_saout" | grep -q '^marker:   .tabstatus-generated (3 files, written first' && printf yes)"
+check 'standalone: then ran the ordinary install - settings.json' '{
+  "env": {
+    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"
+  }
+}' "$(cat "$_sacfg/settings.json")"
+check 'standalone: and linked the skills entry at the tree' "$_satree" \
+    "$(readlink "$_sacfg/skills/claude-tabstatus")"
+# The generated tree has to be a tree Claude Code will load, which is exactly the
+# four entries the README's remote-install section lists.
+check 'standalone: the tree holds the four runtime entries and the marker' \
+    '.claude-plugin/plugin.json
+.tabstatus-generated
+bin/tabstatus
+hooks/hooks.json' \
+    "$(cd -- "$_satree" && find . -mindepth 1 \( -type f -o -type l \) | sed 's|^\./||' | LC_ALL=C sort)"
+
+# doctor, run from the BARE binary in $HOME - which is how a VM would run it. It
+# resolves the tree through the generated-tree fallback, because there is no
+# checkout above $tmp/sa-drop.
+_sadoc=$(_sa doctor)
+check 'doctor: reports standalone mode from a binary outside the tree' 'yes' \
+    "$(printf '%s' "$_sadoc" | grep -q '^mode:      standalone - .tabstatus-generated says' && printf yes)"
+check 'doctor: names the version and triple that generated the tree' 'yes' \
+    "$(printf '%s' "$_sadoc" | grep -q "generated by tabstatus $("$bin" version | awk '{print $2}')" && printf yes)"
+check 'doctor: the tree binary is identical to the one running' 'yes' \
+    "$(printf '%s' "$_sadoc" | grep -q 'tree binary: identical to the one running' && printf yes)"
+check 'doctor: both embedded manifests match in the generated tree' '2' \
+    "$(printf '%s' "$_sadoc" | grep -c '^embedded:  OK')"
+check 'doctor: the standalone install is healthy' 'yes' \
+    "$(printf '%s' "$_sadoc" | grep -q 'env key:   OK' && printf '%s' "$_sadoc" | grep -q 'plugin:    OK' && printf yes)"
+# The stale-tree hazard, which is the one way to get a tree that disagrees with its
+# binary: edit a manifest in the tree and doctor points at the refresh command,
+# NOT at a rebuild - the remedies are opposite in the two modes.
+printf 'edited\n' >>"$_satree/hooks/hooks.json"
+check 'doctor: a tree whose manifest was edited is WARNed, with the refresh remedy' 'yes' \
+    "$(_sa doctor | grep -A1 '^embedded:  WARN hooks/hooks.json differs' \
+       | grep -q 'refresh it with .tabstatus standalone' && printf yes)"
+
+# Refresh: the embedded bytes win inside a tree we own, a file whose bytes CHANGED
+# says so, and a file an older version generated is pruned. That last one is why
+# the marker records a file list: without it an upgrade would silently leave a
+# stale file that nothing rewrites.
+mkdir -p "$_satree/hooks"
+printf '{}\n' >"$_satree/hooks/extra.json"
+printf '{\n  "marker_version": 1,\n  "written_by": "tabstatus standalone",\n  "tabstatus_version": "0.0.1",\n  "target": "x86_64-unknown-linux-musl",\n  "files": [\n    ".claude-plugin/plugin.json",\n    "bin/tabstatus",\n    "hooks/extra.json",\n    "hooks/hooks.json"\n  ]\n}\n' >"$_satree/.tabstatus-generated"
+_saout=$(_sa standalone)
+check 'standalone: refreshing says the tree already existed' 'yes' \
+    "$(printf '%s' "$_saout" | grep -q '^tree:.*(refreshed)' && printf yes)"
+check 'standalone: an edited manifest is overwritten and SAID SO' 'yes' \
+    "$(printf '%s' "$_saout" | grep -q 'wrote:    hooks/hooks.json.*REPLACED, was' && printf yes)"
+check 'standalone: and the file is the embedded bytes again' '' \
+    "$(diff "$repo/hooks/hooks.json" "$_satree/hooks/hooks.json")"
+check 'standalone: a file an older version generated is pruned and named' 'yes' \
+    "$(printf '%s' "$_saout" | grep -q '^pruned:   hooks/extra.json' && printf yes)"
+check 'standalone: and it is gone' '' "$(ls "$_satree/hooks/extra.json" 2>/dev/null)"
+check 'standalone: the install half is idempotent on a refresh' 'yes' \
+    "$(printf '%s' "$_saout" | grep -q 'already "1" - unchanged' \
+       && printf '%s' "$_saout" | grep -q 'symlink:  already correct' && printf yes)"
+
+# Every refusal. Each one leaves the directory untouched and exits 1, because the
+# alternative is writing a plugin tree over something that is not ours.
+_sanot=$tmp/sa-notours
+mkdir -p "$_sanot"
+printf 'mine\n' >"$_sanot/README"
+check 'standalone: refuses a non-empty directory with no marker' 'yes' \
+    "$(_sa standalone "$_sanot" | grep -q 'was not written by .tabstatus standalone' && printf yes)"
+check 'standalone: and writes nothing into it' 'README' "$(ls "$_sanot")"
+check 'standalone: exits 1 on that refusal' '1' \
+    "$(_sa standalone "$_sanot" >/dev/null 2>&1; printf %s $?)"
+# A checkout is refused even if a marker is dropped in it, because the marker is
+# the only evidence of ownership and a tracked tree must not be reachable by it.
+_sackout=$tmp/sa-checkout
+mkdir -p "$_sackout/.git"
+printf '{}\n' >"$_sackout/.tabstatus-generated"
+check 'standalone: refuses a checkout even with a marker in it' 'yes' \
+    "$(_sa standalone "$_sackout" | grep -q 'has a .git in it' && printf yes)"
+check 'standalone: and did not write a manifest there' '' \
+    "$(ls "$_sackout/hooks/hooks.json" 2>/dev/null)"
+# Under <config>/skills, install would be asked to symlink a directory to itself.
+check 'standalone: refuses a target under the skills directory' 'yes' \
+    "$(_sa standalone "$_sacfg/skills/claude-tabstatus" | grep -q 'symlink a directory to itself' && printf yes)"
+check 'standalone: a mistyped flag is not treated as a directory name' 'yes' \
+    "$(_sa standalone --force 2>&1 | grep -q 'unknown option --force' && printf yes)"
+check 'standalone: and materialised nothing called --force' '' "$(ls -d -- "--force" 2>/dev/null)"
+
+# --- the tree does not have to be at the default path -----------------------
+# Everything above drives the DEFAULT location. `standalone <dir>` is documented,
+# and for `doctor` and `uninstall` to work from the scp'd copy afterwards, something
+# has to record WHERE the tree went: <config>/skills/claude-tabstatus, the symlink
+# install itself writes, is that record. Without reading it these two commands only
+# ever worked for the default path - so a tree anywhere else, or a default path that
+# moved because XDG_DATA_HOME is set in an interactive shell and not in
+# `ssh vm '...'`, left a live install neither command could touch, under advice
+# whose only effect was to write a SECOND tree and orphan the first.
+_sbhome=$tmp/sb-home
+_sbcfg=$tmp/sb-config
+_sbdata=$tmp/sb-data
+_sbtree=$tmp/sb-elsewhere/tabstatus
+mkdir -p "$_sbhome" "$tmp/sb-state"
+_sb() {
+    ( HOME=$_sbhome CLAUDE_CONFIG_DIR=$_sbcfg XDG_DATA_HOME=$_sbdata \
+      CCTAB_STATE_DIR=$tmp/sb-state "$_sabin" "$@" </dev/null 2>&1 )
+}
+printf 'standalone elsewhere: tree %s, config %s\n' "$_sbtree" "$_sbcfg"
+_sb standalone "$_sbtree" >/dev/null
+check 'standalone <dir>: wrote the tree where it was told' 'yes' \
+    "$([ -f "$_sbtree/.tabstatus-generated" ] && [ -x "$_sbtree/bin/tabstatus" ] && printf yes)"
+check 'standalone <dir>: and nothing at the default path' '' \
+    "$(ls -d "$_sbdata/claude-tabstatus" 2>/dev/null)"
+check 'doctor: finds a tree that is not at the default path, from the skills link' "$_sbtree" \
+    "$(_sb doctor | sed -n 's/^repo:      //p')"
+check 'doctor: and reports standalone mode for it' 'yes' \
+    "$(_sb doctor | grep -q '^mode:      standalone - .tabstatus-generated says' && printf yes)"
+# The record survives the environment the tree's path was DERIVED from going away,
+# which is the difference between an interactive shell and `ssh vm '...'`.
+check 'doctor: the record survives XDG_DATA_HOME going away' "$_sbtree" \
+    "$( ( HOME=$_sbhome CLAUDE_CONFIG_DIR=$_sbcfg CCTAB_STATE_DIR=$tmp/sb-state \
+          "$_sabin" doctor </dev/null 2>&1 ) | sed -n 's/^repo:      //p')"
+
+# A difference with NO size difference, which is what a plain version bump looks
+# like: 0.1.0 and 0.2.0 are the same length. "(2842 vs 2842 bytes)" reads as a bug
+# in the report rather than as the answer.
+sed 's/"timeout": 5/"timeout": 9/' "$_sbtree/hooks/hooks.json" >"$tmp/sb-same.json"
+cp "$tmp/sb-same.json" "$_sbtree/hooks/hooks.json"
+check 'doctor: a same-size difference says so instead of repeating the number' 'yes' \
+    "$(_sb doctor | grep -q 'differs from the copy compiled in (same [0-9]* bytes, different content)' \
+       && printf yes)"
+check 'standalone: and the refresh names it the same way' 'yes' \
+    "$(_sb standalone "$_sbtree" | grep -q 'REPLACED - same [0-9]* bytes, different content' && printf yes)"
+
+# A run killed between the marker and the last write - ENOSPC during the binary copy
+# on a small VM, a dropped ssh, an OOM. The marker is written FIRST, so this exact
+# directory is still ours to finish; written last, it was refused forever and only
+# `rm -rf` recovered it.
+_sbpart=$tmp/sb-partial
+mkdir -p "$_sbpart/hooks"
+cp "$_sbtree/.tabstatus-generated" "$_sbpart/.tabstatus-generated"
+"$_sabin" print-embedded hooks </dev/null >"$_sbpart/hooks/hooks.json"
+check 'standalone: a tree a killed run left behind is not refused' 'yes' \
+    "$(_sb standalone "$_sbpart" | grep -q '^tree:.*(refreshed)' && printf yes)"
+check 'standalone: and one re-run completes it' 'yes' \
+    "$([ -x "$_sbpart/bin/tabstatus" ] && [ -f "$_sbpart/.claude-plugin/plugin.json" ] && printf yes)"
+# The ordering itself, from the outside: the marker is on disk before the binary is.
+check 'standalone: the marker is never newer than the binary it vouches for' 'yes' \
+    "$([ ! "$_sbpart/.tabstatus-generated" -nt "$_sbpart/bin/tabstatus" ] && printf yes)"
+
+# Run from INSIDE the tree it is refreshing. Not "a SEPARATE tree" - it is the same
+# path, and the next line says (refreshed) - and not a checkout either.
+check 'standalone: refreshing the tree it runs from says exactly that' 'yes' \
+    "$( ( HOME=$_sbhome CLAUDE_CONFIG_DIR=$_sbcfg XDG_DATA_HOME=$_sbdata \
+          CCTAB_STATE_DIR=$tmp/sb-state "$_sbtree/bin/tabstatus" standalone "$_sbtree" \
+          </dev/null 2>&1 ) \
+       | grep -q '^mode:     standalone - refreshing the generated tree this binary is running from' \
+       && printf yes)"
+check 'standalone: and never calls a generated tree a checkout' '' \
+    "$( ( HOME=$_sbhome CLAUDE_CONFIG_DIR=$_sbcfg XDG_DATA_HOME=$_sbdata \
+          CCTAB_STATE_DIR=$tmp/sb-state "$_sbtree/bin/tabstatus" standalone "$_sbtree" \
+          </dev/null 2>&1 ) | grep '^mode:.*checkout')"
+
+# A target that exists and is NOT a directory. This used to reach create_dir_all and
+# print `cannot create <path>: File exists (os error 17)` - which reads like a bug,
+# prints after the mode line as though work had begun, and lacks the closing sentence
+# every real refusal ends with.
+printf 'mine\n' >"$tmp/sb-afile"
+check 'standalone: refuses a target that exists and is not a directory' 'yes' \
+    "$(_sb standalone "$tmp/sb-afile" | grep -q 'already exists and is not a directory' && printf yes)"
+check 'standalone: and that refusal ends like all the others' 'yes' \
+    "$(_sb standalone "$tmp/sb-afile" | grep -q 'Nothing has been changed.' && printf yes)"
+check 'standalone: the file it refused is untouched' 'mine' "$(cat "$tmp/sb-afile")"
+# The non-empty-unmarked refusal now names the remedy it never named: two suggestions
+# used to be "run install there" (it is not a checkout) and "pass a different
+# directory", and removing the directory - the actual fix - was left unsaid.
+check 'standalone: the unmarked-directory refusal names removing it' 'yes' \
+    "$(_sa standalone "$_sanot" | grep -q 'rm -rf ' && printf yes)"
+
+# `standalone` from a CHECKOUT is the one write path where the two copies can
+# disagree and the compiled-in one wins. doctor WARNs about that drift in the same
+# checkout; this is the moment those bytes become live wiring, so it warns too.
+_sbdrift=$tmp/sb-drift
+mkdir -p "$_sbdrift/bin" "$_sbdrift/hooks" "$_sbdrift/.claude-plugin"
+cp -L "$_sabin" "$_sbdrift/bin/tabstatus"
+cp "$repo/.claude-plugin/plugin.json" "$_sbdrift/.claude-plugin/plugin.json"
+{ cat "$repo/hooks/hooks.json"; printf '\n'; } >"$_sbdrift/hooks/hooks.json"
+_sbout=$( HOME=$_sbhome CLAUDE_CONFIG_DIR=$tmp/sb-driftcfg XDG_DATA_HOME=$tmp/sb-driftdata \
+          CCTAB_STATE_DIR=$tmp/sb-state "$_sbdrift/bin/tabstatus" standalone </dev/null 2>&1 )
+check 'standalone: warns when the checkout it runs from disagrees with the compiled-in copy' 'yes' \
+    "$(printf '%s' "$_sbout" | grep -q 'WARN hooks/hooks.json in that checkout differs from the copy compiled in' \
+       && printf yes)"
+check 'standalone: and says which copy the tree will carry' 'yes' \
+    "$(printf '%s' "$_sbout" | grep -q 'the tree carries the COMPILED-IN copy' && printf yes)"
+check 'standalone: the drifted checkout was not written' 'yes' \
+    "$(cmp -s "$_sbdrift/hooks/hooks.json" "$repo/hooks/hooks.json" || printf yes)"
+
+# The install half failing AFTER the tree is written. install's refusals end
+# "Nothing has been changed.", which is true where install is the whole command and
+# false here - and it was the LAST line printed, straight after five lines reporting
+# a complete tree.
+_sbro=$tmp/sb-roconfig
+mkdir -p "$_sbro"
+check 'standalone: an install that fails after the tree was written says so' 'yes' \
+    "$(chmod 500 "$_sbro"
+       ( HOME=$_sbhome CLAUDE_CONFIG_DIR=$_sbro XDG_DATA_HOME=$tmp/sb-rodata \
+         CCTAB_STATE_DIR=$tmp/sb-state "$_sabin" standalone </dev/null 2>&1 ) \
+       | grep -q 'was written and verified, but the install did not happen' && printf yes
+       chmod 700 "$_sbro")"
+check 'standalone: and does not end by claiming nothing changed' '' \
+    "$(chmod 500 "$_sbro"
+       ( HOME=$_sbhome CLAUDE_CONFIG_DIR=$_sbro XDG_DATA_HOME=$tmp/sb-rodata \
+         CCTAB_STATE_DIR=$tmp/sb-state "$_sabin" standalone </dev/null 2>&1 ) \
+       | grep 'Nothing has been changed'
+       chmod 700 "$_sbro")"
+
+# The tree removed by hand, leaving a dangling link, a live env key and a state file.
+# doctor's whole contract is that it runs on the config that is broken, and uninstall
+# has to be able to clean this up; with the default path as the only fallback,
+# NEITHER could.
+rm -rf "$_sbtree"
+check 'doctor: runs on a config whose tree was deleted by hand' 'yes' \
+    "$(_sb doctor | grep -q '^mode:      FAIL the plugin directory' && printf yes)"
+check 'doctor: and still exits 0, because reporting is its whole job' '0' \
+    "$(_sb doctor >/dev/null 2>&1; printf %s $?)"
+check 'uninstall: cleans up after a tree that was deleted by hand' '{}' \
+    "$(_sb uninstall >/dev/null 2>&1; cat "$_sbcfg/settings.json")"
+check 'uninstall: and the dangling link went with it' '' \
+    "$(ls -d "$_sbcfg/skills/claude-tabstatus" 2>/dev/null)"
+
+# uninstall from the bare binary: the default keeps the tree and NAMES it, because
+# a whole plugin directory left behind is not something to find by accident.
+_saout=$(_sa uninstall)
+check 'uninstall: undoes the standalone install' '{}' "$(cat "$_sacfg/settings.json")"
+check 'uninstall: removed the link' '' "$(ls -d "$_sacfg/skills/claude-tabstatus" 2>/dev/null)"
+check 'uninstall: keeps the generated tree but names it' 'yes' \
+    "$(printf '%s' "$_saout" | grep -q "tree:     $_satree was NOT removed" && printf yes)"
+check 'uninstall: the tree is still there' 'yes' "$([ -f "$_satree/hooks/hooks.json" ] && printf yes)"
+check 'uninstall: does not call a generated tree "the repo"' '' \
+    "$(printf '%s' "$_saout" | grep 'The repo itself')"
+# --purge-tree removes it, and only because it carries the marker. It is
+# remove_dir_all, so it also takes files `standalone` deliberately leaves alone -
+# three refresh runs teach the operator that their own files are safe in there. Under
+# a flag with `purge` in its name that is defensible; doing it SILENTLY is not.
+printf 'mine\n' >"$_satree/NOTES.txt"
+mkdir -p "$_satree/commands"
+printf 'mine\n' >"$_satree/commands/mine.md"
+_saout=$(_sa uninstall --purge-tree)
+check 'uninstall --purge-tree: names the files it did not generate' 'yes' \
+    "$(printf '%s' "$_saout" \
+       | grep -q 'went with it: NOTES.txt, commands/mine.md' && printf yes)"
+check 'uninstall --purge-tree: removes the generated tree' '' "$(ls -d "$_satree" 2>/dev/null)"
+check 'uninstall --purge-tree: says so instead of "was not touched"' '' \
+    "$(printf '%s' "$_saout" | grep 'was not touched')"
+# ...and never a checkout, decided in the preflight so nothing is undone first.
+_out=$(_ins uninstall --purge-tree)
+check 'uninstall --purge-tree: refuses a checkout' 'yes' \
+    "$(printf '%s' "$_out" | grep -q -- '--purge-tree only removes a tree' && printf yes)"
+check 'uninstall --purge-tree: the repo is still whole' 'yes' \
+    "$([ -f "$repo/hooks/hooks.json" ] && [ -f "$repo/.claude-plugin/plugin.json" ] && printf yes)"
+
+# THE assertion this whole section exists to protect: not one byte of a tracked
+# manifest was written by any install path above. install_preflight only READS
+# these two files, and `standalone` is the only verb that writes them - into a
+# directory that is absent, empty, or carries our marker.
+check 'the repo hooks.json was never written by any install' '' \
+    "$(diff "$tmp/sa-repo-hooks.json" "$repo/hooks/hooks.json")"
+check 'the repo plugin.json was never written by any install' '' \
+    "$(diff "$tmp/sa-repo-plugin.json" "$repo/.claude-plugin/plugin.json")"
+# doctor in the CHECKOUT reports the other mode, and the other remedy.
+_out=$(_ins doctor)
+check 'doctor: reports checkout mode in the repo' 'yes' \
+    "$(printf '%s' "$_out" | grep -q '^mode:      checkout - no .tabstatus-generated above' && printf yes)"
+check 'doctor: both embedded manifests match in the checkout' '2' \
+    "$(printf '%s' "$_out" | grep -c '^embedded:  OK')"
 
 # --- cross-check against a real git ---------------------------------------
 # Everything above is hand-built, which is what keeps this suite dependency

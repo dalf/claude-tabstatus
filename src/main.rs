@@ -40,6 +40,7 @@
 
 mod config;
 mod edge;
+mod embedded;
 mod emit;
 mod git;
 mod json;
@@ -48,6 +49,7 @@ mod manage;
 mod payload;
 mod render;
 mod settings;
+mod standalone;
 mod state;
 mod text;
 mod tmux;

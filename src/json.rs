@@ -78,6 +78,14 @@ impl J {
             _ => None,
         }
     }
+    /// The elements of an array, for the one array this crate reads back: the
+    /// generated-file list in a standalone tree's marker.
+    pub fn as_arr(&self) -> Option<&[J]> {
+        match self {
+            J::Arr(a) => Some(a),
+            _ => None,
+        }
+    }
 }
 
 /// Structural equality, spans ignored. Object members must appear in the same

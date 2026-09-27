@@ -96,8 +96,14 @@ done
 ln -sfn "tabstatus-$host" bin/tabstatus
 
 # The staleness manifests. Sorted by path so the file is stable, and listing
-# exactly the inputs a rebuild depends on.
-sources="Cargo.toml $(ls src/*.rs | sort)"
+# exactly the inputs a rebuild depends on - which now includes the two manifests,
+# because src/embedded.rs pulls both in with include_str!. rustc already tracks
+# them (they appear in target/<triple>/release/tabstatus.d, so editing only the
+# JSON re-triggers a compile), and this is the layer that covers what rustc cannot:
+# a PREBUILT binary, already copied into bin/ or uploaded as a release asset, going
+# stale against an edited hooks.json without anyone rebuilding. tests/run.sh
+# recomputes this exact list, so both spellings must stay in the same order.
+sources="Cargo.toml .claude-plugin/plugin.json hooks/hooks.json $(ls src/*.rs | sort)"
 have_sha256=
 command -v sha256sum >/dev/null 2>&1 && have_sha256=yes
 for t in $list; do
