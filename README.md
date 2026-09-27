@@ -1250,11 +1250,27 @@ Uninstall preserves these custom formats; the strip reference becomes empty
 when its shared option is removed, leaving the window label and styles intact.
 
 An optional [reference tmux configuration](examples/tmux.conf) includes rounded
-tabs, a dark status badge with a light active label, and `repository@branch`
-labels for Claude panes. Shell panes keep their usual window names. In split
+tabs with a **status-colored left cap**, a light active label, and
+`repository@branch` labels for Claude panes. The left cap replaces the separate
+circle; the right cap and label still distinguish the selected window. Shell panes keep their usual window names. In split
 windows the label follows the active pane, while the strip includes every Claude
 pane. Copy the settings you want into `~/.tmux.conf`; the plugin does not install
 this configuration. The colours are a provisional example, not a required theme.
+
+The theme uses `#{T:@cctab_window_color}` in the left cap's foreground. This
+format returns the highest-priority visible state across all Claude panes in
+that window: orange `#fb923c` > blue `#60a5fa` > purple `#c084fc` > white
+`#e5e7eb`. It shares the strip's carrier recognition and expiry rules, including
+background's protection from expiry, and works even with customized or empty
+glyphs. Empty means no visible Claude state; the theme supplies a neutral color.
+A single cap summarizes the window, so individual pane states remain available
+in the outer title's dot strip. Keep the color reference directly in both window
+formats so the plugin recognizes the custom placement and adds no extra dots.
+After uninstall, the color reference becomes empty and the neutral cap remains.
+
+For an existing installation, update the plugin and restart Claude to install
+the color format, then reload the theme. Remove old plugin-owned local decorators
+as described above if they still override the new global theme.
 
 This uses the same four-state precedence as the outer title. Known background
 has no TTL; completion does not create an alert. [Issue #19](https://github.com/dalf/claude-tabstatus/issues/19)
@@ -1273,6 +1289,7 @@ set -s @cctab_tw/@cctab_ta/@cctab_tg     the three TTLs, in seconds
 set -s @cctab_title                      the generated strip-and-label format
 set -s @cctab_string                     the set-titles-string we installed
 set -s @cctab_window_strip               the generated strip for one window
+set -s @cctab_window_color               one status color for a themed window cap
 set -g set-titles on
 set -g set-titles-string '#{s|^ ||:#{T:@cctab_title}}'
 set -w -t <window> window-status-format          a strip plus the saved normal format

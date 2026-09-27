@@ -83,6 +83,7 @@ const OPT_SAVED: &str = "@cctab_saved";
 const OPT_PREV_STRING: &str = "@cctab_prev_string";
 const OPT_PREV_TITLES: &str = "@cctab_prev_titles";
 const OPT_WINDOW_STRIP: &str = "@cctab_window_strip";
+const OPT_WINDOW_COLOR: &str = "@cctab_window_color";
 
 /// Each local decorator has independent ownership and inheritance metadata, so
 /// a user can replace one format without preventing restoration of the other.
@@ -137,20 +138,25 @@ const LOC: &str = "#{s| ct[12] [waipWA] [0-9]*$||:#{pane_title}}";
 
 /// A tier whose deadline has passed, with its state-specific fallback.
 fn ladder(deadline: &str, live: &str, fallback: &str) -> String {
-    format!("#{{?#{{e|>|:{AGE},#{{{deadline}}}}},#{{{fallback}}},#{{{live}}}}}")
+    format!("#{{?#{{e|>|:{AGE},#{{{deadline}}}}},{fallback},{live}}}")
 }
 
 /// One pane's contribution. Without background, transient glyphs age to white
 /// and eventually disappear. Known background stays purple, including beneath
 /// aged working/waiting carriers. Unknown carrier versions contribute nothing.
 fn cell() -> String {
-    let mut by_state = format!("#{{{OPT_GI}}}");
+    cell_values("#{@cctab_gw}", "#{@cctab_ga}", "#{@cctab_gi}", "#{@cctab_gp}")
+}
+
+/// Share carrier recognition and decay between glyphs and theme colors.
+fn cell_values(working: &str, waiting: &str, idle: &str, background: &str) -> String {
+    let mut by_state = idle.to_owned();
     for (state, value) in [
-        ('p', format!("#{{{OPT_GP}}}")),
-        ('A', ladder(OPT_TA, OPT_GA, OPT_GP)),
-        ('W', ladder(OPT_TW, OPT_GW, OPT_GP)),
-        ('a', ladder(OPT_TA, OPT_GA, OPT_GI)),
-        ('w', ladder(OPT_TW, OPT_GW, OPT_GI)),
+        ('p', background.to_owned()),
+        ('A', ladder(OPT_TA, waiting, background)),
+        ('W', ladder(OPT_TW, working, background)),
+        ('a', ladder(OPT_TA, waiting, idle)),
+        ('w', ladder(OPT_TW, working, idle)),
     ] {
         by_state = format!("#{{?#{{==:{ST},{state}}},{value},{by_state}}}");
     }
@@ -158,6 +164,19 @@ fn cell() -> String {
     // waiting can still age, but fall back to that background state instead.
     let alive = format!("#{{?{HAS_BACKGROUND},{by_state},#{{?#{{e|>|:{AGE},#{{{OPT_TG}}}}},,{by_state}}}}}");
     format!("#{{?{IS},{alive},}}")
+}
+
+/// A theme can replace its per-pane strip with one colored cap. Select the
+/// highest visible priority across ALL panes in this window, independently of
+/// customized glyphs. Empty means no visible Claude state; the theme supplies
+/// its neutral color. Like the strip, expand with T: so expiry uses tmux's clock.
+fn window_color() -> String {
+    let states = format!("#{{P:{}}}", cell_values("w", "a", "i", "p"));
+    let mut color = String::new();
+    for (state, hex) in [('i', "#e5e7eb"), ('p', "#c084fc"), ('w', "#60a5fa"), ('a', "#fb923c")] {
+        color = format!("#{{?#{{m:*{state}*,{states}}},{hex},{color}}}");
+    }
+    color
 }
 
 /// A cell per claude PANE of the attached session, then where you are.
@@ -388,6 +407,7 @@ pub fn session_start(cfg: &Config) {
     set(&mut c, OPT_TG, &ttl("CCTAB_TTL_GONE", DEFAULT_TTL_GONE));
     set(&mut c, OPT_TITLE, &fmt);
     set(&mut c, OPT_WINDOW_STRIP, &format!("#{{P:{}}}", cell()));
+    set(&mut c, OPT_WINDOW_COLOR, &window_color());
     set(&mut c, OPT_STRING, sts);
     c.arg(";").arg("if").arg("-F").arg(format!("#{{==:#{{{OPT_SAVED}}},}}")).arg(format!(
         "set -Fs {OPT_PREV_STRING} \"#{{set-titles-string}}\" ; \
@@ -464,8 +484,8 @@ fn install_window_status(t: &Tmux) {
         c.args(["if-shell", "-F", "-t", &id]);
         let unsaved = format!("#{{&&:#{{==:#{{{}}},}},#{{==:#{{{}}},}}}}", f.saved, f.local);
         let independent = format!(
-            "#{{&&:#{{==:#{{m:*@cctab_prev_window_*,#{{{}}}}},0}},#{{==:#{{m:*{OPT_WINDOW_STRIP}*,#{{{}}}}},0}}}}",
-            f.option, f.option,
+            "#{{&&:#{{==:#{{m:*@cctab_prev_window_*,#{{{}}}}},0}},#{{&&:#{{==:#{{m:*{OPT_WINDOW_STRIP}*,#{{{}}}}},0}},#{{==:#{{m:*{OPT_WINDOW_COLOR}*,#{{{}}}}},0}}}}}}",
+            f.option, f.option, f.option,
         );
         // If an ownership marker was lost, never save our existing wrapper as
         // its own original: E:previous would then recurse into itself.
@@ -789,7 +809,7 @@ fn report_window_status(t: &Tmux) -> String {
         };
         if values[0] == "1" && values[1] == window_status_format(f.previous) {
             installed += 1;
-        } else if values[1].contains(OPT_WINDOW_STRIP)
+        } else if (values[1].contains(OPT_WINDOW_STRIP) || values[1].contains(OPT_WINDOW_COLOR))
             && !window_format_uses_saved_label(&values[1]) {
             custom += 1;
         } else if values[0] == "1" {
@@ -984,7 +1004,7 @@ pub fn uninstall() -> Vec<String> {
 }
 
 /// Every option SessionStart writes, so that uninstall cannot forget one.
-const OURS: [&str; 14] = [
+const OURS: [&str; 15] = [
     OPT_GW,
     OPT_GA,
     OPT_GI,
@@ -999,6 +1019,7 @@ const OURS: [&str; 14] = [
     OPT_PREV_TITLES,
     OPT_EXE,
     OPT_WINDOW_STRIP,
+    OPT_WINDOW_COLOR,
 ];
 
 /// Read several options in ONE invocation, one per line.
@@ -1430,7 +1451,7 @@ mod tests {
         // and @cctab_exe is the one this slice added.
         assert!(OURS.contains(&OPT_EXE));
         assert!(OURS.contains(&OPT_WINDOW_STRIP));
-        assert_eq!(OURS.len(), 14);
+        assert_eq!(OURS.len(), 15);
     }
 
     #[test]

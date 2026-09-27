@@ -39,11 +39,12 @@ SAVED = ("@cctab_window_format_saved", "@cctab_prev_window_format",
          "@cctab_prev_window_current", "@cctab_prev_window_current_local")
 
 
-def terminal_text_and_backgrounds(data):
+def terminal_text_and_backgrounds(data, foreground=False):
     """Remove terminal controls while retaining each printed character's SGR background."""
     data = re.sub(rb"\x1b\].*?(?:\x07|\x1b\\)", b"", data, flags=re.S)
     text, backgrounds = [], []
     background = None
+    reset, base, bright, extended = (39, 30, 90, 38) if foreground else (49, 40, 100, 48)
     for token in re.findall(r"\x1b\[[0-?]*[ -/]*[@-~]|.", data.decode(errors="replace"), re.S):
         if token.startswith("\x1b["):
             if re.fullmatch(r"\x1b\[[0-9;]*m", token):
@@ -51,14 +52,14 @@ def terminal_text_and_backgrounds(data):
                 index = 0
                 while index < len(codes):
                     code = codes[index]
-                    if code in (0, 49):
+                    if code in (0, reset):
                         background = None
-                    elif 40 <= code <= 47 or 100 <= code <= 107:
+                    elif base <= code <= base + 7 or bright <= code <= bright + 7:
                         background = (code,)
                     elif code in (38, 48) and index + 1 < len(codes):
                         count = {2: 3, 5: 1}.get(codes[index + 1], 0)
                         if count and index + 1 + count < len(codes):
-                            if code == 48:
+                            if code == extended:
                                 background = tuple(codes[index + 1:index + 2 + count])
                             index += 1 + count
                     index += 1
@@ -256,6 +257,103 @@ class TmuxStatusTests(unittest.TestCase):
                 self.assertEqual(record.read_bytes(), before)
         finally:
             record.chmod(0o600)
+
+    def test_window_color_uses_all_panes_priority_and_shared_decay(self):
+        self.start(CCTAB_TTL_WORKING="2", CCTAB_TTL_WAITING="2", CCTAB_TTL_GONE="4",
+                   CCTAB_GLYPH_WORKING="", CCTAB_GLYPH_WAITING="custom")
+        other = self.tm("split-window", "-d", "-t", self.pane, "-P", "-F", "#{pane_id}", "/bin/sh")
+        elsewhere = self.new_window("separate")
+        epoch = int(self.tm("display-message", "-p", "%s"))
+        def carrier(pane, state, age=0):
+            tag = "ct2" if state in "pWA" else "ct1"
+            self.tm("select-pane", "-t", pane, "-T", f"project {tag} {state} {epoch-age}")
+        def color(pane=self.pane):
+            return self.tm("display-message", "-p", "-t", pane, "#{T:@cctab_window_color}")
+        carrier(self.pane, "i")
+        self.assertEqual(color(), "#e5e7eb")
+        carrier(other, "p", 365 * 86400)
+        self.assertEqual(color(), "#c084fc")
+        carrier(self.pane, "w")
+        self.assertEqual(color(), "#60a5fa")
+        carrier(other, "A")
+        self.assertEqual(color(), "#fb923c")
+        # Selection and a different window do not hide this inactive pane's wait.
+        self.tm("select-pane", "-t", self.pane)
+        carrier(elsewhere, "p")
+        self.assertEqual(color(), "#fb923c")
+        self.assertEqual(color(elsewhere), "#c084fc")
+        # Both foreground carriers age, but A and W retain known background.
+        carrier(self.pane, "w", 10)
+        carrier(other, "A", 10)
+        self.assertEqual(color(), "#c084fc")
+        carrier(other, "W", 10)
+        self.assertEqual(color(), "#c084fc")
+        carrier(other, "a", 3)
+        self.assertEqual(color(), "#e5e7eb")
+        carrier(other, "i", 10)
+        self.assertEqual(color(), "")
+        self.tm("select-pane", "-t", other, "-T", "shell ct9 a 123")
+        self.assertEqual(color(), "")
+
+    def test_color_theme_has_no_extra_dots_and_survives_start_and_uninstall(self):
+        self.tm("source-file", str(ROOT / "examples/tmux.conf"))
+        before = self.globals()
+        self.start()
+        self.start()
+        self.assertEqual(self.globals(), before)
+        self.assertEqual(self.formats(self.pane), ((False, None), (False, None)))
+        self.assertIn("window list: OK", self.hook("doctor", self.pane).decode())
+        self.publish(self.pane, "waiting")
+        for current in (False, True):
+            rendered = self.rendered(self.pane, current)
+            self.assertIn("#[fg=#fb923c,bg=#1f2329]", rendered)
+            self.assertNotRegex(rendered, "[🔵🟠🟣⚪]")
+        self.assertIn("🟠", self.tm("display-message", "-p", "-t", self.pane, "#{T:@cctab_title}"))
+        label = self.tm("display-message", "-p", "-t", self.pane, "#{E:@claude_window_label}")
+        self.uninstall()
+        self.assertEqual(self.globals(), before)
+        self.assertEqual(self.tm("show-options", "-sqv", "@cctab_window_color"), "")
+        self.assertIn("#[fg=#303641,bg=#1f2329]", self.rendered(self.pane))
+        self.assertIn("#[fg=#e5e7eb,bg=#1f2329]", self.rendered(self.pane, True))
+        self.assertIn(label, self.rendered(self.pane, True))
+
+    def test_actual_status_bar_draws_only_the_left_cap_in_the_status_color(self):
+        self.tm("source-file", str(ROOT / "examples/tmux.conf"))
+        self.start()
+        self.publish(self.pane, "waiting")
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
+        client = subprocess.Popen(self.base + ["attach-session", "-t", "alpha"],
+                                  env=self.env, stdin=slave, stdout=slave, stderr=slave,
+                                  start_new_session=True)
+        os.close(slave)
+        captured = b""
+        fragment = " 0:"
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if select.select([master], [], [], 0.1)[0]:
+                    try:
+                        captured += os.read(master, 65536)
+                    except OSError:
+                        break
+                clean, foregrounds = terminal_text_and_backgrounds(captured, foreground=True)
+                if fragment in clean and "" in clean[clean.index(fragment):]:
+                    break
+            self.assertIn(fragment, clean)
+            left = clean.index(fragment)
+            right = clean.index("", left)
+            self.assertEqual(foregrounds[left], (2, 251, 146, 60))
+            self.assertEqual(foregrounds[right], (2, 229, 231, 235))
+            self.assertNotRegex(clean[left:right], "[🔵🟠🟣⚪]")
+        finally:
+            client.terminate()
+            try:
+                client.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                client.kill()
+                client.wait(timeout=3)
+            os.close(master)
 
     def test_current_state_semantics_agree_with_plain_terminal(self):
         # Exercise all four states and ownership precedence through ordinary

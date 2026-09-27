@@ -24,8 +24,10 @@ Precedence is **input required > main working > background > idle**, using the
 resolved state after the ownership and recovery rules in the
 [state contract](state-contract.md). Raw events do not bypass live waits.
 Terminal titles, tmux window labels and the tmux outer title must use those same
-meanings. A window containing several Claude panes retains an indicator per pane;
-the priority is within a session, not permission to hide another session's wait.
+meanings. The default strip retains an indicator per pane. The optional rounded-cap theme
+summarizes all panes in a window using the same priority, so an inactive pane
+waiting for input still makes the cap orange. Its outer title retains the
+individual pane indicators.
 
 The intended long-workflow sequence is:
 
