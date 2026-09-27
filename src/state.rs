@@ -75,16 +75,16 @@
 //! the harness forked three times per exec and put an 1100us floor under a 500us
 //! measurement. The script interleaves the arms, reports the spread, and compares
 //! the layer against ITSELF switched off. Two independent 21-round passes there:
-//! +15us on the hot `working` read, +15 to +22us on a transition, +16us on `idle`
-//! (which now builds a payload tail for `background_tasks`), against a ~460us
+//! Before structural payload parsing: +15us on the hot `working` read, +15 to
+//! +22us on a transition, +16us on `idle`, against a ~460us
 //! floor - and NEGATIVE for a subagent no-op, which returns before the location
 //! walk and is therefore genuinely cheaper than a painting edge.
 //!
 //! WHEN IT IS ABSENT the binary behaves EXACTLY as it did stateless: no
 //! `XDG_RUNTIME_DIR` (and no `CCTAB_STATE_DIR`), an unusable directory, or a
 //! payload with no `session_id` all leave [`Session::open`] returning `None`, and
-//! `main` then runs the old `Edge::resolve` path unchanged. That is what keeps all
-//! 312 golden-corpus cases byte-identical - the corpus environment sets neither
+//! `main` then runs the stateless `Edge::resolve` path. The golden corpus tests
+//! that path - its environment sets neither
 //! variable - and it is also why the corpus is the wrong home for this module's
 //! behaviour: the corpus is frozen against the SHELL implementation, which has no
 //! record to consult. `tests/run.sh` owns it instead.
@@ -271,7 +271,7 @@ impl Owner {
     /// exactly one call site, the `Notification` backstop, which knows it cannot
     /// attribute what it is reporting.
     fn of(p: &Payload) -> Owner {
-        match p.head_field(b"agent_id").and_then(id_str) {
+        match p.agent_id().map(str::as_bytes).and_then(id_str) {
             Some(id) => Owner::Agent(id),
             None => Owner::Main,
         }
@@ -580,18 +580,13 @@ fn itoa(mut n: u64) -> String {
 /// `background_tasks` is present and EMPTY: this payload says nothing outside the
 /// main loop is running.
 ///
-/// One needle rather than a parse of the array, because the only question asked of
-/// it here is whether it is empty. The two spellings are the ones
-/// `Edge::SessionStart`'s `source` test already covers, for the same reason: a
-/// pretty-printed payload must not read as the opposite answer.
-///
 /// ABSENT IS NOT EMPTY. A `Notification` carries no such member at all, and a
 /// Claude Code that renamed it would carry none either, so "not found" has to mean
 /// "I do not know" and leave every wait standing. That is the conservative
 /// direction, and it is the capture's 68.946 `Stop`, whose array holds the agent
 /// that raises a dialog one second later.
 fn nothing_running(p: &Payload) -> bool {
-    p.has(b"\"background_tasks\":[]") || p.has(b"\"background_tasks\": []")
+    p.background_tasks_empty() == Some(true)
 }
 
 /// This `working` edge is a `UserPromptSubmit` carrying a prompt the USER typed.
@@ -617,17 +612,9 @@ fn nothing_running(p: &Payload) -> bool {
 /// has is an XML-ish tag, and a human prompt that happens to start with `<` costs
 /// only this one retirement condition, out of four.
 ///
-/// FRONT window, where `hook_event_name` sits at offset 759-821 and `prompt`
-/// immediately after it in every captured payload. If a pathological
-/// `transcript_path` pushed them out the needle is not found and the wait stands,
-/// which is the same conservative direction as everything else here.
 fn at_the_prompt(p: &Payload) -> bool {
-    if !(p.head_has(b"\"hook_event_name\":\"UserPromptSubmit\"")
-        || p.head_has(b"\"hook_event_name\": \"UserPromptSubmit\""))
-    {
-        return false;
-    }
-    matches!(p.head_field(b"prompt").and_then(<[u8]>::first), Some(b) if *b != b'<')
+    p.hook_event_name() == Some("UserPromptSubmit")
+        && matches!(p.prompt_first(), Some(c) if c != '<')
 }
 
 /// Where records live, or `None` when there is nowhere to put them.
@@ -680,7 +667,7 @@ impl Session {
     /// means "behave exactly as the stateless version did".
     pub fn open(dir: Option<PathBuf>, p: &Payload) -> Option<Session> {
         let dir = dir?;
-        let id = p.head_field(b"session_id").and_then(id_str)?;
+        let id = p.session_id().map(str::as_bytes).and_then(id_str)?;
         // Mode 0700 on creation rather than a check afterwards: inside
         // XDG_RUNTIME_DIR, itself 0700 and owned by us, there is nobody to race.
         if !dir.is_dir()
@@ -922,7 +909,7 @@ impl Session {
                 // what bounds a subagent wait nothing else can retire - Esc at a
                 // subagent's dialog fires no hook at all - to a single turn rather
                 // than to CCTAB_TTL_WAITING. Tested lazily, so the hot edge, a
-                // PostToolUse with nothing outstanding, never pays for the needle.
+                // PostToolUse with nothing outstanding, skips the prompt-policy branch.
                 if !now.waits.is_empty() && at_the_prompt(p) {
                     now.waits.clear();
                 }
@@ -1330,7 +1317,7 @@ pub fn survey() -> Survey {
 //   Painting it is easy; UN-painting it is the open problem, and it is the same
 //   problem this module already solves. HALF OF THE READ IS ALREADY HERE:
 //   `nothing_running` asks that array the only question `free` needs, whether it
-//   is empty, with one needle and no parse. Purple needs the IDS, which is the
+//   is empty, retaining no entries. Purple needs the IDS, which is the
 //   part deliberately not built. The shape:
 //     * a reserved `g <id> [<id>...]` line records the live set as of the last
 //       Stop. `Record::parse` already SKIPS unknown keys, so writing it does not
@@ -1460,7 +1447,7 @@ mod tests {
     fn payload(line: &str) -> Payload {
         let mut b = line.as_bytes().to_vec();
         b.push(b'\n');
-        Payload::from_bytes(&b)
+        Payload::from_bytes(&b).unwrap()
     }
 
     /// A `Stop` whose `background_tasks` holds a live subagent, which is the
@@ -2388,9 +2375,9 @@ mod tests {
         assert!(!at_the_prompt(&payload(
             r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":""}"#
         )));
-        // `background_tasks` beyond the FRONT window is still found, because
+        // A late top-level `background_tasks` is found regardless of order, because
         // `Stop` serializes it after an unbounded `last_assistant_message`.
-        let big = "x".repeat(crate::payload::PAYLOAD_PREFIX + 512);
+        let big = "x".repeat(8192 + 512);
         assert!(nothing_running(&payload(&format!(
             r#"{{"session_id":"s1","last_assistant_message":"{big}","background_tasks":[]}}"#
         ))));

@@ -36,6 +36,20 @@ import runner  # noqa: E402
 
 # id -> why its expectation changes
 FIXED = {
+    # (g) selective structural parsing: six measured changes from the window
+    # reader. Retain historical case IDs so the before-fixes oracle stays useful.
+    "notify-spaced-out-kind-is-silent":
+        "fix-g: valid whitespace does not hide a waiting notification",
+    "notify-pretty-printed-is-silent":
+        "fix-g: a complete multiline object resolves its idle notification",
+    "notify-multiline-read-and-drained":
+        "fix-g: trailing garbage rejects the complete input instead of painting",
+    "sstart-compact-pretty-printed-escapes-the-belt":
+        "fix-g: multiline compact metadata suppresses session start",
+    "sstart-multiline-drained":
+        "fix-g: trailing garbage rejects session start instead of arming",
+    "sstart-compact-on-second-line":
+        "fix-g: multiple top-level documents reject session start",
     # (c) invalid UTF-8 in a name no longer yields invalid JSON: the display
     # string is repaired to U+FFFD at the boundary, so a title paints.
     "hostile-invalid-utf8-path":

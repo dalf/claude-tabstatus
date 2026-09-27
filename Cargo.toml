@@ -11,22 +11,11 @@ description = "Puts the Claude Code session state into the terminal tab title."
 license = "GPL-3.0-or-later"
 publish = false
 
-# Zero dependencies, deliberately: std only.
-#
-# NOT for speed. Measured: adding 85KB of never-executed code to this binary cost
-# -9us, because unexecuted pages are never faulted in. A dependency is not slow
-# here just by existing, and reasoning from size would be reasoning from a false
-# premise.
-#
-# The argument is trust and proportionality. This binary runs on EVERY tool call,
-# as the user, with the CLAUDE_* environment in scope (CLAUDE_CODE_MESSAGING_TOKEN
-# among it) and with tool_input and tool_response arriving on stdin - file
-# contents, command strings, fetched pages. That is the highest-frequency, most
-# data-rich execution point in the setup, it parses input that merely passed
-# THROUGH Claude, and the update path is `git pull` with no review gate. Against
-# that, serde_json means serde + serde_derive: tens of thousands of transitive
-# lines plus proc macros executing at BUILD time, to emit two JSON fields that a
-# thirty-line hand-rolled writer already covers.
+# Hook metadata is parsed structurally without constructing unused JSON values.
+# No derive feature or procedural macros are needed.
+[dependencies]
+serde = "1"
+serde_json = "1"
 
 [[bin]]
 name = "tabstatus"
@@ -38,3 +27,13 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = "symbols"
+
+# Measured dependency-only speed optimization; application code stays size-first.
+[profile.release.package.serde]
+opt-level = 3
+[profile.release.package.serde_core]
+opt-level = 3
+[profile.release.package.serde_json]
+opt-level = 3
+[profile.release.package.memchr]
+opt-level = 3

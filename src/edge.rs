@@ -2,7 +2,7 @@
 //!
 //! Which hook event maps to which edge is `hooks/hooks.json`'s business, not this
 //! binary's. What is this module's business is that the mapping is a closed set,
-//! decided once from argv and from a handful of substring tests on the payload,
+//! decided once from argv and selectively parsed top-level hook metadata,
 //! so that nothing further down has to ask "was this the notify edge?" again.
 
 use crate::payload::Payload;
@@ -78,30 +78,12 @@ impl Edge {
     }
 
     /// Whether this edge's state depends on the payload. The other edges only
-    /// drain stdin, and never pay for a window of it.
+    /// drain stdin without parsing it when no state directory is configured.
     pub fn reads_payload(self) -> bool {
         matches!(
             self,
             Edge::Notify | Edge::SessionStart | Edge::Working | Edge::SubagentStop
         )
-    }
-
-    /// Whether this edge needs the payload's TAIL once there is a record to
-    /// consult - i.e. an edge whose STATELESS answer needs no payload at all but
-    /// whose stateful one does, and whose discriminator is not a front member.
-    ///
-    /// Exactly one: `idle`. `state::free` reads `background_tasks`, which a `Stop`
-    /// serializes after `last_assistant_message`, so a front window alone loses it
-    /// on any turn with a long final message - and losing it means every wait
-    /// stands when it should have been retired, which is the tab staying orange.
-    /// The other stateful-only edges want `session_id` and `agent_id`, both front
-    /// members, so they keep paying for the front window alone.
-    ///
-    /// Deliberately NOT folded into `reads_payload`: that predicate also governs
-    /// the STATELESS path, where nothing about `idle` depends on the payload, and
-    /// making it build a tail there would spend the work for no answer.
-    pub fn reads_state_tail(self) -> bool {
-        matches!(self, Edge::Idle)
     }
 
     /// The edge plus its payload, resolved to a single decision. `None` means
@@ -119,7 +101,7 @@ impl Edge {
                 // subagent's PermissionRequest still paints `waiting`, because you
                 // are the one blocking on that dialog whoever asked for it.
                 // README's "States" section has the cost this filter carries.
-                if payload.head_has_field(b"agent_id") {
+                if payload.agent_id().is_some() {
                     return None;
                 }
                 Some(Paint::Line(Glyph::Working))
@@ -132,17 +114,9 @@ impl Edge {
                 Notification::Other => None,
             },
             Edge::SessionStart => {
-                // An auto-compaction re-fires SessionStart MID-TURN, which would
-                // repaint the idle dot while Claude is still working AND arm the
-                // tab a second time with no matching unarm. The needles carry the
-                // compact spelling Claude Code actually writes plus the one-space
-                // variant, so a pretty-printed payload matches nothing and falls
-                // through to painting; hooks.json's
-                // `"matcher": "startup|resume|clear|fork"` is the load-bearing
-                // guard and this test is a belt to it.
-                if payload.head_has(b"\"source\":\"compact\"")
-                    || payload.head_has(b"\"source\": \"compact\"")
-                {
+                // Compaction is a mid-turn SessionStart, not a new idle session.
+                // The hook matcher excludes it too; parsed metadata is a backstop.
+                if payload.source() == Some("compact") {
                     return None;
                 }
                 Some(Paint::SessionStart)
@@ -164,8 +138,7 @@ pub enum Notification {
     /// The quiet-turn nudge, fired ~60s after a turn ends. It is the one kind
     /// that MUST NOT paint waiting - it arrives after EVERY quiet turn end, so
     /// mapping it to waiting would turn every idle tab orange a minute later and
-    /// collapse two of the three states into one. Matched FIRST for that reason,
-    /// so it beats a co-present waiting kind.
+    /// collapse two of the three states into one.
     IdlePrompt,
     /// A BACKSTOP, not the fast path: `permission_prompt` is scheduled 6s after
     /// the dialog goes up, fires at most once per dialog, and is suppressed
@@ -182,24 +155,20 @@ pub enum Notification {
     Other,
 }
 
-const WAITING_KINDS: [&[u8]; 5] = [
-    b"\"notification_type\":\"permission_prompt\"",
-    b"\"notification_type\":\"worker_permission_prompt\"",
-    b"\"notification_type\":\"agent_needs_input\"",
-    b"\"notification_type\":\"elicitation_dialog\"",
-    b"\"notification_type\":\"elicitation_url_dialog\"",
+const WAITING_KINDS: [&str; 5] = [
+    "permission_prompt",
+    "worker_permission_prompt",
+    "agent_needs_input",
+    "elicitation_dialog",
+    "elicitation_url_dialog",
 ];
 
 impl Notification {
     pub fn detect(payload: &Payload) -> Notification {
-        // Both windows, because `notification_type` is serialized LAST, after an
-        // unbounded `message`.
-        if payload.has(b"\"notification_type\":\"idle_prompt\"") {
-            Notification::IdlePrompt
-        } else if WAITING_KINDS.iter().any(|k| payload.has(k)) {
-            Notification::Waiting
-        } else {
-            Notification::Other
+        match payload.notification_type() {
+            Some("idle_prompt") => Notification::IdlePrompt,
+            Some(kind) if WAITING_KINDS.contains(&kind) => Notification::Waiting,
+            _ => Notification::Other,
         }
     }
 }
@@ -240,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_edges_with_a_discriminator_pay_for_a_payload_window() {
+    fn only_the_edges_with_a_discriminator_parse_stateless_payloads() {
         assert!(Edge::Notify.reads_payload());
         assert!(Edge::SessionStart.reads_payload());
         assert!(Edge::Working.reads_payload());
@@ -249,19 +218,6 @@ mod tests {
         assert!(!Edge::Idle.reads_payload());
         assert!(!Edge::SessionEnd.reads_payload());
         assert!(!Edge::Unknown.reads_payload());
-        // And exactly one edge needs the tail only once a record exists.
-        for e in [
-            Edge::Notify,
-            Edge::SessionStart,
-            Edge::Working,
-            Edge::SubagentStop,
-            Edge::Waiting,
-            Edge::SessionEnd,
-            Edge::Unknown,
-        ] {
-            assert!(!e.reads_state_tail(), "{e:?}");
-        }
-        assert!(Edge::Idle.reads_state_tail());
     }
 
     #[test]
@@ -281,9 +237,9 @@ mod tests {
         ] {
             assert_eq!(Edge::SessionStart.resolve(&payload(line)), None);
         }
-        // Two spaces is not the spelling Claude Code writes.
+        // Every valid JSON whitespace spelling has the same meaning.
         let p = payload(br#"{"source":  "compact"}"#);
-        assert_eq!(Edge::SessionStart.resolve(&p), Some(Paint::SessionStart));
+        assert_eq!(Edge::SessionStart.resolve(&p), None);
     }
 
     #[test]
@@ -307,37 +263,32 @@ mod tests {
     #[test]
     fn every_waiting_kind_paints_orange() {
         for kind in WAITING_KINDS {
-            let mut line = b"{".to_vec();
-            line.extend_from_slice(kind);
-            line.extend_from_slice(b"}");
+            let line = format!(r#"{{"notification_type": "{kind}"}}"#).into_bytes();
             assert_eq!(
                 Edge::Notify.resolve(&payload(&line)),
                 Some(Paint::Line(Glyph::Waiting)),
                 "{}",
-                String::from_utf8_lossy(kind)
+                kind
             );
         }
     }
 
     #[test]
-    fn idle_prompt_beats_a_co_present_waiting_kind() {
+    fn nested_text_cannot_override_a_kind_and_duplicate_kinds_are_rejected() {
         let p = payload(
             br#"{"notification_type":"permission_prompt","x":"\"notification_type\":\"idle_prompt\""}"#,
         );
         // The escaped copy cannot match, so this one is orange.
         assert_eq!(Edge::Notify.resolve(&p), Some(Paint::Line(Glyph::Waiting)));
-        let p = payload(
+        assert!(Payload::from_bytes(
             br#"{"notification_type":"permission_prompt","also":1,"notification_type":"idle_prompt"}"#,
-        );
-        assert_eq!(Edge::Notify.resolve(&p), Some(Paint::Line(Glyph::Idle)));
+        ).is_err());
     }
 
     #[test]
     fn an_unrecognised_kind_is_silent() {
         for line in [
             &br#"{"notification_type":"agent_completed"}"#[..],
-            // One space after the colon is NOT tolerated on this edge.
-            &br#"{"notification_type": "permission_prompt"}"#[..],
             &br#"{"notification_type":"xpermission_prompt"}"#[..],
             &b"{}"[..],
             &b""[..],
@@ -352,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn a_kind_in_the_back_window_still_counts() {
+    fn a_kind_after_a_large_message_still_counts() {
         // `notification_type` is serialized after an unbounded `message`.
         let mut line = br#"{"message":""#.to_vec();
         line.resize(9000, b'm');
@@ -366,12 +317,10 @@ mod tests {
 
     // Test helpers: a Payload built from bytes rather than from stdin.
     fn payload(line: &[u8]) -> Payload {
-        let mut with = line.to_vec();
-        with.push(b'\n');
-        payload_with_newline(&with)
+        Payload::from_bytes(line).unwrap()
     }
 
     fn payload_with_newline(bytes: &[u8]) -> Payload {
-        Payload::from_bytes(bytes)
+        Payload::from_bytes(bytes).unwrap()
     }
 }

@@ -1,5 +1,6 @@
 //! A JSON reader and writer just big enough for `settings.json` and the state
-//! record, so that `install` needs no jq and no crates.
+//! record, preserving byte spans for installer edits. Hook payloads use Serde
+//! separately; changing this parser would change settings-file round trips.
 //!
 //! Two things make this different from a toy parser, and both exist for the
 //! installer:

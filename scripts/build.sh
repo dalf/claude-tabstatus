@@ -70,7 +70,7 @@ build_one() {
     printf '\n=== %s ===\n' "$_t"
     # Always --target, even for the host: musl is a cross-target on a glibc box,
     # and routing every build the same way keeps the output path predictable.
-    ${CARGO} build --release --target "$_t" || return 1
+    ${CARGO} build --locked --release --target "$_t" || return 1
     _out=target/$_t/release/tabstatus
     [ -f "$_out" ] || _out=target/$_t/release/tabstatus.exe
     case $_t in
@@ -105,7 +105,7 @@ ln -sfn "tabstatus-$host" bin/tabstatus
 # a PREBUILT binary, already copied into bin/ or uploaded as a release asset, going
 # stale against an edited hooks.json without anyone rebuilding. tests/run.sh
 # recomputes this exact list, so both spellings must stay in the same order.
-sources="Cargo.toml .claude-plugin/plugin.json hooks/hooks.json $(ls src/*.rs | sort)"
+sources="Cargo.toml Cargo.lock .claude-plugin/plugin.json hooks/hooks.json $(ls src/*.rs | sort)"
 have_sha256=
 command -v sha256sum >/dev/null 2>&1 && have_sha256=yes
 for t in $list; do

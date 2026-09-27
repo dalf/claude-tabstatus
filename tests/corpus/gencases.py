@@ -3,6 +3,11 @@
 
     python3 gencases.py [--ref 'sh /path/to/tabstatus.sh']
 
+This generator deliberately reproduces the historical shell oracle. After it,
+run refreeze_fixed.py against the current binary to apply named fixes (including
+structural parsing fix-g); historical IDs do not necessarily describe the fixed
+expectation. Do not add diverge flags to exempt parser regressions.
+
 Every case in cases.jsonl is a fully reproducible invocation:
 
   id        stable name, also the label replay.sh prints
@@ -541,7 +546,7 @@ C("sstart-compact-spaced", ["session-start"],
   stdin='{"hook_event_name":"SessionStart","source": "compact"}\n')
 C("sstart-compact-pretty-printed-escapes-the-belt", ["session-start"],
   stdin='{\n  "hook_event_name": "SessionStart",\n  "source": "compact"\n}\n',
-  note="fails OPEN: hooks.json's matcher is the load-bearing guard")
+  note="historical oracle fails open; fix-g recognizes multiline compact metadata")
 C("sstart-word-compact-elsewhere", ["session-start"],
   stdin='{"cwd":"%s/compact","hook_event_name":"SessionStart",'
         '"source":"startup"}\n' % TOK)

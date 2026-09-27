@@ -40,7 +40,7 @@ Three states, and the hook events that paint them:
 
 The `SessionStart` and `PreToolUse` scopes are hook *matchers*, so those hooks
 do not even run outside them. The `Notification` kinds and the `compact` source
-are substring tests inside the binary, so those hooks run and then decide -
+use parsed top-level metadata inside the binary, so those hooks run and then decide -
 which costs one ~0.6ms process on a notification, and buys a decision the test
 suite can assert rather than one that lives only in a config file.
 
@@ -110,27 +110,39 @@ Some of that is less obvious than it looks:
   error - `rate_limit`, `overloaded` - only `StopFailure` fires, so without it a
   rate-limited turn would leave the tab blue indefinitely.
 
-What the binary paints is a function of the edge name, a handful of substring
-tests on the raw payload line, and - for the four edges that can be part of a
-wait - one small record per session. Wait ownership, below, is why that record
-exists and what is in it; with nowhere to keep it, every edge falls back to the
-stateless answer, which is what the whole golden corpus still pins byte for byte.
-`Notification`, `SessionStart`, `PostToolUse` and `SubagentStop` look at their
-payload for a discriminator of their own, and all of them search only **bounded
-windows** of
-the first line: its first 8 KiB, plus - for `Notification` alone - its last
-8 KiB. Nothing between them is ever searched, so the cost does not depend on what
-a tool returned. The back window is not symmetry: a `Notification` serializes
-`notification_type` **last**, after the unbounded `message`, so with a front
-window alone an MCP elicitation carrying a long message lost its own
-discriminator and the tab painted nothing at all. `agent_id` and `source` are
-read from the front window only, because they are serialized before anything
-unbounded (byte 760 of 1360 and byte 713 of 769 in real captures) and because a
-false positive on `agent_id` would silence every `working` repaint for the rest of
-the session. `session_id` is the payload's **first** member in every capture, so
-it is in the front window by construction. The tests carry the compact `"key":"value"` spelling Claude Code
-actually writes, and a payload that matches nothing falls through to painting
-nothing, which leaves whatever the tab already showed.
+What the binary paints depends on the edge, **top-level JSON metadata**, and a
+small record per session for wait ownership. Hook input is parsed with
+`serde_json::from_slice` and a selective visitor: `IgnoredAny` skips unused tool
+inputs and results without constructing a JSON tree. Nested `agent_id`, `source`
+or notification fields cannot impersonate hook metadata. Valid JSON whitespace,
+member order and escapes have the same meaning, including fields far from either
+end of a large payload. Skipped strings are syntax-checked rather than decoded:
+an unpaired surrogate escape in unused data is accepted by `IgnoredAny`, while
+retained string fields require successful decoding. Raw invalid UTF-8 is rejected
+everywhere. Skipped arrays and objects are traversed iteratively, so Serde's
+ordinary recursive-deserialization depth limit does not bound their nesting.
+
+The complete input is buffered up to **16 MiB, including whitespace**. Oversized
+input is drained to EOF and ignored. This bounds the buffered input, not total
+memory or processing time: parsing and draining still require work, and parsing
+may allocate additional storage. Parsed input must be UTF-8 and contain one
+complete JSON object, with no trailing document or garbage. Recognized fields
+must be strings (or null), except `background_tasks`, which must be an array (or
+null). Duplicate recognized keys are rejected, including escaped spellings of the
+same key; unknown keys are skipped. Missing and null fields are absent; empty
+session and agent IDs are absent too. Only the first decoded prompt character and
+whether the background array is empty are retained from those two fields.
+
+Read errors, malformed input, wrong field types and oversized input are **silent
+no-ops, exiting zero before any state record is opened or changed**. Zero-byte
+stdin and interactive terminal invocations retain the manual paint behavior;
+whitespace-only input is invalid. Metadata-independent edges (`waiting`, `idle`,
+`session-end` and unknown edges) still only drain stdin when no state directory
+is configured, so JSON validation does not apply on that stateless fast path.
+With a configured state directory every edge parses its metadata.
+
+This fixes metadata interpretation; it does not change wait-retirement policy,
+background-work semantics, or the separate settings-file editor.
 
 ### Wait ownership
 
@@ -386,30 +398,18 @@ earns its place: after the first main-thread tool call of a turn sets the base, 
 later one in that turn is a read and nothing else, so transitions are a handful per
 turn against hundreds of tool calls.
 
-**The edges that used to only drain stdin now read a window, and that had to be
-bounded.** `waiting`, `idle` and `session-end` have no discriminator of their own;
-they read a payload only because the record is filed under `session_id`. `waiting`
-and `session-end` read the **front** window alone - `session_id` and `agent_id` are
-both front members. The distinction is not cosmetic, because building a tail means
-scanning every byte of the payload for the end of the line, and a
-`PermissionRequest` for a `Write` carries the whole file in `tool_input`: the first
-version of this read the full window on those edges and cost **+555us** on a 1 MiB
-payload, rising with payload size.
-
-`idle` is the one exception, and it is a deliberate trade. It reads
-`background_tasks`, which a `Stop` serializes *after* `last_assistant_message`, so a
-front window alone loses it on any turn that ended with a long message - and losing
-it means every wait stands when it should have been retired, which is the tab staying
-orange. It therefore builds a tail: once per turn, not once per tool call, and
-measured at +16us on a 2 KB payload and +44 to +53us against a pre-slice build. A
-300 KB `Stop` replayed through both binaries is byte-identical.
+**Stateful edges parse the same metadata as stateless edges.** The record is
+filed under the decoded top-level `session_id`, and wait ownership uses the same
+`agent_id` accessor that suppresses stateless subagent repaints. `idle` checks
+whether the top-level `background_tasks` array is empty; absent or null means
+unknown. The parser scans unused values but does not keep their contents. Its
+work grows with input size, unlike the historical bounded-window reader.
 
 **Seams, designed and deliberately not built.** `Stop` carries `background_tasks`,
 which is `[]` when the session is genuinely idle and otherwise holds
 `{id, type:"subagent", status:"running"}` per live agent, where `id` *is* the
 `agent_id` of the hooks that agent fires. Half the read is already here: `idle` asks
-that array the only question a wait needs - whether it is empty - with one needle and
-no parse. Purple needs the **ids**, which is the part not built. A reserved
+that array the only question a wait needs - whether it is empty - without retaining its entries. Purple needs the **ids**, which is the part not built. A reserved
 `g <id>...` line records that set, a fourth base letter paints it, and
 `subagent-stop` - already wired - removes the id and repaints the base. That is the
 un-paint the purple state needs, and it is the same mechanism above. It also sharpens
@@ -806,8 +806,8 @@ three:
 
 `print-embedded` writes the embedded bytes to stdout verbatim and nothing else -
 no trailing newline of its own - so `tabstatus print-embedded hooks | diff -
-hooks/hooks.json` is empty exactly when the two agree. It needs no hasher, which
-is why the zero-dependency claim stays trivially true.
+hooks/hooks.json` is empty exactly when the two agree. It needs no hasher or
+additional dependency.
 
 ### install and uninstall are ordered, both ways
 
@@ -1648,7 +1648,11 @@ sh scripts/build.sh          # the host target, refresh bin/ and its digests
 sh scripts/build.sh --all    # every target in the list
 ```
 
-**Zero dependencies, std only**, and `rust-version` is **1.89** - raised from 1.74
+**Serde and serde_json parse hook metadata**, without enabling `serde_derive`.
+`Cargo.lock` pins their dependency graph and release builds use `--locked`.
+Application code remains optimized for size (`opt-level = "s"`); the measured
+parser dependencies (`serde`, `serde_core`, `serde_json`, `memchr`) use
+`opt-level = 3` for speed. `rust-version` is **1.89** - raised from 1.74
 for `std::fs::File::lock`, which is what makes the state layer's read-modify-write
 atomic without a crate. The alternative was a bounded compare-and-retry loop: more
 code, and only probably correct.
@@ -1660,7 +1664,7 @@ triple's binary behind while a verify read fully green.
 
 | Target | State |
 |---|---|
-| `x86_64-unknown-linux-musl` | **default**, 680 KB, static-pie |
+| `x86_64-unknown-linux-musl` | **default**, static-pie |
 | `x86_64-unknown-linux-gnu` | builds |
 | `x86_64-pc-windows-gnu` | **does not build**, see below |
 
@@ -1686,7 +1690,10 @@ That refusal is not pedantry: the env key it would write switches Claude Code's
 own title painting off, and all eleven hooks would then resolve to a command that
 exits 127 - a tab nothing paints at all, which is strictly worse than no install.
 `install --force` overrides it for the case where you are about to build.
-Zero crates, so `cargo build` needs no network.
+The first build needs registry access (or a populated Cargo cache). Once cached,
+`cargo build --locked --offline` works without network access. The lockfile can
+list optional derive/proc-macro packages that are not compiled; inspect
+`cargo tree -e normal,build` for the active dependency graph.
 
 ## Tests
 
@@ -1704,14 +1711,15 @@ dependence either, so that whole axis is gone.
 
 Beside the two shell harnesses there are in-crate unit tests, which those
 harnesses cannot replace: they pin the argv and environment parsing, the location
-walk, the length cap and its elision, the two payload windows and the JSON writers
+walk, the length cap and its elision, structural hook parsing and the JSON writers
 at FUNCTION granularity, so a refactor can be checked a piece at a time instead of
 only end to end. Some of what they assert is invisible from outside the binary at
 all - that `repair` answers differently from `String::from_utf8_lossy` on a
 truncated sequence, for one.
 
 ```sh
-cargo test   # 168 tests, beside the 596 assertions and the 312 corpus cases
+cargo test --locked
+python3 tests/test_payload.py   # subprocess parsing and state-preservation regressions
 ```
 
 The state section pins `CLAUDE_PID` per case rather than inheriting it, and that is
@@ -1760,7 +1768,7 @@ whole of the server side, including that re-rendering the same paint after a wai
 gives a different answer with no process running and no hook firing.
 
 Two of the assertions exist only to guard the committed binaries: `bin/` carries
-a digest of the `src/*.rs` and `Cargo.toml` it was built from, *per triple built*
+a digest including `src/*.rs`, `Cargo.toml` and `Cargo.lock` it was built from, *per triple built*
 plus an unsuffixed copy for the host, and the suite recomputes it. The per-triple
 split matters: one manifest written for all sources after building only the host left
 the other triple's binary silently behind while `sha256sum -c` read fully green. Git does not preserve mtimes, so "is the binary older than the
@@ -1778,7 +1786,7 @@ config.
 CCTAB_DRY_RUN=1 bin/tabstatus working   # -> 🔵 claude-tabstatus@main
 ```
 
-The two payload-reading edges are assertable the same way, with the payload on
+Payload-dependent behavior is assertable the same way, with the payload on
 stdin - including the cases that must paint *nothing*, which print no bytes at
 all rather than an empty title:
 
@@ -1815,9 +1823,10 @@ dependency; it is checked by hand instead - 82 bytes for a startup, the OSC 50
 arming pair of [Konsole](#konsole) followed by the idle title, and 0 bytes for a
 compaction - and by the 312-case golden corpus in
 [`tests/corpus/`](tests/corpus/), which replays every edge over a freshly
-allocated pty and compares bytes. And the belt is pinned at its real reach rather than a wished-for
-one: `{"source": "compact"}` on one line is caught, the same payload
-pretty-printed over three lines is not, because only the first line is read.
+allocated pty and compares bytes. The compact-session guard now recognizes every
+valid JSON whitespace layout, including pretty-printed input. Named golden-case
+changes are documented in `tests/corpus/refreeze_fixed.py`; the original shell
+oracle and `cases.jsonl.before-fixes` remain historical evidence.
 
 ### The golden corpus
 
@@ -1882,6 +1891,8 @@ on purpose, each named for the limitation it closed. What the language bought:
 | a location outside printable ASCII | never cut, overflows the tab | cut like any other |
 | dependencies | `sh`, `jq` | none |
 
+This table records the pre-Serde implementation, including its old dependency
+count and window-based parser. It is historical, not a current parser benchmark.
 The binary column is best-of-300 on this machine with an exec floor of 288us
 (`/bin/true` through the same harness), so the
 interesting column is the difference, not the absolute. **Which machine and which
@@ -1967,7 +1978,7 @@ the one failure mode every other line rendered as healthy.
 - The fourth glyph: **background work running, main loop free**. `Stop` carries
   `background_tasks`, so painting it is easy and un-painting it is the problem the
   record already solves. Half the read exists: `idle` already asks that array whether
-  it is empty, with one needle. The rest of the shape is designed - a reserved `g`
+  it is empty, without retaining entries. The rest of the shape is designed - a reserved `g`
   line for the ids, a fourth base
   letter, and the `subagent-stop` edge that is already wired - and deliberately not
   built here.

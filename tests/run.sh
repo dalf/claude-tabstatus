@@ -617,10 +617,9 @@ check 'a multi-line payload is drained' '⚪ plain@master' \
     "$(cd -- "$tmp/repos/plain" && printf '%s\n%s\n%s\n' "$payload" "$payload" "$payload" | CCTAB_DRY_RUN=1 "$bin" idle)"
 
 # --- the payload-discriminated edges --------------------------------------
-# Two edges look at the payload, and both do it with `case` globs on the raw
-# line. The fixtures below are shaped exactly as Claude Code writes them:
-# compact JSON, no space after `:` or `,`, one trailing newline. A fixture with
-# spaces in it would assert a contract the product does not have.
+# These edges read top-level metadata structurally. Most fixtures below use
+# compact JSON, but valid whitespace, member order and escapes do not change
+# their meaning, and matching keys nested inside tool data are ignored.
 #
 # dryp is dry() with the payload arriving on OUR stdin instead of /dev/null.
 dryp() {
@@ -682,11 +681,11 @@ check 'notify: idle_prompt inside the message does not steal the paint' '🟠 pl
 # ENDS in a known one is not that kind.
 check 'notify: a kind that merely contains a known one is not it' '0' \
     "$(notif not_really_idle_prompt_either | dryp notify "$tmp/repos/plain" | wc -c | tr -d ' ')"
-# A payload that is not one line, and one with no trailing newline: the first
-# line is what carries the kind, and `read` assigns a partial last line.
+# No trailing newline is needed, but trailing non-JSON text rejects the whole
+# document rather than trusting the first line.
 check 'notify: a payload with no trailing newline still parses' '⚪ plain@master' \
     "$(cd -- "$tmp/repos/plain" && printf '{"notification_type":"idle_prompt"}' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" notify)"
-check 'notify: a multi-line payload is read and drained' '🟠 plain@master' \
+check 'notify: trailing garbage is drained and rejected' '' \
     "$(cd -- "$tmp/repos/plain" && printf '{"notification_type":"permission_prompt"}\ntrailing\ntrailing\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" notify)"
 (notif idle_prompt | dryp notify "$tmp/repos/plain" >/dev/null 2>&1)
 check 'notify: a painting kind exits 0' '0' "$?"
@@ -716,30 +715,17 @@ check 'session-start: the word compact elsewhere is not the source' '⚪ plain@m
 # recovery recipe in the README working from a shell.
 check 'session-start: no payload still paints idle' '⚪ plain@master' \
     "$(dry session-start "$tmp/repos/plain")"
-# The belt's exact reach, pinned in both directions, because the comment in
-# section 0b now claims it. A space after the colon IS caught - that is the one
-# whitespace variant a hand-rolled payload is most likely to have - and a
-# pretty-printed multi-line payload is NOT, because section 0 keeps only the
-# first line. The second case fails OPEN (it paints and, on a real Konsole,
-# arms), which is why hooks.json's matcher is the load-bearing guard and this is
-# only the belt.
+# Whitespace changes JSON spelling, never the decoded metadata.
 check 'session-start: compact with a space after the colon is still caught' '0' \
     "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"SessionStart","source": "compact"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" session-start | wc -c | tr -d ' ')"
-check 'session-start: a pretty-printed compact payload escapes the belt' '⚪ plain@master' \
+check 'session-start: pretty-printed compact is also suppressed' '' \
     "$(cd -- "$tmp/repos/plain" && printf '{\n  "hook_event_name": "SessionStart",\n  "source": "compact"\n}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" session-start)"
-# Same whitespace variant on the notify side falls through to silence, which is
-# the safe direction: an unpainted tab keeps the state it already showed.
-check 'notify: a spaced-out kind is silent, not misread' '0' \
-    "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"Notification","notification_type": "permission_prompt"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" notify | wc -c | tr -d ' ')"
+check 'notify: a spaced-out kind paints waiting' '🟠 plain@master' \
+    "$(cd -- "$tmp/repos/plain" && printf '{"hook_event_name":"Notification","notification_type": "permission_prompt"}\n' | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" notify)"
 
-# --- the edges that must NOT read the payload ------------------------------
-# PostToolUse is the hot edge - one per tool call - and its payload carries the
-# whole tool_response, hundreds of KB on a large Read. It paints `working`
-# unconditionally and never looks at the bytes, which is both why it can afford
-# to run on every call and why a tool_response containing the text of some other
-# event cannot mislead it. Build a 256KB payload whose response body ends in a
-# verbatim idle_prompt notification - a transcript, a log or this very test file
-# is enough to produce one - and assert the title is still `working`.
+# --- large unused tool results --------------------------------------------
+# A nested notification spelling in a large tool result is not top-level
+# metadata. Selective parsing skips the result without constructing its tree.
 _pad=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 _i=0
 while [ "$_i" -lt 13 ]; do
@@ -749,7 +735,7 @@ done
 _bigpl=$tmp/bigpayload.json
 printf '{"session_id":"s1","cwd":"%s","hook_event_name":"PostToolUse","tool_name":"Read","tool_use_id":"tu1","duration_ms":23,"tool_response":"%s{\\"notification_type\\":\\"idle_prompt\\"}"}\n' \
     "$tmp/repos/plain" "$_pad" >"$_bigpl"
-check 'working: a 256KB payload is drained, not read' '🔵 plain@master' \
+check 'working: a 256KB tool result cannot impersonate metadata' '🔵 plain@master' \
     "$(cd -- "$tmp/repos/plain" && HOME=$tmp CCTAB_DRY_RUN=1 "$bin" working <"$_bigpl")"
 (cd -- "$tmp/repos/plain" && HOME=$tmp CCTAB_DRY_RUN=1 "$bin" working <"$_bigpl" >/dev/null 2>&1)
 check 'working: a 256KB payload still exits 0' '0' "$?"
@@ -1010,24 +996,11 @@ check 'a CLAUDE_PID whose fd 1 is not a tty emits nothing' '' \
 check 'a nonsense CLAUDE_PID emits nothing' '' \
     "$(cd -- "$tmp/repos/plain" && CLAUDE_PID=not-a-pid "$bin" session-start </dev/null 2>&1)"
 
-# --- the bounded payload read ---------------------------------------------
-# Only two 8 KiB WINDOWS of the first line are ever searched - its front and its
-# back - and everything between them is drained without being looked at. That
-# bound is what makes the hot edge affordable; in the shell, reading the line and
-# running `case` globs over it cost 165ms under dash and 20ms under bash-as-sh on
-# a 1 MB Notification, measured on this machine, against a 5s hook timeout.
-#
-# There has to be a back window because a Notification serializes
-# `notification_type` LAST, after the unbounded `message`: with a front window
-# alone, an MCP elicitation carrying a ~7.4 KB message silently lost the
-# discriminator and the notify edge painted nothing at all.
-#
-# The bound is asserted through its OBSERVABLE consequences, which is the honest
-# way to test it without a clock in the suite: a last-member discriminator is
-# seen at any message size, and one that is neither near the front nor near the
-# back is not seen.
+# --- complete selective payload parsing -----------------------------------
+# Metadata can appear anywhere in the top-level object, independent of spacing
+# and member order. Large values are skipped without constructing their tree.
 _pad8k=$(awk 'BEGIN{while(i++<9000)printf "a"}')
-check 'notify: idle_prompt inside the front window is seen' '⚪ plain@master' \
+check 'notify: idle_prompt before a large value is seen' '⚪ plain@master' \
     "$(cd -- "$tmp/repos/plain" && printf '{"notification_type":"idle_prompt","message":"%s"}\n' "$_pad8k" | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" notify)"
 check 'notify: the same kind as the LAST member is seen too' '⚪ plain@master' \
     "$(cd -- "$tmp/repos/plain" && printf '{"message":"%s","notification_type":"idle_prompt"}\n' "$_pad8k" | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" notify)"
@@ -1035,13 +1008,10 @@ check 'notify: the same kind as the LAST member is seen too' '⚪ plain@master' 
 _pad200k=$(awk 'BEGIN{while(i++<200000)printf "a"}')
 check 'notify: permission_prompt last after a 200KB message is seen' '🟠 plain@master' \
     "$(cd -- "$tmp/repos/plain" && printf '{"message":"%s","notification_type":"permission_prompt"}\n' "$_pad200k" | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" notify)"
-check 'notify: a kind in neither window is not seen' '' \
+check 'notify: a kind between two large values is seen' '⚪ plain@master' \
     "$(cd -- "$tmp/repos/plain" && printf '{"a":"%s","notification_type":"idle_prompt","b":"%s"}\n' "$_pad8k" "$_pad8k" | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" notify)"
-# agent_id is read from the FRONT window only, on purpose: a false positive there
-# silences every `working` repaint for the rest of the session, and the back of a
-# PostToolUse payload is `tool_response`, which can be an object whose keys are
-# not escaped. Real captures put agent_id at byte 760 of 1360.
-check 'working: agent_id only in the back window does not silence' '🔵 plain@master' \
+# A genuine top-level agent_id is found even after a large tool response.
+check 'working: a late top-level agent_id still suppresses the repaint' '' \
     "$(cd -- "$tmp/repos/plain" && printf '{"tool_response":"%s","agent_id":"a1"}\n' "$_pad8k" | HOME=$tmp CCTAB_DRY_RUN=1 "$bin" working)"
 # A payload far past any real one is still drained and still answers.
 _bigger=$tmp/4mb.json
@@ -1429,7 +1399,7 @@ check 'bin/tabstatus exists and is executable' 'yes' \
     "$([ -x "$repo/bin/tabstatus" ] && printf yes)"
 check 'bin/tabstatus resolves to a committed platform binary' 'yes' \
     "$(_t=$(readlink "$repo/bin/tabstatus") && [ -f "$repo/bin/$_t" ] && printf yes)"
-_sources="Cargo.toml .claude-plugin/plugin.json hooks/hooks.json $(cd -- "$repo" && ls src/*.rs | sort)"
+_sources="Cargo.toml Cargo.lock .claude-plugin/plugin.json hooks/hooks.json $(cd -- "$repo" && ls src/*.rs | sort)"
 if command -v sha256sum >/dev/null 2>&1 && [ -f "$repo/bin/sources.sha256" ]; then
     check 'the committed binaries are not stale (sha256 of src/ and Cargo.toml)' '' \
         "$(cd -- "$repo" && sha256sum $_sources | diff - bin/sources.sha256)"
@@ -2680,13 +2650,8 @@ check 'uninstall: leaves a file that is not a record of ours' '1' \
 check 'uninstall: ...and that file is still there' 'notes.txt' "$(ls -A "$_sd")"
 rm -rf "$_unc" "$_sd"
 
-# The edges that used to only DRAIN stdin - waiting, idle, session-end - now read a
-# window, because the record is filed under the payload's session_id. `waiting` and
-# `session-end` read the FRONT window only: session_id and agent_id are both front
-# members. `idle` is the exception - it reads background_tasks, which a Stop
-# serializes LAST - so it pays for a tail as well, once per turn. Either way it is a
-# bound on the SEARCH, not on the drain: a megabyte of tool_input still has to be
-# read to EOF.
+# With a state directory every edge parses metadata from the complete object.
+# Large unused values do not hide the session ID, owner or background array.
 rm -rf "$_sd"; mkdir -p "$_sd"
 _big=$(awk 'BEGIN{while(i++<1048576)printf "a"}' </dev/null)
 check 'state: a 1 MiB PermissionRequest still finds the session and the owner' '🟠 plain@master' \
@@ -2697,7 +2662,7 @@ check 'state: ...and the wait was recorded against that agent, not lost' \
 check 'state: a 1 MiB Stop with no background_tasks is still refused over that dialog' '' \
     "$(st idle "$(printf '{"session_id":"%s","hook_event_name":"Stop","blob":"%s"}' "$_sid" "$_big")")"
 # ...and the same payload with an EMPTY background_tasks as its last member does
-# retire it, which is the assertion that the tail window is actually read.
+# retire it, which asserts that late metadata is parsed too.
 check 'state: ...but a 1 MiB Stop whose LAST member is an empty array retires it' \
     '⚪ plain@master' \
     "$(st idle "$(printf '{"session_id":"%s","hook_event_name":"Stop","blob":"%s","background_tasks":[]}' \

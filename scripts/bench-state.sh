@@ -140,8 +140,7 @@ b w
 b w
 w $AG:1000000
 " ;;
-    # The edge whose payload WINDOW changed: idle now builds a tail for
-    # background_tasks.
+    # A stateful idle edge parses the payload, including background_tasks.
     new-idle)         time_arm "$NEW"  idle    "$W/p.stop"  "$W/sd" "cts1
 b i
 " ;;

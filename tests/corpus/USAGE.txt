@@ -337,3 +337,25 @@ Not in the corpus, because it needs a tmux server: what the format RENDERS, the
 decay itself, the save and restore, the re-arm hook, and doctor's report. Those
 are the tmux section of tests/run.sh - 81 assertions - driven against a private
 `tmux -L cctabprobe -f /dev/null` that is killed afterwards.
+
+
+Amendment, structural hook metadata (fix-g)
+------------------------------------------
+The current hook parser uses serde_json::from_slice and IgnoredAny rather than
+first-line windows. Earlier descriptions above record the historical parser.
+Six existing cases intentionally change, and only those six were re-recorded:
+
+  notify-spaced-out-kind-is-silent              -> waiting title
+  notify-pretty-printed-is-silent               -> idle title
+  notify-multiline-read-and-drained             -> silent (trailing garbage)
+  sstart-compact-pretty-printed-escapes-the-belt -> silent (compact)
+  sstart-multiline-drained                     -> silent (trailing garbage)
+  sstart-compact-on-second-line                -> silent (two documents)
+
+Historical IDs, the shell oracle and cases.jsonl.before-fixes stay unchanged.
+The new expectations carry explicit fix-g reasons, not diverge exemptions.
+Regeneration remains: gencases.py against the oracle, then refreeze_fixed.py
+against the current binary. Unit tests in src/payload.rs and subprocess tests in
+tests/test_payload.py additionally cover nested metadata, late and escaped keys,
+duplicate/type rejection, input limits and state preservation on rejected input.
+Run: python3 tests/test_payload.py (or set CCTAB_TEST_BIN for another build).
