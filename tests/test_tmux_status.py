@@ -317,7 +317,7 @@ class TmuxStatusTests(unittest.TestCase):
         self.assertIn("#[fg=#e5e7eb,bg=#1f2329]", self.rendered(self.pane, True))
         self.assertIn(label, self.rendered(self.pane, True))
 
-    def test_actual_status_bar_draws_only_the_left_cap_in_the_status_color(self):
+    def test_actual_status_bar_draws_a_wide_left_end_in_the_status_color(self):
         self.tm("source-file", str(ROOT / "examples/tmux.conf"))
         self.start()
         self.publish(self.pane, "waiting")
@@ -328,7 +328,7 @@ class TmuxStatusTests(unittest.TestCase):
                                   start_new_session=True)
         os.close(slave)
         captured = b""
-        fragment = " 0:"
+        fragment = "   0:"
         try:
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
@@ -343,6 +343,9 @@ class TmuxStatusTests(unittest.TestCase):
             self.assertIn(fragment, clean)
             left = clean.index(fragment)
             right = clean.index("", left)
+            _, backgrounds = terminal_text_and_backgrounds(captured)
+            self.assertEqual(backgrounds[left + 1:left + 3], [(2, 251, 146, 60)] * 2)
+            self.assertEqual(backgrounds[left + 3], (2, 229, 231, 235))
             self.assertEqual(foregrounds[left], (2, 251, 146, 60))
             self.assertEqual(foregrounds[right], (2, 229, 231, 235))
             self.assertNotRegex(clean[left:right], "[🔵🟠🟣⚪]")

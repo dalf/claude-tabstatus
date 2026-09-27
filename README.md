@@ -1251,8 +1251,8 @@ when its shared option is removed, leaving the window label and styles intact.
 
 An optional [reference tmux configuration](examples/tmux.conf) includes rounded
 tabs with a **status-colored left cap**, a light active label, and
-`repository@branch` labels for Claude panes. The left cap replaces the separate
-circle; the right cap and label still distinguish the selected window. Shell panes keep their usual window names. In split
+`repository@branch` labels for Claude panes. The left cap and two filled character cells replace the separate
+circle, making a wider status band; the right cap and label still distinguish the selected window. Shell panes keep their usual window names. In split
 windows the label follows the active pane, while the strip includes every Claude
 pane. Copy the settings you want into `~/.tmux.conf`; the plugin does not install
 this configuration. The colours are a provisional example, not a required theme.
