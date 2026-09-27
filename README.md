@@ -5,13 +5,27 @@ location, so a row of tabs tells you which session wants you without losing
 track of where each one is.
 
 ```text
-🔵 streaming-browser@master       working  - Claude is running
+🔵 streaming-browser@master       working  - the main agent is working
 🟠 streaming-browser@master       waiting  - Claude needs an answer
-⚪ streaming-browser@master       idle     - Claude has stopped
+⚪ streaming-browser@master       idle     - the main agent is idle
 ⚪ srv:streaming-browser@master   the same session, over ssh
 ⚪ ~/code/bug_fedora              not a repo, so the path instead
 ⚪ ~                              at $HOME
 ```
+
+**Current behavior:** white does not establish that background work finished or
+the turn succeeded. Orange takes precedence while a known input request remains;
+focusing its tab does not resolve it. Interruptions and expired indicators can
+leave incomplete information about the session.
+
+**Approved next behavior:** background work will have a standard purple indicator,
+enabled by default, and white will mean no known foreground or background work
+remains. A long workflow must stay visible after the main agent answers, including
+when you can continue chatting with it. This is the decision from
+[#10](https://github.com/dalf/claude-tabstatus/issues/10); tracking and rendering
+are still to be implemented in [#15](https://github.com/dalf/claude-tabstatus/issues/15).
+The [indicator policy](docs/indicator-semantics.md) defines precedence, failure,
+attention, long-duration behavior and the compatibility plan.
 
 Claude Code's own title cannot tell you the second line from the third: it
 renders one static glyph whether Claude is thinking or waiting for an answer
@@ -19,7 +33,7 @@ from you. Telling those two apart across a row of tabs is what this exists for.
 
 ## States
 
-Three states, and the hook events that paint them:
+The three states currently implemented, and the hook events that paint them:
 
 | Event | Scoped to | Paints |
 |---|---|---|
@@ -504,16 +518,15 @@ whether the top-level `background_tasks` array is empty; absent or null means
 unknown. The parser scans unused values but does not keep their contents. Its
 work grows with input size, unlike the historical bounded-window reader.
 
-**Seams, designed and deliberately not built.** `Stop` carries `background_tasks`,
-which is `[]` when the session is genuinely idle and otherwise holds
-`{id, type:"subagent", status:"running"}` per live agent, where `id` *is* the
-`agent_id` of the hooks that agent fires. Half the read is already here: `idle` asks
-that array the only question a wait needs - whether it is empty - without retaining its entries. Purple needs the **ids**, which is the part not built. A reserved
-`g <id>...` line records that set, a fourth base letter paints it, and
-`subagent-stop` - already wired - removes the id and repaints the base. That is the
-un-paint the purple state needs, and it is the same mechanism above. It also sharpens
-the rule above: an agent wait whose id is absent from `g` is stale even while *other*
-agents run, where today an empty array is the only signal. A reserved `n <epoch> <text>` line, last in the
+**Planned extensions.** The current reader tests `background_tasks` emptiness
+without retaining entries. Background tracking needs identities, task-kind
+semantics, and validated completion/cancellation/failure evidence, including a
+workflow finishing without another prompt. `SubagentStop` alone does not prove
+the lifecycle of every background task. The [indicator policy](docs/indicator-semantics.md)
+records the approved default and [#15](https://github.com/dalf/claude-tabstatus/issues/15)
+owns implementation and capture requirements. An earlier proposed `g <id>...`
+record is a design sketch, not an implemented or verified lifecycle.
+A reserved `n <epoch> <text>` line, last in the
 record because everything above it is ASCII words, caches the session title
 `aiTitle` from a bounded tail read of `transcript_path`. Both keys are already
 skipped by this version's parser. `src/state.rs` carries the detail.
@@ -1471,10 +1484,9 @@ set-titles-string is not ours any more` - so start a new claude session, or
 
 ### Deliberately not built
 
-- **A fourth glyph for background work**, and **OSC 9;4 progress**. The record
-  reserves the `g` key for the first, and the state layer's `subagent-stop` edge is
-  already the un-painter it needs; the seam is designed in full at the bottom of
-  `src/state.rs` and in [Wait ownership](#wait-ownership), and built not at all.
+- **The approved fourth state for background work**, tracked in
+  [#15](https://github.com/dalf/claude-tabstatus/issues/15). Its completion signal
+  still needs lifecycle evidence. **OSC 9;4 progress** is also not implemented.
 - **A cached session title.** The record reserves the `n` key for it, last in the
   file so that its free-form text arrives whole. Same seam, same status: designed,
   not built. It is the one future field that would put a record read on the
@@ -2147,13 +2159,10 @@ the one failure mode every other line rendered as healthy.
 
 **Not yet built:**
 
-- The fourth glyph: **background work running, main loop free**. `Stop` carries
-  `background_tasks`, so painting it is easy and un-painting it is the problem the
-  record already solves. Half the read exists: `idle` already asks that array whether
-  it is empty, without retaining entries. The rest of the shape is designed - a reserved `g`
-  line for the ids, a fourth base
-  letter, and the `subagent-stop` edge that is already wired - and deliberately not
-  built here.
+- The fourth state: **background work running, main loop free**, approved as a
+  default in [#10](https://github.com/dalf/claude-tabstatus/issues/10). The current
+  empty-array check does not implement task tracking. Completion and long-workflow
+  evidence, migration and rendering remain in [#15](https://github.com/dalf/claude-tabstatus/issues/15).
 - A **cached session title**. The transcript records carry `aiTitle`, readable from
   a bounded tail read, and it is the only field that distinguishes five concurrent
   sessions that all render as `streaming-browser@master`. A reserved `n` line

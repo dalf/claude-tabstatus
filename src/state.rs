@@ -1515,31 +1515,14 @@ pub fn survey() -> Survey {
 // `b`, `p` and `w` are ASCII words and may sit in any order.
 //
 // PURPLE - "background work running, main loop free".
-//   `Stop` carries `background_tasks`, an array that is `[]` when the session is
-//   genuinely idle and otherwise holds `{id, type:"subagent", status:"running"}`
-//   per live agent, where `id` IS the `agent_id` of the hooks that agent fires.
-//   Painting it is easy; UN-painting it is the open problem, and it is the same
-//   problem this module already solves. HALF OF THE READ IS ALREADY HERE:
-//   `nothing_running` asks that array the only question `free` needs, whether it
-//   is empty, retaining no entries. Purple needs the IDS, which is the
-//   part deliberately not built. The shape:
-//     * a reserved `g <id> [<id>...]` line records the live set as of the last
-//       Stop. `Record::parse` already SKIPS unknown keys, so writing it does not
-//       break this version.
-//     * `free()` sets `base` to the new `Glyph::Background` when `g` is non-empty
-//       and to `Glyph::Idle` when it is empty. `Record::parse` already maps an
-//       unknown base letter to idle, so an older binary reading a `b p` record
-//       degrades instead of misreading it.
-//     * `agent_gone()` removes the id from `g` too, and repaints the base. That
-//       is the un-paint, and `SubagentStop` is already wired for it.
-//     * `free()`'s wait-retirement rule then reads the SET rather than the
-//       emptiness: an Agent wait whose id is absent from `g` is stale even while
-//       OTHER agents run, which is strictly sharper than what is built here.
-//   Nothing else moves. The 3s idle nudge is not a hazard for it either: `free()`
-//   recomputes the base from `g` rather than asserting idle. Note that the nudge's
-//   payload carries NO `background_tasks`, which is why "absent" has to mean "I
-//   do not know" rather than "empty" - the record is the only place the live set
-//   can be read from on that edge.
+//   Issue #10 approves this as a standard fourth state; docs/indicator-semantics.md
+//   defines its meaning and migration requirements. Issue #15 owns implementation.
+//   The current parser only tests background_tasks emptiness. A proposed g <id>...
+//   record needs task-kind semantics and captured start/end evidence before use.
+//   SubagentStop must not be assumed to complete a whole workflow or a shell task.
+//   A missing array or a long duration cannot establish that known work ended.
+//   New base letters need a new record/carrier version: silently reading an
+//   unknown background base as idle would contradict the approved policy.
 //
 // THE CACHED SESSION TITLE.
 //   `aiTitle` lives in the transcript records at `transcript_path`, which every

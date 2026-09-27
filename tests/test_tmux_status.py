@@ -174,6 +174,70 @@ class TmuxStatusTests(unittest.TestCase):
             self.publish(self.pane, edge)
             self.assertEqual(self.rendered(self.pane, True), glyph + " C:current")
 
+    def test_current_state_semantics_agree_with_plain_terminal(self):
+        # Issue10's current baseline: the future background state is not yet
+        # implemented. Exercise the same ownership sequence through ordinary
+        # terminalSequence output and real tmux pane-tty delivery.
+        self.start()
+        epoch = int(self.tm("display-message", "-p", "%s"))
+        pid = self.tm("display-message", "-p", "-t", self.pane, "#{pane_pid}")
+        plain_env = dict(self.env, CLAUDE_PID="0", CCTAB_TERMINAL="other",
+                         CCTAB_GLYPH_POS="prefix", CCTAB_STATE_DIR=str(self.root / "plain-state"))
+        mux_env = {"CLAUDE_PID": pid, "CCTAB_STATE_DIR": str(self.root / "tmux-state")}
+        running = [{"id": "child", "type": "subagent", "status": "running"}]
+        # Last item is an emitted state, or None for a silent hook.
+        steps = [
+            ("working", "UserPromptSubmit", {"prompt": "launch workflow"}, "w"),
+            ("idle", "Stop", {"background_tasks": running}, "i"),
+            ("working", "PostToolUse", {"agent_id": "child"}, None),
+            ("waiting", "PermissionRequest", {"agent_id": "child"}, "a"),
+            ("working", "PostToolUse", {}, None),
+            ("idle", "StopFailure", {}, None),
+            ("idle", "Stop", {"background_tasks": running}, None),
+            ("subagent-stop", "SubagentStop", {"agent_id": "other"}, None),
+            ("working", "PostToolUse", {"agent_id": "child"}, "i"),
+            ("subagent-stop", "SubagentStop", {"agent_id": "child"}, None),
+            ("notify", "Notification", {"notification_type": "idle_prompt"}, "i"),
+            ("working", "UserPromptSubmit", {"prompt": "continue"}, "w"),
+            ("idle", "StopFailure", {"background_tasks": []}, "i"),
+        ]
+        glyphs = {"w": "🔵", "a": "🟠", "i": "⚪"}
+        carrier = None
+        displayed = None
+        for index, (edge, event, fields, paint) in enumerate(steps):
+            with self.subTest(event=event, step=index):
+                now = str(epoch + index)
+                payload = {"session_id": "s1", "hook_event_name": event, **fields}
+                plain_env["CCTAB_NOW"] = now
+                result = subprocess.run([str(BIN), edge], input=json.dumps(payload).encode(),
+                                        env=plain_env, cwd=self.root, capture_output=True, timeout=10)
+                self.assertEqual((result.returncode, result.stderr), (0, b""))
+                self.assertEqual(self.hook(edge, self.pane, {**mux_env, "CCTAB_NOW": now}, payload), b"")
+                if paint is None:
+                    self.assertEqual(result.stdout, b"")
+                else:
+                    message = json.loads(result.stdout)
+                    sequence = message["terminalSequence"]
+                    self.assertTrue(sequence.startswith("\x1b]0;" + glyphs[paint] + " "), sequence)
+                    self.assertTrue(sequence.endswith("\x07"), sequence)
+                    self.assertTrue(message["suppressOutput"])
+                    carrier = f"{paint} {now}"
+                    displayed = glyphs[paint]
+                self.wait_for(lambda: self.tm("display-message", "-p", "-t", self.pane,
+                                             "#{pane_title}").rsplit(" ct1 ", 1)[-1], carrier)
+                self.assertEqual(self.rendered(self.pane, True), displayed + " C:current")
+                self.assertEqual(self.rendered(self.pane), displayed + " N:current")
+                self.assertIn(displayed, self.tm("display-message", "-p", "-t", self.pane,
+                                                "#{T:@cctab_title}"))
+                if paint == "a":
+                    record = self.root / "tmux-state" / "s1"
+                    before = record.read_bytes()
+                    other = self.new_window("focus-away")
+                    self.tm("select-window", "-t", other)
+                    self.tm("select-window", "-t", self.pane)
+                    self.assertEqual(record.read_bytes(), before)
+                    self.assertEqual(self.rendered(self.pane, True), "🟠 C:current")
+
     def test_invalid_pid_and_headless_process_never_emit_json_or_change_the_pane(self):
         self.start()
         self.publish(self.pane)

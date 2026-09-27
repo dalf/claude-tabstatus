@@ -6,8 +6,10 @@ consolidates issues [#5](https://github.com/dalf/claude-tabstatus/issues/5),
 [#7](https://github.com/dalf/claude-tabstatus/issues/7),
 [#8](https://github.com/dalf/claude-tabstatus/issues/8), and the direct elicitation
 lifecycle added by [#9](https://github.com/dalf/claude-tabstatus/issues/9).
-It does not introduce a background-work state or track individual background
-tasks; that remains [#10](https://github.com/dalf/claude-tabstatus/issues/10).
+It specifies the current implementation, which has no background-work state or
+individual task tracking. The [indicator policy](indicator-semantics.md) records
+#10's approved four-state default; implementation remains
+[#15](https://github.com/dalf/claude-tabstatus/issues/15).
 
 ## Meaning of state and output
 
