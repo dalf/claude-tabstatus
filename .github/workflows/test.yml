@@ -51,6 +51,7 @@ jobs:
             binary="$GITHUB_WORKSPACE/bin/tabstatus-$target"
             CCTAB_TEST_BIN="$binary" python3 tests/test_payload.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_state_contract.py
+            CCTAB_TEST_BIN="$binary" python3 tests/test_background.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_state_guarantees.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_elicitation.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_tmux_status.py

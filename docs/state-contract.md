@@ -1,22 +1,20 @@
-# State and wait-ownership contract, version 1
+# State and wait-ownership contract, version 2
 
-This specifies the existing three-state model used by the registered hooks. It
+This specifies the four-state model used by the registered hooks. It
 consolidates issues [#5](https://github.com/dalf/claude-tabstatus/issues/5),
 [#6](https://github.com/dalf/claude-tabstatus/issues/6),
 [#7](https://github.com/dalf/claude-tabstatus/issues/7),
 [#8](https://github.com/dalf/claude-tabstatus/issues/8), and the direct elicitation
 lifecycle added by [#9](https://github.com/dalf/claude-tabstatus/issues/9).
-It specifies the current implementation, which has no background-work state or
-individual task tracking. The [indicator policy](indicator-semantics.md) records
-#10's approved four-state default; implementation remains
-[#15](https://github.com/dalf/claude-tabstatus/issues/15).
-
+Background lifecycle and compatibility added by [#15](https://github.com/dalf/claude-tabstatus/issues/15)
+follow the [indicator policy](indicator-semantics.md).
 ## Meaning of state and output
 
 Each session has a **base** (`working` or `idle`), a bounded set of outstanding
-waits, and a bounded history of completed elicitation identities. The initial
+waits, a background snapshot epoch, and a bounded history of completed elicitation identities. The initial
 base is idle. A wait overlays the base without replacing it. The **logical
-state** is waiting while any recorded wait remains, otherwise the base.
+state** is waiting while any recorded wait remains; otherwise working if the
+main base is working, background if its snapshot epoch is present, else idle.
 The reader also accepts a legacy `waiting` base; ordinary transitions never
 create that base.
 
@@ -107,13 +105,13 @@ only when no wait remains.
 
 | Hook/edge | State change | Paint |
 |---|---|---|
-| Non-compaction session start | Reset base to idle; clear waits and completion history. | Idle startup. |
+| Non-compaction session start | Reset base to idle; clear background, waits and completion history. | Idle startup. |
 | Compaction session start | None, including no expiry/reaping. | None. |
 | Permission request / registered blocking-tool wait | Raise its owner, or anonymous permission if its supplied owner is unusable; leave base unchanged. | Waiting. |
 | Main working edge | Base becomes working; retire main and unknown permission/MCP-notification waits, subject to prompt rule below. | Base if clear; otherwise none. |
 | Usable agent working edge | Retire only that agent's permission wait; leave base unchanged. | Base only if it cleared the last live wait. |
 | `SubagentStop` | Retire only the matching agent permission wait. | Base only if it cleared the last live wait. |
-| Idle (`Stop`, `StopFailure`, idle notification) | Base becomes idle; retire main wait. If `background_tasks` is exactly `[]`, also retire agent, anonymous permission, and unknown notification/permission waits. | Idle if clear; otherwise none. |
+| Idle (`Stop`, `StopFailure`, idle notification) | Base becomes idle; retire main wait. If `background_tasks` is exactly `[]`, also retire agent, anonymous permission, and unknown notification/permission waits. | Purple or white if clear; otherwise orange only if background presence changed. |
 | Supported direct request | Raise exact identity, or anonymous direct aggregate, unless completion history suppresses it. | Waiting unless suppressed. |
 | Supported identified direct result | Retire only its exact identity and remember completion, even if no request was recorded. | Base only if it cleared the last live wait. |
 | Other notification | None, including no expiry. | None. |
@@ -122,7 +120,11 @@ only when no wait remains.
 An empty background array is a **recovery heuristic**, not an MCP response and
 not proof that an arbitrary notification was answered. Missing, null and
 nonempty arrays do not trigger this recovery. They still permit retirement of
-the main wait. Background entries themselves are not interpreted or tracked.
+the main wait. Only main `Stop` uses the array as a complete activity snapshot: nonempty sets
+the background epoch, empty removes it, and absent/null preserves it. Task entries
+are not retained individually. Other idle edges preserve background knowledge.
+Where the table says paint the base, an idle base with known background paints
+purple. See the [lifecycle evidence](indicator-semantics.md#background-lifecycle-and-reconciliation).
 
 A main `UserPromptSubmit` is treated as a human prompt only when `prompt` is
 nonempty and its **first character** is not `<`. That heuristic clears every
@@ -237,11 +239,12 @@ the record, so no ordering guarantee is made across teardown. Reaping on startup
 and explicit uninstall are also separate from the ordinary update guards.
 This is an existing lifecycle limitation, not an ownership-retirement rule.
 
-The wire writer emits `cts4`, whose `?p` owner preserves anonymous permission
-provenance; readers also accept `cts1`, `cts2`, and `cts3`. The new tag prevents an
-older reader from silently dropping that new owner during an ordinary update.
+The wire writer emits `cts5`, preserving both anonymous permission provenance
+(`?p`) and known background (`g <epoch>`). Readers also accept `cts1`–`cts4`,
+without interpreting their reserved `g` fields. Guarded older readers refuse
+ordinary updates of newer records rather than silently dropping activity.
 Recognized older records migrate on a changed write; missing historical owner
-provenance cannot be reconstructed. Unknown fields are ignored; invalid individual
+provenance or background knowledge cannot be reconstructed. Unknown fields are ignored; invalid individual
 wait tokens are dropped and malformed/foreign readable record contents fall back
 to a fresh base rather than becoming reliable wait evidence. Accepted records are
 not an authenticated input boundary. The dedicated directory is trusted; the
@@ -250,7 +253,9 @@ path checks do not promise resistance to malicious concurrent filesystem changes
 Startup examines at most 256 directory entries for stale records. Known records
 with a stored process ID/start-time pair can be reaped when that origin no longer
 matches. Records without origin, future-version records and recognized temporary
-files use a 24-hour mtime recovery rule; future mtimes count as stale. Alien record
+files use a 24-hour mtime recovery rule; future mtimes count as stale. Recognized
+background records without origin are exempt: missing process metadata cannot
+prove their work ended. Alien record
 contents and unrelated filenames are not startup-reaped. Explicit uninstall has
 broader name-based cleanup and does not preserve live sessions' records.
 

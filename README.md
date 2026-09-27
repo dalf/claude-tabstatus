@@ -7,33 +7,30 @@ track of where each one is.
 ```text
 🔵 streaming-browser@master       working  - the main agent is working
 🟠 streaming-browser@master       waiting  - Claude needs an answer
-⚪ streaming-browser@master       idle     - the main agent is idle
+🟣 streaming-browser@master       background - work continues after the main reply
+⚪ streaming-browser@master       idle     - no known active work
 ⚪ srv:streaming-browser@master   the same session, over ssh
 ⚪ ~/code/bug_fedora              not a repo, so the path instead
 ⚪ ~                              at $HOME
 ```
 
-**Current behavior:** white does not establish that background work finished or
-the turn succeeded. Orange takes precedence while a known input request remains;
-focusing its tab does not resolve it. Interruptions and expired indicators can
-leave incomplete information about the session.
+The default priority is **input required > main working > background > idle**.
+A long workflow remains purple after the main agent answers, including when you
+can keep chatting with it. Main activity temporarily shows blue; unresolved
+input requests stay orange. White means no known active work, not success.
+Focusing a tab does not resolve a request.
 
-**Approved next behavior:** background work will have a standard purple indicator,
-enabled by default, and white will mean no known foreground or background work
-remains. A long workflow must stay visible after the main agent answers, including
-when you can continue chatting with it. This is the decision from
-[#10](https://github.com/dalf/claude-tabstatus/issues/10); tracking and rendering
-are still to be implemented in [#15](https://github.com/dalf/claude-tabstatus/issues/15).
-The [indicator policy](docs/indicator-semantics.md) defines precedence, failure,
-attention, long-duration behavior and the compatibility plan.
-
-Claude Code's own title cannot tell you the second line from the third: it
-renders one static glyph whether Claude is thinking or waiting for an answer
-from you. Telling those two apart across a row of tabs is what this exists for.
+Background tracking uses main `Stop` snapshots of the session's in-flight work.
+Missing metadata and elapsed time cannot clear known activity. The
+[indicator policy](docs/indicator-semantics.md) documents captured lifecycle
+evidence, stale-state behavior, and compatibility. It requires a valid session
+ID and writable state directory, as configured by the installed plugin; the
+legacy stateless fallback cannot remember background work between hooks.
 
 ## States
 
-The three states currently implemented, and the hook events that paint them:
+The four states and the hook events that request transitions (live waits take
+precedence, and idle transitions preserve known background work):
 
 | Event | Scoped to | Paints |
 |---|---|---|
@@ -45,10 +42,10 @@ The three states currently implemented, and the hook events that paint them:
 | `PostToolUse` | | 🔵 working |
 | `PostToolUseFailure` | | 🔵 working |
 | `Notification` | `permission_prompt`, `worker_permission_prompt`, `agent_needs_input`, `elicitation_dialog`, `elicitation_url_dialog` | 🟠 waiting |
-| `Notification` | `idle_prompt` | ⚪ idle |
+| `Notification` | `idle_prompt` | 🟣 background if known, otherwise ⚪ idle |
 | `Notification` | any other kind | *nothing* |
-| `Stop` | | ⚪ idle |
-| `StopFailure` | | ⚪ idle |
+| `Stop` | | 🟣 while background remains, otherwise ⚪ idle |
+| `StopFailure` | | 🟣 background if known, otherwise ⚪ idle |
 | `SubagentStop` | | *nothing*, unless that agent owned the wait |
 | `Elicitation` | form/URL request | 🟠 waiting; duplicate completed requests stay silent |
 | `ElicitationResult` | matching server and request ID, `accept`, `decline`, or `cancel` | restores the base only when no other wait remains |
@@ -81,7 +78,7 @@ Some of that is less obvious than it looks:
 - **A `Notification` never paints waiting on `idle_prompt`.** That kind is the
   quiet-turn nudge, fired `messageIdleNotifThresholdMs` (default 60s) after a
   turn ends, so mapping it to waiting would turn every idle tab orange a minute
-  later and collapse two of the three states into one. It is also the only
+  later and collapse idle and input-required into one. It is also the only
   recovery from an interrupted turn - see the Ctrl+C limitation below.
 - **The waiting notifications are a backstop, not the fast path.**
   `permission_prompt` is scheduled 6.00s after the dialog appears, fires at most
@@ -156,8 +153,9 @@ whitespace-only input is invalid. Metadata-independent edges (`waiting`, `idle`,
 is configured, so JSON validation does not apply on that stateless fast path.
 With a configured state directory every edge parses its metadata.
 
-This fixes metadata interpretation; it does not change wait-retirement policy,
-background-work semantics, or the separate settings-file editor.
+The payload parser fixes metadata interpretation; wait retirement and the
+settings-file editor have separate contracts. Background lifecycle has its own
+captured and synthetic tests, described in the indicator policy.
 
 ### Wait ownership
 
@@ -176,21 +174,22 @@ largest being that its `PermissionRequest` branch no-ops on a subagent's dialog,
 which the capture below shows would paint idle while a human is being asked.
 
 
-A wait is an **overlay on a base**. The base is what the tab shows when nothing
-is waiting; a dialog covers it; clearing the *last* dialog restores it. Who
+A wait is an **overlay on activity**. Main work shows blue; otherwise known
+background shows purple and idle shows white. A dialog covers that activity;
+clearing the *last* dialog restores it. Who
 raised a wait is therefore part of the state, and it cannot be recovered from any
-one payload - which is why this is the one thing the binary writes down.
+one payload - which is why it is persisted alongside background knowledge.
 
 The capture that forced it, timings relative to that session's `SessionStart`:
 
 | t | event | `agent_id` | stateless | with ownership |
 |---|---|---|---|---|
 | 66.283 | `PreToolUse` `tool_name=Agent` | - | 🔵 | 🔵 base `w` |
-| 68.946 | `Stop` `background_tasks=[subagent:running:aec99e]` | - | ⚪ | ⚪ base `i` |
+| 68.946 | `Stop` `background_tasks=[subagent:running:aec99e]` | - | ⚪ | 🟣 base `i`, background recorded |
 | 69.960 | `PermissionRequest` | `aec99e1f` | 🟠 | 🟠 wait owned by `aec99e1f` |
 | 75.983 | `Notification` `permission_prompt` | *absent* | 🟠 | 🟠 no second owner added |
 | 98.459 | `SubagentStop` | `a8e90c10` | - | *nothing*: owns no wait |
-| 107.496 | `PostToolUse` (you approved) | `aec99e1f` | *nothing* | ⚪ the base comes back |
+| 107.496 | `PostToolUse` (you approved) | `aec99e1f` | *nothing* | 🟣 background remains |
 | 110.230 | `SubagentStop` | `aec99e1f` | - | *nothing*: already cleared |
 
 Three things in that sequence decide the design, and each one rules out a simpler
@@ -217,7 +216,7 @@ The rules, in full:
 | `working`, a `PostToolUse` on the main thread | base ← `w`; clears main and anonymous notification waits, preserving direct elicitations | the base, or nothing if a wait remains |
 | `working`, a `UserPromptSubmit` **you typed** | base ← `w`; clears **every** wait | the base |
 | `working`, a subagent | clears only the wait it owns; base untouched | the base if that emptied the set, else nothing |
-| `idle` | base ← `i`; clears a main wait, and remaining permission/notification waits when `background_tasks` is `[]`; direct elicitations remain | ⚪, or nothing if a wait remains |
+| `idle` | base ← `i`; clears a main wait, and remaining permission/notification waits when `background_tasks` is `[]`; direct elicitations remain | 🟣 if background remains, otherwise ⚪; orange refresh when background presence changes beneath a wait |
 | `subagent-stop` | clears only the wait it owns | the base if that emptied the set, else nothing |
 | `session-start` | resets the record, and reaps | ⚪ as before |
 | `session-end` | removes the record | clears the title |
@@ -386,7 +385,9 @@ so the field is read *after the last* `") "`, in the binary and in the test alik
 A file that names no origin - a record written before this field existed, or a
 `.tmp` from a crashed write, or a *newer* version's record whose writer may be
 running right now - falls back to mtime with a **one-day** horizon, deliberately
-long for the reason above.
+long for the reason above. A recognized record with known background is exempt
+when its origin is missing: elapsed time alone cannot prove that work ended.
+It remains until a clearing snapshot, session reset/end, or explicit cleanup.
 
 **The reaper deletes only what it can prove is ours, and everything else is left
 alone forever.** A file whose name is not a session id, a file that is not a record
@@ -438,8 +439,9 @@ std (1.89), so this costs no dependency; it
 is the reason `rust-version` moved from 1.74 to 1.89.
 
 ```text
-cts4                                           the tag: version 4 of the wire
+cts5                                           the tag: version 5 of the wire
 b i                                            base = w | a | i
+g 1790380620                                  last main Stop reporting background
 p 3709427 84460384                             the session's (pid, start time)
 w aec99e1f4bda1972b:1790380630 -:1790380631    one wait per word: owner, then epoch
 ```
@@ -455,12 +457,13 @@ letter this version cannot paint reads as idle, so a newer version's record
 degrades rather than being misread; and a record this version did not *change* is
 not rewritten, so it keeps the fields it did not understand.
 
-Versions 1–3 (`cts1`, `cts2`, `cts3`) remain readable and become `cts4`
+Versions 1–4 (`cts1`, `cts2`, `cts3`, `cts4`) remain readable and become `cts5`
 on the next state change. Version 1 `?` waits lack provenance and retain the permission-backstop
 deduplication policy; the original notification kind cannot be recovered.
-The `cts4` tag prevents recent older binaries from interpreting `?p` as an invalid
-owner and dropping a live wait: their ordinary update guards leave the record
-untouched. Session teardown and older releases without those guards remain outside
+The `cts5` tag prevents guarded older binaries from dropping known background
+activity: their ordinary update guards leave the record untouched. The optional
+`g` epoch never expires. Older records do not acquire background knowledge during
+migration, even if they contain a formerly reserved `g` field. Session teardown and older releases without those guards remain outside
 that guarantee. Use the updated binary for all hooks.
 
 Anonymous permission requests remain independent of named requests and notification
@@ -518,18 +521,16 @@ whether the top-level `background_tasks` array is empty; absent or null means
 unknown. The parser scans unused values but does not keep their contents. Its
 work grows with input size, unlike the historical bounded-window reader.
 
-**Planned extensions.** The current reader tests `background_tasks` emptiness
-without retaining entries. Background tracking needs identities, task-kind
-semantics, and validated completion/cancellation/failure evidence, including a
-workflow finishing without another prompt. `SubagentStop` alone does not prove
-the lifecycle of every background task. The [indicator policy](docs/indicator-semantics.md)
-records the approved default and [#15](https://github.com/dalf/claude-tabstatus/issues/15)
-owns implementation and capture requirements. An earlier proposed `g <id>...`
-record is a design sketch, not an implemented or verified lifecycle.
-A reserved `n <epoch> <text>` line, last in the
-record because everything above it is ASCII words, caches the session title
-`aiTitle` from a bounded tail read of `transcript_path`. Both keys are already
-skipped by this version's parser. `src/state.rs` carries the detail.
+**Background work.** Main `Stop` snapshots record a bounded aggregate of in-flight
+work: a nonempty registry sets `g <epoch>`, an explicit empty registry clears it,
+and missing/null metadata preserves it. No individual task list or count is
+stored. Unknown kinds and arbitrarily many entries within the payload limit stay
+conservatively active. Child completion alone does not prove that a workflow
+ended. The [indicator policy](docs/indicator-semantics.md) documents the observed
+automatic completion turns and the last-known diagnostic when a hook is missed.
+
+**Planned extension.** A reserved `n <epoch> <text>` line, last in the record,
+could cache the session's `aiTitle` from the transcript. It remains unimplemented.
 
 ## Location
 
@@ -1163,7 +1164,9 @@ stores it as that pane's `pane_title` and emits a title of its *own*, computed
 from `set-titles-string`, and it recomputes that title on a timer. `%s` - the
 epoch - is available inside a tmux format, so if the paint carries the moment it
 happened, the format can render the live glyph while the paint is fresh, the idle
-glyph once it is stale, and nothing at all once it is old. **No process runs, no
+glyph once it is stale, and nothing at all once it is old, **unless background
+work is known**. Background-aware blue/orange age to purple; purple never expires
+or disappears through a TTL. **No process runs, no
 hook fires and nothing is notified**; the only input that moved is tmux's own
 clock.
 
@@ -1175,7 +1178,7 @@ is a silent no-op. The non-tmux JSON delivery path is unchanged.
 
 That is worth much more than tmux convenience. The wrong titles in [Known
 limitations](#known-limitations) are all the same shape - an edge that paints
-with no matching un-paint. Inside tmux every one of them heals itself.
+with no matching un-paint. Inside tmux those transient carriers can age; known background remains visible.
 
 So inside tmux the payload the plugin emits stops being a tab title and becomes a
 **record**:
@@ -1183,7 +1186,14 @@ So inside tmux the payload the plugin emits stops being a tab title and becomes 
 ```text
 <location> ct1 <state> <epoch>          state = w (working) | a (waiting) | i (idle)
 ~/code/one ct1 w 1790443548
+<location> ct2 <state> <epoch>          state = p (background) | W / A (working / waiting with background)
+~/code/one ct2 p 1790443550
 ```
+
+SessionStart installs formats that understand both versions before publishing a
+carrier. Old panes remain readable. Upgrade all installed copies and start a new
+Claude session to refresh the server; `doctor` warns about incompatible formats.
+Update the reference theme too if its label strips only `ct1`.
 
 The glyph is not in it. `#{=1:}` counts *columns* and returns the empty string
 for a width-2 emoji, so a glyph cannot be sliced back out of a title at all; the
@@ -1246,8 +1256,8 @@ windows the label follows the active pane, while the strip includes every Claude
 pane. Copy the settings you want into `~/.tmux.conf`; the plugin does not install
 this configuration. The colours are a provisional example, not a required theme.
 
-This is another view of the existing three states, with the same TTLs, rather
-than a new background-work state or alert. [Issue #19](https://github.com/dalf/claude-tabstatus/issues/19)
+This uses the same four-state precedence as the outer title. Known background
+has no TTL; completion does not create an alert. [Issue #19](https://github.com/dalf/claude-tabstatus/issues/19)
 is not explicitly placed in the [roadmap](https://github.com/dalf/claude-tabstatus/issues/16);
 this implementation leaves the state-contract decisions in
 [issue #10](https://github.com/dalf/claude-tabstatus/issues/10) unchanged.
@@ -1258,7 +1268,7 @@ this implementation leaves the state-contract decisions in
 decorates its window's two status formats. You need no `~/.tmux.conf` edit:
 
 ```text
-set -s @cctab_gw/@cctab_ga/@cctab_gi     the three glyphs
+set -s @cctab_gw/@cctab_ga/@cctab_gp/@cctab_gi     the four glyphs
 set -s @cctab_tw/@cctab_ta/@cctab_tg     the three TTLs, in seconds
 set -s @cctab_title                      the generated strip-and-label format
 set -s @cctab_string                     the set-titles-string we installed
@@ -1484,9 +1494,7 @@ set-titles-string is not ours any more` - so start a new claude session, or
 
 ### Deliberately not built
 
-- **The approved fourth state for background work**, tracked in
-  [#15](https://github.com/dalf/claude-tabstatus/issues/15). Its completion signal
-  still needs lifecycle evidence. **OSC 9;4 progress** is also not implemented.
+- **OSC 9;4 progress** is not implemented.
 - **A cached session title.** The record reserves the `n` key for it, last in the
   file so that its free-form text arrives whole. Same seam, same status: designed,
   not built. It is the one future field that would put a record read on the
@@ -1746,7 +1754,7 @@ Everything the runtime half reads, in one place:
 
 | variable | default | what it does |
 |---|---|---|
-| `CCTAB_GLYPH_WORKING` / `_WAITING` / `_IDLE` | 🔵 / 🟠 / ⚪ | the three glyphs; empty drops the glyph and its space |
+| `CCTAB_GLYPH_WORKING` / `_WAITING` / `_BACKGROUND` / `_IDLE` | 🔵 / 🟠 / 🟣 / ⚪ | the four glyphs; empty drops the glyph and its space |
 | `CCTAB_GLYPH_POS` | terminal-dependent | `prefix`, `suffix` or `both`; inside tmux, which end the strip goes on |
 | `CCTAB_MAX_LOCATION` | `32` | characters before the location elides; `0` = no limit |
 | `CCTAB_MAX_HOST` | `16` | characters for the ssh host prefix; `0` = no limit |
@@ -1943,6 +1951,9 @@ listed, configured or killed. They are SKIPPED, never failed, where there is no
 client, which needs a pty this suite cannot allocate; what they do assert is the
 whole of the server side, including that re-rendering the same paint after a wait
 gives a different answer with no process running and no hook firing.
+
+`tests/test_background.py` replays six sanitized live lifecycle traces and tests
+long duration, missing metadata, concurrent waits, bounded tracking and migration.
 
 `tests/test_tmux_status.py` adds isolated private-server tests for window-list
 rendering, split panes, background windows, TTL decay and exact format restoration.
@@ -2159,10 +2170,6 @@ the one failure mode every other line rendered as healthy.
 
 **Not yet built:**
 
-- The fourth state: **background work running, main loop free**, approved as a
-  default in [#10](https://github.com/dalf/claude-tabstatus/issues/10). The current
-  empty-array check does not implement task tracking. Completion and long-workflow
-  evidence, migration and rendering remain in [#15](https://github.com/dalf/claude-tabstatus/issues/15).
 - A **cached session title**. The transcript records carry `aiTitle`, readable from
   a bounded tail read, and it is the only field that distinguishes five concurrent
   sessions that all render as `streaming-browser@master`. A reserved `n` line

@@ -1,15 +1,15 @@
 # Indicator meanings and background-work decision
 
 Decision for [#10](https://github.com/dalf/claude-tabstatus/issues/10): background
-activity is a standard state, enabled by default when implemented in
+activity is a standard state, enabled by default since
 [#15](https://github.com/dalf/claude-tabstatus/issues/15). A workflow can run for a
 long time while the main agent accepts more prompts. Availability for another
 prompt must not make that workflow appear finished.
 
-This is the approved product policy. The current release still renders three
-states and does not track background tasks. Its white indicator means the main
-conversation is idle, even when children remain active. That known gap belongs
-to #15; this document does not claim it is implemented.
+This policy is implemented by the registered stateful hooks. Background activity
+is a separate persisted fact beneath the main state and outstanding waits.
+Without a usable session ID and state directory, the legacy stateless fallback
+cannot retain that fact across hooks.
 
 ## Meanings and precedence
 
@@ -17,8 +17,8 @@ to #15; this document does not claim it is implemented.
 |---|---|
 | Orange: input required | A known unresolved request needs a response. Work may continue elsewhere in the session. |
 | Blue: working | The main agent is actively working. |
-| Purple: background | The main agent is idle and session-owned background work is known to remain in flight. Planned in #15. |
-| White: idle | No foreground or background work is known to remain active. This is the target meaning after #15, not a success signal. |
+| Purple: background | The main agent is idle and session-owned background work is known to remain in flight. |
+| White: idle | No foreground or background work is known to remain active. This is not a success signal. |
 
 Precedence is **input required > main working > background > idle**, using the
 resolved state after the ownership and recovery rules in the
@@ -42,51 +42,72 @@ color is selected here; the conversation remains the source of the result.
 Normal completion and the quiet `idle_prompt` notification are not requests for
 input.
 
-## Scenario decisions and current limits
+## Background lifecycle and reconciliation
 
-| Scenario | Current three-state behavior | Approved behavior / interpretation |
-|---|---|---|
-| Main stops with running children and no wait | White. Ordinary child progress is silent. | Purple in #15; main availability alone is insufficient for white. |
-| Main stops with an outstanding child wait | Idle base; orange remains. | Orange remains. Resolving the last wait restores purple if work continues, otherwise the appropriate base. |
-| Main turn fails | Same idle edge as normal Stop, subject to waits. | Failure is an outcome, not proof that all session work ended. Preserve waits/background work. |
-| Quiet idle notification | Idle base, subject to waits. | No alert or orange merely because a turn ended; missing task metadata cannot erase known background work. |
-| Child completes | Clears only its own wait, if any; does not track remaining children. | #15 updates the matching activity or a validated complete snapshot. Other work survives; the last completion removes purple without requiring another prompt. |
-| Interrupt produces no hook | Display persists until a recovery event or applicable expiry. | Do not promise immediate cancellation detection. Silence supplies no completion evidence. |
-| A TTL expires | State waits expire on eligible hooks; tmux independently ages its carrier. | Recovery is not proof of an answer or successful completion. The future background state must not decay to white solely because a workflow is long. |
-| User focuses a waiting tab | Focus does not resolve state. | An alert may be acknowledged separately; orange remains while the wait remains. |
-| Background metadata is absent/null | No background tracking; quiet-Stop wait recovery is not triggered. | Unknown information, not an empty activity set. Preserve previously established activity until retirement evidence or explicit lifecycle cleanup. |
+The authoritative snapshot is **main `Stop.background_tasks`**. Claude Code's
+[hook reference](https://code.claude.com/docs/en/hooks) describes it as the
+session's in-flight background registry. A nonempty array records known activity;
+an explicit empty array clears it. Absent or null arrays preserve the previous
+fact. Ordinary main progress, replies without metadata, idle notifications,
+`StopFailure`, focus and elapsed time do not clear it.
 
-## Activity scope and lifecycle requirements for #15
+This is one bounded aggregate, not a task inventory or a count. It includes
+session-owned workflows, subagents and background shells, including pending work
+already registered to an active workflow. Unknown task kinds also count because
+they occupy the in-flight registry. No entry is evicted when many tasks are
+present. `session_crons` and scheduled future occurrences do not count by
+existence alone; their registered in-flight executions do. Unrelated OS processes
+do not count. The shared 16 MiB payload limit still applies; rejected payloads
+make no state change.
 
-Count in-flight work registered to this Claude session: workflows, subagents,
-and background shell tasks. Running and pending work already belonging to an
-active workflow count. Scheduled future occurrences (`session_crons`, schedules
-or an inactive loop) do not count merely because they exist. A schedule's actual
-in-flight execution does count. Unrelated operating-system processes do not.
+`SubagentStop` clears only its existing permission-wait ownership. It does not
+clear background activity, even if its array is empty: a child can finish while
+its enclosing workflow or another task continues. Main `Stop` supplies the next
+complete snapshot. This is independent from the older permission-wait recovery
+heuristic in the [state contract](state-contract.md).
 
-Task kinds share the same user-facing meaning but can require different evidence.
-Do not infer that a shell exit emits a subagent completion hook, or equate one
-child finishing with the enclosing workflow finishing. Unknown task kinds in a
-validated in-flight snapshot must not silently become evidence of an idle session.
+Live interactive Claude Code **2.1.274** traces establish the clearing path:
 
-Use validated session-scoped identities and authoritative in-flight snapshots or
-matching lifecycle events. An empty array can clear the tracked set only where
-the event's snapshot completeness is established. An unrelated event, missing
-array, main reply, focus change or elapsed duration cannot clear it. This does
-not change the current permission-wait recovery heuristic.
+| Captured task | Observed clearing evidence |
+|---|---|
+| Background shell | Automatic task-notification turn, then main `Stop` with `[]`, without another human prompt. |
+| Background subagent | Its own `SubagentStop` still lists it; automatic task-notification turn then main `Stop` with `[]`. |
+| Workflow completing normally | Child completion still lists the workflow; automatic turn then main `Stop` with `[]`, without another human prompt. |
+| Workflow failing intentionally | Failure notification wakes the main agent; subsequent main `Stop` has `[]`. |
+| Workflow cancelled with `TaskStop` | Main `Stop` has `[]` after cancellation, without a child `SubagentStop`. The UI briefly retained a cancelled child's cleanup entry; this tracks the registry, not OS-process termination. |
+| Workflow spanning turns | Three main `Stop` snapshots remain nonempty through two additional human prompts, then the automatic completion turn reports `[]`. |
 
-#15 must capture normal completion without another prompt, cancellation, failure,
-missing metadata, work spanning many turns, and shell versus subagent behavior.
-Those captures must establish both creation and removal of activity. Existing
-synthetic tests and the historical permission capture do not establish that
-background lifecycle.
+The [sanitized captures](../tests/fixtures/background-v1.json) retain lifecycle
+metadata and authored expectations, with original prompts/tool text removed.
+The multi-turn live probe used a bounded 20-second task; year-long duration is
+covered by synthetic clocks, not claimed as a live observation. Ordinary hooks
+in the traces omit background metadata. Missing/null **Stop** metadata and
+`StopFailure` preservation are additionally tested synthetically.
 
-Do not reuse the working-state timeout to turn purple white. When evidence grows
-stale, retain the last known activity; report uncertainty through diagnostics.
-Session end/reset may discard the session's tracking without claiming the work
-succeeded. A missing reliable clearing signal remains an implementation blocker
-for #15: it needs a validated reconciliation mechanism before release. An expiry
-that merely calls the session idle would reintroduce the reported problem.
+No daemon polls tasks. A later main `Stop` reconciles the aggregate. If the
+completion notification, main turn or hook never arrives, retain the last known
+activity instead of inventing completion. `doctor` reports when background was
+last reported and explicitly labels it as last-known, unexpired evidence.
+Session end/reset can discard tracking without claiming success; compaction
+preserves it. Startup reaping also preserves a background record with no process
+origin, regardless of age; a known dead origin can still be cleaned up. State write failures and missing/unusable state storage retain the
+existing best-effort limits. Interrupts that emit no hook cannot be detected
+immediately.
+
+## Long duration and input precedence
+
+Waits keep their existing ownership, recovery and expiry rules. Orange overrides
+blue and purple. Resolving the final wait restores blue if the main agent is
+working, purple if only background is known, otherwise white. If a main snapshot
+changes background knowledge beneath an outstanding wait, repaint orange to
+update tmux's fallback too.
+
+Purple has **no TTL**. tmux carriers with known background also cannot disappear
+through `CCTAB_TTL_GONE`; blue/orange can age to purple using their existing TTLs.
+Carriers without known background retain the existing white/disappearance decay.
+A stale display or a recovered wait is not proof of success. Focus does not
+resolve requests. Terminal delivery remains best effort; after a silent hook the
+plain terminal retains its previous display.
 
 ## Attention and acknowledgement
 
@@ -100,40 +121,33 @@ the state record.
 
 ## Compatibility and delivery
 
-#10 changes documentation and verification, not the emitted states or existing
-glyphs. #15 is the separately approved behavior change to four default states.
-It must ship state resolution, rendering, configuration and migration together:
+- `CCTAB_GLYPH_BACKGROUND` defaults to 🟣 and follows the other glyph settings,
+  including an empty value. Existing working/waiting/idle customization remains.
+- The record writer emits `cts5`. Its optional `g <epoch>` records the last main
+  Stop reporting active work, independently of `b` (main base) and `w` (waits).
+  Readers accept `cts1`–`cts4` without inventing background history, even if an
+  old record contains a formerly reserved `g` field. Migration occurs on a
+  changed write. Guarded older binaries refuse ordinary updates of `cts5`, so
+  they cannot silently drop this activity; explicit teardown and much older
+  unguarded versions remain outside that guarantee. Update all installed copies.
+- tmux consumers still read `ct1 w/a/i`. Background-aware paints use **ct2**:
+  `p` means background, `W` working with background, `A` waiting with background.
+  `SessionStart` installs compatible server formats before publishing its title.
+  New readers support old panes alongside new ones; old readers ignore ct2
+  rather than interpreting it as white. `doctor` warns when installed formats
+  cannot consume background. Update all plugin copies and start a new Claude
+  session to refresh an existing tmux server; old sessions can otherwise replace
+  the shared formats. Refresh the optional [theme](../examples/tmux.conf) too.
+- Session locks serialize the aggregate with waits and completion history.
+  Atomic record replacement prevents partial reads. Concurrent independent
+  snapshots have no source sequence number, so the last processed snapshot wins;
+  terminal output after unlocking has the same existing ordering limitation.
+  Different sessions remain isolated.
 
-- Add a configurable background glyph/color with purple as the default, following
-  existing configuration conventions. Custom working/waiting/idle settings stay
-  intact. Theme and example configuration must include the fourth state.
-- Version the tmux carrier when extending today's `ct1` grammar (`w`, `a`, `i`).
-  New consumers must still read `ct1`; install compatible formats before emitting
-  the new carrier and test upgrade/restoration of existing servers. Mixed-version
-  or unsupported consumers must be diagnosed, not silently translate active
-  background work into white.
-- Version persisted state when adding task ownership and a background base.
-  Read existing `cts1`–`cts4` records without inventing background history. Older
-  readers must not silently discard new activity on an ordinary update. Retain
-  the documented session-cleanup limits and bounded-record requirements.
-- Define conservative overflow/unknown-task handling, concurrency and per-session
-  isolation. A full record must not evict live activity and falsely render idle.
-- Verify the full sequence above in plain-terminal output, tmux pane/window and
-  outer-title rendering, including long duration and the final completion event.
-
-## Existing validation
-
-These checks establish the current behavior and its documented gap, not an
-implemented purple state:
-
-| Requirement | Existing regression coverage |
-|---|---|
-| Main Stop with running children; child completion | `capture_s4_reconstruction`, `overlap_reverse_completions` in [semantic fixtures](../tests/fixtures/state-contract-v1.json) |
-| Live waits, StopFailure, absent/null/nonempty background metadata | `stop_background_distinctions` |
-| Interruption, lazy expiry, display uncertainty | `interruption_without_a_hook`, `per_owner_expiry_and_stale_display`, `clock_rollback_and_ttl_zero` |
-| Plain-terminal output and real tmux wait precedence, main/child completion, failure and focus | `test_current_state_semantics_agree_with_plain_terminal` in [tmux integration tests](../tests/test_tmux_status.py) |
-| Actual tmux carrier decay | `test_native_window_format_decays_without_hook_activity` |
-
-The semantic fixtures run independently of the historical golden oracle. Future
-background scenarios must extend them once #15 has the required lifecycle
-evidence; changing the existing white expectations alone does not implement it.
+[Background tests](../tests/test_background.py) replay all six live scenarios and
+exercise duration, missing metadata, lifecycle cleanup, unknown kinds, large
+registries, concurrency, isolation, diagnostics and record migration. The
+[tmux tests](../tests/test_tmux_status.py) check four-state parity with plain
+terminal output, age-to-purple behavior, mixed carriers, custom glyphs, theme
+labels and incompatible-consumer diagnostics. Existing wait-ownership scenarios
+remain in the [state contract fixtures](../tests/fixtures/state-contract-v1.json).

@@ -18,7 +18,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("CCTAB_TEST_BIN", ROOT / "bin/tabstatus")).resolve()
 FIXTURE = ROOT / "tests/fixtures/state-contract-v1.json"
-STATES = {"working", "waiting", "idle"}
+STATES = {"working", "waiting", "background", "idle"}
 EDGES = {"working", "waiting", "idle", "notify", "session-start", "session-end",
          "subagent-stop", "elicitation", "elicitation-result"}
 OWNERS = {"main", "unknown-permission", "anonymous-permission", "notification-mcp", "anonymous-direct-mcp",
@@ -100,7 +100,7 @@ def validate_fixture(fixture):
 
 
 def decode_owner(token):
-    """Decode cts4's private wire spelling, without transition or expiry logic."""
+    """Decode cts5's private wire spelling, without transition or expiry logic."""
     owner, epoch = token.rsplit(":", 1)
     aliases = {"-": "main", "?": "unknown-permission", "?p": "anonymous-permission", "?!": "notification-mcp",
                "!?": "anonymous-direct-mcp", "!+": "overflow"}
@@ -121,18 +121,18 @@ def decode_record(path):
     if not path.exists():
         return {"record": "absent", "base": "idle", "waits": [], "tombstones": [], "logical": "idle"}
     lines = path.read_text().splitlines()
-    require(lines and lines[0] == "cts4", "expected a complete cts4 record")
+    require(lines and lines[0] == "cts5", "expected a complete cts5 record")
     fields = {}
     for line in lines[1:]:
         key, value = line.split(" ", 1)
-        require(key in {"b", "w", "e"} and key not in fields, "unexpected/duplicate wire field")
+        require(key in {"b", "w", "e", "g"} and key not in fields, "unexpected/duplicate wire field")
         fields[key] = value
     require(fields.get("b") in {"w", "a", "i"}, "missing/invalid base")
     base = {"w": "working", "a": "waiting", "i": "idle"}[fields["b"]]
     waits = [decode_owner(word) for word in fields.get("w", "").split()]
     tombstones = [decode_owner(word) for word in fields.get("e", "").split()]
     return {"record": "present", "base": base, "waits": waits, "tombstones": tombstones,
-            "logical": "waiting" if waits else base}
+            "logical": "waiting" if waits else "background" if base == "idle" and "g" in fields else base}
 
 
 def observe_paint(output):
@@ -160,7 +160,7 @@ class StateContractTests(unittest.TestCase):
                    "CCTAB_STATE_DIR": str(state), "CCTAB_DRY_RUN": "1",
                    "CCTAB_TERMINAL": "other", "CCTAB_GLYPH_POS": "prefix",
                    "CCTAB_GLYPH_WORKING": "WORKING", "CCTAB_GLYPH_WAITING": "WAITING",
-                   "CCTAB_GLYPH_IDLE": "IDLE", **scenario["env"]}
+                   "CCTAB_GLYPH_BACKGROUND": "BACKGROUND", "CCTAB_GLYPH_IDLE": "IDLE", **scenario["env"]}
             displayed = "unpainted"
             for index, step in enumerate(scenario["steps"]):
                 with self.subTest(trace=scenario["id"], step=index, event=step["name"]):

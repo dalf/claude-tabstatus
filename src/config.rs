@@ -161,6 +161,7 @@ const DEFAULT_ELLIPSIS: &str = "\u{2026}";
 const DEFAULT_GLYPH_WORKING: &str = "\u{1f535}";
 const DEFAULT_GLYPH_WAITING: &str = "\u{1f7e0}";
 const DEFAULT_GLYPH_IDLE: &str = "\u{26aa}";
+const DEFAULT_GLYPH_BACKGROUND: &str = "\u{1f7e3}";
 /// Roughly what a Konsole tab shows before it elides, and a floor below which a
 /// title would be made mostly of marker.
 const DEFAULT_MAX_LOCATION: usize = 32;
@@ -179,6 +180,7 @@ pub struct Config {
     glyph_working: String,
     glyph_waiting: String,
     glyph_idle: String,
+    glyph_background: String,
     pub max_location: Cap,
     pub max_host: Cap,
     /// Whether this session came in over ssh. Only then is a host prefix
@@ -212,6 +214,7 @@ impl Config {
             glyph_working: var_or("CCTAB_GLYPH_WORKING", DEFAULT_GLYPH_WORKING),
             glyph_waiting: var_or("CCTAB_GLYPH_WAITING", DEFAULT_GLYPH_WAITING),
             glyph_idle: var_or("CCTAB_GLYPH_IDLE", DEFAULT_GLYPH_IDLE),
+            glyph_background: var_or("CCTAB_GLYPH_BACKGROUND", DEFAULT_GLYPH_BACKGROUND),
             max_location: Cap::parse(
                 var("CCTAB_MAX_LOCATION").as_deref(),
                 DEFAULT_MAX_LOCATION,
@@ -245,6 +248,7 @@ impl Config {
             glyph_working: DEFAULT_GLYPH_WORKING.to_owned(),
             glyph_waiting: DEFAULT_GLYPH_WAITING.to_owned(),
             glyph_idle: DEFAULT_GLYPH_IDLE.to_owned(),
+            glyph_background: DEFAULT_GLYPH_BACKGROUND.to_owned(),
             max_location: Cap::Max(DEFAULT_MAX_LOCATION),
             max_host: Cap::Max(DEFAULT_MAX_HOST),
             ssh: false,
@@ -264,6 +268,7 @@ impl Config {
             Glyph::Working => self.glyph_working = to,
             Glyph::Waiting => self.glyph_waiting = to,
             Glyph::Idle => self.glyph_idle = to,
+            Glyph::Background => self.glyph_background = to,
         }
     }
 
@@ -272,6 +277,7 @@ impl Config {
             Glyph::Working => &self.glyph_working,
             Glyph::Waiting => &self.glyph_waiting,
             Glyph::Idle => &self.glyph_idle,
+            Glyph::Background => &self.glyph_background,
         }
     }
 }

@@ -5,7 +5,8 @@
 //! format, because tmux runs strftime over it before expanding `#{}`. So if the
 //! paint carries the moment it happened, the format can render one glyph while
 //! the paint is fresh, the idle glyph once it is stale, and nothing at all once
-//! it is old - with no process running, no hook firing and nothing to go wrong.
+//! it is old. Known background work is exempt: purple persists, and blue/orange
+//! with background fall back to purple. No timer proves that work finished.
 //!
 //! That is worth far more than tmux convenience. This project's recurring defect
 //! is "an edge that paints with no matching un-paint": an abandoned permission
@@ -19,6 +20,9 @@
 //! becomes a record:
 //!
 //!     <location> ct1 <state> <epoch>          state = w | a | i
+//!     <location> ct2 <state> <epoch>          state = p | W | A
+//!
+//! ct2 carries known background, including beneath main work or an input wait.
 //!
 //! The glyph is NOT in it. Three measurements forced that: `#{=1:}` counts
 //! COLUMNS and returns the EMPTY string for a width-2 emoji, so a glyph cannot be
@@ -56,6 +60,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// shape can change it and let an old format ignore the new panes rather than
 /// misread them.
 const TAG: &str = "ct1";
+const BACKGROUND_TAG: &str = "ct2";
 
 // The server options SessionStart writes and the generated format reads. They
 // are options rather than text spliced into the format because an option's VALUE
@@ -65,6 +70,7 @@ const TAG: &str = "ct1";
 const OPT_GW: &str = "@cctab_gw";
 const OPT_GA: &str = "@cctab_ga";
 const OPT_GI: &str = "@cctab_gi";
+const OPT_GP: &str = "@cctab_gp";
 const OPT_TW: &str = "@cctab_tw";
 const OPT_TA: &str = "@cctab_ta";
 const OPT_TG: &str = "@cctab_tg";
@@ -110,7 +116,8 @@ const OPT_EXE: &str = "@cctab_exe";
 ///
 /// The `/r` flag needs the COLON form: `#{m/r|...}` parses as a single argument
 /// and silently matches everything, which makes every shell pane a claude.
-const IS: &str = "#{m/r: ct1 [wai] [0-9]+$,#{pane_title}}";
+const IS: &str = "#{||:#{m/r: ct1 [wai] [0-9]+$,#{pane_title}},#{m/r: ct2 [pWA] [0-9]+$,#{pane_title}}}";
+const HAS_BACKGROUND: &str = "#{m/r: ct2 [pWA] [0-9]+$,#{pane_title}}";
 /// Seconds since the paint. `%s` is strftime's, expanded over the whole format
 /// before `#{}` is, so every cell in one render shares one `now`.
 ///
@@ -120,29 +127,36 @@ const IS: &str = "#{m/r: ct1 [wai] [0-9]+$,#{pane_title}}";
 const AGE: &str = "#{e|-|:%s,#{s|^.* ||:#{pane_title}}}";
 /// The state letter. One ASCII column, so `#{=1:}` - which counts COLUMNS, and
 /// returns EMPTY for a width-2 emoji - is safe here and nowhere near a glyph.
-const ST: &str = "#{=1:#{s|^.* ct1 ||:#{pane_title}}}";
+const ST: &str = "#{=1:#{s|^.* ct[12] ||:#{pane_title}}}";
 /// The location, with the record taken back off.
 ///
 /// No colon may appear anywhere inside an `s` modifier's arguments: measured,
 /// one silently empties the WHOLE expansion, with any delimiter and with `##:`
 /// escaping. That is why the wire tag is colon-free.
-const LOC: &str = "#{s| ct1 [wai] [0-9]*$||:#{pane_title}}";
+const LOC: &str = "#{s| ct[12] [waipWA] [0-9]*$||:#{pane_title}}";
 
-/// A tier whose deadline has passed and whose remedy is the idle glyph.
-fn ladder(deadline: &str, live: &str) -> String {
-    format!("#{{?#{{e|>|:{AGE},#{{{deadline}}}}},#{{{OPT_GI}}},#{{{live}}}}}")
+/// A tier whose deadline has passed, with its state-specific fallback.
+fn ladder(deadline: &str, live: &str, fallback: &str) -> String {
+    format!("#{{?#{{e|>|:{AGE},#{{{deadline}}}}},#{{{fallback}}},#{{{live}}}}}")
 }
 
-/// One pane's contribution: its glyph while fresh, the idle glyph once stale,
-/// and nothing at all once it is old or was never ours.
-///
-/// Idle has no freshness tier of its own, because white is already what the
-/// other two decay INTO - there is nothing left for it to become.
+/// One pane's contribution. Without background, transient glyphs age to white
+/// and eventually disappear. Known background stays purple, including beneath
+/// aged working/waiting carriers. Unknown carrier versions contribute nothing.
 fn cell() -> String {
-    let w = ladder(OPT_TW, OPT_GW);
-    let a = ladder(OPT_TA, OPT_GA);
-    let by_state = format!("#{{?#{{==:{ST},w}},{w},#{{?#{{==:{ST},a}},{a},#{{{OPT_GI}}}}}}}");
-    let alive = format!("#{{?#{{e|>|:{AGE},#{{{OPT_TG}}}}},,{by_state}}}");
+    let mut by_state = format!("#{{{OPT_GI}}}");
+    for (state, value) in [
+        ('p', format!("#{{{OPT_GP}}}")),
+        ('A', ladder(OPT_TA, OPT_GA, OPT_GP)),
+        ('W', ladder(OPT_TW, OPT_GW, OPT_GP)),
+        ('a', ladder(OPT_TA, OPT_GA, OPT_GI)),
+        ('w', ladder(OPT_TW, OPT_GW, OPT_GI)),
+    ] {
+        by_state = format!("#{{?#{{==:{ST},{state}}},{value},{by_state}}}");
+    }
+    // Known background work never expires to idle or disappears. Working and
+    // waiting can still age, but fall back to that background state instead.
+    let alive = format!("#{{?{HAS_BACKGROUND},{by_state},#{{?#{{e|>|:{AGE},#{{{OPT_TG}}}}},,{by_state}}}}}");
     format!("#{{?{IS},{alive},}}")
 }
 
@@ -263,11 +277,13 @@ fn carrier_at(paint: Paint, place: &str, epoch: u64) -> String {
         return String::new();
     };
     let state = match g {
-        Glyph::Working => 'w',
-        Glyph::Waiting => 'a',
+        Glyph::Working => if paint.background() { 'W' } else { 'w' },
+        Glyph::Waiting => if paint.background() { 'A' } else { 'a' },
+        Glyph::Background => 'p',
         Glyph::Idle => 'i',
     };
-    format!("{place} {TAG} {state} {epoch}")
+    let tag = if paint.background() { BACKGROUND_TAG } else { TAG };
+    format!("{place} {tag} {state} {epoch}")
 }
 
 /// The epoch the record carries. `CCTAB_NOW` pins it, which is the only reason
@@ -366,6 +382,7 @@ pub fn session_start(cfg: &Config) {
     set(&mut c, OPT_GW, cfg.glyph(Glyph::Working));
     set(&mut c, OPT_GA, cfg.glyph(Glyph::Waiting));
     set(&mut c, OPT_GI, cfg.glyph(Glyph::Idle));
+    set(&mut c, OPT_GP, cfg.glyph(Glyph::Background));
     set(&mut c, OPT_TW, &ttl("CCTAB_TTL_WORKING", DEFAULT_TTL_WORKING));
     set(&mut c, OPT_TA, &ttl("CCTAB_TTL_WAITING", DEFAULT_TTL_WAITING));
     set(&mut c, OPT_TG, &ttl("CCTAB_TTL_GONE", DEFAULT_TTL_GONE));
@@ -967,10 +984,11 @@ pub fn uninstall() -> Vec<String> {
 }
 
 /// Every option SessionStart writes, so that uninstall cannot forget one.
-const OURS: [&str; 13] = [
+const OURS: [&str; 14] = [
     OPT_GW,
     OPT_GA,
     OPT_GI,
+    OPT_GP,
     OPT_TW,
     OPT_TA,
     OPT_TG,
@@ -1138,6 +1156,13 @@ pub fn report(cfg: &Config) -> Vec<String> {
                   SessionStart has run on this server yet",
         }
     ));
+    if let Ok(formats) = ask(&t, &[&format!("#{{{OPT_TITLE}}}"), &format!("#{{{OPT_WINDOW_STRIP}}}")]) {
+        if formats.iter().any(|f| !f.contains(HAS_BACKGROUND)) {
+            out.push("           background: WARN installed formats cannot reliably display ct2 background work; update all plugin copies and start a new Claude session to refresh this server".to_owned());
+        } else {
+            out.push("           background: OK   ct1/ct2 consumers installed; known background never expires".to_owned());
+        }
+    }
     // The glyph LAYOUT is server-wide too, and the `ours` test above can never
     // catch a drift: the SessionStart that changed the layout rewrote
     // @cctab_string in the same batch, so the two always agree. Comparing what
@@ -1305,18 +1330,17 @@ mod tests {
     /// private tmux server.
     #[test]
     fn the_generated_format_is_a_strip_and_a_label_either_way_round() {
-        const LABEL: &str = "#{?#{m/r: ct1 [wai] [0-9]+$,#{pane_title}},\
-                             #{s| ct1 [wai] [0-9]*$||:#{pane_title}},\
-                             #{session_name}:#{window_index}:#{window_name}}";
+        let label = format!("#{{?{IS},{LOC},#{{session_name}}:#{{window_index}}:#{{window_name}}}}");
+        let label = label.as_str();
         let prefix = title_format(GlyphPos::Prefix);
         let suffix = title_format(GlyphPos::Suffix);
         // One strip, one label, one separator, and the separator is the ONLY
         // place the two variants differ - which is what makes the two trims in
         // `set_titles_string` symmetric.
         assert!(prefix.starts_with("#{W:#{P:"));
-        assert!(prefix.ends_with(&format!(" {LABEL}")));
-        assert!(suffix.starts_with(LABEL));
-        assert!(suffix[LABEL.len()..].starts_with(" #{W:#{P:"));
+        assert!(prefix.ends_with(&format!(" {label}")));
+        assert!(suffix.starts_with(label));
+        assert!(suffix[label.len()..].starts_with(" #{W:#{P:"));
         assert_eq!(prefix.len(), suffix.len());
         assert_eq!(prefix.matches("#{W:#{P:").count(), 1);
         assert_eq!(suffix.matches("#{W:#{P:").count(), 1);
@@ -1364,18 +1388,14 @@ mod tests {
     }
 
     #[test]
-    fn the_three_states_each_decay_into_the_idle_glyph_and_then_into_nothing() {
+    fn known_background_bypasses_disappearance_and_is_the_decay_fallback() {
         let c = cell();
-        // working and waiting each have their own deadline, idle has none.
-        assert_eq!(c.matches("@cctab_tw").count(), 1);
-        assert_eq!(c.matches("@cctab_ta").count(), 1);
-        assert_eq!(c.matches("@cctab_tg").count(), 1);
-        // The disappear test comes FIRST, so an old pane costs one comparison.
-        let gone = c.find("@cctab_tg").expect("a disappear tier");
-        assert!(gone < c.find("@cctab_tw").expect("a working tier"));
-        // The numeric comparison, never the string one.
+        assert!(c.contains(HAS_BACKGROUND));
+        assert!(c.contains("@cctab_gp"));
+        assert!(c.contains("@cctab_tw"));
+        assert!(c.contains("@cctab_ta"));
+        assert!(c.contains("@cctab_tg"));
         assert!(!c.contains("#{>:"));
-        assert_eq!(c.matches("#{e|>|:").count(), 3);
     }
 
     #[test]
@@ -1410,7 +1430,7 @@ mod tests {
         // and @cctab_exe is the one this slice added.
         assert!(OURS.contains(&OPT_EXE));
         assert!(OURS.contains(&OPT_WINDOW_STRIP));
-        assert_eq!(OURS.len(), 13);
+        assert_eq!(OURS.len(), 14);
     }
 
     #[test]

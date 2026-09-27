@@ -174,9 +174,91 @@ class TmuxStatusTests(unittest.TestCase):
             self.publish(self.pane, edge)
             self.assertEqual(self.rendered(self.pane, True), glyph + " C:current")
 
+    def test_background_survives_decay_and_updates_waiting_fallback_in_both_directions(self):
+        self.start(CCTAB_TTL_WORKING="1", CCTAB_TTL_WAITING="1", CCTAB_TTL_GONE="1")
+        epoch = int(self.tm("display-message", "-p", "%s")) - 365 * 86400
+        pid = self.tm("display-message", "-p", "-t", self.pane, "#{pane_pid}")
+        env = {"CLAUDE_PID": pid, "CCTAB_STATE_DIR": str(self.root / "state"), "CCTAB_NOW": str(epoch), "CCTAB_TTL_WAITING": "0"}
+
+        def emit(edge, event, state, **fields):
+            self.hook(edge, self.pane, env, {"session_id": "s1", "hook_event_name": event, **fields})
+            self.wait_for(lambda: self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}").split()[-2], state)
+
+        request = {"mcp_server_name": "server", "elicitation_id": "request", "mode": "form"}
+        emit("elicitation", "Elicitation", "a", **request)
+        emit("idle", "Stop", "A", background_tasks=[{"type": "workflow"}])
+        self.assertEqual(self.rendered(self.pane, True), "🟣 C:current")
+        # Missing metadata preserves both the request and the background fact.
+        emit("idle", "Stop", "A")
+        emit("elicitation-result", "ElicitationResult", "p", action="accept", **request)
+        self.assertEqual(self.rendered(self.pane, True), "🟣 C:current")
+        emit("working", "UserPromptSubmit", "W", prompt="progress?")
+        self.assertEqual(self.rendered(self.pane, True), "🟣 C:current")
+        self.assertIn("🟣", self.tm("display-message", "-p", "-t", self.pane, "#{T:@cctab_title}"))
+        request["elicitation_id"] = "next"
+        emit("elicitation", "Elicitation", "A", **request)
+        env["CCTAB_NOW"] = self.tm("display-message", "-p", "%s")
+        emit("idle", "Stop", "a", background_tasks=[])
+        self.assertEqual(self.rendered(self.pane, True), "🟠 C:current")
+        emit("elicitation-result", "ElicitationResult", "i", action="accept", **request)
+        self.assertEqual(self.rendered(self.pane, True), "⚪ C:current")
+
+    def test_ct1_and_ct2_panes_coexist_with_custom_background_glyph_and_theme(self):
+        self.tm("source-file", str(ROOT / "examples/tmux.conf"))
+        self.start(CCTAB_GLYPH_BACKGROUND="BG")
+        other = self.new_window("legacy")
+        self.start(other, CCTAB_GLYPH_BACKGROUND="BG")
+        self.publish(other, "working")
+        pid = self.tm("display-message", "-p", "-t", self.pane, "#{pane_pid}")
+        epoch = self.tm("display-message", "-p", "%s")
+        self.hook("idle", self.pane, {"CLAUDE_PID": pid, "CCTAB_STATE_DIR": str(self.root / "state"),
+                                     "CCTAB_NOW": epoch},
+                  {"session_id": "s1", "hook_event_name": "Stop", "background_tasks": [{"type": "workflow"}]})
+        self.wait_for(lambda: self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}").split()[-3:],
+                      ["ct2", "p", epoch])
+        self.assertEqual(self.tm("display-message", "-p", "-t", self.pane, "#{T:@cctab_window_strip}"), "BG")
+        label = self.tm("display-message", "-p", "-t", self.pane, "#{E:@claude_window_label}")
+        self.assertNotIn("ct2", label)
+        self.assertNotEqual(label, "current")
+        outer = self.tm("display-message", "-p", "-t", self.pane, "#{T:@cctab_title}")
+        self.assertIn("BG", outer)
+        self.assertIn("🔵", outer)
+
+    def test_doctor_reports_consumers_that_do_not_understand_background(self):
+        self.start()
+        env = dict(self.env, TMUX=f"{self.socket},1,0", TMUX_PANE=self.pane, CLAUDE_PID="0")
+        def doctor():
+            return subprocess.run([str(BIN), "doctor"], env=env, cwd=self.root,
+                                  capture_output=True, text=True, timeout=10).stdout
+        self.assertIn("background: OK", doctor())
+        self.tm("set", "-s", "@cctab_window_strip", "old ct1 format")
+        self.assertIn("background: WARN", doctor())
+        self.start()
+        self.assertIn("background: OK", doctor())
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses read-only record permissions")
+    def test_unwritable_record_keeps_background_in_the_waiting_carrier(self):
+        self.start(CCTAB_TTL_WAITING="1", CCTAB_TTL_GONE="1")
+        epoch = str(int(self.tm("display-message", "-p", "%s")) - 1000)
+        env = {"CCTAB_STATE_DIR": str(self.root / "state"), "CCTAB_NOW": epoch,
+               "CLAUDE_PID": self.tm("display-message", "-p", "-t", self.pane, "#{pane_pid}")}
+        self.hook("idle", self.pane, env, {"session_id": "s1", "hook_event_name": "Stop", "background_tasks": [{}]})
+        record = self.root / "state" / "s1"
+        before = record.read_bytes()
+        record.chmod(0o400)
+        try:
+            for edge, event, fields in [("waiting", "PermissionRequest", {"agent_id": "child"}),
+                                        ("elicitation", "Elicitation", {"mode": "form", "mcp_server_name": "s", "elicitation_id": "r"})]:
+                self.hook(edge, self.pane, env, {"session_id": "s1", "hook_event_name": event, **fields})
+                self.wait_for(lambda: self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}").split()[-3:],
+                              ["ct2", "A", epoch])
+                self.assertEqual(self.rendered(self.pane, True), "🟣 C:current")
+                self.assertEqual(record.read_bytes(), before)
+        finally:
+            record.chmod(0o600)
+
     def test_current_state_semantics_agree_with_plain_terminal(self):
-        # Issue10's current baseline: the future background state is not yet
-        # implemented. Exercise the same ownership sequence through ordinary
+        # Exercise all four states and ownership precedence through ordinary
         # terminalSequence output and real tmux pane-tty delivery.
         self.start()
         epoch = int(self.tm("display-message", "-p", "%s"))
@@ -188,20 +270,22 @@ class TmuxStatusTests(unittest.TestCase):
         # Last item is an emitted state, or None for a silent hook.
         steps = [
             ("working", "UserPromptSubmit", {"prompt": "launch workflow"}, "w"),
-            ("idle", "Stop", {"background_tasks": running}, "i"),
+            ("idle", "Stop", {"background_tasks": running}, "p"),
             ("working", "PostToolUse", {"agent_id": "child"}, None),
-            ("waiting", "PermissionRequest", {"agent_id": "child"}, "a"),
+            ("waiting", "PermissionRequest", {"agent_id": "child"}, "A"),
             ("working", "PostToolUse", {}, None),
             ("idle", "StopFailure", {}, None),
             ("idle", "Stop", {"background_tasks": running}, None),
             ("subagent-stop", "SubagentStop", {"agent_id": "other"}, None),
-            ("working", "PostToolUse", {"agent_id": "child"}, "i"),
+            ("working", "PostToolUse", {"agent_id": "child"}, "p"),
             ("subagent-stop", "SubagentStop", {"agent_id": "child"}, None),
-            ("notify", "Notification", {"notification_type": "idle_prompt"}, "i"),
-            ("working", "UserPromptSubmit", {"prompt": "continue"}, "w"),
-            ("idle", "StopFailure", {"background_tasks": []}, "i"),
+            ("notify", "Notification", {"notification_type": "idle_prompt"}, "p"),
+            ("working", "UserPromptSubmit", {"prompt": "continue"}, "W"),
+            ("idle", "StopFailure", {"background_tasks": []}, "p"),
+            ("working", "UserPromptSubmit", {"prompt": "<task-notification>done</task-notification>"}, "W"),
+            ("idle", "Stop", {"background_tasks": []}, "i"),
         ]
-        glyphs = {"w": "🔵", "a": "🟠", "i": "⚪"}
+        glyphs = {"w": "🔵", "W": "🔵", "a": "🟠", "A": "🟠", "p": "🟣", "i": "⚪"}
         carrier = None
         displayed = None
         for index, (edge, event, fields, paint) in enumerate(steps):
@@ -221,15 +305,15 @@ class TmuxStatusTests(unittest.TestCase):
                     self.assertTrue(sequence.startswith("\x1b]0;" + glyphs[paint] + " "), sequence)
                     self.assertTrue(sequence.endswith("\x07"), sequence)
                     self.assertTrue(message["suppressOutput"])
-                    carrier = f"{paint} {now}"
+                    carrier = f"ct{2 if paint in 'pWA' else 1} {paint} {now}"
                     displayed = glyphs[paint]
                 self.wait_for(lambda: self.tm("display-message", "-p", "-t", self.pane,
-                                             "#{pane_title}").rsplit(" ct1 ", 1)[-1], carrier)
+                                             "#{pane_title}").rsplit(" ", 3)[-3:], carrier.split())
                 self.assertEqual(self.rendered(self.pane, True), displayed + " C:current")
                 self.assertEqual(self.rendered(self.pane), displayed + " N:current")
                 self.assertIn(displayed, self.tm("display-message", "-p", "-t", self.pane,
                                                 "#{T:@cctab_title}"))
-                if paint == "a":
+                if paint == "A":
                     record = self.root / "tmux-state" / "s1"
                     before = record.read_bytes()
                     other = self.new_window("focus-away")

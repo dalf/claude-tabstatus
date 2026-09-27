@@ -2283,14 +2283,14 @@ check 'state: a subagent PermissionRequest paints waiting, as it always did' '�
 # dialogs more often than the TTL never expired it - and nothing paints while a
 # wait is held, so the tab froze orange for the rest of the session.
 check 'state: ...and the wait is recorded against that agent, with its own epoch' \
-    "cts4|b i|w $_ag:1000000|" "$(rec)"
+    "cts5|b i|w $_ag:1000000|" "$(rec)"
 
 # The backstop is for the SAME dialog. Recording a second, UNKNOWN owner for it
 # would mean two waits for one dialog and only one of them retirable - so it is
 # only recorded when nothing is waiting at all.
 check 'state: the 6s notification backstop adds no second owner' '🟠 plain@master' \
     "$(st notify "$(pl Notification ',"notification_type":"permission_prompt"')")"
-check 'state: ...and the record is unchanged' "cts4|b i|w $_ag:1000000|" "$(rec)"
+check 'state: ...and the record is unchanged' "cts5|b i|w $_ag:1000000|" "$(rec)"
 
 # A main-thread tool call while the dialog is up. Stateless this painted BLUE over
 # the open dialog, once per tool call. The base still moves - main IS working -
@@ -2298,20 +2298,20 @@ check 'state: ...and the record is unchanged' "cts4|b i|w $_ag:1000000|" "$(rec)
 check 'state: a main-thread PostToolUse does not repaint over the dialog' '' \
     "$(st working "$(pl PostToolUse)")"
 check 'state: ...but the base it would have painted is remembered' \
-    "cts4|b w|w $_ag:1000000|" "$(rec)"
+    "cts5|b w|w $_ag:1000000|" "$(rec)"
 
 # The ghost. No SubagentStart ever announced a8e90c10, its agent_type is empty,
 # and it fires nine seconds before the user answers. Matching on the OWNER is what
 # stops it un-painting a live dialog.
 check 'state: a SubagentStop for an agent that owns nothing does nothing' '' \
     "$(st subagent-stop "$(pl SubagentStop ",\"agent_id\":\"$_ghost\"")")"
-check 'state: ...and leaves the record alone' "cts4|b w|w $_ag:1000000|" "$(rec)"
+check 'state: ...and leaves the record alone' "cts5|b w|w $_ag:1000000|" "$(rec)"
 
 # THE FIX. The subagent's own PostToolUse is the un-paint, and what comes back is
 # the BASE the wait covered up - not a guess at it.
 check 'state: the owning agent PostToolUse clears the wait and restores the base' \
     '🔵 plain@master' "$(st working "$(pl PostToolUse ",\"agent_id\":\"$_ag\"")")"
-check 'state: ...and nothing is waiting any more' 'cts4|b w|' "$(rec)"
+check 'state: ...and nothing is waiting any more' 'cts5|b w|' "$(rec)"
 
 # With nothing waiting, a background subagent's tool call is the ORIGINAL filter,
 # unchanged - and it writes nothing, which is what keeps the hot edge a read.
@@ -2326,7 +2326,7 @@ check 'state: ...and writes nothing' "$_before" "$(rec)"
 # agent is LISTED in background_tasks, so the main loop has nothing to say about it.
 rm -rf "$_sd"
 st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
-check 'state: Stop paints nothing while a listed agent dialog is outstanding' '' \
+check 'state: Stop preserves orange and records its background fallback' '🟠 plain@master' \
     "$(st idle "$(stop_busy)")"
 check 'state: the 3s idle nudge is guarded the same way' '' \
     "$(st notify "$(pl Notification ',"notification_type":"idle_prompt"')")"
@@ -2342,7 +2342,7 @@ check 'state: a Stop that does not mention background_tasks retires nothing' '' 
 # whole 900s TTL, and outside tmux nothing else decays.
 check 'state: an empty background_tasks at Stop retires an abandoned agent wait' \
     '⚪ plain@master' "$(st idle "$(stop_quiet)")"
-check 'state: ...and the record no longer holds it' 'cts4|b i|' "$(rec)"
+check 'state: ...and the record no longer holds it' 'cts5|b i|' "$(rec)"
 
 # The OTHER main-thread retirement: you cannot type at the prompt while a modal
 # dialog is up, so a UserPromptSubmit proves the screen is clear whoever owned it.
@@ -2361,7 +2361,7 @@ check 'state: an injected task-notification prompt retires nothing' '' \
     "$(st working "$(pl UserPromptSubmit ',"prompt":"<task-notification>\n<task-id>x</task-id>"')")"
 check 'state: a UserPromptSubmit the USER typed retires every wait' '🔵 plain@master' \
     "$(st working "$(pl UserPromptSubmit ',"prompt":"carry on"')")"
-check 'state: ...and the record is clean' 'cts4|b w|' "$(rec)"
+check 'state: ...and the record is clean' 'cts5|b w|' "$(rec)"
 
 # ...but a MAIN wait at Stop is stale by construction: the loop could not have
 # stopped while a main-thread dialog blocked it. A rejected ExitPlanMode is
@@ -2369,7 +2369,7 @@ check 'state: ...and the record is clean' 'cts4|b w|' "$(rec)"
 # deliberately non-empty to prove so.
 rm -rf "$_sd"
 st waiting "$(pl PreToolUse ',"tool_name":"ExitPlanMode"')" >/dev/null
-check 'state: Stop does clear a stale main-thread wait' '⚪ plain@master' \
+check 'state: Stop clears a stale main-thread wait and restores background' '🟣 plain@master' \
     "$(st idle "$(stop_busy)")"
 
 # A declined dialog: the tool never runs, so no PostToolUse ever comes. The
@@ -2385,7 +2385,7 @@ rm -rf "$_sd"
 st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
 st waiting "$(pl PermissionRequest)" >/dev/null
 check 'state: two overlapping dialogs are both recorded, newest last' \
-    "cts4|b i|w $_ag:1000000 -:1000000|" "$(rec)"
+    "cts5|b i|w $_ag:1000000 -:1000000|" "$(rec)"
 check 'state: answering the main one keeps the tab orange' '' \
     "$(st working "$(pl PostToolUse)")"
 check 'state: answering the agent one finally restores the base' '🔵 plain@master' \
@@ -2400,16 +2400,16 @@ for _t in 1000002 1000004 1000006 1000008; do
     _now=$_t st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag2\"")" >/dev/null
 done
 check 'state: an unrelated dialog does not touch another wait epoch' \
-    "cts4|b i|w $_ag:1000000 $_ag2:1000008|" "$(rec)"
+    "cts5|b i|w $_ag:1000000 $_ag2:1000008|" "$(rec)"
 _now=1000009
-check 'state: the stale wait expires on its OWN clock and the fresh one holds' '' \
+check 'state: the stale wait expires and the fresh one gets a background fallback' '🟠 plain@master' \
     "$(cd -- "$tmp/repos/plain" && printf '%s\n' "$(stop_busy)" \
         | HOME=$tmp CCTAB_DRY_RUN=1 CCTAB_STATE_DIR=$_sd CCTAB_NOW=$_now \
           CCTAB_TTL_WAITING=3 CLAUDE_PID= "$bin" idle)"
 # ...and the expiry was PERSISTED, so a later, larger CCTAB_TTL_WAITING cannot
 # resurrect a wait that has already been declared dead.
 check 'state: ...and the expired wait is written out of the record' \
-    "cts4|b i|w $_ag2:1000008|" "$(rec)"
+    "cts5|b i|g 1000009|w $_ag2:1000008|" "$(rec)"
 _now=1000000
 
 # The unattributable `?`. It used to survive Stop AND the 3s nudge, so once the
@@ -2464,7 +2464,7 @@ rm -rf "$_sd"
 st notify "$(pl Notification ',"notification_type":"worker_permission_prompt"')" >/dev/null
 st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
 check 'state: an attributable dialog supersedes a lone unknown owner' \
-    "cts4|b i|w $_ag:1000000|" "$(rec)"
+    "cts5|b i|w $_ag:1000000|" "$(rec)"
 
 # MCP notifications and permission requests can describe DIFFERENT dialogs.
 # Keep both regardless of arrival order, then retire only the permission wait
@@ -2486,11 +2486,11 @@ for _kind in elicitation_dialog elicitation_url_dialog; do
             check "state: $_kind ($_order) remains after the permission owner's $_event" '' \
                 "$(st "$_edge" "$(pl "$_event" ",\"agent_id\":\"$_ag\"")")"
             check 'state: resolving the permission leaves only the MCP wait' \
-                'cts4|b w|w ?!:1000000|' "$(rec)"
+                'cts5|b w|w ?!:1000000|' "$(rec)"
             check 'state: main progress recovers the remaining notification wait' \
                 '🔵 plain@master' "$(st working "$(pl PostToolUse)")"
             check 'state: main progress persists the notification resolution' \
-                'cts4|b w|' "$(rec)"
+                'cts5|b w|' "$(rec)"
         done
     done
 
@@ -2503,18 +2503,18 @@ for _kind in elicitation_dialog elicitation_url_dialog; do
     check 'state: the injected prompt leaves MCP provenance unchanged' "$_before" "$(rec)"
     check "state: a new human prompt clears $_kind" '🔵 plain@master' \
         "$(st working "$(pl UserPromptSubmit ',"prompt":"carry on"')")"
-    check 'state: the human prompt persists the MCP wait removal' 'cts4|b w|' "$(rec)"
+    check 'state: the human prompt persists the MCP wait removal' 'cts5|b w|' "$(rec)"
 
     st notify "$(pl Notification ",\"notification_type\":\"$_kind\"")" >/dev/null
     _now=1000900
-    check "state: $_kind survives at the waiting TTL boundary" '' \
+    check "state: $_kind survives at the waiting TTL boundary" '🟠 plain@master' \
         "$(st idle "$(stop_busy)")"
     check 'state: the boundary retains the MCP wait and its original clock' \
-        'cts4|b i|w ?!:1000000|' "$(rec)"
+        'cts5|b i|g 1000900|w ?!:1000000|' "$(rec)"
     _now=1000901
-    check "state: $_kind expires beyond the waiting TTL" '⚪ plain@master' \
+    check "state: $_kind expires beyond the waiting TTL" '🟣 plain@master' \
         "$(st idle "$(stop_busy)")"
-    check 'state: expiry persists the MCP wait removal' 'cts4|b i|' "$(rec)"
+    check 'state: expiry persists the MCP wait removal' 'cts5|b i|g 1000901|' "$(rec)"
     _now=1000000
 done
 
@@ -2525,17 +2525,17 @@ done
 rm -rf "$_sd"
 st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
 _now=1000900
-check 'state: a wait still inside CCTAB_TTL_WAITING holds the tab' '' \
+check 'state: a wait still inside CCTAB_TTL_WAITING holds the tab' '🟠 plain@master' \
     "$(st idle "$(stop_busy)")"
 _now=1000901
-check 'state: a wait past CCTAB_TTL_WAITING has expired' '⚪ plain@master' \
+check 'state: a wait past CCTAB_TTL_WAITING has expired' '🟣 plain@master' \
     "$(st idle "$(stop_busy)")"
 _now=1000000
 # The knob is the tmux one, and one grammar covers both.
 rm -rf "$_sd"
 st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
 _now=1000061
-check 'state: CCTAB_TTL_WAITING moves the horizon' '⚪ plain@master' \
+check 'state: CCTAB_TTL_WAITING moves the horizon' '🟣 plain@master' \
     "$(cd -- "$tmp/repos/plain" && printf '%s\n' "$(stop_busy)" \
         | HOME=$tmp CCTAB_DRY_RUN=1 CCTAB_STATE_DIR=$_sd CCTAB_NOW=$_now \
           CCTAB_TTL_WAITING=60 CLAUDE_PID= "$bin" idle)"
@@ -2551,7 +2551,7 @@ printf 'cts1\nb i\n' >"$_sd/dead-session-0000"
 touch -d '2 days ago' "$_sd/dead-session-0000" 2>/dev/null \
     || touch -t 200001010000 "$_sd/dead-session-0000"
 st session-start "$(pl SessionStart ',"source":"resume"')" >/dev/null 2>&1
-check 'state: SessionStart resets the record' 'cts4|b i|' "$(rec)"
+check 'state: SessionStart resets the record' 'cts5|b i|' "$(rec)"
 check 'state: SessionStart reaps a record nothing has touched for a day' 'gone' \
     "$([ -e "$_sd/dead-session-0000" ] && printf present || printf gone)"
 check 'state: SessionStart does not reap a live record' 'present' \
@@ -2636,11 +2636,11 @@ check 'state: the reaper takes a record whose pid has exited' 'gone' \
 check 'state: the reaper takes a record whose pid was recycled' 'gone' \
     "$([ -e "$_sd/recycled-0003" ] && printf present || printf gone)"
 check 'state: SessionStart stamps its own origin into the record' \
-    "cts4|b i|p $_livepid $_livest|" "$(rec)"
+    "cts5|b i|p $_livepid $_livest|" "$(rec)"
 # And the stamp is carried by the next painting edge without a second /proc read.
 stp working "$(pl PostToolUse)" "$_livepid" >/dev/null 2>&1
 check 'state: ...and a later edge carries the origin rather than dropping it' \
-    "cts4|b w|p $_livepid $_livest|" "$(rec)"
+    "cts5|b w|p $_livepid $_livest|" "$(rec)"
 # A record that carries NO origin - one written before this field existed, or by a
 # session whose SessionStart never ran - gains one on its next write, so the
 # reaper's liveness proof covers every record this version writes. Without that,
@@ -2649,7 +2649,7 @@ check 'state: ...and a later edge carries the origin rather than dropping it' \
 printf 'cts1\nb i\n' >"$_sd/$_sid"
 stp working "$(pl PostToolUse)" "$_livepid" >/dev/null 2>&1
 check 'state: a write stamps an origin the record was missing' \
-    "cts4|b w|p $_livepid $_livest|" "$(rec)"
+    "cts5|b w|p $_livepid $_livest|" "$(rec)"
 
 # doctor is how you find out which of the above happened. Read-only, deliberately:
 # the command you run when something is already wrong must not delete the evidence,
@@ -2735,7 +2735,7 @@ check 'state: a 1 MiB PermissionRequest still finds the session and the owner' '
     "$(st waiting "$(printf '{"session_id":"%s","hook_event_name":"PermissionRequest","agent_id":"%s","tool_input":{"content":"%s"}}' \
         "$_sid" "$_ag" "$_big")")"
 check 'state: ...and the wait was recorded against that agent, not lost' \
-    "cts4|b i|w $_ag:1000000|" "$(rec)"
+    "cts5|b i|w $_ag:1000000|" "$(rec)"
 check 'state: a 1 MiB Stop with no background_tasks is still refused over that dialog' '' \
     "$(st idle "$(printf '{"session_id":"%s","hook_event_name":"Stop","blob":"%s"}' "$_sid" "$_big")")"
 # ...and the same payload with an EMPTY background_tasks as its last member does
@@ -2754,7 +2754,7 @@ st session-start "$(pl SessionStart ',"source":"resume"')" >/dev/null 2>&1
 # reset nothing either.
 st waiting "$(pl PermissionRequest ",\"agent_id\":\"$_ag\"")" >/dev/null
 st session-start "$(pl SessionStart ',"source":"compact"')" >/dev/null 2>&1
-check 'state: a compaction SessionStart resets nothing' "cts4|b i|w $_ag:1000000|" "$(rec)"
+check 'state: a compaction SessionStart resets nothing' "cts5|b i|w $_ag:1000000|" "$(rec)"
 check 'state: SessionEnd removes the record' 'gone' \
     "$(st session-end "$(pl SessionEnd)" >/dev/null 2>&1
        [ -e "$_sd/$_sid" ] && printf present || printf gone)"

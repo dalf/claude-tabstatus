@@ -35,6 +35,7 @@ pub enum Edge {
 pub enum Glyph {
     Working,
     Waiting,
+    Background,
     Idle,
 }
 
@@ -44,6 +45,9 @@ pub enum Glyph {
 pub enum Paint {
     /// A glyph beside the location, as one line of hook-protocol JSON.
     Line(Glyph),
+    /// A visible state with background activity still known. Tmux must retain
+    /// that fact when aging a working/waiting paint instead of falling to idle.
+    LineWithBackground(Glyph),
     /// The idle glyph, written to the pty directly, after arming the tab.
     SessionStart,
     /// An EMPTY title, written to the pty directly, after restoring the tab.
@@ -57,10 +61,14 @@ impl Paint {
     /// Which dot this paints, or `None` when the title is deliberately empty.
     pub fn glyph(self) -> Option<Glyph> {
         match self {
-            Paint::Line(g) => Some(g),
+            Paint::Line(g) | Paint::LineWithBackground(g) => Some(g),
             Paint::SessionStart => Some(Glyph::Idle),
             Paint::SessionEnd => None,
         }
+    }
+
+    pub fn background(self) -> bool {
+        matches!(self, Paint::LineWithBackground(_) | Paint::Line(Glyph::Background))
     }
 }
 

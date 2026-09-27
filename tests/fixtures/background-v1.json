@@ -1,0 +1,1276 @@
+{
+  "schema_version": 1,
+  "scenarios": [
+    {
+      "id": "shell_normal",
+      "provenance": {
+        "kind": "sanitized-live-hook-projection",
+        "claude_version": "2.1.274",
+        "date": "2026-09-27",
+        "mode": "interactive PTY, real Claude service, isolated config, dontAsk with scoped harmless tool allowances",
+        "conditions": "Bash sleep 20 launched with run_in_background; main replied STARTED. No additional human prompt before the injected completion and empty Stop.",
+        "redaction": "Metadata-only recorder discarded prompts/tool text/paths at capture time; session/task/tool IDs renamed consistently per scenario; prompt replaced with a representative value preserving its first-character classification. Relative times retained. Expected states are authored separately, not captured output."
+      },
+      "steps": [
+        {
+          "offset_ms": 0,
+          "payload": {
+            "hook_event_name": "SessionStart",
+            "session_id": "s1",
+            "source": "startup"
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        },
+        {
+          "offset_ms": 55,
+          "payload": {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "redacted human prompt"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 3305,
+          "payload": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "s1",
+            "tool_name": "Bash",
+            "tool_use_id": "task1"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 3517,
+          "payload": {
+            "hook_event_name": "PostToolUse",
+            "session_id": "s1",
+            "tool_name": "Bash",
+            "tool_use_id": "task1",
+            "tool_response": {
+              "backgroundTaskId": "task2"
+            }
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 4765,
+          "payload": {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "stop_hook_active": false,
+            "background_tasks": [
+              {
+                "id": "task2",
+                "type": "shell",
+                "status": "running"
+              }
+            ],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "background",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 23553,
+          "payload": {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "<task-notification>redacted</task-notification>"
+          },
+          "expect": {
+            "base": "working",
+            "background": true,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 25622,
+          "payload": {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "stop_hook_active": false,
+            "background_tasks": [],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        },
+        {
+          "offset_ms": 57580,
+          "payload": {
+            "hook_event_name": "SessionEnd",
+            "session_id": "s1"
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "clear",
+            "displayed": "cleared"
+          }
+        }
+      ]
+    },
+    {
+      "id": "workflow_normal",
+      "provenance": {
+        "kind": "sanitized-live-hook-projection",
+        "claude_version": "2.1.274",
+        "date": "2026-09-27",
+        "mode": "interactive PTY, real Claude service, isolated config, dontAsk with scoped harmless tool allowances",
+        "conditions": "Real Workflow with one agent running foreground sleep 20. No additional human prompt before completion. Child SubagentStop still lists its enclosing workflow running.",
+        "redaction": "Metadata-only recorder discarded prompts/tool text/paths at capture time; session/task/tool IDs renamed consistently per scenario; prompt replaced with a representative value preserving its first-character classification. Relative times retained. Expected states are authored separately, not captured output."
+      },
+      "steps": [
+        {
+          "offset_ms": 0,
+          "payload": {
+            "hook_event_name": "SessionStart",
+            "session_id": "s1",
+            "source": "startup"
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        },
+        {
+          "offset_ms": 131,
+          "payload": {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "redacted human prompt"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 4596,
+          "payload": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "s1",
+            "tool_name": "Workflow",
+            "tool_use_id": "task1"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 4631,
+          "payload": {
+            "hook_event_name": "PostToolUse",
+            "session_id": "s1",
+            "tool_name": "Workflow",
+            "tool_use_id": "task1",
+            "tool_response": {
+              "status": "async_launched"
+            }
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 4643,
+          "payload": {
+            "hook_event_name": "SubagentStart",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "workflow-subagent"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 6213,
+          "payload": {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "stop_hook_active": false,
+            "background_tasks": [
+              {
+                "id": "task3",
+                "type": "workflow",
+                "status": "running"
+              }
+            ],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "background",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 7783,
+          "payload": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "workflow-subagent",
+            "tool_name": "Bash",
+            "tool_use_id": "task4"
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "silent",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 28008,
+          "payload": {
+            "hook_event_name": "PostToolUse",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "workflow-subagent",
+            "tool_name": "Bash",
+            "tool_use_id": "task4",
+            "tool_response": {}
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "silent",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 29495,
+          "payload": {
+            "hook_event_name": "SubagentStop",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "workflow-subagent",
+            "stop_hook_active": false,
+            "background_tasks": [
+              {
+                "id": "task3",
+                "type": "workflow",
+                "status": "running"
+              }
+            ],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "silent",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 29535,
+          "payload": {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "<task-notification>redacted</task-notification>"
+          },
+          "expect": {
+            "base": "working",
+            "background": true,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 31063,
+          "payload": {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "stop_hook_active": false,
+            "background_tasks": [],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        },
+        {
+          "offset_ms": 42404,
+          "payload": {
+            "hook_event_name": "SessionEnd",
+            "session_id": "s1"
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "clear",
+            "displayed": "cleared"
+          }
+        }
+      ]
+    },
+    {
+      "id": "workflow_failure",
+      "provenance": {
+        "kind": "sanitized-live-hook-projection",
+        "claude_version": "2.1.274",
+        "date": "2026-09-27",
+        "mode": "interactive PTY, real Claude service, isolated config, dontAsk with scoped harmless tool allowances",
+        "conditions": "Real Workflow runs one agent with sleep 4, then throws an intentional Error. Terminal confirmed workflow failure; the automatic completion turn reported an empty Stop. No retry.",
+        "redaction": "Metadata-only recorder discarded prompts/tool text/paths at capture time; session/task/tool IDs renamed consistently per scenario; prompt replaced with a representative value preserving its first-character classification. Relative times retained. Expected states are authored separately, not captured output."
+      },
+      "steps": [
+        {
+          "offset_ms": 0,
+          "payload": {
+            "hook_event_name": "SessionStart",
+            "session_id": "s1",
+            "source": "startup"
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        },
+        {
+          "offset_ms": 163,
+          "payload": {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "redacted human prompt"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 3162,
+          "payload": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "s1",
+            "tool_name": "Workflow",
+            "tool_use_id": "task1"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 3193,
+          "payload": {
+            "hook_event_name": "PostToolUse",
+            "session_id": "s1",
+            "tool_name": "Workflow",
+            "tool_use_id": "task1",
+            "tool_response": {
+              "status": "async_launched"
+            }
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 3201,
+          "payload": {
+            "hook_event_name": "SubagentStart",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "workflow-subagent"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 4965,
+          "payload": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "workflow-subagent",
+            "tool_name": "Bash",
+            "tool_use_id": "task3"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 4992,
+          "payload": {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "stop_hook_active": false,
+            "background_tasks": [
+              {
+                "id": "task4",
+                "type": "workflow",
+                "status": "running"
+              }
+            ],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "background",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 9178,
+          "payload": {
+            "hook_event_name": "PostToolUse",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "workflow-subagent",
+            "tool_name": "Bash",
+            "tool_use_id": "task3",
+            "tool_response": {}
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "silent",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 10302,
+          "payload": {
+            "hook_event_name": "SubagentStop",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "workflow-subagent",
+            "stop_hook_active": false,
+            "background_tasks": [
+              {
+                "id": "task4",
+                "type": "workflow",
+                "status": "running"
+              }
+            ],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "silent",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 10338,
+          "payload": {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "<task-notification>redacted</task-notification>"
+          },
+          "expect": {
+            "base": "working",
+            "background": true,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 11991,
+          "payload": {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "stop_hook_active": false,
+            "background_tasks": [],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        },
+        {
+          "offset_ms": 12036,
+          "payload": {
+            "hook_event_name": "SessionEnd",
+            "session_id": "s1"
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "clear",
+            "displayed": "cleared"
+          }
+        }
+      ]
+    },
+    {
+      "id": "workflow_cancel_v2",
+      "provenance": {
+        "kind": "sanitized-live-hook-projection",
+        "claude_version": "2.1.274",
+        "date": "2026-09-27",
+        "mode": "interactive PTY, real Claude service, isolated config, dontAsk with scoped harmless tool allowances",
+        "conditions": "Real Workflow with one sleeping agent, cancelled using TaskStop after the first active Stop. The subsequent main Stop is empty; no child SubagentStop was required. Exit cleanup was confirmed for the remaining cancelled-child UI entry.",
+        "redaction": "Metadata-only recorder discarded prompts/tool text/paths at capture time; session/task/tool IDs renamed consistently per scenario; prompt replaced with a representative value preserving its first-character classification. Relative times retained. Expected states are authored separately, not captured output."
+      },
+      "steps": [
+        {
+          "offset_ms": 0,
+          "payload": {
+            "hook_event_name": "SessionStart",
+            "session_id": "s1",
+            "source": "startup"
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        },
+        {
+          "offset_ms": 167,
+          "payload": {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "redacted human prompt"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 3186,
+          "payload": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "s1",
+            "tool_name": "Workflow",
+            "tool_use_id": "task1"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 3218,
+          "payload": {
+            "hook_event_name": "PostToolUse",
+            "session_id": "s1",
+            "tool_name": "Workflow",
+            "tool_use_id": "task1",
+            "tool_response": {
+              "status": "async_launched"
+            }
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 3229,
+          "payload": {
+            "hook_event_name": "SubagentStart",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "workflow-subagent"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 5436,
+          "payload": {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "stop_hook_active": false,
+            "background_tasks": [
+              {
+                "id": "task3",
+                "type": "workflow",
+                "status": "running"
+              }
+            ],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "background",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 6238,
+          "payload": {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "redacted human prompt"
+          },
+          "expect": {
+            "base": "working",
+            "background": true,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 6267,
+          "payload": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "workflow-subagent",
+            "tool_name": "Bash",
+            "tool_use_id": "task4"
+          },
+          "expect": {
+            "base": "working",
+            "background": true,
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 9195,
+          "payload": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "s1",
+            "tool_name": "TaskStop",
+            "tool_use_id": "task5"
+          },
+          "expect": {
+            "base": "working",
+            "background": true,
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 9223,
+          "payload": {
+            "hook_event_name": "PostToolUse",
+            "session_id": "s1",
+            "tool_name": "TaskStop",
+            "tool_use_id": "task5",
+            "tool_response": {
+              "task_id": "task3"
+            }
+          },
+          "expect": {
+            "base": "working",
+            "background": true,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 11251,
+          "payload": {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "stop_hook_active": false,
+            "background_tasks": [],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        },
+        {
+          "offset_ms": 78461,
+          "payload": {
+            "hook_event_name": "SessionEnd",
+            "session_id": "s1"
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "clear",
+            "displayed": "cleared"
+          }
+        }
+      ]
+    },
+    {
+      "id": "workflow_long",
+      "provenance": {
+        "kind": "sanitized-live-hook-projection",
+        "claude_version": "2.1.274",
+        "date": "2026-09-27",
+        "mode": "interactive PTY, real Claude service, isolated config, dontAsk with scoped harmless tool allowances",
+        "conditions": "Real Workflow with sleep 20, with two additional main prompts asking only for PONG. All three main Stops before completion retain the workflow. This is a bounded multi-turn capture, not an hour-long live test.",
+        "redaction": "Metadata-only recorder discarded prompts/tool text/paths at capture time; session/task/tool IDs renamed consistently per scenario; prompt replaced with a representative value preserving its first-character classification. Relative times retained. Expected states are authored separately, not captured output."
+      },
+      "steps": [
+        {
+          "offset_ms": 0,
+          "payload": {
+            "hook_event_name": "SessionStart",
+            "session_id": "s1",
+            "source": "startup"
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        },
+        {
+          "offset_ms": 158,
+          "payload": {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "redacted human prompt"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 2544,
+          "payload": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "s1",
+            "tool_name": "Workflow",
+            "tool_use_id": "task1"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 2576,
+          "payload": {
+            "hook_event_name": "PostToolUse",
+            "session_id": "s1",
+            "tool_name": "Workflow",
+            "tool_use_id": "task1",
+            "tool_response": {
+              "status": "async_launched"
+            }
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 2587,
+          "payload": {
+            "hook_event_name": "SubagentStart",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "workflow-subagent"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 3653,
+          "payload": {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "stop_hook_active": false,
+            "background_tasks": [
+              {
+                "id": "task3",
+                "type": "workflow",
+                "status": "running"
+              }
+            ],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "background",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 4184,
+          "payload": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "workflow-subagent",
+            "tool_name": "Bash",
+            "tool_use_id": "task4"
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "silent",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 4470,
+          "payload": {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "redacted human prompt"
+          },
+          "expect": {
+            "base": "working",
+            "background": true,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 5705,
+          "payload": {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "stop_hook_active": false,
+            "background_tasks": [
+              {
+                "id": "task3",
+                "type": "workflow",
+                "status": "running"
+              }
+            ],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "background",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 9628,
+          "payload": {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "redacted human prompt"
+          },
+          "expect": {
+            "base": "working",
+            "background": true,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 10766,
+          "payload": {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "stop_hook_active": false,
+            "background_tasks": [
+              {
+                "id": "task3",
+                "type": "workflow",
+                "status": "running"
+              }
+            ],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "background",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 24324,
+          "payload": {
+            "hook_event_name": "PostToolUse",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "workflow-subagent",
+            "tool_name": "Bash",
+            "tool_use_id": "task4",
+            "tool_response": {}
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "silent",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 25299,
+          "payload": {
+            "hook_event_name": "SubagentStop",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "workflow-subagent",
+            "stop_hook_active": false,
+            "background_tasks": [
+              {
+                "id": "task3",
+                "type": "workflow",
+                "status": "running"
+              }
+            ],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "silent",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 25333,
+          "payload": {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "<task-notification>redacted</task-notification>"
+          },
+          "expect": {
+            "base": "working",
+            "background": true,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 26625,
+          "payload": {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "stop_hook_active": false,
+            "background_tasks": [],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        },
+        {
+          "offset_ms": 27465,
+          "payload": {
+            "hook_event_name": "SessionEnd",
+            "session_id": "s1"
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "clear",
+            "displayed": "cleared"
+          }
+        }
+      ]
+    },
+    {
+      "id": "subagent_normal",
+      "provenance": {
+        "kind": "sanitized-live-hook-projection",
+        "claude_version": "2.1.274",
+        "date": "2026-09-27",
+        "mode": "interactive PTY, real Claude service, isolated config, dontAsk with scoped harmless tool allowances",
+        "conditions": "Standalone background Agent running sleep 20. No additional human prompt before completion. Its SubagentStop snapshot still contains its own running ID.",
+        "redaction": "Metadata-only recorder discarded prompts/tool text/paths at capture time; session/task/tool IDs renamed consistently per scenario; prompt replaced with a representative value preserving its first-character classification. Relative times retained. Expected states are authored separately, not captured output."
+      },
+      "steps": [
+        {
+          "offset_ms": 0,
+          "payload": {
+            "hook_event_name": "SessionStart",
+            "session_id": "s1",
+            "source": "startup"
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        },
+        {
+          "offset_ms": 132,
+          "payload": {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "redacted human prompt"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 4361,
+          "payload": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "s1",
+            "tool_name": "Agent",
+            "tool_use_id": "task1"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 4389,
+          "payload": {
+            "hook_event_name": "PostToolUse",
+            "session_id": "s1",
+            "tool_name": "Agent",
+            "tool_use_id": "task1",
+            "tool_response": {
+              "agentId": "task2",
+              "status": "async_launched",
+              "isAsync": true
+            }
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 4390,
+          "payload": {
+            "hook_event_name": "SubagentStart",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "general-purpose"
+          },
+          "expect": {
+            "base": "working",
+            "background": false,
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 6428,
+          "payload": {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "stop_hook_active": false,
+            "background_tasks": [
+              {
+                "id": "task2",
+                "type": "subagent",
+                "status": "running",
+                "agent_type": "general-purpose"
+              }
+            ],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "background",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 6939,
+          "payload": {
+            "hook_event_name": "PreToolUse",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "general-purpose",
+            "tool_name": "Bash",
+            "tool_use_id": "task3"
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "silent",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 27157,
+          "payload": {
+            "hook_event_name": "PostToolUse",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "general-purpose",
+            "tool_name": "Bash",
+            "tool_use_id": "task3",
+            "tool_response": {}
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "silent",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 29324,
+          "payload": {
+            "hook_event_name": "SubagentStop",
+            "session_id": "s1",
+            "agent_id": "task2",
+            "agent_type": "general-purpose",
+            "stop_hook_active": false,
+            "background_tasks": [
+              {
+                "id": "task2",
+                "type": "subagent",
+                "status": "running",
+                "agent_type": "general-purpose"
+              }
+            ],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": true,
+            "paint": "silent",
+            "displayed": "background"
+          }
+        },
+        {
+          "offset_ms": 29361,
+          "payload": {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "prompt": "<task-notification>redacted</task-notification>"
+          },
+          "expect": {
+            "base": "working",
+            "background": true,
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "offset_ms": 34165,
+          "payload": {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "stop_hook_active": false,
+            "background_tasks": [],
+            "session_crons": []
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        },
+        {
+          "offset_ms": 35002,
+          "payload": {
+            "hook_event_name": "SessionEnd",
+            "session_id": "s1"
+          },
+          "expect": {
+            "base": "idle",
+            "background": false,
+            "paint": "clear",
+            "displayed": "cleared"
+          }
+        }
+      ]
+    }
+  ]
+}

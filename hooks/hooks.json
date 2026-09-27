@@ -1,5 +1,5 @@
 {
-  "description": "Writes the session state (working / waiting / idle) plus the location into the terminal tab title, arming Konsole's per-tab title format on SessionStart and restoring it on SessionEnd.",
+  "description": "Writes the session state (working / waiting / background / idle) plus the location into the terminal tab title, arming Konsole's per-tab title format on SessionStart and restoring it on SessionEnd.",
   "hooks": {
     "SessionStart": [
       {

@@ -29,13 +29,13 @@
             ]
           },
           "expect": {
-            "record": "absent",
+            "record": "present",
             "base": "idle",
             "waits": [],
             "tombstones": [],
-            "logical": "idle",
-            "paint": "idle",
-            "displayed": "idle"
+            "logical": "background",
+            "paint": "background",
+            "displayed": "background"
           },
           "capture_offset_seconds": 68.946
         },
@@ -116,7 +116,7 @@
           "capture_offset_seconds": 98.459
         },
         {
-          "name": "matching tool completion restores idle base",
+          "name": "matching tool completion restores background",
           "now": 1000107,
           "edge": "working",
           "payload": {
@@ -129,9 +129,9 @@
             "base": "idle",
             "waits": [],
             "tombstones": [],
-            "logical": "idle",
-            "paint": "idle",
-            "displayed": "idle"
+            "logical": "background",
+            "paint": "background",
+            "displayed": "background"
           },
           "capture_offset_seconds": 107.496
         },
@@ -149,9 +149,9 @@
             "base": "idle",
             "waits": [],
             "tombstones": [],
-            "logical": "idle",
+            "logical": "background",
             "paint": "silent",
-            "displayed": "idle"
+            "displayed": "background"
           },
           "capture_offset_seconds": 110.23
         }
@@ -338,12 +338,12 @@
             ],
             "tombstones": [],
             "logical": "waiting",
-            "paint": "silent",
+            "paint": "waiting",
             "displayed": "waiting"
           }
         },
         {
-          "name": "first agent completes last and restores idle",
+          "name": "first agent completes last wait and restores known background",
           "now": 1007,
           "edge": "subagent-stop",
           "payload": {
@@ -356,9 +356,9 @@
             "base": "idle",
             "waits": [],
             "tombstones": [],
-            "logical": "idle",
-            "paint": "idle",
-            "displayed": "idle"
+            "logical": "background",
+            "paint": "background",
+            "displayed": "background"
           }
         }
       ]
@@ -1059,7 +1059,7 @@
             ],
             "tombstones": [],
             "logical": "waiting",
-            "paint": "silent",
+            "paint": "waiting",
             "displayed": "waiting"
           }
         },

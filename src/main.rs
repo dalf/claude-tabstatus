@@ -147,7 +147,7 @@ fn paint(edge: Edge) -> io::Result<()> {
         }
         // Claude Code may wrap terminalSequence in tmux passthrough, which
         // bypasses pane_title. Our carrier must reach the pane's pty as raw OSC.
-        Paint::Line(_) if cfg.tmux.is_some() => emit::pane_title(&payload, &cfg),
-        Paint::Line(_) => emit::json_line(&payload),
+        Paint::Line(_) | Paint::LineWithBackground(_) if cfg.tmux.is_some() => emit::pane_title(&payload, &cfg),
+        Paint::Line(_) | Paint::LineWithBackground(_) => emit::json_line(&payload),
     }
 }

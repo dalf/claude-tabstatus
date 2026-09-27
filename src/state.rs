@@ -126,11 +126,10 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-/// The wire tag. Version 4 distinguishes anonymous permission requests from
-/// notification backstops; versions 1–3 remain readable. A later shape changes it
-/// so this version ignores new records
-/// rather than misreading them.
-const TAG: &str = "cts4";
+/// Version 5 carries known background separately from the main base. Versions
+/// 1–4 remain readable. A future shape changes the tag so ordinary updates leave
+/// newer records intact instead of dropping facts they cannot understand.
+const TAG: &str = "cts5";
 
 /// The prefix every version's tag shares, which is what lets this one tell "a
 /// NEWER version's record, leave it alone" from "not one of ours at all".
@@ -403,11 +402,12 @@ fn id_str(raw: &[u8]) -> Option<String> {
 /// The record, which is the whole of the state.
 ///
 /// Wire format, one field per line, unknown keys SKIPPED so that a newer version
-/// writing `g` or `n` (see the SEAM) does not confuse this one:
+/// writing `n` (see the SEAM) does not confuse this one:
 ///
 /// ```text
-///   cts4
+///   cts5
 ///   b i                                        base = w | a | i
+///   g 1790380620                            last positive main Stop snapshot
 ///   p 3709427 84460384                         the session's (pid, start time)
 ///   w aec99e1f4bda1972b:1790380630 -:1790380631
 /// ```
@@ -419,12 +419,16 @@ fn id_str(raw: &[u8]) -> Option<String> {
 /// `!?` an anonymous direct request, and `!+` an overflow aggregate. A direct
 /// identity is `!<hex-server>.<hex-id>`. The optional `e` line stores completed
 /// direct identities in the same owner:epoch shape, independently bounded to
-/// eight. None of these markers can be an agent id. The cts4 tag prevents older
-/// readers from silently dropping anonymous permission requests. An absent `p` line means
-/// the reaper falls back to mtime for this file.
+/// eight. None of these markers can be an agent id. The cts5 tag prevents guarded
+/// older readers from silently dropping background activity. The optional g
+/// epoch records known in-flight work independently of the main base and never
+/// expires. An absent `p` line means the reaper falls back to mtime for this file.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Record {
     base: Glyph,
+    /// Last main Stop reporting in-flight work. A bounded aggregate of an
+    /// authoritative registry snapshot, not a guessed child count. Never expires.
+    background: Option<u64>,
     /// Whose session this is. Written by the first edge that writes anything at
     /// all and then carried unchanged, because every later write starts from the
     /// record it read.
@@ -442,6 +446,7 @@ impl Record {
     fn fresh() -> Record {
         Record {
             base: Glyph::Idle,
+            background: None,
             origin: None,
             waits: Vec::new(),
             completed: Vec::new(),
@@ -467,7 +472,8 @@ impl Record {
     /// a wait that had already been declared dead.
     fn parse(text: &str) -> Option<Record> {
         let mut lines = text.lines();
-        if !matches!(lines.next(), Some(TAG | "cts1" | "cts2" | "cts3")) {
+        let tag = lines.next();
+        if !matches!(tag, Some(TAG | "cts1" | "cts2" | "cts3" | "cts4")) {
             return None;
         }
         let mut r = Record::fresh();
@@ -493,11 +499,14 @@ impl Record {
                 // demotes this file to the mtime rule rather than inventing a
                 // liveness answer for it.
                 "p" => r.origin = Origin::parse(rest),
+                // Earlier versions reserved g for a different, unimplemented
+                // shape. Only the current version assigns it this meaning.
+                "g" if tag == Some(TAG) => r.background = digits(rest),
                 "w" => r.waits = rest.split(' ').filter_map(Wait::parse).take(MAX_WAITS + 1).collect(),
                 "e" => r.completed = rest.split(' ').filter_map(Wait::parse)
                     .filter(|w| matches!(w.who, Owner::Elicitation(_)))
                     .take(MAX_WAITS).collect(),
-                // `g` and `n` are RESERVED - see the SEAM. Skipped, not rejected.
+                // Unknown fields remain forward-extensible.
                 _ => {}
             }
         }
@@ -526,9 +535,12 @@ impl Record {
         out.push(match self.base {
             Glyph::Working => 'w',
             Glyph::Waiting => 'a',
-            Glyph::Idle => 'i',
+            Glyph::Idle | Glyph::Background => 'i',
         });
         out.push('\n');
+        if let Some(epoch) = self.background {
+            out.push_str(&format!("g {epoch}\n"));
+        }
         if let Some(o) = self.origin {
             out.push_str("p ");
             out.push_str(&itoa(u64::from(o.pid)));
@@ -604,9 +616,12 @@ impl Record {
             match self.base {
                 Glyph::Working => "working",
                 Glyph::Waiting => "waiting",
-                Glyph::Idle => "idle",
+                Glyph::Idle | Glyph::Background => "idle",
             }
         );
+        if let Some(epoch) = self.background {
+            s.push_str(&format!(", background reported {}s ago (last known snapshot; not expired)", now.saturating_sub(epoch)));
+        }
         match self.origin {
             Some(o) if o.alive() => s.push_str(&format!(", session pid {} live", o.pid)),
             Some(o) => s.push_str(&format!(", session pid {} GONE", o.pid)),
@@ -627,6 +642,14 @@ impl Record {
             ));
         }
         s
+    }
+
+    fn paint(&self, glyph: Glyph) -> Paint {
+        if self.background.is_some() {
+            Paint::LineWithBackground(if glyph == Glyph::Idle { Glyph::Background } else { glyph })
+        } else {
+            Paint::Line(glyph)
+        }
     }
 
     /// Drop a wait, and say whether one was actually held.
@@ -1064,14 +1087,14 @@ impl Session {
         // A wait somebody else still holds keeps the tab: this is the second half
         // of the fix, and the half that matters most. Stateless, a main-thread
         // PostToolUse repainted blue over a subagent's open dialog.
-        now.waits.is_empty().then_some(Paint::Line(now.base))
+        now.waits.is_empty().then_some(now.paint(now.base))
     }
 
     /// `PermissionRequest`, `PreToolUse` on the two tools that always block, and
     /// the `Notification` backstop: a dialog is up.
     fn wait(&self, o: Owner) -> Option<Paint> {
         let Some(_lock) = self.lock(true) else {
-            return Some(Paint::Line(Glyph::Waiting));
+            return Some(self.unpersisted_wait());
         };
         let (was, mut now) = self.load();
         // The backstop fires ~6s after the dialog for a PermissionRequest already
@@ -1095,19 +1118,41 @@ impl Session {
         self.write_if_changed(&was, &mut now);
         // Always orange, whatever the base: a dialog on screen is the truth, and
         // repainting refreshes the tmux carrier's epoch, which restarts the decay.
-        Some(Paint::Line(Glyph::Waiting))
+        Some(now.paint(Glyph::Waiting))
+    }
+
+    /// A failed write lock still permits a conservative orange paint. Preserve
+    /// any readable background fact so that its tmux carrier cannot age to white.
+    /// This reads one atomic snapshot and never mutates it without the lock.
+    fn unpersisted_wait(&self) -> Paint {
+        match stored_at(&self.path) {
+            Stored::Ours(record) => record.paint(Glyph::Waiting),
+            _ => Paint::Line(Glyph::Waiting),
+        }
     }
 
     /// `Stop`, `StopFailure`, and the idle nudge: the main loop is free.
     fn free(&self, p: &Payload) -> Option<Paint> {
-        let Some(_lock) = self.lock(false) else {
+        // Live 2.1.274 captures establish main Stop as a complete parent-session
+        // registry snapshot, including the automatic turn after a task finishes.
+        // SubagentStop may still list its own finishing task; never infer that
+        // one child finishing ends a workflow. Other hooks supply no such proof.
+        let snapshot = (p.hook_event_name() == Some("Stop"))
+            .then(|| p.background_tasks_empty())
+            .flatten();
+        let Some(_lock) = self.lock(snapshot == Some(false)) else {
             // A genuinely fresh quiet session needs no record. An inaccessible
             // or contended existing record must never be mutated without a lock.
             return matches!(fs::symlink_metadata(&self.path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-                .then_some(Paint::Line(Glyph::Idle));
+                .then_some(Paint::Line(if snapshot == Some(false) { Glyph::Background } else { Glyph::Idle }));
         };
         let (was, mut now) = self.load();
         now.base = Glyph::Idle;
+        match snapshot {
+            Some(false) => now.background = Some(self.now),
+            Some(true) => now.background = None,
+            None => {}
+        }
         // The main loop could not have stopped while a MAIN-thread dialog blocked
         // it, so a main wait outstanding here is a stale one - a rejected
         // ExitPlanMode, whose PostToolUse never comes.
@@ -1127,10 +1172,17 @@ impl Session {
             now.waits.retain(|w| w.who.direct_elicitation());
         }
         self.write_if_changed(&was, &mut now);
-        // NOT painting here is the point: an agent's dialog outstanding at Stop is
-        // the capture's 68.946/69.960 pair with the order reversed, and painting
-        // idle would say "come back later" about a dialog waiting for you.
-        now.waits.is_empty().then_some(Paint::Line(Glyph::Idle))
+        // Never paint idle over an outstanding dialog. A changed background
+        // fact may need an orange refresh so tmux retains the correct fallback.
+        if now.waits.is_empty() {
+            Some(now.paint(Glyph::Idle))
+        } else if was.background.is_some() != now.background.is_some() {
+            // Keep orange while updating tmux's fallback when this snapshot
+            // first discovers background work, or proves it has ended.
+            Some(now.paint(Glyph::Waiting))
+        } else {
+            None
+        }
     }
 
     /// `SubagentStop`: this agent will never resolve anything again.
@@ -1152,7 +1204,7 @@ impl Session {
             return None;
         }
         self.write_if_changed(&was, &mut now);
-        now.waits.is_empty().then_some(Paint::Line(now.base))
+        now.waits.is_empty().then_some(now.paint(now.base))
     }
 
     /// Direct starts and identified notification backstops share one exact key.
@@ -1170,7 +1222,7 @@ impl Session {
         let Some(_lock) = self.lock(true) else {
             // Painting a request is harmless without persistence; resolving one
             // without persistence is not, so results below instead stay silent.
-            return Some(Paint::Line(Glyph::Waiting));
+            return Some(self.unpersisted_wait());
         };
         let (was, mut now) = self.load();
         if now.completed.iter().any(|w| w.who == owner) {
@@ -1183,7 +1235,7 @@ impl Session {
             now.raise(owner, self.now);
         }
         self.write_if_changed(&was, &mut now);
-        Some(Paint::Line(Glyph::Waiting))
+        Some(now.paint(Glyph::Waiting))
     }
 
     fn elicitation_result(&self, p: &Payload) -> Option<Paint> {
@@ -1199,7 +1251,7 @@ impl Session {
         let cleared = now.clear(&owner);
         now.complete(owner, self.now);
         self.write_if_changed(&was, &mut now);
-        (cleared && now.waits.is_empty()).then_some(Paint::Line(now.base))
+        (cleared && now.waits.is_empty()).then_some(now.paint(now.base))
     }
 }
 
@@ -1306,7 +1358,8 @@ impl Named {
 ///     and it is why an idle session is not on a clock at all.
 ///   * a record with no origin, a newer version's record, or a `.tmp`, falls back
 ///     to mtime and [`REAP_AFTER`]. mtime cannot prove a session dead, so its
-///     horizon is a day.
+///     horizon is a day. Recognized background records with missing origin are
+///     exempt: uncertainty cannot establish completion.
 ///
 /// Everything else is left alone FOREVER: a file whose name is not a session id, a
 /// file that is not a record in any version's shape, a file we could not read, and
@@ -1328,6 +1381,9 @@ fn reapable(path: &Path, name: Named) -> Option<String> {
     match (name, stored_at(path)) {
         (Named::Record, Stored::Ours(r)) => match r.origin {
             Some(o) => (!o.alive()).then(|| format!("pid {} is not that process any more", o.pid)),
+            // Missing process metadata cannot prove known background work has
+            // ended. Keep this record until a snapshot or explicit cleanup.
+            None if r.background.is_some() => None,
             None => stale_by_mtime(&lm, "no origin recorded"),
         },
         (Named::Record, Stored::Future) | (Named::Tmp, _) => {
@@ -1514,15 +1570,12 @@ pub fn survey() -> Survey {
 // only free-form field planned - `n` - must therefore also be last in the file.
 // `b`, `p` and `w` are ASCII words and may sit in any order.
 //
-// PURPLE - "background work running, main loop free".
-//   Issue #10 approves this as a standard fourth state; docs/indicator-semantics.md
-//   defines its meaning and migration requirements. Issue #15 owns implementation.
-//   The current parser only tests background_tasks emptiness. A proposed g <id>...
-//   record needs task-kind semantics and captured start/end evidence before use.
-//   SubagentStop must not be assumed to complete a whole workflow or a shell task.
-//   A missing array or a long duration cannot establish that known work ended.
-//   New base letters need a new record/carrier version: silently reading an
-//   unknown background base as idle would contradict the approved policy.
+// BACKGROUND. Main Stop snapshots own the aggregate `g` epoch. No per-child
+// identity set is needed: a nonempty complete registry proves activity and an
+// empty one retires it. Captured automatic completion turns supply that Stop.
+// SubagentStop can still list its own finishing task, or its enclosing workflow;
+// it clears wait ownership only. Missing metadata and duration never erase g.
+// docs/indicator-semantics.md records evidence, reconciliation and migration.
 //
 // THE CACHED SESSION TITLE.
 //   `aiTitle` lives in the transcript records at `transcript_path`, which every
@@ -1807,22 +1860,22 @@ mod tests {
         // background_tasks, which is why this one retires nothing.
         assert_eq!(
             f.session(&main).resolve(Edge::Idle, &main),
-            Some(Paint::Line(Glyph::Idle))
+            Some(Paint::LineWithBackground(Glyph::Background))
         );
         // 69.960 the subagent's PermissionRequest.
         assert_eq!(
             f.session(&agent).resolve(Edge::Waiting, &agent),
-            Some(Paint::Line(Glyph::Waiting))
+            Some(Paint::LineWithBackground(Glyph::Waiting))
         );
         // 75.983 the 6s backstop for the SAME dialog: still orange, and it must
         // not add an owner nothing can clear.
         let backstop = notify("permission_prompt");
         assert_eq!(
             f.session(&backstop).resolve(Edge::Notify, &backstop),
-            Some(Paint::Line(Glyph::Waiting))
+            Some(Paint::LineWithBackground(Glyph::Waiting))
         );
         let origin = f.origin_line();
-        let held = format!("cts4\nb i\n{origin}w aec99e1f4bda1972b:1000000\n");
+        let held = format!("cts5\nb i\ng 1000000\n{origin}w aec99e1f4bda1972b:1000000\n");
         assert_eq!(f.record(), held);
         // 98.459 the GHOST SubagentStop, for an agent that owns nothing.
         let ghost = agent_stop("a8e90c10430da8891");
@@ -1831,9 +1884,9 @@ mod tests {
         // 107.496 you approved: the subagent's own PostToolUse restores the base.
         assert_eq!(
             f.session(&agent).resolve(Edge::Working, &agent),
-            Some(Paint::Line(Glyph::Idle))
+            Some(Paint::LineWithBackground(Glyph::Background))
         );
-        assert_eq!(f.record(), format!("cts4\nb i\n{origin}"));
+        assert_eq!(f.record(), format!("cts5\nb i\ng 1000000\n{origin}"));
     }
 
     #[test]
@@ -1858,7 +1911,7 @@ mod tests {
         assert_eq!(f.session(&main).resolve(Edge::Working, &main), None);
         assert_eq!(
             f.record(),
-            format!("cts4\nb w\n{}w aaa:1000000\n", f.origin_line())
+            format!("cts5\nb w\n{}w aaa:1000000\n", f.origin_line())
         );
         // ...and when the agent resolves it, the base that comes back is the
         // WORKING one this turn established, not a guess.
@@ -1877,7 +1930,7 @@ mod tests {
         f.session(&main).resolve(Edge::Waiting, &main);
         assert_eq!(
             f.record(),
-            format!("cts4\nb i\n{}w aaa:1000000 -:1000000\n", f.origin_line())
+            format!("cts5\nb i\n{}w aaa:1000000 -:1000000\n", f.origin_line())
         );
         // Answering the main one leaves the agent's dialog on screen, so the tab
         // stays orange. A single owner slot would have got this wrong whichever
@@ -1896,7 +1949,7 @@ mod tests {
         let agent = agent_ev("aaa");
         let main = main_ev();
         f.session(&agent).resolve(Edge::Waiting, &agent);
-        assert_eq!(f.session(&main).resolve(Edge::Idle, &main), None);
+        assert_eq!(f.session(&main).resolve(Edge::Idle, &main), Some(Paint::LineWithBackground(Glyph::Waiting)));
         // The idle nudge is the same transition and is guarded the same way. It
         // matters because this user's `messageIdleNotifThresholdMs` is 3000. Its
         // payload carries no `background_tasks` at all, so it cannot retire
@@ -1916,9 +1969,9 @@ mod tests {
         f.session(&main).resolve(Edge::Waiting, &main);
         assert_eq!(
             f.session(&main).resolve(Edge::Idle, &main),
-            Some(Paint::Line(Glyph::Idle))
+            Some(Paint::LineWithBackground(Glyph::Background))
         );
-        assert_eq!(f.record(), format!("cts4\nb i\n{}", f.origin_line()));
+        assert_eq!(f.record(), format!("cts5\nb i\ng 1000000\n{}", f.origin_line()));
     }
 
     /// The fix for the stale AGENT wait: a `Stop` that says nothing is running
@@ -1935,7 +1988,7 @@ mod tests {
             f.session(&quiet).resolve(Edge::Idle, &quiet),
             Some(Paint::Line(Glyph::Idle))
         );
-        assert_eq!(f.record(), format!("cts4\nb i\n{}", f.origin_line()));
+        assert_eq!(f.record(), format!("cts5\nb i\n{}", f.origin_line()));
     }
 
     /// And the other main-thread retirement: you cannot type at the prompt while a
@@ -1957,7 +2010,7 @@ mod tests {
         assert_eq!(f.session(&injected).resolve(Edge::Working, &injected), None);
         assert_eq!(
             f.record(),
-            format!("cts4\nb w\n{}w aaa:1000000\n", f.origin_line())
+            format!("cts5\nb w\n{}w aaa:1000000\n", f.origin_line())
         );
         // The user typing does.
         let prompt = user_prompt();
@@ -1965,7 +2018,7 @@ mod tests {
             f.session(&prompt).resolve(Edge::Working, &prompt),
             Some(Paint::Line(Glyph::Working))
         );
-        assert_eq!(f.record(), format!("cts4\nb w\n{}", f.origin_line()));
+        assert_eq!(f.record(), format!("cts5\nb w\n{}", f.origin_line()));
     }
 
     /// The defect a SHARED epoch caused: unrelated later dialogs refreshed a stale
@@ -1985,19 +2038,19 @@ mod tests {
         }
         assert_eq!(
             f.record(),
-            format!("cts4\nb i\n{}w aaa:1000000 bbb:1000008\n", f.origin_line())
+            format!("cts5\nb i\n{}w aaa:1000000 bbb:1000008\n", f.origin_line())
         );
         // aaa is 9s old against a 3s horizon and goes; bbb is 1s old and stays, so
         // the tab is still correctly orange and nothing paints.
         std::env::set_var("CCTAB_NOW", "1000009");
         std::env::set_var("CCTAB_TTL_WAITING", "3");
         let main = main_ev();
-        assert_eq!(f.session(&main).resolve(Edge::Idle, &main), None);
+        assert_eq!(f.session(&main).resolve(Edge::Idle, &main), Some(Paint::LineWithBackground(Glyph::Waiting)));
         // And the expiry was PERSISTED rather than recomputed for ever, so raising
         // the TTL later cannot resurrect a wait already declared dead.
         assert_eq!(
             f.record(),
-            format!("cts4\nb i\n{}w bbb:1000008\n", f.origin_line())
+            format!("cts5\nb i\ng 1000009\n{}w bbb:1000008\n", f.origin_line())
         );
     }
 
@@ -2010,7 +2063,7 @@ mod tests {
             ));
             assert_eq!(f.session(&request).resolve(Edge::Waiting, &request),
                 Some(Paint::Line(Glyph::Waiting)));
-            assert_eq!(f.record(), format!("cts4\nb i\n{}w ?p:1000000\n", f.origin_line()));
+            assert_eq!(f.record(), format!("cts5\nb i\n{}w ?p:1000000\n", f.origin_line()));
             let stop = payload(r#"{"session_id":"s1","hook_event_name":"Stop"}"#);
             assert_eq!(f.session(&stop).resolve(Edge::Idle, &stop), None);
             let unrelated = agent_stop("other");
@@ -2032,11 +2085,11 @@ mod tests {
         );
         assert_eq!(
             f.record(),
-            format!("cts4\nb i\n{}w ?:1000000\n", f.origin_line())
+            format!("cts5\nb i\n{}w ?:1000000\n", f.origin_line())
         );
         // A `Stop` with a live subagent still says nothing about it.
         let busy = main_ev();
-        assert_eq!(f.session(&busy).resolve(Edge::Idle, &busy), None);
+        assert_eq!(f.session(&busy).resolve(Edge::Idle, &busy), Some(Paint::LineWithBackground(Glyph::Waiting)));
         // No evidence connects this agent to the notification's unknown owner.
         let agent = agent_ev("aaa");
         let held = f.record();
@@ -2047,7 +2100,7 @@ mod tests {
             f.session(&quiet).resolve(Edge::Idle, &quiet),
             Some(Paint::Line(Glyph::Idle))
         );
-        assert_eq!(f.record(), format!("cts4\nb i\n{}", f.origin_line()));
+        assert_eq!(f.record(), format!("cts5\nb i\n{}", f.origin_line()));
     }
 
     /// The `?` used to survive `Stop` AND the 3s nudge, so once the user had dealt
@@ -2091,7 +2144,7 @@ mod tests {
         f.session(&agent).resolve(Edge::Waiting, &agent);
         assert_eq!(
             f.record(),
-            format!("cts4\nb i\n{}w aaa:1000000\n", f.origin_line())
+            format!("cts5\nb i\n{}w aaa:1000000\n", f.origin_line())
         );
         assert_eq!(
             f.session(&agent).resolve(Edge::Working, &agent),
@@ -2111,7 +2164,7 @@ mod tests {
             f.session(&stop).resolve(Edge::SubagentStop, &stop),
             Some(Paint::Line(Glyph::Idle))
         );
-        assert_eq!(f.record(), format!("cts4\nb i\n{}", f.origin_line()));
+        assert_eq!(f.record(), format!("cts5\nb i\n{}", f.origin_line()));
     }
 
     /// A lone unknown wait provides no evidence linking it to a stopping agent.
@@ -2134,7 +2187,7 @@ mod tests {
             f.session(&prompt).resolve(Edge::Working, &prompt);
             let notification = notify(kind);
             f.session(&notification).resolve(Edge::Notify, &notification);
-            let held = format!("cts4\nb w\n{}w ?!:1000000\n", f.origin_line());
+            let held = format!("cts5\nb w\n{}w ?!:1000000\n", f.origin_line());
             assert_eq!(f.record(), held);
             for (edge, event) in [
                 (Edge::Working, agent_ev("unrelated")),
@@ -2168,7 +2221,7 @@ mod tests {
             }
             assert_eq!(Record::parse(&f.record()).unwrap().waits.len(), 2);
             assert_eq!(f.session(&permission).resolve(Edge::Working, &permission), None);
-            assert_eq!(f.record(), format!("cts4\nb i\n{}w ?!:1000000\n", f.origin_line()));
+            assert_eq!(f.record(), format!("cts5\nb i\n{}w ?!:1000000\n", f.origin_line()));
         }
     }
 
@@ -2185,9 +2238,9 @@ mod tests {
             assert_eq!(Record::parse(&f.record()).unwrap().waits.len(), 2);
             let owner = agent_ev("aaa");
             f.session(&owner).resolve(Edge::Waiting, &owner);
-            assert_eq!(f.record(), format!("cts4\nb i\n{}w ?!:1000000 aaa:1000000\n", f.origin_line()));
+            assert_eq!(f.record(), format!("cts5\nb i\n{}w ?!:1000000 aaa:1000000\n", f.origin_line()));
             assert_eq!(f.session(&owner).resolve(Edge::Working, &owner), None);
-            assert_eq!(f.record(), format!("cts4\nb i\n{}w ?!:1000000\n", f.origin_line()));
+            assert_eq!(f.record(), format!("cts5\nb i\n{}w ?!:1000000\n", f.origin_line()));
         }
     }
 
@@ -2221,7 +2274,7 @@ mod tests {
         }
         let prompt = user_prompt();
         f.session(&prompt).resolve(Edge::Working, &prompt);
-        assert!(f.record().starts_with("cts4\n"));
+        assert!(f.record().starts_with("cts5\n"));
         assert!(!f.record().contains("\nw "));
     }
 
@@ -2237,7 +2290,7 @@ mod tests {
         let main = main_ev();
         assert_eq!(
             f.session(&main).resolve(Edge::Idle, &main),
-            Some(Paint::Line(Glyph::Idle))
+            Some(Paint::LineWithBackground(Glyph::Background))
         );
     }
 
@@ -2254,7 +2307,7 @@ mod tests {
         );
         // Reset, AND claimed: the origin is what lets another session's reaper
         // tell this file from a dead session's.
-        assert_eq!(f.record(), format!("cts4\nb i\n{}", f.origin_line()));
+        assert_eq!(f.record(), format!("cts5\nb i\n{}", f.origin_line()));
         let end = payload(r#"{"session_id":"s1","hook_event_name":"SessionEnd"}"#);
         assert_eq!(
             f.session(&end).resolve(Edge::SessionEnd, &end),
@@ -2276,7 +2329,7 @@ mod tests {
         // its first tool call.
         let main = main_tool();
         f.session(&main).resolve(Edge::Working, &main);
-        assert_eq!(f.record(), format!("cts4\nb w\n{origin}"));
+        assert_eq!(f.record(), format!("cts5\nb w\n{origin}"));
 
         // With no `CLAUDE_PID` there is no origin to claim, so a fresh session's
         // `SessionStart` has nothing to say that the ABSENCE of a file does not
@@ -2298,10 +2351,10 @@ mod tests {
     fn a_write_stamps_an_origin_the_record_is_missing() {
         let f = Fixture::new("restamp");
         fs::create_dir_all(&f.dir).expect("a writable state dir");
-        fs::write(f.dir.join("s1"), "cts4\nb i\n").expect("a writable state dir");
+        fs::write(f.dir.join("s1"), "cts5\nb i\n").expect("a writable state dir");
         let main = main_tool();
         f.session(&main).resolve(Edge::Working, &main);
-        assert_eq!(f.record(), format!("cts4\nb w\n{}", f.origin_line()));
+        assert_eq!(f.record(), format!("cts5\nb w\n{}", f.origin_line()));
     }
 
     #[test]
@@ -2312,7 +2365,7 @@ mod tests {
         let before = f.record();
         assert_eq!(
             before,
-            format!("cts4\nb i\n{}w aaa:1000000\n", f.origin_line())
+            format!("cts5\nb i\n{}w aaa:1000000\n", f.origin_line())
         );
         let start =
             payload(r#"{"session_id":"s1","hook_event_name":"SessionStart","source":"compact"}"#);
@@ -2348,16 +2401,16 @@ mod tests {
             assert_eq!(Record::parse(text), None, "{text:?}");
         }
         // Our tag with nothing usable under it IS ours, and reads as fresh.
-        assert_eq!(Record::parse("cts4\nb\nw\n"), Some(Record::fresh()));
+        assert_eq!(Record::parse("cts5\nb\nw\n"), Some(Record::fresh()));
         // A base letter this version cannot paint - the purple seam - degrades to
         // idle, and a reserved key is skipped rather than failing the parse.
-        let r = Record::parse("cts4\nb p\ng aaa bbb\nn 5 a title\nw -:999\n")
+        let r = Record::parse("cts5\nb p\ng aaa bbb\nn 5 a title\nw -:999\n")
             .expect("our own tag parses");
         assert_eq!(r.base, Glyph::Idle);
         assert_eq!(r.waits, vec![Wait { who: Owner::Main, raised: 999 }]);
         // A `w` word in the older single-epoch shape is dropped rather than read
         // with an invented clock, so such a record degrades to "nothing waiting".
-        let old = Record::parse("cts4\nb w\nw 1790459815 aec99e1f\n").expect("our own tag");
+        let old = Record::parse("cts5\nb w\nw 1790459815 aec99e1f\n").expect("our own tag");
         assert_eq!(old.waits, Vec::new());
     }
 
@@ -2372,13 +2425,13 @@ mod tests {
             fs::write(&p, body).expect("a writable state dir");
             p
         };
-        assert!(matches!(stored_at(&at("ours", b"cts4\nb w\n")), Stored::Ours(_)));
+        assert!(matches!(stored_at(&at("ours", b"cts5\nb w\n")), Stored::Ours(_)));
         assert!(matches!(stored_at(&at("later", b"cts9\nb w\n")), Stored::Future));
         assert!(matches!(stored_at(&at("empty", b"")), Stored::Alien));
         assert!(matches!(stored_at(&at("bin", b"\x00\x01\x02junk")), Stored::Alien));
         // Our tag on its own IS ours - an empty record - because temp-then-rename
         // means a half-written record is not a shape that can reach the disk.
-        assert!(matches!(stored_at(&at("bare", b"cts4")), Stored::Ours(_)));
+        assert!(matches!(stored_at(&at("bare", b"cts5")), Stored::Ours(_)));
         assert!(matches!(stored_at(&at("torn", b"ct")), Stored::Alien));
         assert!(matches!(
             stored_at(&at("big", &vec![b'x'; MAX_RECORD + 1])),
@@ -2425,6 +2478,7 @@ mod tests {
             },
             Record {
                 base: Glyph::Waiting,
+                background: Some(123),
                 origin: Some(Origin { pid: 3_709_427, start: 84_460_384 }),
                 waits: vec![
                     Wait { who: Owner::Agent("aec99e1f4bda1972b".to_owned()), raised: 999_995 },
@@ -2437,6 +2491,7 @@ mod tests {
             // `digits` rather than the formatter and `parse`.
             Record {
                 base: Glyph::Idle,
+                background: Some(u64::MAX),
                 origin: Some(Origin { pid: u32::MAX, start: u64::MAX }),
                 waits: vec![Wait { who: Owner::Main, raised: u64::MAX }],
                 completed: Vec::new(),
@@ -2449,12 +2504,13 @@ mod tests {
         assert_eq!(
             Record {
                 base: Glyph::Working,
+                background: None,
                 origin: Some(Origin { pid: 42, start: 7 }),
                 waits: vec![Wait { who: Owner::Agent("ab-c_D".to_owned()), raised: 99 }],
                 completed: Vec::new(),
             }
             .render(),
-            "cts4\nb w\np 42 7\nw ab-c_D:99\n"
+            "cts5\nb w\np 42 7\nw ab-c_D:99\n"
         );
     }
 
@@ -2520,9 +2576,9 @@ mod tests {
         // No origin at all - a record from before this field. Freshly written, so
         // the mtime rule keeps it: mtime cannot prove a session dead, so it must
         // not be the rule that reaps a young file. Aged, it goes.
-        let anon = write("anon", "cts4\nb w\n");
+        let anon = write("anon", "cts5\nb w\n");
         assert_eq!(verdict(&anon), None);
-        let old_anon = write("oldanon", "cts4\nb w\n");
+        let old_anon = write("oldanon", "cts5\nb w\n");
         age(&old_anon);
         assert!(verdict(&old_anon).is_some());
         // A `.tmp` from a crashed write, same rule - and a FRESH one must survive,
@@ -2586,6 +2642,7 @@ mod tests {
             f.dir.join("live"),
             Record {
                 base: Glyph::Working,
+                background: None,
                 origin: Some(mine),
                 waits: vec![Wait {
                     who: Owner::Agent("aec99e1f".to_owned()),
@@ -2684,8 +2741,8 @@ mod tests {
         let f = Fixture::new("purge");
         fs::create_dir_all(&f.dir).expect("a writable state dir");
         for (name, body) in [
-            ("s1", "cts4\nb w\n"),
-            ("s2", "cts4\nb i\n"),
+            ("s1", "cts5\nb w\n"),
+            ("s2", "cts5\nb i\n"),
             ("s2.99.tmp", "half"),
             ("notes.txt", "mine"),
         ] {
@@ -2701,7 +2758,7 @@ mod tests {
         assert_eq!(left, vec!["notes.txt".to_owned()]);
         // With only our own files in it, the directory goes too.
         fs::remove_file(f.dir.join("notes.txt")).expect("our own file");
-        fs::write(f.dir.join("s3"), "cts4\nb i\n").expect("a writable state dir");
+        fs::write(f.dir.join("s3"), "cts5\nb i\n").expect("a writable state dir");
         assert_eq!(purge(), Some((f.dir.clone(), 1, true)));
         assert!(!f.dir.exists());
         // And an absent directory is not a failure, just nothing to do.
