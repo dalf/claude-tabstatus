@@ -14,9 +14,8 @@ Three modes:
   pty      a helper process is spawned whose fd 1 is a freshly allocated pty,
            and @@PID_PTY@@ becomes its pid. Whatever the implementation writes
            to that pty is captured as `pty_out`. The pty is allocated by the
-           kernel, checked NOT to be one of /dev/pts/0../dev/pts/5 (a live
-           Konsole tab of this user), and put in raw mode so the bytes come back
-           exactly as written.
+           kernel as a new pair, independent of existing terminal sessions,
+           and put in raw mode so the bytes come back exactly as written.
 """
 import base64
 import errno
@@ -30,7 +29,6 @@ import sys
 import termios
 import tty
 
-FORBIDDEN_PTS = {0, 1, 2, 3, 4, 5}
 TIMEOUT = 60
 
 
@@ -84,21 +82,11 @@ class Helpers:
 
     def pty_pid(self):
         if self.pty_proc is None:
-            master = slave = None
-            for _ in range(16):
-                m, s = os.openpty()
-                path = os.ttyname(s)
-                num = path.rsplit("/", 1)[-1]
-                if num.isdigit() and int(num) in FORBIDDEN_PTS:
-                    os.close(m)
-                    os.close(s)
-                    continue
-                master, slave, self.pty_path = m, s, path
-                break
-            if master is None:
-                raise RuntimeError(
-                    "refusing to run pty cases: the kernel only offered "
-                    "/dev/pts/0../dev/pts/5, which are live tabs")
+            # openpty allocates a NEW pair; its number says nothing about
+            # whether another terminal is live. On an otherwise empty runner,
+            # rejecting and closing pts/0 just lets the kernel offer it again.
+            master, slave = os.openpty()
+            self.pty_path = os.ttyname(slave)
             tty.setraw(slave)
             fcntl.fcntl(master, fcntl.F_SETFL,
                         fcntl.fcntl(master, fcntl.F_GETFL) | os.O_NONBLOCK)

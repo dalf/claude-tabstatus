@@ -104,8 +104,9 @@ The three modes
              implementation writes to that pty is captured. This is the ONLY way
              to cover session-start and session-end, which write the pty
              directly; tests/run.sh cannot allocate one and says so. The pty is
-             put in raw mode and REFUSED if the kernel offers /dev/pts/0 ..
-             /dev/pts/5, which are this user's live Konsole tabs.
+             allocated as a new pair by os.openpty() and put in raw mode.
+             Low numbers such as /dev/pts/0 are valid on a clean CI runner;
+             allocation does not reuse another live terminal's pair.
 
 The pty cases are the ones that pin the Konsole arming and restore byte for
 byte, including the compiled-in defaults the session-end path writes back:

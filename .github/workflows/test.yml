@@ -42,6 +42,9 @@ jobs:
       - name: Build release binaries and source manifests
         run: sh scripts/build.sh --all
 
+      - name: Test corpus fixtures
+        run: python3 -m unittest discover -s tests/corpus -p 'test_*.py' -v
+
       - name: Run integration tests and golden corpus
         run: |
           for target in x86_64-unknown-linux-musl x86_64-unknown-linux-gnu; do
