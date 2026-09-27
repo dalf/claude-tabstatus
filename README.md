@@ -189,12 +189,13 @@ The rules, in full:
 | edge | what it does to the record | what it paints |
 |---|---|---|
 | `waiting` | adds this owner (`agent_id`, or the main loop), with its own epoch | 🟠 always |
-| `waiting` from a `Notification` | adds an *unknown* owner, and only when nothing is waiting; an owned wait raised while `?` is the only one outstanding replaces it | 🟠 always |
+| `waiting` from a permission/input `Notification` | adds an unknown permission owner `?` unless a permission wait already exists; an owned permission wait replaces that anonymous permission backstop | 🟠 always |
+| `waiting` from an MCP `Notification` | adds an anonymous elicitation wait `?!`, independently of permission waits | 🟠 always |
 | `working`, a `PostToolUse` on the main thread | base ← `w`; clears the main and unknown waits | the base, or nothing if a wait remains |
 | `working`, a `UserPromptSubmit` **you typed** | base ← `w`; clears **every** wait | the base |
-| `working`, a subagent | clears the wait it owns, or a lone `?`; base untouched | the base if that emptied the set, else nothing |
+| `working`, a subagent | clears only the wait it owns; base untouched | the base if that emptied the set, else nothing |
 | `idle` | base ← `i`; clears a main wait, and **every** wait when `background_tasks` is `[]` | ⚪, or nothing if a wait remains |
-| `subagent-stop` | clears the wait it owns, or a lone `?` | the base if that emptied the set, else nothing |
+| `subagent-stop` | clears only the wait it owns | the base if that emptied the set, else nothing |
 | `session-start` | resets the record, and reaps | ⚪ as before |
 | `session-end` | removes the record | clears the title |
 
@@ -227,20 +228,28 @@ Four consequences worth naming:
 **An overlay nothing can lift is worse than no overlay at all.** While any wait is
 held, neither `working` nor `idle` paints - that is the whole mechanism - so a wait
 that outlives its dialog freezes the tab orange, and outside tmux nothing decays it.
-Every wait therefore has four independent retirement conditions, and each is a
-proof rather than a guess:
+The retirement conditions include ownership evidence and stale-wait recovery:
 
-| what retires it | why it is a proof |
+| what retires it | evidence or recovery policy |
 |---|---|
-| the owner's own completion | that agent's `PostToolUse`, or its `SubagentStop` when you declined and no tool ever ran |
+| the known owner's own completion | that agent's `PostToolUse`, or its `SubagentStop` when you declined and no tool ever ran; an arbitrary agent never owns an anonymous wait |
+| main-thread tool progress | preserves the existing recovery policy for main and anonymous waits; this does not correlate an MCP response |
 | a `UserPromptSubmit` you typed | a modal dialog and a usable prompt cannot both be on screen |
-| `background_tasks` empty at `Stop` | the array holds one entry per live subagent - the capture's 68.946 `Stop` lists the very agent that raises the dialog a second later - so an empty one proves nothing outside the main loop is running, and therefore that no subagent's dialog and no unattributable dialog is outstanding |
+| `background_tasks` empty at `Stop` | preserves the existing recovery policy when no background tasks remain; this does not correlate an MCP response |
 | its own expiry | `CCTAB_TTL_WAITING`, **per wait** |
 
-The last three exist because the captures are emphatic that *abandoning* a dialog
+The recovery paths exist because the captures are emphatic that *abandoning* a dialog
 fires no hook whatsoever: Esc on a live dialog (`s2`), declining one (`s7`) and
 Ctrl+C mid-tool (`s5`) each emit nothing at all until the next prompt. Nothing the
 owner does can be waited for, because the owner does nothing.
+
+Notification-only waits carry no request identity. An unrelated subagent's
+`PostToolUse`, `PostToolUseFailure`, or `SubagentStop` therefore leaves them intact,
+even when there is only one wait. Injected or missing-content `UserPromptSubmit`
+events also preserve anonymous waits. MCP notifications retain separate provenance
+so a permission request cannot replace them, and a matching subagent permission completion
+leaves the MCP wait standing. Both MCP notification kinds share one anonymous slot;
+matching individual MCP responses remains [issue #9](https://github.com/dalf/claude-tabstatus/issues/9).
 
 "Absent" is not "empty", and that asymmetry is deliberate in both directions. A
 `Notification` carries no `background_tasks` at all, and a Claude Code that renamed
@@ -342,18 +351,26 @@ a clear. `std::fs::File::lock` ships in std (1.89), so this costs no dependency;
 is the reason `rust-version` moved from 1.74 to 1.89.
 
 ```text
-cts1                                           the tag: version 1 of the wire
+cts2                                           the tag: version 2 of the wire
 b i                                            base = w | a | i
 p 3709427 84460384                             the session's (pid, start time)
 w aec99e1f4bda1972b:1790380630 -:1790380631    one wait per word: owner, then epoch
 ```
 
-`-` is the main loop and `?` is an unknown owner, which is why an `agent_id` is
+`-` is the main loop, `?` an unknown permission/input owner, and `?!` an anonymous
+MCP elicitation owner. An `agent_id` is
 accepted only as `[A-Za-z0-9_-]{1,64}` - the same test that stops a `session_id`
 from choosing the path it is filed under. Unknown keys are **skipped**, and a base
 letter this version cannot paint reads as idle, so a newer version's record
 degrades rather than being misread; and a record this version did not *change* is
 not rewritten, so it keeps the fields it did not understand.
+
+Version 1 (`cts1`) records remain readable and become `cts2` on the next state
+change. Their `?` waits lack provenance and retain the permission-backstop
+deduplication policy; the original notification kind cannot be recovered.
+Older binaries cannot read `cts2` records and may overwrite them on a state
+transition. Use the updated binary for all hooks; mixed versions do not preserve
+the new wait policy.
 
 **What it costs, per edge - and how to re-measure it.** This section used to carry
 remembered numbers, and they did not reproduce: a per-edge cost of tens of
@@ -1400,6 +1417,11 @@ invocation, no arming.
   plugin registers neither (see [Not yet built](#slices)), so the tab turns
   orange only when the `elicitation_dialog` notification arrives about 6s later,
   and only if you have not touched the keyboard in the meantime.
+  The anonymous wait survives unrelated subagent activity and coexists with
+  permission waits. Main-thread tool progress, a quiet `Stop`, a new human prompt,
+  expiry, or a session reset can still retire it as recovery; none is a correlated
+  MCP result. Direct request/result matching is tracked in
+  [issue #9](https://github.com/dalf/claude-tabstatus/issues/9).
 - **Konsole repaints the tab on a ~2s tick**, not when the title arrives, so
   the dot trails the actual state change by up to about two seconds. That, not
   the ~2ms hook, is the responsiveness ceiling.
