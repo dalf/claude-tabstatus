@@ -1228,8 +1228,23 @@ control.
 path `hooks/hooks.json` invokes. A fresh clone has no `bin/` until you build,
 and `tabstatus install` refuses rather than half-installing.
 
-Binaries are meant to ship as **GitHub release assets** rather than in git
-history, so that installing needs no toolchain. That is not wired up yet.
+Binaries ship as **GitHub release assets** rather than in git history, so that
+installing needs no toolchain. The [Test workflow](.github/workflows/test.yml)
+builds both Linux targets and runs Rust unit tests, the shell integration suite
+(including tmux), and the golden corpus on every branch push and pull request.
+The tested binaries are also available as workflow artifacts.
+
+Pushing a Git tag runs the [Release workflow](.github/workflows/release.yml).
+It runs the same checks on the tagged commit, then creates a GitHub release with
+`tabstatus-x86_64-unknown-linux-musl`, `tabstatus-x86_64-unknown-linux-gnu`, and
+`SHA256SUMS` attached. For example, after updating the package and plugin versions
+and committing the changes, push `v0.1.0` with `git tag v0.1.0` followed by
+`git push origin v0.1.0`. All tag names trigger a release; use a new tag for each
+release. macOS support is tracked in [issue #1](https://github.com/dalf/claude-tabstatus/issues/1).
+
+After downloading a binary and `SHA256SUMS` from the same release, verify it with
+`sha256sum --check --ignore-missing SHA256SUMS` and make it executable with
+`chmod +x tabstatus-x86_64-unknown-linux-musl` (adjust the name for the GNU build).
 
 ```sh
 sh scripts/build.sh          # the host target, refresh bin/ and its digests

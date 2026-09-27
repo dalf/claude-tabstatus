@@ -1,0 +1,66 @@
+name: Test
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test Linux binaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+      TERM: xterm-256color
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools tmux
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Run Rust unit tests
+        run: |
+          cargo test --locked --target x86_64-unknown-linux-musl
+          cargo test --locked --target x86_64-unknown-linux-gnu
+
+      - name: Build release binaries and source manifests
+        run: sh scripts/build.sh --all
+
+      - name: Run integration tests and golden corpus
+        run: |
+          for target in x86_64-unknown-linux-musl x86_64-unknown-linux-gnu; do
+            binary="$GITHUB_WORKSPACE/bin/tabstatus-$target"
+            CCTAB_TEST_BIN="$binary" sh tests/run.sh
+            sh tests/corpus/replay.sh "$binary"
+          done
+
+      - name: Generate binary checksums
+        working-directory: bin
+        run: sha256sum tabstatus-x86_64-unknown-linux-musl tabstatus-x86_64-unknown-linux-gnu > SHA256SUMS
+
+      - name: Upload tested binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-binaries
+          path: |
+            bin/tabstatus-x86_64-unknown-linux-musl
+            bin/tabstatus-x86_64-unknown-linux-gnu
+            bin/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
