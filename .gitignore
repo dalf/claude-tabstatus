@@ -14,8 +14,9 @@ claude-tabstatus.state
 
 # Build output, deliberately NOT committed. bin/ is produced by
 # `sh scripts/build.sh`; binaries will ship as GitHub release assets instead of
-# living in git history. A fresh clone therefore has no bin/ until you build,
-# and `tabstatus install` refuses rather than half-installing.
+# living in git history. A fresh clone therefore has no bin/ until you build -
+# and the binary you then run is what supplies the plugin tree's own
+# bin/tabstatus, because `install` copies itself into the tree.
 /bin
 
 # The golden corpus's fixture tree is built under $TMPDIR, not here - it must not

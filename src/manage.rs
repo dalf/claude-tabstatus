@@ -5,33 +5,41 @@
 //! cost -9us on the hot edge and 90KB of file size, because code that never runs is
 //! never paged in. One file to copy, one path in hooks.json, one `--version`.
 //!
-//! What it changes:
+//! What `install` changes:
 //!
-//!   1. one key   <config>/settings.json -> env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE = "1"
-//!   2. a symlink <config>/skills/claude-tabstatus -> this repo
-//!   3. a record  <config>/claude-tabstatus.state  -> what was there before
+//!   1. a tree     <data>/claude-tabstatus/        <- the plugin directory itself
+//!   2. one key    <config>/settings.json -> env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE = "1"
+//!   3. a symlink  <config>/skills/claude-tabstatus -> that tree
+//!   4. a record   <config>/claude-tabstatus.state -> the prior state, and the tree
 //!
-//! settings.json is written FIRST and the symlink LAST, so a failure mid-edit
-//! cannot leave the plugin loaded with Claude Code's built-in title repainting over
-//! it - which looks broken rather than uninstalled. uninstall mirrors that for the
-//! sharper version of the same reason: env key still set and plugin gone paints NO
-//! title at all. Both halves preflight every refusal, so the window between the two
-//! writes holds nothing that can decide to stop.
+//! THE PLUGIN DIRECTORY IS BUILD OUTPUT, like `bin/`. It is materialised from the
+//! manifests compiled into this binary (`src/embedded.rs`), never symlinked to a
+//! checkout, and `src/tree.rs` carries why: when the checkout WAS the plugin
+//! directory, `git checkout` of a branch with a broken hooks.json broke every prompt
+//! in every running session with no deploy step in sight. There is one install path
+//! and it always writes the tree - in a checkout and on a bare VM alike - so nothing
+//! here has to ask which shape the plugin directory is.
 //!
-//! `standalone` is a FOURTH thing, and it changes none of the three: it writes a
-//! self-contained plugin tree from the manifests compiled into this binary (see
-//! `src/embedded.rs`) and then runs the ordinary install against it, so a remote
-//! machine needs one scp and one run instead of a tree. The embedded bytes are
-//! authoritative only inside a tree this tool generated - `install` never reads
-//! them and never writes a manifest, so a checkout's tracked files are not
-//! reachable from any install path. `src/standalone.rs` carries why.
+//! The tree is written FIRST, then settings.json, and the symlink LAST, which is one
+//! step in front of the ordering this module always had. The reason for the last two
+//! is unchanged: the env key switches Claude Code's own title painting off and the
+//! plugin paints the replacement, so "key set, plugin gone" is the one combination
+//! that paints NO title at all. The tree goes before both because it is INERT until
+//! the symlink points at it - so an abort anywhere before that last step leaves a
+//! first-time user exactly as they were. `uninstall` mirrors it: settings first, the
+//! link next, the tree last. Both halves preflight every refusal, so the window
+//! between the writes holds nothing that can decide to stop.
+//!
+//! And the symlink is repointed with rename(2), not unlink-then-symlink. Hooks fire
+//! constantly; a path that resolves to nothing for even a moment is a hook exec'ing a
+//! missing file, and a non-zero PreToolUse hook BLOCKS A TOOL.
 //!
 //! CLAUDE_CONFIG_DIR overrides the config directory, which is how the tests
 //! point all of this at a throwaway tree instead of a real one.
 
 use crate::embedded::{self, Verdict};
 use crate::settings::{self, Outcome};
-use crate::standalone;
+use crate::tree;
 use crate::config::{self, Config, Terminal};
 use crate::edge::{Glyph, Paint};
 use crate::{json, render, state, tmux};
@@ -40,18 +48,20 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 const KEY: &str = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE";
 const PLUGIN: &str = "claude-tabstatus";
-const STATE_VERSION: i32 = 2;
+const STATE_VERSION: i32 = 3;
 
 /// One of this half's options. Spelled here and nowhere else; which subcommand
 /// accepts which is [`Subcommand::parse`]'s business.
 enum Flag {
     Force,
     RestoreBackup,
-    PurgeTree,
+    KeepTree,
+    /// `--tree <dir>`, the only option here that takes a value.
+    Tree,
 }
 
 impl Flag {
@@ -59,7 +69,8 @@ impl Flag {
         match a.as_bytes() {
             b"--force" => Some(Flag::Force),
             b"--restore-backup" => Some(Flag::RestoreBackup),
-            b"--purge-tree" => Some(Flag::PurgeTree),
+            b"--keep-tree" => Some(Flag::KeepTree),
+            b"--tree" => Some(Flag::Tree),
             _ => None,
         }
     }
@@ -68,19 +79,23 @@ impl Flag {
 /// A management subcommand and its options, decided once from argv. Nothing below
 /// this type looks at an argument again.
 pub enum Subcommand {
+    /// `install [--tree <dir>]` - materialise the plugin tree from the copies
+    /// compiled into this binary, then link it and set the env key. ONE path, in a
+    /// checkout and on a bare VM alike.
     Install {
-        force: bool,
+        tree: Option<OsString>,
     },
     Uninstall {
         force: bool,
         restore_backup: bool,
-        purge_tree: bool,
+        keep_tree: bool,
     },
     Doctor,
-    /// `standalone [<dir>]` - write a self-contained plugin tree from the copies
-    /// compiled into this binary, then install it. The remote-install verb: scp
-    /// one file, run it once.
-    Standalone(Option<OsString>),
+    /// The word `standalone` used to be a second install verb, for a machine with no
+    /// checkout. `install` now does exactly what it did, everywhere, so the word is
+    /// kept only long enough to say so: a name that used to work and now errors
+    /// obscurely is worse than one that points at its replacement.
+    StandaloneGone,
     /// `print-embedded <plugin|hooks>` - the embedded bytes on stdout, verbatim.
     /// Not in `usage`, because it exists for the test suite's byte-for-byte diff
     /// against the files in the repo and for a spot-check on a machine that has no
@@ -109,6 +124,9 @@ pub enum Subcommand {
     /// `install --nope` is refused even where there is no config directory to
     /// find.
     BadOption(OsString),
+    /// Something this half owns, used wrongly in a way `BadOption` cannot say:
+    /// `--tree` with nothing after it, or a bare directory where `--tree` is needed.
+    BadUsage(String),
 }
 
 impl Subcommand {
@@ -126,7 +144,7 @@ impl Subcommand {
             // These three take no options and IGNORE any argument given, which is
             // what they have always done: `doctor --force` runs doctor.
             b"doctor" => Subcommand::Doctor,
-            b"standalone" => standalone_options(rest),
+            b"standalone" => Subcommand::StandaloneGone,
             b"print-embedded" => Subcommand::PrintEmbedded(rest.first().cloned()),
             b"tmux-format" => Subcommand::TmuxFormat,
             b"tmux-arm" => Subcommand::TmuxArm(rest.first().cloned()),
@@ -141,23 +159,28 @@ impl Subcommand {
     /// contract, not this one's.
     pub fn run(self) -> i32 {
         match self {
-            Subcommand::Install { force } => with_ctx(|c| install(c, force)),
-            Subcommand::Uninstall {
-                force,
-                restore_backup,
-                purge_tree,
-            } => with_ctx(|c| uninstall(c, force, restore_backup, purge_tree)),
-            Subcommand::Doctor => with_ctx(doctor),
-            // NOT `with_ctx`: the whole point is that there is no tree above the
-            // running binary yet, so the repo cannot be resolved before one is
-            // written.
-            Subcommand::Standalone(dir) => match standalone_cmd(dir) {
+            // NOT `with_ctx`: install resolves its OWN tree - it is the command that
+            // decides where the plugin directory is, rather than discovering one.
+            Subcommand::Install { tree } => match install(tree) {
                 Ok(()) => 0,
                 Err(e) => {
                     fail(&e);
                     1
                 }
             },
+            Subcommand::Uninstall {
+                force,
+                restore_backup,
+                keep_tree,
+            } => with_ctx(|c| uninstall(c, force, restore_backup, keep_tree)),
+            Subcommand::Doctor => with_ctx(doctor),
+            Subcommand::StandaloneGone => {
+                fail("`standalone` is now just `install`.");
+                fail("install always writes the plugin tree from the copies compiled into");
+                fail("this binary, on a bare machine and in a checkout alike, so there is");
+                fail("only one verb: tabstatus install [--tree <dir>]");
+                1
+            }
             Subcommand::PrintEmbedded(which) => print_embedded(which.as_deref()),
             Subcommand::TmuxFormat => {
                 for line in tmux::format_lines(&Config::from_env()) {
@@ -190,47 +213,80 @@ impl Subcommand {
                 ));
                 1
             }
+            Subcommand::BadUsage(why) => {
+                fail(&why);
+                1
+            }
         }
     }
 }
 
+/// `install [--tree <dir>]`.
+///
+/// `--force` is gone with the check it forced. It existed for "install anyway, I am
+/// about to build `bin/tabstatus`", and install now SUPPLIES the binary it needs - it
+/// copies the running one into the tree - so there is nothing left to force. Refused
+/// by name rather than ignored, the same way `--restore-backup` always was.
 fn install_options(rest: &[OsString]) -> Subcommand {
-    let mut force = false;
-    for arg in rest {
-        match Flag::parse(arg) {
-            Some(Flag::Force) => force = true,
-            // `--restore-backup` is a real flag, but not one install accepts.
-            _ => return Subcommand::BadOption(arg.clone()),
+    let mut tree = None;
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        if matches!(Flag::parse(arg), Some(Flag::Tree)) {
+            match it.next() {
+                Some(d) if !d.is_empty() && !d.as_bytes().starts_with(b"-") => {
+                    tree = Some(d.clone())
+                }
+                // A mistyped flag must not be silently taken as a directory name and
+                // materialised into `./--force`.
+                Some(d) => {
+                    return Subcommand::BadUsage(format!(
+                        "--tree takes the directory to write the plugin tree into, and \
+                         {:?} is not one",
+                        String::from_utf8_lossy(d.as_bytes())
+                    ))
+                }
+                None => {
+                    return Subcommand::BadUsage(
+                        "--tree needs the directory to write the plugin tree into, \
+                         e.g. tabstatus install --tree ~/.local/share/claude-tabstatus"
+                            .to_string(),
+                    )
+                }
+            }
+            continue;
         }
+        // Every other option, real or mistyped, is one install does not accept.
+        if arg.as_bytes().starts_with(b"-") {
+            return Subcommand::BadOption(arg.clone());
+        }
+        // A bare path. `standalone <dir>` took one; install spells it out, so muscle
+        // memory cannot make it write a tree somewhere it was not asked to.
+        return Subcommand::BadUsage(format!(
+            "install takes no bare directory. To choose where the plugin tree goes: \
+             tabstatus install --tree {}",
+            String::from_utf8_lossy(arg.as_bytes())
+        ));
     }
-    Subcommand::Install { force }
+    Subcommand::Install { tree }
 }
 
 fn uninstall_options(rest: &[OsString]) -> Subcommand {
     let mut force = false;
     let mut restore_backup = false;
-    let mut purge_tree = false;
+    let mut keep_tree = false;
     for arg in rest {
         match Flag::parse(arg) {
             Some(Flag::Force) => force = true,
             Some(Flag::RestoreBackup) => restore_backup = true,
-            Some(Flag::PurgeTree) => purge_tree = true,
-            None => return Subcommand::BadOption(arg.clone()),
+            Some(Flag::KeepTree) => keep_tree = true,
+            // `--tree` is a real flag, but only install takes it.
+            Some(Flag::Tree) | None => return Subcommand::BadOption(arg.clone()),
         }
     }
     Subcommand::Uninstall {
         force,
         restore_backup,
-        purge_tree,
-    }
-}
-
-/// `standalone` takes a DIRECTORY, not options - but a mistyped flag must not be
-/// silently treated as a directory name and materialised into `./--force`.
-fn standalone_options(rest: &[OsString]) -> Subcommand {
-    match rest.first() {
-        Some(a) if a.as_bytes().starts_with(b"-") => Subcommand::BadOption(a.clone()),
-        other => Subcommand::Standalone(other.cloned()),
+        keep_tree,
     }
 }
 
@@ -272,14 +328,16 @@ fn usage() {
     say(concat!(
         "tabstatus - the Claude Code session state in the terminal tab title\n",
         "\n",
-        "  tabstatus install            link the plugin and disable the built-in title\n",
-        "  tabstatus standalone [<dir>] write a self-contained plugin tree from the\n",
-        "                               copies compiled into this binary, then install\n",
-        "                               it - for a machine with no checkout on it\n",
-        "  tabstatus uninstall          undo exactly that\n",
+        "  tabstatus install            write the plugin tree from the copies compiled\n",
+        "                               into this binary, link it, and disable the\n",
+        "                               built-in title. The plugin directory is BUILD\n",
+        "                               OUTPUT, like bin/ - never your checkout\n",
+        "      --tree <dir>             put it somewhere other than\n",
+        "                               $XDG_DATA_HOME/claude-tabstatus\n",
+        "  tabstatus uninstall          undo exactly that, tree included\n",
         "      --force                  remove the env key even with no state record\n",
         "      --restore-backup         roll settings.json back to the pre-install copy\n",
-        "      --purge-tree             also remove a tree `standalone` generated\n",
+        "      --keep-tree              leave the generated plugin tree on disk\n",
         "  tabstatus doctor             report what is installed and what would paint\n",
         "  tabstatus tmux-format        print the two tmux format strings we install\n",
         "  tabstatus tmux-arm <tty>     re-arm one Konsole tab; tmux's client-attached\n",
@@ -303,8 +361,10 @@ fn version() {
 
 /// std has no target-triple constant and this crate has no build script, so the
 /// triple is composed from the cfg the build actually used. Reported by
-/// `version` and `doctor` because the repo ships prebuilt binaries under bin/
-/// and "which one of those am I running" is then a real question.
+/// `version` and `doctor` because releases ship a binary per triple and bin/ holds
+/// whichever ones you built, so "which one of those am I running" is a real question -
+/// and the tree's marker records it, so `doctor` can spot a tree materialised by one
+/// architecture and later run by another.
 fn target_triple() -> &'static str {
     if cfg!(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu")) {
         "x86_64-unknown-linux-gnu"
@@ -325,8 +385,38 @@ fn target_triple() -> &'static str {
 
 // --- context ----------------------------------------------------------------
 
+/// How the live plugin tree was found. Printed, not inferred: the checkout used to
+/// be the answer to "where is the plugin", and now there are three possible sources,
+/// so a report that does not say which one it used cannot be acted on.
+#[derive(Clone, Copy, PartialEq)]
+enum TreeFrom {
+    /// `--tree <dir>`.
+    Explicit,
+    /// `<config>/skills/claude-tabstatus`, the symlink install itself wrote. The
+    /// AUTHORITATIVE record of where the plugin directory is.
+    Link,
+    /// The state record's `tree` field, which is how a hand-repointed link still
+    /// leaves `uninstall` able to find the tree it owns.
+    Record,
+    /// `$XDG_DATA_HOME/claude-tabstatus`, or `$HOME/.local/share/claude-tabstatus`.
+    Default,
+}
+
+impl TreeFrom {
+    fn why(self) -> &'static str {
+        match self {
+            TreeFrom::Explicit => "from --tree",
+            TreeFrom::Link => "from the plugin symlink",
+            TreeFrom::Record => "from the state record",
+            TreeFrom::Default => "the default path",
+        }
+    }
+}
+
 struct Ctx {
-    repo: PathBuf,
+    /// The plugin directory: generated, never a checkout.
+    tree: PathBuf,
+    tree_from: TreeFrom,
     config: PathBuf,
     skills: PathBuf,
     link: PathBuf,
@@ -346,17 +436,19 @@ struct Ctx {
     safety: PathBuf,
 }
 
-/// The config directory, resolved on its own because `standalone` needs it BEFORE
-/// there is a tree to make a [`Ctx`] out of - it refuses a target under
-/// `<config>/skills`.
+/// The config directory, resolved on its own because `install` needs it BEFORE there
+/// is a tree to make a [`Ctx`] out of: it resolves its own tree, and one of the
+/// refusals is a target under `<config>/skills`.
 ///
 /// Stays OsString: a HOME or CLAUDE_CONFIG_DIR that is not valid UTF-8 still names
 /// a real directory, and repairing it here would edit a different one.
 fn config_dir() -> Result<PathBuf, String> {
     match config::var_nonempty("CLAUDE_CONFIG_DIR") {
-        Some(v) => Ok(PathBuf::from(v)),
+        // Absolute, so that `<config>/skills` is comparable with the tree and every
+        // path this half prints or records is the same path from any directory.
+        Some(v) => absolute(&PathBuf::from(v)),
         None => match config::var_nonempty("HOME") {
-            Some(home) => Ok(PathBuf::from(home).join(".claude")),
+            Some(home) => absolute(&PathBuf::from(home).join(".claude")),
             None => Err("neither CLAUDE_CONFIG_DIR nor HOME is set, so there \
                          is no config directory to work on"
                 .to_string()),
@@ -364,14 +456,61 @@ fn config_dir() -> Result<PathBuf, String> {
     }
 }
 
+/// A path made absolute and lexically normalised, ONCE, before anything looks at it.
+///
+/// Everything downstream compares these paths, writes through them and RECORDS them,
+/// and a raw `--tree` string defeated all three. `--tree skills/claude-tabstatus` run
+/// from `<config>` walked straight past the refusal whose whole job is to keep the tree
+/// out of `skills/`, because that test is a component-prefix test. Worse, the symlink
+/// then got the relative string as its target, which resolves against the LINK's
+/// directory rather than the shell's - a dangling link with the env key set, install
+/// saying "Done.", and nothing painting. And the record kept the relative string, so a
+/// later `uninstall` from a different directory removed files from whatever else
+/// happened to be named that.
+///
+/// `fs::canonicalize` is the wrong tool: it resolves symlinks - which is what makes it
+/// right for settings.json and wrong here - and it FAILS on a path that does not exist
+/// yet, which the tree usually does not. So `..` and `.` are folded textually.
+fn absolute(p: &Path) -> Result<PathBuf, String> {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| {
+                format!(
+                    "cannot read the current directory ({}), so the relative path {} \
+                     cannot be made absolute. Pass an absolute one.",
+                    e,
+                    p.display()
+                )
+            })?
+            .join(p)
+    };
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            // At the root `..` is the root, which is what `pop` returning false means.
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    Ok(if out.as_os_str().is_empty() { PathBuf::from("/") } else { out })
+}
+
 impl Ctx {
+    /// For `doctor` and `uninstall`, which have to work on whatever is there.
     fn new() -> Result<Ctx, String> {
-        Ctx::at(repo_root()?)
+        let config = config_dir()?;
+        let (tree, from) = live_tree(&config)?;
+        Ctx::at(tree, from)
     }
 
-    /// Everything in `new` except finding the plugin directory, so `standalone` can
-    /// install the tree it has just written instead of one it had to discover.
-    fn at(repo: PathBuf) -> Result<Ctx, String> {
+    /// Everything in `new` except finding the plugin directory, so `install` can work
+    /// on the tree it RESOLVED rather than one it had to discover.
+    fn at(tree: PathBuf, tree_from: TreeFrom) -> Result<Ctx, String> {
         let config = config_dir()?;
         let skills = config.join("skills");
         let link = skills.join(PLUGIN);
@@ -396,7 +535,8 @@ impl Ctx {
         let backup = with_suffix(&settings, ".cctab-preinstall");
         let safety = with_suffix(&settings, ".cctab-preuninstall");
         Ok(Ctx {
-            repo,
+            tree,
+            tree_from,
             config,
             skills,
             link,
@@ -409,23 +549,12 @@ impl Ctx {
         })
     }
 
-    /// Which of the two shapes this plugin directory is. Asserted by the marker
-    /// file `standalone` writes, never guessed: the same embedded-vs-on-disk
-    /// comparison gets OPPOSITE remedies in the two modes, so a mode nobody can
-    /// state is a report that gives the wrong advice.
-    fn mode(&self) -> Mode {
-        if standalone::is_generated(&self.repo) {
-            Mode::Standalone
-        } else {
-            Mode::Checkout
-        }
-    }
-
     /// The binary hooks.json invokes. Kept separate from the running executable:
-    /// `cargo run` and a copy in a scratchpad are both legitimate ways to run
-    /// `install`, and what must exist afterwards is the committed one.
+    /// `./bin/tabstatus install`, `cargo run` and a copy in a scratchpad are all
+    /// legitimate ways to run `install`, and what must exist afterwards is the copy
+    /// inside the tree.
     fn hook_binary(&self) -> PathBuf {
-        self.repo.join("bin").join("tabstatus")
+        self.tree.join(tree::BIN)
     }
 }
 
@@ -435,60 +564,49 @@ fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Walk up from the running executable looking for the plugin manifest. That
-/// finds the repo whether the binary is `bin/tabstatus`, a `bin/tabstatus-<triple>`
-/// it points at, or `target/release/tabstatus` straight out of a build - and
-/// /proc/self/exe is already symlink-resolved, so installing through the
-/// installed link records the real clone rather than a link to a link.
-fn repo_root() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("cannot find my own path ({}), so I cannot find the repo", e))?;
-    if let Some(d) = plugin_dir_above(&exe) {
-        return Ok(d);
+/// Where the plugin directory IS, for the two commands that have to work on whatever
+/// is already there.
+///
+/// Walking up from the running executable is deliberately NOT one of the answers any
+/// more, and that is the point of the whole change: `./bin/tabstatus doctor` in a
+/// checkout would find `.claude-plugin/plugin.json` above itself and report that the
+/// plugin is this checkout - which is exactly the wiring being abolished, restated by
+/// the tool as fact. The binary you RUN and the directory Claude Code LOADS are two
+/// different things now, and only the config directory knows the second one.
+///
+/// FIRST the symlink `install` wrote, which is the authoritative record and is taken
+/// even when it dangles or points somewhere surprising: a dead link with a live env
+/// key behind it is exactly the broken config `doctor` exists to explain and
+/// `uninstall` has to clean up, and nothing downstream writes into it on that basis -
+/// removal re-checks the marker, and a directory without one is never removed.
+///
+/// THEN the state record's own `tree` field, for the one shape the link cannot cover:
+/// somebody repointed or removed the link by hand, and the tree this install owns
+/// would otherwise be an orphan nothing can name.
+///
+/// THEN the default path, for a config that has neither.
+fn live_tree(config: &Path) -> Result<(PathBuf, TreeFrom), String> {
+    let link = config.join("skills").join(PLUGIN);
+    if let Some(t) = link_target(&link) {
+        return Ok((t, TreeFrom::Link));
     }
-    // No tree above us, which is the normal shape of a binary scp'd to a VM. Two
-    // fallbacks, in this order.
-    //
-    // FIRST the symlink `install` itself wrote. `<config>/skills/claude-tabstatus`
-    // is the AUTHORITATIVE record of where the plugin directory is, written by the
-    // same run that created the tree - so reading it is what makes `standalone
-    // <dir>` a real option. Without it these two commands only ever worked for the
-    // DEFAULT path: a tree anywhere else, or a default path that moved because
-    // XDG_DATA_HOME is set in an interactive shell and not in `ssh vm '...'`, left a
-    // live install that neither `doctor` nor `uninstall` could touch, under advice
-    // whose only effect was to materialise a SECOND tree and orphan the first.
-    //
-    // The target is taken even when it does not exist or is incomplete. A dangling
-    // link with a live env key and a state file behind it is exactly the broken
-    // config `doctor` is for and `uninstall` has to clean up, and nothing here
-    // writes into the repo path on that basis: `install` re-checks both manifests,
-    // `--purge-tree` re-checks the marker, and a directory with no marker is never
-    // removed.
-    let recorded = config_dir().map(|c| c.join("skills").join(PLUGIN));
-    if let Ok(link) = &recorded {
-        if let Some(t) = link_target(link) {
-            return Ok(t);
-        }
+    if let Some(t) = recorded_tree(config) {
+        return Ok((t, TreeFrom::Record));
     }
-    // THEN the default location, for the one shape the link cannot cover: a
-    // `standalone` that wrote its tree and then could not install it.
-    if let Ok(t) = standalone::default_tree() {
-        let complete = embedded::MANIFESTS.iter().all(|(rel, _)| t.join(rel).is_file());
-        if standalone::is_generated(&t) && complete {
-            return Ok(t);
-        }
-    }
-    Err(format!(
-        "{} is not inside a claude-tabstatus checkout (no .claude-plugin/plugin.json \
-         and hooks/hooks.json above it), {} records no plugin directory, and there is \
-         no generated tree at the default place to fall back on. Write one: \
-         tabstatus standalone",
-        exe.display(),
-        match &recorded {
-            Ok(l) => l.display().to_string(),
-            Err(_) => "and with no config directory there is nothing that".to_string(),
-        }
-    ))
+    Ok((tree::default_tree()?, TreeFrom::Default))
+}
+
+/// The tree the state record says this install owns, as install wrote it.
+fn recorded_tree(config: &Path) -> Option<PathBuf> {
+    let raw = fs::read(config.join(format!("{}.state", PLUGIN))).ok()?;
+    let v = json::parse(&raw).ok()?;
+    let t = v.as_obj()?.get("tree")?.val.as_str()?.to_vec();
+    let p = PathBuf::from(OsString::from_vec(t));
+    // Absolute or nothing. `install` writes it absolute; a relative one could only
+    // come from a hand-edited record, and resolving it against whatever directory
+    // `uninstall` happens to be run from is how a tool removes files somewhere it was
+    // never pointed at.
+    (p.is_absolute() && p.as_os_str().len() > 1).then_some(p)
 }
 
 /// The plugin directory `<config>/skills/claude-tabstatus` points at, resolved
@@ -509,7 +627,10 @@ fn link_target(link: &Path) -> Option<PathBuf> {
     }
 }
 
-/// The upward walk itself: the plugin directory above `from`, or `None`.
+/// A checkout above `from`, for ONE remaining purpose: `doctor`'s `source:` line, and
+/// `install`'s copy of it, which ask whether the manifests in the checkout this binary
+/// came out of still match the copies compiled into it. It is no longer how anything
+/// finds the plugin directory - see `live_tree`.
 fn plugin_dir_above(from: &Path) -> Option<PathBuf> {
     let mut dir = from.parent().map(|p| p.to_path_buf());
     for _ in 0..5 {
@@ -586,6 +707,13 @@ fn dir_writable(p: &Path) -> bool {
 
 // --- the state record -------------------------------------------------------
 
+/// The record `uninstall` reads back. Two halves, and they have opposite lifetimes.
+///
+/// "What was here BEFORE" is written once and never rewritten - a second install must
+/// not record the state the first one left. "Which tree this install OWNS" is
+/// rewritten every time, because `install --tree <somewhere else>` moves it and a
+/// record naming the old one would leave the new tree unfindable and the old one an
+/// orphan. Splitting them is what made this state_version 3.
 struct State {
     env_had: bool,
     env_raw: Option<Vec<u8>>,
@@ -602,7 +730,11 @@ fn state_text(c: &Ctx, s: &State) -> Vec<u8> {
     out.push_str("{\n");
     out.push_str(&format!("  \"state_version\": {},\n", STATE_VERSION));
     out.push_str("  \"written_by\": \"tabstatus install\",\n");
-    out.push_str(&format!("  \"repo\": {},\n", json::quote(c.repo.as_os_str().as_bytes())));
+    // The tree this install owns. The v2 field here was called "repo" and was never
+    // read back by anything, which is why renaming it costs nothing - and it has to
+    // be READ back now, because it is how `uninstall` finds the tree when the link no
+    // longer points at it.
+    out.push_str(&format!("  \"tree\": {},\n", json::quote(c.tree.as_os_str().as_bytes())));
     out.push_str(&format!(
         "  \"settings_path\": {},\n",
         json::quote(c.settings.as_os_str().as_bytes())
@@ -761,12 +893,30 @@ fn scratch_pid(name: &str) -> Option<&str> {
 }
 
 /// Every directory this tool writes scratch files into.
+///
+/// `c.skills` is here because the atomic symlink swap's temp file lives in it, and
+/// that is the directory Claude Code ENUMERATES for plugins - litter there is not
+/// merely untidy. The tree and its parent are here because the writability probe and
+/// the binary's temp copy live in them, and both are new places for this tool to leave
+/// anything. Called after the preflight has passed, so the tree is one we own by then.
 fn sweep_all(c: &Ctx) {
     sweep_litter(&c.config);
     let dir = c.settings.parent().unwrap_or(Path::new("."));
     if dir != c.config {
         sweep_litter(dir);
     }
+    if c.skills != c.config {
+        sweep_litter(&c.skills);
+    }
+    // The tree, its parent and its bin/: the writability probe lands in whichever of
+    // the first two existed at preflight time, and the binary's temp copy in the third.
+    // All three are swept whatever exists now, so a probe left in the PARENT by a run
+    // that found no tree is still cleaned up by the next run, which finds one.
+    sweep_litter(&c.tree);
+    if let Some(d) = c.tree.parent() {
+        sweep_litter(d);
+    }
+    sweep_litter(&c.tree.join("bin"));
 }
 
 fn refuse_link(p: &Path, what: &str) -> String {
@@ -781,70 +931,135 @@ fn refuse_link(p: &Path, what: &str) -> String {
 
 // --- install ----------------------------------------------------------------
 
-/// Three writes, in the order the module header explains, with every refusal
-/// decided before the first of them.
-fn install(c: &Ctx, force: bool) -> Result<(), String> {
-    let hook = c.hook_binary();
-    let existing = install_preflight(c, force, &hook)?;
-    install_header(c, &hook);
-    // Clear this tool's own scratch files left by a killed run, in the two
-    // directories it is about to write.
-    sweep_all(c);
+/// Where THIS install writes the plugin tree.
+///
+/// `--tree` wins. Otherwise the tree the link already points at, but only when that
+/// target is OURS or is NOT THERE AT ALL - and those two cases are one rule, not two:
+/// a marked directory is a tree we wrote and an absent path cannot be anybody's.
+///
+/// Reusing an unmarked, EXISTING target is the case that must not happen. It would send
+/// `refuse_target` at somebody else's directory and dead-end the whole install with
+/// nowhere to go, where falling through to the default path and repointing - loudly -
+/// always has a way forward. That one rule is what keeps every awkward link state
+/// recoverable, and it is also what makes the migration work: the link currently points
+/// at the CHECKOUT, which exists and has no marker, so install picks the default path
+/// and repoints instead of trying to write into the source tree.
+///
+/// The absent case is the heal. A tree deleted by hand leaves a live link, and
+/// rewriting the tree where that link already points fixes the install without moving
+/// it - `install --tree <somewhere>` once, deleted by accident, must not silently come
+/// back at the default path with the chosen location abandoned.
+fn resolve_tree(dir: Option<OsString>, config: &Path) -> Result<(PathBuf, TreeFrom), String> {
+    if let Some(d) = dir {
+        return Ok((absolute(&PathBuf::from(d))?, TreeFrom::Explicit));
+    }
+    let link = config.join("skills").join(PLUGIN);
+    if let Some(t) = link_target(&link) {
+        if tree::is_generated(&t) || !t.exists() {
+            return Ok((t, TreeFrom::Link));
+        }
+    }
+    Ok((tree::default_tree()?, TreeFrom::Default))
+}
+
+/// Four writes, in the order the module header explains, with every refusal decided
+/// before the first of them.
+///
+/// It resolves its own tree rather than being handed one by `with_ctx`, because
+/// install is the command that DECIDES where the plugin directory is. Everything else
+/// discovers it.
+fn install(dir: Option<OsString>) -> Result<(), String> {
+    let config = config_dir()?;
+    let (tree, from) = resolve_tree(dir, &config)?;
+    let c = Ctx::at(tree, from)?;
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("cannot find my own path ({}), so there is nothing to copy", e))?;
+
+    let (existing, prior) = install_preflight(&c)?;
+    install_header(&c, &exe);
+    // Clear this tool's own scratch files left by a killed run, in the directories it
+    // is about to write.
+    sweep_all(&c);
     fs::create_dir_all(&c.config)
         .map_err(|e| format!("cannot create {}: {}", c.config.display(), e))?;
 
-    record_prior_state(c, existing.as_deref())?;
-    write_env_key(c, existing)?;
-    link_the_plugin(c)?;
+    // What uninstall would put the link back to, decided from the record BEFORE
+    // `record_state` consumes it: the promise `link_the_plugin` prints about a target
+    // it is replacing has to be about the record that will actually be read.
+    let promise = RecordedPrior::of(prior.as_ref());
+    let lines = tree::materialise(&c.tree, &exe, env!("CARGO_PKG_VERSION"), target_triple())
+        .map_err(|e| early_failure(&c, &e))?;
+    for line in lines {
+        say(&line);
+    }
+    record_state(&c, prior, existing.as_deref())?;
+    write_env_key(&c, existing)?;
+    link_the_plugin(&c, &promise)?;
 
     say("");
     say("Done. Nothing else on this machine was modified.");
     say("Start a NEW Claude Code session for the plugin and the env key to take effect.");
+    say(&format!("Live sessions paint through {}.", c.tree.display()));
+    if let Some(co) = plugin_dir_above(&exe) {
+        if !tree::is_generated(&co) {
+            say(&format!(
+                "The checkout at {} is wired to nothing: its hooks.json and plugin.json",
+                co.display()
+            ));
+            say("are source, and `tabstatus install` is what deploys them.");
+        }
+    }
     say("To undo: tabstatus uninstall");
     Ok(())
 }
 
 /// Every reason to refuse, and the settings document to edit if there is none.
 ///
-/// `Ok(None)` means "write settings.json fresh": either it does not exist, or it
-/// exists and holds nothing but whitespace, which Claude Code reads as no settings
-/// at all.
-fn install_preflight(c: &Ctx, force: bool, hook: &Path) -> Result<Option<Vec<u8>>, String> {
+/// ONE preflight, in front of the FIRST write, which is what lets every refusal here
+/// still end "Nothing has been changed." honestly. The old second verb wrapped these
+/// refusals AFTER it had written a tree and had to strip that sentence back off them.
+///
+/// The settings document is `None` when settings.json is to be written fresh: either
+/// it does not exist, or it exists and holds nothing but whitespace, which Claude Code
+/// reads as no settings at all. The state record comes back too, because reading it can
+/// FAIL - a record that will not parse - and that refusal belongs in front of the first
+/// write like every other one, not between the tree and settings.json.
+#[allow(clippy::type_complexity)]
+fn install_preflight(c: &Ctx) -> Result<(Option<Vec<u8>>, Option<State>), String> {
     if let Some(e) = refuse_unresolved(c) {
         return Err(e);
     }
-    for f in [".claude-plugin/plugin.json", "hooks/hooks.json"] {
-        if !c.repo.join(f).is_file() {
-            return Err(format!("{} does not look like the {} repo (missing {})", c.repo.display(), PLUGIN, f));
-        }
+    // The tree: is it ours to write, and can we write it? Writability is checked HERE
+    // because the alternative is failing mid-materialise, possibly after the marker.
+    if let Some(why) = tree::refuse_target(&c.tree, &c.skills) {
+        return Err(why);
     }
-    // The binary hooks.json invokes. Without it the install is strictly WORSE
-    // than no install: the env key switches Claude Code's own title painting off
-    // and all ten hooks then resolve to a command that exits 127, so nothing
-    // paints the tab at all. Refused rather than warned about, because the
-    // warning exited 0 and was invisible to any wrapper script.
-    if !hook.is_file() && !force {
-        return Err(format!(
-            "{} is missing, so none of the ten hooks could run - and installing \
-             anyway would set env.{}, which switches Claude Code's OWN title \
-             painting off. That leaves a tab nothing paints at all, so this is \
-             refused rather than warned about. Nothing has been changed.\n\
-             \n\
-             Build it:   sh scripts/build.sh\n\
-             Or install anyway, if you are about to build it: tabstatus install --force",
-            hook.display(),
-            KEY
-        ));
+    if let Some(d) = nearest_existing(&c.tree) {
+        if !d.is_dir() {
+            return Err(format!(
+                "{} is not a directory, and the plugin tree goes under it. Nothing has \
+                 been changed.",
+                d.display()
+            ));
+        }
+        if !dir_writable(&d) {
+            return Err(format!(
+                "{} is not writable, and the plugin tree goes {}. Nothing has been \
+                 changed.",
+                d.display(),
+                if d == c.tree { "in it" } else { "under it" }
+            ));
+        }
     }
     match link_state(&c.link) {
         LinkState::Dir => return Err(refuse_link(&c.link, "a real directory, not a symlink")),
         LinkState::Other => return Err(refuse_link(&c.link, "not a symlink")),
         _ => {}
     }
-    // `<config>/skills` itself, which step 3 has to create or write into. Checked
-    // HERE because step 3 runs after settings.json has already been edited: a
-    // refusal there would leave the env key set with no plugin to honour it,
-    // which is the one half-state this ordering exists to prevent.
+    // `<config>/skills` itself, which the last step has to create or write into.
+    // Checked HERE because that step runs after settings.json has already been
+    // edited: a refusal there would leave the env key set with no plugin to honour
+    // it, which is the one half-state this ordering exists to prevent.
     if c.skills.exists() {
         if !c.skills.is_dir() {
             return Err(refuse_link(&c.skills, "not a directory"));
@@ -912,62 +1127,147 @@ fn install_preflight(c: &Ctx, force: bool, hook: &Path) -> Result<Option<Vec<u8>
     } else {
         None
     };
-    Ok(existing)
+    Ok((existing, read_state(c)?))
 }
 
-/// What is about to be touched, before anything is.
-fn install_header(c: &Ctx, hook: &Path) {
-    say(&format!("repo:     {}", c.repo.display()));
+/// The deepest ancestor of `p` - `p` itself included - that exists, so the
+/// writability probe asks about a directory that is actually there. `None` only if
+/// nothing up to the root does, which on a Unix filesystem does not happen.
+fn nearest_existing(p: &Path) -> Option<PathBuf> {
+    let mut d = Some(p.to_path_buf());
+    while let Some(cur) = d {
+        if cur.exists() {
+            return Some(cur);
+        }
+        d = cur.parent().map(|x| x.to_path_buf());
+    }
+    None
+}
+
+/// What is about to be touched, before anything is - including, LOUDLY, a link that
+/// currently points somewhere else.
+fn install_header(c: &Ctx, exe: &Path) {
+    say(&format!("tree:     {} ({})", c.tree.display(), c.tree_from.why()));
     say(&format!("config:   {}", c.config.display()));
+    say(&format!("binary:   {} (copied into the tree)", exe.display()));
     if let Some(l) = &c.settings_link {
         say(&format!("settings: following the symlink {} -> {}", l.display(), c.settings.display()));
     }
-    if hook.is_file() {
-        say(&format!("binary:   {}", hook.display()));
-    } else {
-        // Only reachable with --force, which the preflight demands.
-        say(&format!(
-            "binary:   WARNING - {} is missing, so NOTHING will paint until you \
-             build it.\n          Installing anyway because --force was given.\n\
-                       Build it: sh scripts/build.sh",
-            hook.display()
-        ));
+    // The checkout above the running binary is the one place the two copies of a
+    // manifest can disagree, and this is the write path that turns the embedded bytes
+    // into LIVE WIRING. `doctor` WARNs about exactly this drift; staying silent here -
+    // at the moment a stale build's copy becomes the hooks a session runs - would
+    // leave the guard's last doorway open.
+    if let Some(d) = plugin_dir_above(exe) {
+        if !tree::is_generated(&d) {
+            say(&format!("source:   {} (the checkout this binary came out of)", d.display()));
+            warn_checkout_drift(&d);
+        }
     }
+    repoint_warning(c);
     say("");
 }
 
-/// Step 1: what was here before we touched it, written once and never rewritten -
-/// a second install must not record the state the FIRST one left.
-fn record_prior_state(c: &Ctx, existing: Option<&[u8]>) -> Result<(), String> {
-    if c.state.exists() {
-        say(&format!("state:    {} exists - keeping the original record", c.state.display()));
-    } else {
-        let (link_had, link_target) = match link_state(&c.link) {
-            LinkState::Link(t, _) => (true, Some(t.as_os_str().as_bytes().to_vec())),
-            _ => (false, None),
-        };
-        let env_raw = match existing {
-            Some(doc) => settings::env_raw_text(doc, KEY)?,
-            None => None,
-        };
-        let env_object_had = match existing {
-            Some(doc) => settings::has_env_object(doc)?,
-            None => false,
-        };
-        let s = State {
-            env_had: env_raw.is_some(),
-            env_raw,
-            env_object_had,
-            link_had,
-            link_target,
-        };
-        write_atomic(&c.state, &state_text(c, &s), 0o600)?;
-        say(&format!("state:    recorded the prior state in {}", c.state.display()));
+/// The migration, said out loud BEFORE anything is written.
+///
+/// The live wiring on this machine right now is a link to a CHECKOUT. Repointing it is
+/// the whole point of the change, and a silent repoint of live wiring is the wrong
+/// behaviour whatever the change is for: the operator has to be able to see, before
+/// the first write, that a directory they have been editing stops being the plugin.
+fn repoint_warning(c: &Ctx) {
+    let LinkState::Link(t, _) = link_state(&c.link) else { return };
+    if t == c.tree {
+        return;
+    }
+    say(&format!("plugin:   {}", c.link.display()));
+    say(&format!(
+        "          now  -> {}{}",
+        t.display(),
+        if is_checkout(&t) { " (a checkout, not a generated tree)" } else { "" }
+    ));
+    say(&format!("          will -> {}", c.tree.display()));
+    if is_checkout(&t) {
+        say("          That checkout stops being the live plugin. Its hooks.json and");
+        say("          plugin.json are SOURCE from now on; `tabstatus install` is what");
+        say("          deploys them. Nothing in it is modified.");
+    }
+}
+
+/// A plugin directory that is not one of ours: it holds a `plugin.json`, so Claude
+/// Code would load it, but carries no marker. Before this change that WAS the install,
+/// which is why it is named rather than lumped in with "somewhere else".
+fn is_checkout(p: &Path) -> bool {
+    p.join(embedded::PLUGIN_JSON_PATH).is_file() && !tree::is_generated(p)
+}
+
+/// The state record: the write-once half, and the half every install rewrites.
+///
+/// A v2 record is upgraded IN PLACE rather than replaced, because its first half -
+/// what settings.json and the symlink looked like before any of this - is unrecoverable
+/// once it is lost, and it is the only thing `uninstall` has to go on.
+fn record_state(c: &Ctx, prior: Option<State>, existing: Option<&[u8]>) -> Result<(), String> {
+    match prior {
+        Some(prior) => {
+            // The prior half, re-emitted verbatim, with this install's tree beside it.
+            let text = state_text(c, &prior);
+            let same = fs::read(&c.state).map(|b| b == text).unwrap_or(false);
+            if same {
+                say(&format!("state:    {} exists - keeping the original record", c.state.display()));
+            } else {
+                let was = state_version_on_disk(c);
+                write_atomic(&c.state, &text, 0o600)?;
+                match was {
+                    Some(v) if v != STATE_VERSION.to_string().as_bytes() => say(&format!(
+                        "state:    upgraded the record to state_version {} to note the \
+                         generated tree",
+                        STATE_VERSION
+                    )),
+                    _ => say(&format!(
+                        "state:    kept the prior state in {} and noted the tree it owns",
+                        c.state.display()
+                    )),
+                }
+            }
+        }
+        None => {
+            let (link_had, link_target) = match link_state(&c.link) {
+                LinkState::Link(t, _) => (true, Some(t.as_os_str().as_bytes().to_vec())),
+                _ => (false, None),
+            };
+            let env_raw = match existing {
+                Some(doc) => settings::env_raw_text(doc, KEY)?,
+                None => None,
+            };
+            let env_object_had = match existing {
+                Some(doc) => settings::has_env_object(doc)?,
+                None => false,
+            };
+            let s = State {
+                env_had: env_raw.is_some(),
+                env_raw,
+                env_object_had,
+                link_had,
+                link_target,
+            };
+            write_atomic(&c.state, &state_text(c, &s), 0o600)?;
+            say(&format!("state:    recorded the prior state in {}", c.state.display()));
+        }
     }
     Ok(())
 }
 
-/// Step 2: the one key, spliced into the document we parsed in the preflight.
+/// Which version the record on disk claims, as its source text, so an upgrade can say
+/// it is one. Numbers are kept verbatim by this parser, so comparing the text is
+/// exactly comparing the value and needs no integer accessor.
+fn state_version_on_disk(c: &Ctx) -> Option<Vec<u8>> {
+    let raw = fs::read(&c.state).ok()?;
+    match json::parse(&raw).ok()?.as_obj()?.get("state_version")?.val {
+        json::J::Num(ref n) => Some(n.clone()),
+        _ => None,
+    }
+}
+
+/// The one key, spliced into the document we parsed in the preflight.
 fn write_env_key(c: &Ctx, existing: Option<Vec<u8>>) -> Result<(), String> {
     match existing {
         None => {
@@ -1017,39 +1317,127 @@ fn write_env_key(c: &Ctx, existing: Option<Vec<u8>>) -> Result<(), String> {
     Ok(())
 }
 
-/// Step 3: the skills symlink. Everything here is preflighted, so a failure is a
-/// surprise - a race, a full disk - and it has to say what state it leaves,
-/// because settings.json has already been written by the time it runs.
-fn link_the_plugin(c: &Ctx) -> Result<(), String> {
+/// The LAST step, and the only irreversible one: it is the one write that changes what
+/// code a running session executes, so an abort at any earlier point is a complete
+/// no-op for a first-time user - the tree is inert until this link points at it, and
+/// settings.json is recoverable from its backup and the record.
+///
+/// It comes after `verify` inside the tree write, because that is what proves the new
+/// target works, and after settings.json, because "env key set + plugin gone" is the
+/// one combination that paints no title at all.
+///
+/// And it is ATOMIC. `remove_file` then `symlink` leaves a window where the path does
+/// not resolve at all, and a hook firing in that window execs a missing file: 127 per
+/// event, and a non-zero PreToolUse hook BLOCKS A TOOL. `rename(2)` over a symlink
+/// means the name resolves to the old target or the new one and never to nothing, so
+/// the transition itself has no window.
+/// What `uninstall` would do with the plugin link, which is NOT "put back whatever
+/// this install replaced".
+///
+/// The record's first half is write-once on purpose - a second install must not record
+/// the state the first one left - so from the second install onwards the target being
+/// replaced here and the target uninstall reads are different paths. The old wording
+/// promised "uninstall puts the old target back" in exactly the case it is printed for:
+/// live wiring being repointed.
+enum RecordedPrior {
+    /// THIS install writes the record, so the target it replaces IS the one uninstall
+    /// will put back.
+    ThisRun,
+    /// A record already existed. Its write-once half names this, and nothing here can
+    /// change it.
+    Earlier(Option<PathBuf>),
+}
+
+impl RecordedPrior {
+    fn of(prior: Option<&State>) -> RecordedPrior {
+        match prior {
+            None => RecordedPrior::ThisRun,
+            Some(s) => RecordedPrior::Earlier(
+                s.link_target
+                    .clone()
+                    .filter(|_| s.link_had)
+                    .filter(|b| !b.is_empty())
+                    .map(|b| PathBuf::from(OsString::from_vec(b))),
+            ),
+        }
+    }
+}
+
+fn link_the_plugin(c: &Ctx, promise: &RecordedPrior) -> Result<(), String> {
     fs::create_dir_all(&c.skills).map_err(|e| late_failure(c, &format!("cannot create {}: {}", c.skills.display(), e)))?;
     match link_state(&c.link) {
         LinkState::Absent => {
-            symlink(&c.repo, &c.link).map_err(|e| late_failure(c, &e))?;
+            symlink(&c.tree, &c.link).map_err(|e| late_failure(c, &e))?;
             say("symlink:  created");
-            say(&format!("          {} -> {}", c.link.display(), c.repo.display()));
+            say(&format!("          {} -> {}", c.link.display(), c.tree.display()));
         }
-        LinkState::Link(t, resolves) if t == c.repo => {
+        LinkState::Link(t, resolves) if t == c.tree => {
             if resolves {
                 say("symlink:  already correct");
-                say(&format!("          {} -> {}", c.link.display(), c.repo.display()));
+                say(&format!("          {} -> {}", c.link.display(), c.tree.display()));
             } else {
+                swap_symlink(&c.tree, &c.link).map_err(|e| late_failure(c, &e))?;
                 say("symlink:  points here but does not resolve - recreated");
-                say(&format!("          {} -> {}", c.link.display(), c.repo.display()));
+                say(&format!("          {} -> {}", c.link.display(), c.tree.display()));
             }
         }
         LinkState::Link(t, resolves) => {
-            fs::remove_file(&c.link)
-                .map_err(|e| late_failure(c, &format!("cannot replace {}: {}", c.link.display(), e)))?;
-            symlink(&c.repo, &c.link).map_err(|e| late_failure(c, &e))?;
-            say(if resolves {
+            let was_checkout = is_checkout(&t);
+            // A fourth case, and the one the old wording got wrong: the previous target
+            // is a tree WE generated. `install --tree <somewhere else>` is the only way
+            // to reach it, and calling that "a symlink this installer did not create"
+            // was simply false.
+            let was_ours = tree::is_generated(&t);
+            swap_symlink(&c.tree, &c.link).map_err(|e| late_failure(c, &e))?;
+            say(if was_checkout {
+                "symlink:  REPOINTED from the checkout to the generated tree"
+            } else if was_ours {
+                "symlink:  MOVED the plugin to a different generated tree"
+            } else if resolves {
                 "symlink:  WARNING - repointed a symlink this installer did not create"
             } else {
                 "symlink:  WARNING - replaced a BROKEN symlink this installer did not create"
             });
             say(&format!("          {}", c.link.display()));
             say(&format!("          was  {}", t.display()));
-            say(&format!("          now  {}", c.repo.display()));
-            say("          uninstall puts the old target back.");
+            say(&format!("          now  {}", c.tree.display()));
+            if was_checkout {
+                say("          that checkout is source now, and is not modified.");
+            } else if was_ours {
+                say(&format!(
+                    "          {} is left behind and is now an orphan - remove it with",
+                    t.display()
+                ));
+                say(&format!("          `rm -rf {}`", t.display()));
+            } else {
+                match promise {
+                    RecordedPrior::ThisRun => say("          uninstall puts the old target back."),
+                    // is_checkout first: uninstall declines to restore a checkout at
+                    // all, so naming the path without that would be a second wrong
+                    // promise in the same line.
+                    RecordedPrior::Earlier(Some(p)) if is_checkout(p) => {
+                        say("          uninstall will NOT put this target back: the record is");
+                        say(&format!(
+                            "          write-once and names the checkout {}, which is no",
+                            p.display()
+                        ));
+                        say("          longer a plugin directory, so it removes the link instead.");
+                    }
+                    RecordedPrior::Earlier(Some(p)) => {
+                        say("          uninstall will NOT put this target back: the record is");
+                        say(&format!(
+                            "          write-once, so it restores {} - what the",
+                            p.display()
+                        ));
+                        say("          FIRST install found here.");
+                    }
+                    RecordedPrior::Earlier(None) => {
+                        say("          uninstall will NOT put this target back: the record is");
+                        say("          write-once and says there was no link here before, so it");
+                        say("          removes the link instead.");
+                    }
+                }
+            }
         }
         LinkState::Dir => return Err(refuse_link(&c.link, "a real directory, not a symlink")),
         LinkState::Other => return Err(refuse_link(&c.link, "not a symlink")),
@@ -1057,9 +1445,49 @@ fn link_the_plugin(c: &Ctx) -> Result<(), String> {
     Ok(())
 }
 
+/// Repoint a symlink with no window in which it resolves to nothing: a new link at a
+/// pid-named temp name in the same directory, then `rename(2)` onto the live name.
+///
+/// The single most important call in this module. Everything else here can be retried;
+/// a hook that execs a missing `bin/tabstatus` cannot be un-run.
+fn swap_symlink(target: &Path, link: &Path) -> Result<(), String> {
+    let tmp = tree::scratch_beside(link);
+    let _ = fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(target, &tmp)
+        .map_err(|e| format!("cannot create the symlink {}: {}", tmp.display(), e))?;
+    fs::rename(&tmp, link).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("cannot move the symlink into place at {}: {}", link.display(), e)
+    })
+}
+
 fn symlink(target: &Path, link: &Path) -> Result<(), String> {
     std::os::unix::fs::symlink(target, link)
         .map_err(|e| format!("cannot create the symlink {}: {}", link.display(), e))
+}
+
+/// A failure inside `materialise`, which is the FIRST write - and it lands directly
+/// after a header that may have just announced, in three loud lines, that the live
+/// plugin link "will ->" the new tree. The bare OS error alone leaves the one question
+/// that matters unanswered: did the link move?
+///
+/// It did not. Nothing outside the tree is touched before this point, so this says so
+/// by name rather than leaving it to be inferred.
+fn early_failure(c: &Ctx, what: &str) -> String {
+    format!(
+        "{}\n\
+         \n\
+         The plugin symlink {} was NOT touched, and neither were settings.json or the \
+         state record at {} - so live sessions still paint through whatever the header \
+         above printed as `now`, and nothing has become live wiring.\n\
+         Part of {} may have been written. It carries {}, so a re-run resumes into it \
+         rather than refusing.",
+        what,
+        c.link.display(),
+        c.state.display(),
+        c.tree.display(),
+        tree::MARKER
+    )
 }
 
 /// A failure AFTER settings.json has been written. Everything reachable here is
@@ -1081,133 +1509,31 @@ fn late_failure(c: &Ctx, what: &str) -> String {
     )
 }
 
-// --- standalone -------------------------------------------------------------
-
-/// Which shape the plugin directory is, and therefore which of the two copies of a
-/// manifest is the truth.
-#[derive(PartialEq)]
-enum Mode {
-    /// A checkout: the FILE is the truth and a disagreeing binary is the stale
-    /// thing, so the remedy is a rebuild.
-    Checkout,
-    /// A tree `standalone` generated: the BINARY is the truth and a disagreeing
-    /// file is the stale thing, so the remedy is another `standalone`.
-    Standalone,
-}
-
-/// Materialise a self-contained plugin tree, prove the copy runs, then install it.
-///
-/// Nothing about `install` changes: it still requires both manifests on disk and
-/// still refuses without them, so this verb is the only thing in the binary that
-/// can turn the embedded bytes into files - and it can only do it in a directory
-/// that is absent, empty, or already carries our marker.
-fn standalone_cmd(dir: Option<OsString>) -> Result<(), String> {
-    let exe = std::env::current_exe()
-        .map_err(|e| format!("cannot find my own path ({}), so there is nothing to copy", e))?;
-    let config = config_dir()?;
-    let skills = config.join("skills");
-    let tree = match dir {
-        Some(d) if d.is_empty() => return Err("the directory to materialise into is empty".into()),
-        Some(d) => PathBuf::from(d),
-        None => standalone::default_tree()?,
-    };
-    if let Some(why) = standalone::refuse_target(&tree, &skills) {
-        return Err(why);
-    }
-    let above = plugin_dir_above(&exe);
-    say(&format!("mode:     standalone - {}", standalone_mode_line(above.as_deref(), &tree)));
-    // A checkout above us is the one place the two copies of a manifest can
-    // disagree, and this is the one write path that turns the embedded bytes into
-    // LIVE WIRING. `doctor` WARNs about exactly this drift in exactly this checkout;
-    // staying silent here - at the moment a stale prebuilt binary's copy becomes the
-    // hooks a session will run - was the last doorway the guard left open.
-    if let Some(d) = above.as_deref() {
-        if !standalone::is_generated(d) {
-            warn_checkout_drift(d);
-        }
-    }
-    for line in standalone::materialise(&tree, &exe, env!("CARGO_PKG_VERSION"), target_triple())? {
-        say(&line);
-    }
-    // Before the install, not after: a tree whose binary cannot exec would set the
-    // env key and leave a tab nothing paints, which is the half-state the whole
-    // write ordering exists to prevent.
-    say(&format!("verify:   {}", standalone::verify(&tree, env!("CARGO_PKG_VERSION"))?));
-    say("");
-    // The tree EXISTS by now, so install's refusals cannot be passed through as
-    // they stand: they are worded for the install-only path, where nothing had been
-    // written yet, and "Nothing has been changed." as the last line after five lines
-    // reporting a complete tree contradicts itself - and it is the last line the
-    // operator reads. Leaving the tree is right: it is inert, and a re-run reuses
-    // it. Saying so is the part that was missing.
-    Ctx::at(tree.clone()).and_then(|c| install(&c, false)).map_err(|e| {
-        format!(
-            "the tree at {} was written and verified, but the install did not happen: \
-             {}\nFix that and re-run `tabstatus standalone`, or remove the tree.",
-            tree.display(),
-            without_nothing_changed(&e)
-        )
-    })
-}
-
-/// Which directory this run is writing, in terms of what is above the running
-/// binary - and never calling a generated tree a checkout, which is the one
-/// distinction this verb exists to keep straight. Refreshing the tree you are
-/// running from is a normal thing to do, and it is not "a SEPARATE tree".
-fn standalone_mode_line(above: Option<&Path>, tree: &Path) -> String {
-    let Some(d) = above else {
-        return "no checkout above the running binary, so the tree is written from \
-                the copies compiled in"
-            .to_string();
-    };
-    if !standalone::is_generated(d) {
-        return format!(
-            "running from the checkout at {}, materialising a SEPARATE tree (that \
-             checkout is not touched)",
-            d.display()
-        );
-    }
-    let same = fs::canonicalize(d)
-        .ok()
-        .zip(fs::canonicalize(tree).ok())
-        .map(|(a, b)| a == b)
-        .unwrap_or(false);
-    if same {
-        format!("refreshing the generated tree this binary is running from, at {}", d.display())
-    } else {
-        format!(
-            "running from the generated tree at {}, materialising a SEPARATE tree \
-             (that tree is not touched)",
-            d.display()
-        )
-    }
-}
+// --- the checkout above the running binary ----------------------------------
 
 /// The copies compiled in, against the checkout the running binary came out of.
+///
 /// Only ever a WARN: the bytes that are about to land in the tree are the embedded
-/// ones either way, and which of the two the operator MEANT is not ours to decide.
+/// ones either way, and which of the two the operator MEANT is not ours to decide. A
+/// mid-edit working tree is a normal state, so this must never fail an install.
+///
+/// It is the one thing the deleted `Mode::Checkout` report was ever right about,
+/// moved to where it is actionable: an edited `hooks.json` that has not been rebuilt
+/// means THIS binary would deploy the OLD copy.
 fn warn_checkout_drift(repo: &Path) {
     for (rel, text) in embedded::MANIFESTS {
         if let Verdict::Differs { on_disk, embedded: emb } = embedded::compare(repo, rel, text) {
             say(&format!(
-                "          WARN {} in that checkout differs from the copy compiled in ({})",
+                "          WARN {} there differs from the copy compiled in ({})",
                 rel,
                 embedded::differs_phrase(on_disk, emb)
             ));
             say(
                 "          the tree carries the COMPILED-IN copy; rebuild with \
-                 `sh scripts/build.sh` first if you meant to ship that edit",
+                 `sh scripts/build.sh` first if you meant to deploy that edit",
             );
         }
     }
-}
-
-/// Install's refusals end "Nothing has been changed.", which is true when install is
-/// the whole command and false once `standalone` has written a tree. Dropped rather
-/// than contradicted.
-fn without_nothing_changed(e: &str) -> &str {
-    let t = e.trim_end();
-    t.strip_suffix("Nothing has been changed.").unwrap_or(t).trim_end()
 }
 
 /// The embedded bytes, verbatim, so `tests/run.sh` can diff them against the files
@@ -1248,10 +1574,10 @@ struct Prior {
     state: Option<State>,
 }
 
-/// The mirror of install: settings first and the link last. See the module header
-/// for why that order is the sharper of the two.
-fn uninstall(c: &Ctx, force: bool, restore_backup: bool, purge_tree: bool) -> Result<(), String> {
-    let prior = match uninstall_preflight(c, force, restore_backup, purge_tree)? {
+/// The mirror of install: settings first, the link next, the tree last. See the module
+/// header for why that order is the sharper of the two.
+fn uninstall(c: &Ctx, force: bool, restore_backup: bool, keep_tree: bool) -> Result<(), String> {
+    let prior = match uninstall_preflight(c, force, restore_backup)? {
         Preflight::Go(prior) => prior,
         Preflight::Refused => return Ok(()),
     };
@@ -1272,7 +1598,7 @@ fn uninstall(c: &Ctx, force: bool, restore_backup: bool, purge_tree: bool) -> Re
     // LAST, because it holds the binary this process is running. Unlinking a
     // running executable is fine on Linux; unlinking it before the writes above
     // would leave the hooks pointing at nothing if one of them failed.
-    let purged = remove_tree(c, purge_tree)?;
+    remove_tree(c, keep_tree)?;
 
     say("");
     say("Done. Start a NEW Claude Code session for the change to take effect.");
@@ -1284,59 +1610,92 @@ fn uninstall(c: &Ctx, force: bool, restore_backup: bool, purge_tree: bool) -> Re
             ));
         }
     }
-    // Mode-specific, as remove_tree's own line already is: a generated tree is not
-    // "the repo", and the `tree:` line above has already named it and said it was
-    // kept. A repo path that is not there at all - a tree removed by hand, which
-    // these commands can now still run on - gets no line either.
-    if !purged && c.mode() == Mode::Checkout && c.repo.is_dir() {
-        say(&format!("The repo itself at {} was not touched.", c.repo.display()));
+    Ok(())
+}
+
+/// The plugin tree, removed BY DEFAULT now - nothing else owns it, so leaving it
+/// behind leaves a whole plugin directory in `~/.local/share` that nothing will ever
+/// mention again.
+///
+/// Conservative, though, and the two rules are what make removing it by default
+/// defensible. Only a directory carrying our marker is touched at all: a link that
+/// still points at a CHECKOUT - which is the pre-change wiring, and the state an
+/// uninstall run before the migration sees - is named and left alone, because that is
+/// somebody's source. And within a tree we do own, only the files the marker lists,
+/// plus the directories those leave empty. Anything else is NAMED and left; there is
+/// no `remove_dir_all` here on a path derived from a symlink.
+fn remove_tree(c: &Ctx, keep: bool) -> Result<(), String> {
+    if !tree::is_generated(&c.tree) {
+        if c.tree.is_dir() {
+            say(&format!(
+                "tree:     {} carries no {}, so it was not written by `tabstatus \
+                 install` and is left alone",
+                c.tree.display(),
+                tree::MARKER
+            ));
+            if is_checkout(&c.tree) {
+                say("          (it is a checkout - the wiring from before the plugin tree \
+                     existed)");
+            }
+        }
+        return Ok(());
+    }
+    if keep {
+        say(&format!(
+            "tree:     {} was kept (--keep-tree). Remove it with `rm -rf {}`.",
+            c.tree.display(),
+            c.tree.display()
+        ));
+        return Ok(());
+    }
+    // Collected BEFORE the removal: once the live tree is gone it is itself a
+    // candidate, and naming the directory we just emptied as an orphan would be a lie.
+    let orphans = orphan_trees(c);
+    let r = tree::remove(&c.tree)?;
+    if r.dir_gone {
+        say(&format!(
+            "tree:     removed the plugin tree {} ({} generated file{})",
+            c.tree.display(),
+            r.removed,
+            if r.removed == 1 { "" } else { "s" }
+        ));
+    } else {
+        say(&format!(
+            "tree:     removed {} generated file{} from {}{}",
+            r.removed,
+            if r.removed == 1 { "" } else { "s" },
+            c.tree.display(),
+            describe_extra(&r.left)
+        ));
+        // The brief's rule is that uninstall names anything it leaves behind, and a
+        // directory is a thing it leaves behind. This arm IS the survival arm, so it
+        // must never be the one that says "empty": there is a directory there, and the
+        // honest instruction for somebody who wants it gone is `rm -rf`.
+        if r.left.is_empty() {
+            say("          the directory itself survived - it holds no file this report can");
+            say(&format!("          name, only empty directories. Remove it with `rm -rf {}`", c.tree.display()));
+        }
+    }
+    // Paths the marker listed that were NOT taken, because they could not be proved to
+    // be inside the tree. Loud: a marker is trivially forgeable by anything that can
+    // write the tree, so this is where a tampered one shows up.
+    for why in &r.blocked {
+        say(&format!("tree:     LEFT a file the marker listed - {}", why));
+    }
+    for o in orphans {
+        say(&format!(
+            "tree:     {} is another generated tree and was NOT the live one, so it is \
+             left behind. Remove it with `rm -rf {}`.",
+            o.display(),
+            o.display()
+        ));
     }
     Ok(())
 }
 
-/// The generated tree, which is the one thing an uninstall can be asked to remove
-/// and by default does not.
-///
-/// A checkout is never removable here whatever flags are given - that is the
-/// user's source - and a tree without our marker is not ours either. The default
-/// NAMES the tree rather than staying silent, because the report ends "Done." and
-/// a whole plugin directory left in `~/.local/share` is not something to find by
-/// accident.
-fn remove_tree(c: &Ctx, purge: bool) -> Result<bool, String> {
-    let generated = c.mode() == Mode::Standalone;
-    if !purge {
-        if generated {
-            say(&format!(
-                "tree:     {} was NOT removed (it holds the binary). Remove it with \
-                 `tabstatus uninstall --purge-tree`.",
-                c.repo.display()
-            ));
-        }
-        return Ok(false);
-    }
-    // What goes with it that we never wrote. `standalone` is scrupulous - prune only
-    // ever touches the marker's list - so a few refresh runs teach the operator by
-    // behaviour that their own files are safe in that directory. remove_dir_all takes
-    // them anyway. Refusing would be over-cautious for a flag with `purge` in its
-    // name; taking them SILENTLY is the part that is wrong.
-    let known = match standalone::read_marker(&c.repo) {
-        Some(Ok(m)) => m.files,
-        _ => Vec::new(),
-    };
-    let extra = standalone::extra_files(&c.repo, &known);
-    fs::remove_dir_all(&c.repo)
-        .map_err(|e| format!("cannot remove {}: {}", c.repo.display(), e))?;
-    say(&format!(
-        "tree:     removed the generated tree {}{}",
-        c.repo.display(),
-        describe_extra(&extra)
-    ));
-    Ok(true)
-}
-
-/// The parenthesis `--purge-tree` adds when the tree held files nothing generated.
-/// A few names, then a count: the point is that the operator can see what they lost,
-/// not that the report reproduces a `find`.
+/// The parenthesis naming what removal LEFT BEHIND. A few names, then a count: the
+/// point is that the operator can see what is still there and why the directory
+/// survived, not that the report reproduces a `find`.
 fn describe_extra(extra: &[String]) -> String {
     if extra.is_empty() {
         return String::new();
@@ -1345,7 +1704,7 @@ fn describe_extra(extra: &[String]) -> String {
     let named: Vec<&str> = extra.iter().take(SHOW).map(String::as_str).collect();
     let more = extra.len() - named.len();
     format!(
-        " ({} file{} it did not generate went with it: {}{})",
+        ", which was left in place because it holds {} file{} nothing here generated: {}{}",
         extra.len(),
         if extra.len() == 1 { "" } else { "s" },
         named.join(", "),
@@ -1363,25 +1722,9 @@ enum Preflight {
 }
 
 /// Every refusal, decided before anything is removed.
-fn uninstall_preflight(
-    c: &Ctx,
-    force: bool,
-    restore_backup: bool,
-    purge_tree: bool,
-) -> Result<Preflight, String> {
+fn uninstall_preflight(c: &Ctx, force: bool, restore_backup: bool) -> Result<Preflight, String> {
     if let Some(e) = refuse_unresolved(c) {
         return Err(e);
-    }
-    // Decided HERE, before anything is removed: `--purge-tree` against a checkout
-    // must not first undo the install and then refuse.
-    if purge_tree && c.mode() != Mode::Standalone {
-        return Err(format!(
-            "--purge-tree only removes a tree `tabstatus standalone` generated, and \
-             {} carries no {} - it is a checkout, so its files are yours, not this \
-             uninstaller's. Re-run without --purge-tree. Nothing has been changed.",
-            c.repo.display(),
-            standalone::MARKER
-        ));
     }
     match link_state(&c.link) {
         LinkState::Dir => return Err(refuse_link(&c.link, "a real directory, not a symlink")),
@@ -1484,11 +1827,22 @@ fn remove_env_key(c: &Ctx, prior: &Prior, force: bool, restore_backup: bool) -> 
         } else {
             let want = state.as_ref().and_then(|s| if s.env_had { s.env_raw.clone() } else { None });
             let env_was_there = state.as_ref().map(|s| s.env_object_had).unwrap_or(false);
+            // Whatever value is about to be LEFT in place. When the record says the
+            // key was the user's own, uninstall correctly keeps it - and it is about to
+            // unlink the plugin, so this is `late_failure`'s "a tab nothing paints"
+            // reached by being scrupulous instead of by failing. It was reported as a
+            // neutral "unchanged".
+            let kept_on = want.as_deref().map(reads_as_on).unwrap_or(false);
             match settings::restore_env_key(&doc, KEY, want.as_deref(), env_was_there)? {
-                Outcome::Unchanged => say(&format!(
-                    "settings: env.{} already holds the value install found - unchanged",
-                    KEY
-                )),
+                Outcome::Unchanged => {
+                    say(&format!(
+                        "settings: env.{} already holds the value install found - unchanged",
+                        KEY
+                    ));
+                    if kept_on {
+                        warn_key_stays_on(c);
+                    }
+                }
                 Outcome::Changed { text, .. } => {
                     let mode = mode_of(&c.settings).unwrap_or(0o600);
                     fs::copy(&c.settings, &c.safety)
@@ -1496,11 +1850,16 @@ fn remove_env_key(c: &Ctx, prior: &Prior, force: bool, restore_backup: bool) -> 
                     say(&format!("settings: backed up to {}", c.safety.display()));
                     write_atomic(&c.settings, &text, mode)?;
                     match &want {
-                        Some(raw) => say(&format!(
-                            "settings: restored env.{} = {} (the value install found here)",
-                            KEY,
-                            String::from_utf8_lossy(raw)
-                        )),
+                        Some(raw) => {
+                            say(&format!(
+                                "settings: restored env.{} = {} (the value install found here)",
+                                KEY,
+                                String::from_utf8_lossy(raw)
+                            ));
+                            if kept_on {
+                                warn_key_stays_on(c);
+                            }
+                        }
                         None => {
                             say(&format!("settings: removed env.{}", KEY));
                             let after = read_file(&c.settings)?;
@@ -1523,11 +1882,40 @@ fn remove_env_key(c: &Ctx, prior: &Prior, force: bool, restore_backup: bool) -> 
     Ok(())
 }
 
-/// Step 2, AFTER settings.json: the mirror image of install's ordering and for the
-/// same reason. The env key switches Claude Code's own title painting off and the
-/// plugin paints the replacement, so the moment where only one of the two is undone
-/// must be the moment where the KEY is already back. A failure between them then
-/// leaves a working install rather than a blank tab.
+/// Would Claude Code read this value as "do not paint the title"?
+///
+/// Deliberately generous, because the rule is Claude Code's and not ours: only the
+/// spellings that are obviously OFF count as off, and everything else gets the note.
+/// Warning once too often about a key the user set themselves is much the cheaper
+/// mistake - the other way round is a blank tab with no explanation anywhere.
+fn reads_as_on(raw: &[u8]) -> bool {
+    let s = String::from_utf8_lossy(raw);
+    !matches!(s.trim().trim_matches('"'), "" | "0" | "false" | "null")
+}
+
+/// The combination `late_failure` spells out in install, reached here by uninstall
+/// doing the right thing: the record says the key was the user's before this tool ran,
+/// so it stays - and the plugin that painted the replacement is being unlinked in the
+/// next step. Claude Code's own title painting is off and nothing paints instead.
+fn warn_key_stays_on(c: &Ctx) {
+    say("          NOTE that value switches Claude Code's OWN title painting off, and the");
+    say("          plugin that painted the replacement is unlinked below - so nothing will");
+    say(&format!("          paint the tab. It was already set when install ran, so {} keeps", PLUGIN));
+    say(&format!("          it; unset it yourself in {} if that was not deliberate.", c.settings.display()));
+}
+
+/// AFTER settings.json: the mirror image of install's ordering and for the same
+/// reason. The env key switches Claude Code's own title painting off and the plugin
+/// paints the replacement, so the moment where only one of the two is undone must be
+/// the moment where the KEY is already back. A failure between them then leaves a
+/// working install rather than a blank tab.
+///
+/// One thing it will NOT do: restore a recorded prior target that is a checkout. That
+/// is not a hypothetical - the live record on the machine this change was written for
+/// says `symlink_before.target` is the checkout, because that is what the link pointed
+/// at before the first install, and `record_prior_state` is write-once so the migration
+/// leaves it exactly as it is. Restoring it would rebuild the precise wiring this whole
+/// change exists to abolish, on an uninstall, silently. So it is declined and said.
 fn unlink_the_plugin(c: &Ctx, prior: &Prior) -> Result<(), String> {
     let state = &prior.state;
     match link_state(&c.link) {
@@ -1539,16 +1927,29 @@ fn unlink_the_plugin(c: &Ctx, prior: &Prior) -> Result<(), String> {
                     None
                 }
             });
+            let recorded = recorded
+                .filter(|old| !old.is_empty())
+                .map(|old| PathBuf::from(OsString::from_vec(old)));
+            let refuse_restore = recorded.as_deref().filter(|p| is_checkout(p)).map(Path::to_path_buf);
             fs::remove_file(&c.link)
                 .map_err(|e| format!("cannot remove {}: {}", c.link.display(), e))?;
-            match recorded {
-                Some(old) if !old.is_empty() => {
-                    let old = PathBuf::from(OsString::from_vec(old));
+            match (refuse_restore, recorded) {
+                (Some(co), _) => {
+                    say(&format!("symlink:  removed {}", c.link.display()));
+                    say(&format!("          (was -> {})", t.display()));
+                    say(&format!(
+                        "          the recorded prior target was the checkout at {};",
+                        co.display()
+                    ));
+                    say("          a checkout is no longer a plugin directory, so the link is");
+                    say("          removed rather than pointed back at it.");
+                }
+                (None, Some(old)) => {
                     symlink(&old, &c.link)?;
                     say("symlink:  put back the target install found here");
                     say(&format!("          {} -> {}", c.link.display(), old.display()));
                 }
-                _ => {
+                (None, None) => {
                     say(&format!("symlink:  removed {}", c.link.display()));
                     say(&format!("          (was -> {})", t.display()));
                 }
@@ -1605,10 +2006,10 @@ fn remove_records() {
 /// config has to be able to run on the config that is broken.
 fn doctor(c: &Ctx) -> Result<(), String> {
     say(&format!("tabstatus {} ({})", env!("CARGO_PKG_VERSION"), target_triple()));
-    say(&format!("repo:      {}", c.repo.display()));
-    report_mode(c);
+    report_tree(c);
     say(&format!("config:    {}", c.config.display()));
     report_binary(c);
+    report_source();
     report_plugin(c);
     report_embedded(c);
     report_env_key(c)?;
@@ -1620,121 +2021,127 @@ fn doctor(c: &Ctx) -> Result<(), String> {
     Ok(())
 }
 
-/// Which shape the plugin directory is, where it is, and - in a generated tree -
-/// whether it still matches the binary that is running.
+/// WHERE the plugin directory is, and how that was decided.
 ///
-/// The mode has to be STATED, not left for the reader to infer, because every
-/// remedy below it differs between the two: in a checkout the file on disk is the
-/// truth and a stale binary is rebuilt, and in a generated tree the binary is the
-/// truth and a stale tree is re-materialised.
-fn report_mode(c: &Ctx) {
-    // A plugin directory that is NOT THERE gets neither mode: the mode is read off a
-    // marker inside it, and calling a path that does not exist "a checkout" is the
-    // same mis-wording this slice removed everywhere else. Reachable because
-    // `repo_root` now takes the location from the symlink install wrote, so a tree
-    // deleted by hand leaves a config these commands can still explain and clean up.
-    if !c.repo.is_dir() {
-        say(&format!(
-            "mode:      FAIL the plugin directory {} is not there, so nothing can load \
-             and neither mode can be read off it. `tabstatus uninstall` clears what is \
-             left of the install; `tabstatus standalone` writes a fresh tree.",
-            c.repo.display()
-        ));
+/// The repo is no longer the answer to "where is the plugin", and there are three
+/// places the answer can come from, so the source is STATED. It replaces a `mode:`
+/// line that existed only to say which of two shapes the directory was; there is one
+/// shape now, so what is left to report is the location and whether it is ours.
+fn report_tree(c: &Ctx) {
+    say(&format!("tree:      {} ({})", c.tree.display(), c.tree_from.why()));
+    if !c.tree.is_dir() {
+        // Both live effects, because they DIFFER and only naming both answers "what
+        // happens if I delete the tree but keep the link".
+        say("           FAIL the plugin directory is not there.");
+        say("           A session already running has its hooks registered and now execs a");
+        say("           missing file - 127 per event, and a PreToolUse 127 can block a tool.");
+        say("           A NEW session loads no plugin at all and the tab stays BLANK, with no");
+        say(&format!("           error anywhere, because env.{} is still set.", KEY));
+        say("           `tabstatus install` writes it back.");
         return;
     }
-    match c.mode() {
-        Mode::Checkout => {
+    match tree::read_marker(&c.tree) {
+        Some(Ok(m)) => {
             say(&format!(
-                "mode:      checkout - no {} above, so the manifests on disk are the \
-                 truth and the copies compiled in are a projection",
-                standalone::MARKER
+                "           generated by tabstatus {} ({})",
+                String::from_utf8_lossy(&m.version),
+                String::from_utf8_lossy(&m.target)
             ));
-        }
-        Mode::Standalone => {
-            say(&format!(
-                "mode:      standalone - {} says this tree was materialised from a \
-                 binary, so the BINARY is the truth here",
-                standalone::MARKER
-            ));
-            match standalone::read_marker(&c.repo) {
-                Some(Ok(m)) => {
-                    say(&format!(
-                        "           generated by tabstatus {} ({})",
-                        String::from_utf8_lossy(&m.version),
-                        String::from_utf8_lossy(&m.target)
-                    ));
-                    // A tree materialised by one architecture and later run by
-                    // another: the hooks would exec a binary this machine cannot.
-                    if m.target != target_triple().as_bytes() {
-                        say(&format!(
-                            "           WARN the tree was written by a {} binary and this \
-                             one is {}",
-                            String::from_utf8_lossy(&m.target),
-                            target_triple()
-                        ));
-                    }
-                }
-                Some(Err(e)) => say(&format!("           WARN {} is unreadable: {}", standalone::MARKER, e)),
-                // Unreachable: the mode IS the marker's presence.
-                None => say(&format!("           WARN {} vanished while reading it", standalone::MARKER)),
+            // A tree materialised by one architecture and later run by another: the
+            // hooks would exec a binary this machine cannot.
+            if m.target != target_triple().as_bytes() {
+                say(&format!(
+                    "           WARN the tree was written by a {} binary and this one is {}",
+                    String::from_utf8_lossy(&m.target),
+                    target_triple()
+                ));
             }
-            report_tree_binary(c);
         }
+        Some(Err(e)) => say(&format!("           WARN {} is unreadable: {}", tree::MARKER, e)),
+        None => {
+            say(&format!(
+                "           WARN it carries no {}, so `tabstatus install` did not write it",
+                tree::MARKER
+            ));
+            if is_checkout(&c.tree) {
+                say("           it is a CHECKOUT - the wiring from before the plugin directory");
+                say("           became build output. `tabstatus install` repoints this.");
+            }
+        }
+    }
+    report_orphan(c);
+}
+
+/// Marked trees that are NOT the live one. Named rather than left silent by both
+/// `doctor` and `uninstall`: a hand-repointed link, or an `install --tree <somewhere
+/// else>`, leaves a whole working plugin directory that nothing will ever mention
+/// again. The two places it can still be found are the state record and the default
+/// path.
+fn orphan_trees(c: &Ctx) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for cand in [recorded_tree(&c.config), tree::default_tree().ok()].into_iter().flatten() {
+        if cand != c.tree && !out.contains(&cand) && tree::is_generated(&cand) {
+            out.push(cand);
+        }
+    }
+    out
+}
+
+fn report_orphan(c: &Ctx) {
+    for o in orphan_trees(c) {
+        say(&format!(
+            "           NOTE {} is also a generated tree and is not the live one - an \
+             orphan",
+            o.display()
+        ));
     }
 }
 
-/// Is the tree's binary the one running? The one way to get a stale tree is to scp
-/// a newer binary straight over `<tree>/bin/tabstatus` and skip `standalone`, and
-/// this is the line that catches it.
-fn report_tree_binary(c: &Ctx) {
-    let tree_bin = c.repo.join(standalone::BIN);
-    let exe = std::env::current_exe().ok();
-    let same_path = exe
-        .as_ref()
-        .and_then(|e| fs::canonicalize(e).ok())
-        .zip(fs::canonicalize(&tree_bin).ok())
-        .map(|(a, b)| a == b)
-        .unwrap_or(false);
-    if same_path {
-        say("           tree binary: the one running this report");
+/// The checkout the RUNNING BINARY came out of, if there is one: do its manifests still
+/// match the copies compiled in?
+///
+/// A mismatch means the operator edited `hooks/hooks.json` and has not rebuilt, so
+/// THIS binary would deploy the OLD copy. WARN, never FAIL - a mid-edit working tree is
+/// a normal state. This one line is all that is left of the `Mode::Checkout` report,
+/// and it is the only part of it that was ever actionable.
+fn report_source() {
+    let Some(exe) = std::env::current_exe().ok() else { return };
+    let Some(d) = plugin_dir_above(&exe) else { return };
+    if tree::is_generated(&d) {
         return;
     }
-    let both = exe.as_ref().and_then(|e| fs::read(e).ok()).zip(fs::read(&tree_bin).ok());
-    match both {
-        Some((a, b)) if a == b => say("           tree binary: identical to the one running"),
-        Some((a, b)) => {
-            // Same size and different bytes is the LIKELY shape of this, because a
-            // version bump rarely changes the length, so "635440 vs 635440" would
-            // read as a bug in the report rather than as the answer.
+    let mut drift = false;
+    for (rel, text) in embedded::MANIFESTS {
+        if let Verdict::Differs { on_disk, embedded: emb } = embedded::compare(&d, rel, text) {
             say(&format!(
-                "           WARN tree binary DIFFERS from the one running ({})",
-                if a.len() == b.len() {
-                    format!("same {} bytes, different content", a.len())
-                } else {
-                    format!("{} in the tree vs {} running", b.len(), a.len())
-                }
+                "source:    WARN {} in the checkout at {} differs from the copy compiled",
+                rel,
+                d.display()
             ));
-            say("           refresh the tree from this binary: tabstatus standalone");
+            say(&format!(
+                "           into this binary ({}), so an install from HERE would deploy the",
+                embedded::differs_phrase(on_disk, emb)
+            ));
+            say("           older copy. Rebuild first: sh scripts/build.sh");
+            drift = true;
         }
-        None => say(&format!("           WARN cannot compare {} with the running binary", tree_bin.display())),
+    }
+    if !drift {
+        say(&format!(
+            "source:    OK   {} - both manifests match the copies compiled in",
+            d.display()
+        ));
     }
 }
 
-/// The two manifests, against the copies compiled into this binary.
+/// The two manifests in the live tree, against the copies compiled into this binary.
 ///
-/// WARN, never FAIL, in a checkout: a mid-edit `hooks/hooks.json` is a normal
-/// working-tree state and the one command people run daily must not cry wolf over
-/// it. In a generated tree it is still WARN, but the remedy is the opposite one.
+/// ONE remedy now, where there used to be two opposite ones: the tree is generated, so
+/// drift means the tree is stale and `tabstatus install` rewrites it. The checkout's
+/// side of that question is `source:`, above, where it is actionable.
 fn report_embedded(c: &Ctx) {
-    let standalone_mode = c.mode() == Mode::Standalone;
-    let remedy = if standalone_mode {
-        "this tree was generated, so the BINARY is the truth: refresh it with \
-         `tabstatus standalone`"
-    } else {
-        "this is a checkout, so the FILE is the truth: rebuild with `sh scripts/build.sh`"
-    };
     for (rel, text) in embedded::MANIFESTS {
-        match embedded::compare(&c.repo, rel, text) {
+        match embedded::compare(&c.tree, rel, text) {
             Verdict::Same => say(&format!("embedded:  OK   {} matches the copy compiled in", rel)),
             Verdict::Differs { on_disk, embedded: emb } => {
                 say(&format!(
@@ -1742,13 +2149,12 @@ fn report_embedded(c: &Ctx) {
                     rel,
                     embedded::differs_phrase(on_disk, emb)
                 ));
-                say(&format!("           {}", remedy));
+                say("           the tree is stale: `tabstatus install` rewrites it");
             }
             Verdict::Missing => say(&format!(
                 "embedded:  FAIL {} is missing, so Claude Code cannot load the plugin. \
-                 The copy compiled in is intact: {}",
-                rel,
-                if standalone_mode { "re-run `tabstatus standalone`" } else { "restore it from git" }
+                 The copy compiled in is intact: re-run `tabstatus install`",
+                rel
             )),
             Verdict::Unreadable(e) => {
                 say(&format!("embedded:  WARN {} cannot be read: {}", rel, e))
@@ -1758,7 +2164,7 @@ fn report_embedded(c: &Ctx) {
 }
 
 /// The binary hooks.json invokes, which is the one thing whose absence makes every
-/// hook exit 127.
+/// hook exit 127 - and whether it is the build that is running.
 fn report_binary(c: &Ctx) {
     let hook = c.hook_binary();
     match fs::metadata(&hook) {
@@ -1772,19 +2178,73 @@ fn report_binary(c: &Ctx) {
             hook.display()
         )),
     }
+    report_tree_binary(c);
 }
 
+/// Is the live tree's binary the one running? UNCONDITIONALLY, which it was not: this
+/// comparison used to be reachable only inside the deleted standalone arm, so the
+/// commonest real case of all - `./bin/tabstatus doctor` in the checkout after a
+/// rebuild, asking whether the running build has been deployed - never reached it.
+fn report_tree_binary(c: &Ctx) {
+    let tree_bin = c.hook_binary();
+    let exe = std::env::current_exe().ok();
+    let same_path = exe
+        .as_ref()
+        .and_then(|e| fs::canonicalize(e).ok())
+        .zip(fs::canonicalize(&tree_bin).ok())
+        .map(|(a, b)| a == b)
+        .unwrap_or(false);
+    if same_path {
+        say("           the binary in the tree is the one running this report");
+        return;
+    }
+    let both = exe.as_ref().and_then(|e| fs::read(e).ok()).zip(fs::read(&tree_bin).ok());
+    match both {
+        Some((a, b)) if a == b => say("           identical to the one running this report"),
+        Some((a, b)) => {
+            // Same size and different bytes is the LIKELY shape of this, because a
+            // version bump rarely changes the length, so "635440 vs 635440" would
+            // read as a bug in the report rather than as the answer.
+            say(&format!(
+                "           WARN the live tree is running a different build of tabstatus \
+                 than this one ({})",
+                if a.len() == b.len() {
+                    format!("same {} bytes, different content", a.len())
+                } else {
+                    format!("{} in the tree vs {} running", b.len(), a.len())
+                }
+            ));
+            say("           deploy this build: tabstatus install");
+        }
+        None => {}
+    }
+}
+
+/// The symlink Claude Code loads the plugin through - and, when it points at a
+/// checkout, the fact that this is the wiring from before the change, said in those
+/// words. `doctor` is what people run when a tab misbehaves, so it is how the
+/// migration gets discovered.
 fn report_plugin(c: &Ctx) {
     match link_state(&c.link) {
         LinkState::Absent => say(&format!(
             "plugin:    FAIL not linked. Run `tabstatus install`. ({})",
             c.link.display()
         )),
-        LinkState::Link(t, true) if t == c.repo => {
+        LinkState::Link(t, true) if t == c.tree && is_checkout(&t) => {
+            say(&format!(
+                "plugin:    WARN {} points at a CHECKOUT, not at a generated tree:",
+                c.link.display()
+            ));
+            say(&format!("           {}", t.display()));
+            say("           That is the wiring from before the plugin directory became build");
+            say("           output - a `git checkout` there changes what every running session");
+            say("           runs. `tabstatus install` repoints it at a generated tree.");
+        }
+        LinkState::Link(t, true) if t == c.tree => {
             say(&format!("plugin:    OK   linked, {} -> {}", c.link.display(), t.display()))
         }
         LinkState::Link(t, true) => say(&format!(
-            "plugin:    WARN {} points at {}, not at this repo",
+            "plugin:    WARN {} points at {}, not at the tree above",
             c.link.display(),
             t.display()
         )),
@@ -1794,7 +2254,7 @@ fn report_plugin(c: &Ctx) {
             t.display()
         )),
         LinkState::Dir => say(&format!(
-            "plugin:    WARN {} is a real directory, not a link to this repo",
+            "plugin:    WARN {} is a real directory, not a link to the plugin tree",
             c.link.display()
         )),
         LinkState::Other => {
@@ -2038,12 +2498,17 @@ mod tests {
 
     #[test]
     fn every_verb_and_every_spelling_of_one_parses() {
-        assert!(matches!(parse(&["install"]), Subcommand::Install { force: false }));
+        assert!(matches!(parse(&["install"]), Subcommand::Install { tree: None }));
         assert!(matches!(
             parse(&["uninstall"]),
-            Subcommand::Uninstall { force: false, restore_backup: false, purge_tree: false }
+            Subcommand::Uninstall { force: false, restore_backup: false, keep_tree: false }
         ));
-        assert!(matches!(parse(&["standalone"]), Subcommand::Standalone(None)));
+        // The word that used to be a second install verb still parses, so it can point
+        // at its replacement instead of erroring obscurely - and it must stay a
+        // subcommand, because a word that falls through to the paint path would paint
+        // an idle tab.
+        assert!(matches!(parse(&["standalone"]), Subcommand::StandaloneGone));
+        assert!(matches!(parse(&["standalone", "/tmp/x"]), Subcommand::StandaloneGone));
         assert!(matches!(parse(&["doctor"]), Subcommand::Doctor));
         for w in ["version", "--version", "-V"] {
             assert!(matches!(parse(&[w]), Subcommand::Version), "{}", w);
@@ -2068,25 +2533,53 @@ mod tests {
 
     #[test]
     fn a_flag_attaches_only_to_the_verb_that_accepts_it() {
-        assert!(matches!(parse(&["install", "--force"]), Subcommand::Install { force: true }));
+        match parse(&["install", "--tree", "/tmp/somewhere"]) {
+            Subcommand::Install { tree: Some(d) } => assert_eq!(d, OsString::from("/tmp/somewhere")),
+            _ => panic!("install --tree must carry the directory"),
+        }
         assert!(matches!(
             parse(&["uninstall", "--force"]),
-            Subcommand::Uninstall { force: true, restore_backup: false, purge_tree: false }
+            Subcommand::Uninstall { force: true, restore_backup: false, keep_tree: false }
         ));
         assert!(matches!(
             parse(&["uninstall", "--restore-backup"]),
-            Subcommand::Uninstall { force: false, restore_backup: true, purge_tree: false }
+            Subcommand::Uninstall { force: false, restore_backup: true, keep_tree: false }
         ));
         assert!(matches!(
             parse(&["uninstall", "--restore-backup", "--force"]),
-            Subcommand::Uninstall { force: true, restore_backup: true, purge_tree: false }
+            Subcommand::Uninstall { force: true, restore_backup: true, keep_tree: false }
         ));
         assert!(matches!(
-            parse(&["uninstall", "--purge-tree"]),
-            Subcommand::Uninstall { force: false, restore_backup: false, purge_tree: true }
+            parse(&["uninstall", "--keep-tree"]),
+            Subcommand::Uninstall { force: false, restore_backup: false, keep_tree: true }
         ));
-        // Repeats are idempotent, as they were.
-        assert!(matches!(parse(&["install", "--force", "--force"]), Subcommand::Install { force: true }));
+        // Repeats are idempotent, as they were: the last one wins.
+        match parse(&["install", "--tree", "/a", "--tree", "/b"]) {
+            Subcommand::Install { tree: Some(d) } => assert_eq!(d, OsString::from("/b")),
+            _ => panic!("the last --tree wins"),
+        }
+    }
+
+    /// `--tree` is the only option here that takes a value, so the two ways to get it
+    /// wrong need saying rather than guessing: a missing directory must not silently
+    /// mean the default, and a mistyped flag must not become a directory NAME and get
+    /// a plugin tree materialised into `./--force`.
+    #[test]
+    fn tree_needs_a_directory_and_will_not_take_a_flag_as_one() {
+        for words in [&["install", "--tree"][..], &["install", "--tree", "--force"][..]] {
+            match parse(words) {
+                Subcommand::BadUsage(why) => assert!(why.contains("--tree"), "{}", why),
+                _ => panic!("{:?} should be a BadUsage", words),
+            }
+        }
+        // And a bare directory, which is how the deleted verb took it: named, with the
+        // spelling that works.
+        match parse(&["install", "/tmp/somewhere"]) {
+            Subcommand::BadUsage(why) => {
+                assert!(why.contains("--tree /tmp/somewhere"), "{}", why)
+            }
+            _ => panic!("a bare directory should be a BadUsage"),
+        }
     }
 
     #[test]
@@ -2095,13 +2588,15 @@ mod tests {
         for words in [
             &["install", "--restore-backup"][..],
             &["install", "--bogus"][..],
-            &["install", "--force", "--bogus"][..],
+            &["install", "--tree", "/tmp/x", "--bogus"][..],
             &["uninstall", "--bogus"][..],
-            // `--purge-tree` is a real flag, but only uninstall takes it.
-            &["install", "--purge-tree"][..],
-            // `standalone` takes a DIRECTORY; a mistyped flag must not become one.
-            &["standalone", "--force"][..],
-            &["standalone", "-d"][..],
+            // `--keep-tree` is a real flag, but only uninstall takes it.
+            &["install", "--keep-tree"][..],
+            // `--force` went with the check it forced: install supplies the binary it
+            // needs, so there is nothing left to force.
+            &["install", "--force"][..],
+            // `--tree` is a real flag, but only install takes it.
+            &["uninstall", "--tree"][..],
         ] {
             match parse(words) {
                 Subcommand::BadOption(a) => assert_eq!(a, OsString::from(words[words.len() - 1])),
@@ -2118,14 +2613,9 @@ mod tests {
         assert!(matches!(parse(&["help", "--bogus"]), Subcommand::Help));
     }
 
-    /// `standalone <dir>` has to carry the directory through, and the two new verbs
-    /// must be as disjoint from the edge names as the old ones.
+    /// The verbs must be as disjoint from the edge names as the old ones.
     #[test]
-    fn standalone_carries_its_directory_and_print_embedded_its_name() {
-        match parse(&["standalone", "/tmp/somewhere"]) {
-            Subcommand::Standalone(Some(d)) => assert_eq!(d, OsString::from("/tmp/somewhere")),
-            _ => panic!("standalone must carry the directory"),
-        }
+    fn print_embedded_carries_its_name_and_near_misses_still_paint() {
         match parse(&["print-embedded", "hooks"]) {
             Subcommand::PrintEmbedded(Some(n)) => assert_eq!(n, OsString::from("hooks")),
             _ => panic!("print-embedded must carry the name"),
@@ -2144,12 +2634,13 @@ mod tests {
     fn the_embedded_manifests_are_the_two_files_a_plugin_tree_needs() {
         let paths: Vec<&str> = embedded::MANIFESTS.iter().map(|(p, _)| *p).collect();
         assert_eq!(paths, vec![".claude-plugin/plugin.json", "hooks/hooks.json"]);
-        // install_preflight demands exactly these two on disk, so the embedded set
-        // and the required set cannot drift apart.
+        // The two Claude Code demands of a plugin directory, which is what install
+        // writes and what `doctor` compares - so the embedded set and the set a
+        // loadable tree needs cannot drift apart.
         for (rel, _) in embedded::MANIFESTS {
             assert!(
                 [".claude-plugin/plugin.json", "hooks/hooks.json"].contains(&rel),
-                "{} is embedded but not required by install_preflight",
+                "{} is embedded but is not one of the two a plugin directory needs",
                 rel
             );
         }
@@ -2175,7 +2666,8 @@ mod tests {
     fn ctx() -> Ctx {
         let config = PathBuf::from("/cfg");
         Ctx {
-            repo: PathBuf::from("/repo"),
+            tree: PathBuf::from("/tree"),
+            tree_from: TreeFrom::Default,
             skills: config.join("skills"),
             link: config.join("skills").join(PLUGIN),
             settings: config.join("settings.json"),
@@ -2216,6 +2708,13 @@ mod tests {
             root.get(m)?.val.as_obj()?.get(k)?.val.as_bool()
         };
         assert!(root.get("state_version").is_some());
+        // The half every install rewrites, and the ONLY field of the record that is
+        // read back other than the prior state: without it, `uninstall` can find the
+        // tree only through the link, and a hand-repointed link orphans it.
+        assert_eq!(
+            root.get("tree").and_then(|m| m.val.as_str()),
+            Some(&b"/tree"[..])
+        );
         assert_eq!(flag("env_key_before", "had"), Some(true));
         assert_eq!(field("env_key_before", "raw").as_deref(), Some(&b"\"0\""[..]));
         assert_eq!(flag("env_object_before", "had"), Some(true));
@@ -2245,7 +2744,7 @@ mod tests {
     #[test]
     fn an_invalid_utf8_path_is_quoted_one_replacement_per_byte() {
         let mut c = ctx();
-        c.repo = PathBuf::from(OsString::from_vec(b"/repo/tr\xf0\x9f\x98x".to_vec()));
+        c.tree = PathBuf::from(OsString::from_vec(b"/tree/tr\xf0\x9f\x98x".to_vec()));
         let raw = state_text(&c, &State {
             env_had: false,
             env_raw: None,
@@ -2254,9 +2753,9 @@ mod tests {
             link_target: None,
         });
         let v = json::parse(&raw).expect("still valid JSON");
-        let repo = v.as_obj().and_then(|o| o.get("repo")).and_then(|m| m.val.as_str());
+        let t = v.as_obj().and_then(|o| o.get("tree")).and_then(|m| m.val.as_str());
         // Three bytes of a truncated four-byte sequence: three U+FFFD, not one.
-        assert_eq!(repo, Some("/repo/tr\u{fffd}\u{fffd}\u{fffd}x".as_bytes()));
+        assert_eq!(t, Some("/tree/tr\u{fffd}\u{fffd}\u{fffd}x".as_bytes()));
     }
 
     #[test]

@@ -79,7 +79,7 @@ impl J {
         }
     }
     /// The elements of an array, for the one array this crate reads back: the
-    /// generated-file list in a standalone tree's marker.
+    /// generated-file list in a plugin tree's marker.
     pub fn as_arr(&self) -> Option<&[J]> {
         match self {
             J::Arr(a) => Some(a),

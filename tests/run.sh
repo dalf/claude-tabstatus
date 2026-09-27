@@ -42,6 +42,13 @@ trap 'cleanup; exit 130' HUP INT TERM
 # every assertion below would flip. Neutralise the detection here; the
 # glyph-position section sets these explicitly, per case.
 unset KONSOLE_VERSION KONSOLE_DBUS_SESSION TMUX STY CCTAB_GLYPH_POS
+# And XDG_DATA_HOME, which is NEW here and the one that now decides where a real
+# plugin tree lands: `install` materialises one, so an install section with only HOME
+# and CLAUDE_CONFIG_DIR redirected would write 680 KB into the RUNNER'S OWN
+# $XDG_DATA_HOME/claude-tabstatus on any machine where that variable is set. It happens
+# to be unset on the machine this was written on, so the bug would not have shown
+# locally. Every install case below pins it per case as well; this is the belt.
+unset XDG_DATA_HOME
 # And the state layer, for two reasons. XDG_RUNTIME_DIR is set in any real login
 # session, so leaving it here would (a) write records into the user's own
 # /run/user/<uid> from a test run and (b) make every assertion below whose stdin
@@ -1085,10 +1092,23 @@ check 'the 256-character bound ellipsis is escaped by the writer' 'yes' \
     "$(cd -- "$tmp/q\"$_long/$_long/$_long" && CCTAB_MAX_LOCATION=0 CCTAB_ELLIPSIS='q"x' HOME=$tmp "$bin" idle </dev/null | grep -q 'aq\\"x\\u0007' && printf yes)"
 
 # --- install / uninstall --------------------------------------------------
-# Against a throwaway config dir under $tmp, never the real one:
-# CLAUDE_CONFIG_DIR is what the installer reads, and $tmp is removed on exit.
+# Against a throwaway config dir AND a throwaway data dir under $tmp, never the real
+# ones. FOUR variables, because `install` now materialises the plugin tree itself:
+# CLAUDE_CONFIG_DIR is where the key, link and record go, XDG_DATA_HOME is where the
+# TREE goes, HOME is the fallback for both, and CCTAB_STATE_DIR is the one that is not
+# derived from any of them - `state::purge` reads XDG_RUNTIME_DIR/CCTAB_STATE_DIR
+# alone, so an uninstall without it would delete the real wait records of whoever is
+# running this suite. $tmp is removed on exit.
 _cfg=$tmp/config
-_ins() { ( cd -- "$repo" && HOME=$tmp CLAUDE_CONFIG_DIR=$_cfg "$bin" "$@" </dev/null 2>&1 ); }
+_data=$tmp/ins-data
+_itree=$_data/claude-tabstatus
+_ins() { ( cd -- "$repo" && HOME=$tmp CLAUDE_CONFIG_DIR=$_cfg XDG_DATA_HOME=$_data \
+           CCTAB_STATE_DIR=$tmp/ins-state "$bin" "$@" </dev/null 2>&1 ); }
+printf 'install section: tree %s, config %s\n' "$_itree" "$_cfg"
+# The repo's own manifests, saved so the last assertion of this file can prove that
+# no install path wrote a tracked file.
+cp "$repo/hooks/hooks.json" "$tmp/repo-hooks.json"
+cp "$repo/.claude-plugin/plugin.json" "$tmp/repo-plugin.json"
 _ins install >/dev/null
 check 'install: created settings.json with just the one key' \
     '{
@@ -1098,20 +1118,101 @@ check 'install: created settings.json with just the one key' \
 }' "$(cat "$_cfg/settings.json")"
 check 'install: mode 600, because that file holds env values' '600' \
     "$(stat -c %a "$_cfg/settings.json" 2>/dev/null || printf 600)"
-check 'install: linked the plugin at the repo' "$repo" \
+# THE assertion of this whole change: the link points at BUILD OUTPUT, never at the
+# checkout. A `git checkout` in the repo must not be able to change what a running
+# session executes.
+check 'install: linked the plugin at the generated tree, not the checkout' "$_itree" \
     "$(readlink "$_cfg/skills/claude-tabstatus")"
+check 'install: and that tree is a loadable plugin directory with our marker' 'yes' \
+    "$([ -f "$_itree/.claude-plugin/plugin.json" ] && [ -f "$_itree/hooks/hooks.json" ] \
+       && [ -x "$_itree/bin/tabstatus" ] && [ -f "$_itree/.tabstatus-generated" ] && printf yes)"
+check 'install: the tree holds exactly the four runtime entries and the marker' \
+    '.claude-plugin/plugin.json
+.tabstatus-generated
+bin/tabstatus
+hooks/hooks.json' \
+    "$(cd -- "$_itree" && find . -mindepth 1 \( -type f -o -type l \) | sed 's|^\./||' | LC_ALL=C sort)"
+check 'install: and what it linked holds no .git - it is not a checkout' '' \
+    "$(ls -d "$_cfg/skills/claude-tabstatus/.git" 2>/dev/null)"
+check 'install: the two manifests in the tree are the embedded bytes' '' \
+    "$("$bin" print-embedded hooks </dev/null | diff - "$_itree/hooks/hooks.json")"
+check 'install: recorded WHICH TREE it owns, so uninstall can find it' 'yes' \
+    "$(grep -q "\"tree\": \"$_itree\"" "$_cfg/claude-tabstatus.state" && printf yes)"
 check 'install: recorded the prior state' 'yes' \
     "$([ -f "$_cfg/claude-tabstatus.state" ] && printf yes)"
 check 'install: is idempotent' 'yes' \
     "$(_ins install | grep -q 'already "1" - unchanged' && printf yes)"
+# A no-op install must not disturb LIVE WIRING. Eleven hooks exec that binary; renaming
+# a fresh inode over it for nothing is work with a window in it, however small.
+_inode=$(ls -i "$_itree/bin/tabstatus" | awk '{print $1}')
+check 'install: a re-install skips an identical binary instead of replacing it' 'yes' \
+    "$(_ins install | grep -q 'bin/tabstatus.*unchanged - identical bytes' && printf yes)"
+check 'install: and the binary hooks exec keeps its inode' "$_inode" \
+    "$(ls -i "$_itree/bin/tabstatus" | awk '{print $1}')"
+check 'install: a re-install reports every manifest unchanged too' '2' \
+    "$(_ins install | grep -c 'bytes, unchanged)')"
 check 'doctor: reports a healthy install' 'yes' \
     "$(_ins doctor | grep -q 'env key:   OK' && _ins doctor | grep -q 'plugin:    OK' && printf yes)"
-_ins uninstall >/dev/null
+check 'doctor: names the live tree and how it was resolved' "$_itree (from the plugin symlink)" \
+    "$(_ins doctor | sed -n 's/^tree:      //p')"
+# The REFRESH: a stale tree is rewritten unconditionally, a changed file is NAMED, and
+# a file an older version generated is pruned. "Leave what is there" would be the
+# upgrade that silently does nothing.
+printf 'edited\n' >>"$_itree/hooks/hooks.json"
+printf '{}\n' >"$_itree/hooks/extra.json"
+printf '{\n  "marker_version": 1,\n  "written_by": "tabstatus install",\n  "tabstatus_version": "0.0.1",\n  "target": "x86_64-unknown-linux-musl",\n  "files": [\n    ".claude-plugin/plugin.json",\n    "bin/tabstatus",\n    "hooks/extra.json",\n    "hooks/hooks.json"\n  ]\n}\n' >"$_itree/.tabstatus-generated"
+_out=$(_ins install)
+check 'install: a stale tree says it is being refreshed' 'yes' \
+    "$(printf '%s' "$_out" | grep -q '^tree:.*(refreshed)' && printf yes)"
+check 'install: an edited manifest is overwritten and SAID SO' 'yes' \
+    "$(printf '%s' "$_out" | grep -q 'wrote:    hooks/hooks.json.*REPLACED, was' && printf yes)"
+check 'install: and the file is the embedded bytes again' '' \
+    "$("$bin" print-embedded hooks </dev/null | diff - "$_itree/hooks/hooks.json")"
+check 'install: a file an older version generated is pruned and named' 'yes' \
+    "$(printf '%s' "$_out" | grep -q '^pruned:   hooks/extra.json' && printf yes)"
+check 'install: and it is gone' '' "$(ls "$_itree/hooks/extra.json" 2>/dev/null)"
+# The BINARY is written before the manifests, and that order is load-bearing: the only
+# in-between state a live hook can see is a NEW binary with OLD manifests, because a
+# new binary understands old edge words while an old binary paints a newer hooks.json's
+# new edge word as the idle glyph.
+check 'install: writes the binary before the manifests' 'yes' \
+    "$(printf '%s' "$_out" | grep -n '^wrote:' | head -1 | grep -q 'bin/tabstatus' && printf yes)"
+check 'install: and execs the copy before it becomes the one hooks run' 'yes' \
+    "$(printf '%s' "$_out" | grep -q "^verify:   tabstatus $("$bin" version | awk '{print $2}')" && printf yes)"
+# uninstall now removes the TREE too, by default - nothing else owns it, so leaving it
+# behind leaves a whole plugin directory nothing will ever mention again. CONSERVATIVELY:
+# the marker's file list plus the directories that leaves empty, and a file of the
+# user's is NAMED and kept rather than taken by a remove_dir_all on a path derived from
+# a symlink.
+printf 'mine\n' >"$_itree/NOTES.txt"
+_out=$(_ins uninstall)
 check 'uninstall: removed the key and the empty env with it' '{}' \
     "$(cat "$_cfg/settings.json")"
 check 'uninstall: removed the link' '' "$(ls -d "$_cfg/skills/claude-tabstatus" 2>/dev/null)"
 check 'uninstall: removed the state record' '' \
     "$(ls "$_cfg/claude-tabstatus.state" 2>/dev/null)"
+check 'uninstall: removed the generated files from the tree' '' \
+    "$(ls "$_itree/bin/tabstatus" "$_itree/hooks/hooks.json" "$_itree/.tabstatus-generated" 2>/dev/null)"
+check 'uninstall: kept the file it did not generate, and NAMED it' 'yes' \
+    "$(printf '%s' "$_out" | grep -q 'left in place because it holds 1 file nothing here generated: NOTES.txt' \
+       && [ -f "$_itree/NOTES.txt" ] && printf yes)"
+check 'uninstall: emptied directories went, the one holding something did not' 'yes' \
+    "$([ ! -d "$_itree/.claude-plugin" ] && [ ! -d "$_itree/bin" ] && [ -d "$_itree" ] && printf yes)"
+# ...and with nothing of the user's in it, the directory itself goes.
+rm -f "$_itree/NOTES.txt"
+_ins install >/dev/null
+_out=$(_ins uninstall)
+check 'uninstall: a tree holding only what we generated goes completely' '' \
+    "$(ls -d "$_itree" 2>/dev/null)"
+check 'uninstall: and says so' 'yes' \
+    "$(printf '%s' "$_out" | grep -q "^tree:     removed the plugin tree $_itree (3 generated files)" && printf yes)"
+# --keep-tree is the opt-out, and it names how to finish the job by hand.
+_ins install >/dev/null
+_out=$(_ins uninstall --keep-tree)
+check 'uninstall --keep-tree: leaves it and names the rm' 'yes' \
+    "$(printf '%s' "$_out" | grep -q "was kept (--keep-tree). Remove it with \`rm -rf $_itree\`" \
+       && [ -x "$_itree/bin/tabstatus" ] && printf yes)"
+rm -rf "$_itree"
 # Every other byte of an existing file survives, which is the point of splicing
 # the member in instead of reprinting the document.
 rm -rf "$_cfg"
@@ -1170,6 +1271,12 @@ check 'install: refuses a settings.json that is not an object' 'yes' \
     "$(printf '%s' "$_out" | grep -q 'not the expected shape' && printf yes)"
 check 'install: and changes nothing when it refuses' '[1, 2]' "$(cat "$_cfg/settings.json")"
 check 'install: not even the symlink' '' "$(ls -d "$_cfg/skills/claude-tabstatus" 2>/dev/null)"
+# The ONE preflight is in front of the FIRST write, and the tree is now the first
+# write - so a refusal still honestly ends "Nothing has been changed." The deleted
+# second verb wrapped these refusals AFTER writing a tree and had to strip that
+# sentence back off them.
+check 'install: and no tree either - the preflight is in front of the first write' '' \
+    "$(ls -d "$_itree" 2>/dev/null)"
 # --- the half-states, which are the whole point of the write ordering ------
 # install writes settings.json (Claude Code's own title OFF) and then the plugin
 # symlink (which paints the replacement). Between those two writes there is a
@@ -1182,6 +1289,7 @@ check 'install: refuses a skills path that is not a directory' 'yes' \
     "$(printf '%s' "$_out" | grep -q 'not a directory' && printf yes)"
 check 'install: and settings.json was never written' '' \
     "$(ls "$_cfg/settings.json" 2>/dev/null)"
+check 'install: nor the tree' '' "$(ls -d "$_itree" 2>/dev/null)"
 rm -rf "$_cfg"; mkdir -p "$_cfg/skills"; chmod 500 "$_cfg/skills"
 _out=$(_ins install)
 chmod 700 "$_cfg/skills"
@@ -1189,29 +1297,41 @@ check 'install: refuses an unwritable skills directory' 'yes' \
     "$(printf '%s' "$_out" | grep -q 'is not writable, and the plugin symlink' && printf yes)"
 check 'install: and settings.json was never written either' '' \
     "$(ls "$_cfg/settings.json" 2>/dev/null)"
-# Installing with no bin/tabstatus is strictly worse than not installing: the env
-# key switches Claude Code's title painting off and all eleven hooks then exit 127.
-# It used to WARN and exit 0.
+check 'install: nor the tree, for the same reason' '' "$(ls -d "$_itree" 2>/dev/null)"
+# The missing-bin refusal and its --force escape hatch are GONE with their subject:
+# install supplies the binary itself now, copying the running one into the tree, so
+# there is nothing to be missing and nothing to force. What survives is that install
+# names an option it does not accept rather than ignoring it - and --force is now one
+# of those.
 rm -rf "$_cfg"; mkdir -p "$_cfg"
-_fake=$tmp/fakerepo
-mkdir -p "$_fake/.claude-plugin" "$_fake/hooks" "$_fake/bin"
-printf '{}\n' >"$_fake/.claude-plugin/plugin.json"
-printf '{}\n' >"$_fake/hooks/hooks.json"
-cp "$bin" "$_fake/bin/runner"
-_fins() { ( cd -- "$_fake" && HOME=$tmp CLAUDE_CONFIG_DIR=$_cfg "$_fake/bin/runner" "$@" </dev/null 2>&1 ); }
-_out=$(_fins install)
-check 'install: refuses when bin/tabstatus is missing' 'yes' \
-    "$(printf '%s' "$_out" | grep -q 'refused rather than warned about' && printf yes)"
-( cd -- "$_fake" && HOME=$tmp CLAUDE_CONFIG_DIR=$_cfg "$_fake/bin/runner" install </dev/null >/dev/null 2>&1 )
-check 'install: and exits nonzero so a wrapper can see it' '1' "$?"
-check 'install: nothing was written without the binary' '' \
-    "$(ls "$_cfg/settings.json" "$_cfg/skills/claude-tabstatus" 2>/dev/null)"
-check 'install: --force installs anyway, for the build-it-next case' 'yes' \
-    "$(_fins install --force | grep -q 'WARNING' && printf yes)"
-check 'install: --force really did write the key' 'yes' \
-    "$(grep -q CLAUDE_CODE_DISABLE_TERMINAL_TITLE "$_cfg/settings.json" && printf yes)"
 check 'install: an unknown option is refused' 'yes' \
-    "$(_fins install --nonsense | grep -q 'unknown option' && printf yes)"
+    "$(_ins install --nonsense | grep -q 'unknown option' && printf yes)"
+check 'install: --force went with the check it forced, and is refused by name' 'yes' \
+    "$(_ins install --force | grep -q 'unknown option --force' && printf yes)"
+check 'install: and a refused option writes nothing' '' \
+    "$(ls "$_cfg/settings.json" "$_cfg/skills/claude-tabstatus" 2>/dev/null)"
+# --tree is the only option here that takes a value, so both ways of getting it wrong
+# have to be named: a missing directory must not silently mean the default, and a
+# mistyped flag must not become a directory NAME and get a tree materialised into
+# ./--force.
+check 'install: --tree with no directory says what it needs' 'yes' \
+    "$(_ins install --tree | grep -q 'needs the directory to write the plugin tree into' && printf yes)"
+check 'install: --tree will not take a flag as a directory' 'yes' \
+    "$(_ins install --tree --force | grep -q -- '--tree takes the directory' && printf yes)"
+check 'install: and nothing called --force was materialised' '' "$(ls -d -- "--force" 2>/dev/null)"
+check 'install: a bare directory points at the spelling that works' 'yes' \
+    "$(_ins install "$tmp/nope" | grep -q -- "--tree $tmp/nope" && printf yes)"
+check 'install: exits nonzero on a refusal so a wrapper can see it' '1' \
+    "$(_ins install --force >/dev/null 2>&1; printf %s $?)"
+# `standalone` was a second install verb. It is gone, and the word says so instead of
+# erroring obscurely - and it must stay a SUBCOMMAND: a word that fell through to the
+# paint path would start painting an idle tab.
+check 'standalone: the word now points at install' 'yes' \
+    "$(_ins standalone | grep -q 'is now just .install' && printf yes)"
+check 'standalone: and exits 1' '1' "$(_ins standalone >/dev/null 2>&1; printf %s $?)"
+check 'standalone: and never paints' '' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CCTAB_DRY_RUN=1 "$bin" standalone </dev/null 2>/dev/null | grep '^⚪')"
+check 'standalone: it does not write a tree either' '' "$(ls -d "$_itree" 2>/dev/null)"
 # uninstall is the MIRROR: settings.json first, the link last. Its one reachable
 # refusal - the key is set but no state record proves we set it - used to fire
 # AFTER the link had already been removed, leaving exactly the blank-tab state.
@@ -1263,18 +1383,36 @@ check 'install: refuses the same dangling symlink' 'yes' \
     "$(_ins install | grep -q 'could not be resolved' && printf yes)"
 check 'doctor: exits 0 on a broken config' '0' \
     "$(_ins doctor >/dev/null 2>&1; printf %s $?)"
+# A state record that will not parse is refused in the PREFLIGHT, in front of the first
+# write - which is now the tree, not settings.json. Reading the record moved there for
+# exactly this: a refusal between the tree and settings.json could not honestly say
+# nothing had been changed.
+rm -rf "$_cfg" "$_itree"; mkdir -p "$_cfg"
+printf 'not json at all\n' >"$_cfg/claude-tabstatus.state"
+_out=$(_ins install)
+check 'install: refuses a state record it cannot parse' 'yes' \
+    "$(printf '%s' "$_out" | grep -q 'is not valid JSON' && printf yes)"
+check 'install: and nothing at all was written, tree included' '' \
+    "$(ls -d "$_cfg/settings.json" "$_cfg/skills/claude-tabstatus" "$_itree" 2>/dev/null)"
 # A killed run leaves a pid-named probe or temp file; the next run sweeps the ones
-# whose pid is gone, and leaves a live pid's alone.
-rm -rf "$_cfg"; mkdir -p "$_cfg"
+# whose pid is gone, and leaves a live pid's alone. FOUR directories now, because the
+# tree and its parent are new places this tool writes scratch into: the writability
+# probe and the binary's temp copy.
+rm -rf "$_cfg" "$_itree"; mkdir -p "$_cfg" "$_data" "$_itree/bin"
 : >"$_cfg/.cctab-wtest.999999"
 : >"$_cfg/.settings.json.cctab-tmp.999999"
+: >"$_data/.cctab-wtest.999999"
+: >"$_itree/bin/.tabstatus.cctab-tmp.999999"
 : >"$_cfg/.cctab-wtest.$$"
+printf '{"marker_version":1,"files":[]}\n' >"$_itree/.tabstatus-generated"
 _ins install >/dev/null
 check 'install: sweeps scratch files from a killed run' '' \
     "$(ls "$_cfg/.cctab-wtest.999999" "$_cfg/.settings.json.cctab-tmp.999999" 2>/dev/null)"
+check "install: sweeps them in the tree and its parent too" '' \
+    "$(ls "$_data/.cctab-wtest.999999" "$_itree/bin/.tabstatus.cctab-tmp.999999" 2>/dev/null)"
 check "install: leaves a LIVE pid's scratch file alone" 'yes' \
     "$([ -f "$_cfg/.cctab-wtest.$$" ] && printf yes)"
-rm -rf "$_cfg"
+rm -rf "$_cfg" "$_itree"
 
 # The subcommands must not collide with the edge names, in either direction.
 check 'an edge name is not a subcommand' '⚪ ~/plaindir' "$(dry idle "$tmp/plaindir")"
@@ -1310,8 +1448,8 @@ check 'bin/tabstatus reports the version in Cargo.toml' \
 
 # --- the embedded manifests -----------------------------------------------
 # src/embedded.rs compiles .claude-plugin/plugin.json and hooks/hooks.json into the
-# binary with include_str!, so `tabstatus standalone` can write a plugin tree on a
-# machine that has no checkout. Two copies of a version-controlled file can drift,
+# binary with include_str!, so `tabstatus install` can write the plugin tree from the
+# binary alone. Two copies of a version-controlled file can drift,
 # and a stale embedded hooks.json silently disagreeing with the repo is the worst
 # outcome that change could have, so it is guarded in three places:
 #
@@ -1345,15 +1483,15 @@ check 'print-embedded with no name says what it needs' '1' \
 check 'print-embedded never paints' '' \
     "$(cd -- "$tmp/plaindir" && HOME=$tmp CCTAB_DRY_RUN=1 "$bin" print-embedded hooks </dev/null | grep '^⚪')"
 
-# --- standalone: the whole remote install, into a throwaway tree ------------
-# Everything below runs a BARE copy of the binary - one with no plugin tree above
-# it, which is the shape of a binary scp'd to a VM - and pins four variables:
-# HOME, CLAUDE_CONFIG_DIR and XDG_DATA_HOME are what the installer reads, and
-# CCTAB_STATE_DIR is the one that is NOT derived from them. state::purge resolves
-# the record directory from XDG_RUNTIME_DIR/CCTAB_STATE_DIR alone, so an uninstall
-# with only HOME and CLAUDE_CONFIG_DIR redirected would delete the REAL session
-# records of whoever is running this suite. Both are unset at the top of this file;
-# CCTAB_STATE_DIR is pinned here as well so that stays true if that ever changes.
+# --- install on a bare machine, and the migration off a checkout link -------
+# Everything below runs a BARE copy of the binary - one with no plugin tree above it,
+# which is the shape of a binary scp'd to a VM - and pins four variables: HOME,
+# CLAUDE_CONFIG_DIR and XDG_DATA_HOME are what the installer reads, and CCTAB_STATE_DIR
+# is the one that is NOT derived from them. state::purge resolves the record directory
+# from XDG_RUNTIME_DIR/CCTAB_STATE_DIR alone, so an uninstall with only the first three
+# redirected would delete the REAL session records of whoever is running this suite.
+# XDG_DATA_HOME matters most of all now: it is what decides where a real 680 KB tree
+# lands, so a case that forgot it would write into the runner's own ~/.local/share.
 _sahome=$tmp/sa-home
 _sacfg=$tmp/sa-config
 _sadata=$tmp/sa-data
@@ -1366,120 +1504,155 @@ _sa() {
     ( HOME=$_sahome CLAUDE_CONFIG_DIR=$_sacfg XDG_DATA_HOME=$_sadata \
       CCTAB_STATE_DIR=$tmp/sa-state "$_sabin" "$@" </dev/null 2>&1 )
 }
-printf 'standalone section: tree %s, config %s\n' "$_satree" "$_sacfg"
-# The repo's own manifests, saved so the LAST assertion of this section can prove
-# that nothing here wrote a tracked file.
-cp "$repo/hooks/hooks.json" "$tmp/sa-repo-hooks.json"
-cp "$repo/.claude-plugin/plugin.json" "$tmp/sa-repo-plugin.json"
+printf 'bare-machine section: tree %s, config %s\n' "$_satree" "$_sacfg"
 
-_saout=$(_sa standalone)
-check 'standalone: says which mode it is in and why' 'yes' \
-    "$(printf '%s' "$_saout" | grep -q '^mode:     standalone - no checkout above the running binary' && printf yes)"
-check 'standalone: wrote hooks.json byte-for-byte' '' \
+# A FIRST INSTALL on a machine with no checkout at all. One binary, one run: this is
+# what the deleted `standalone` verb did, and `install` now does it with no mode, no
+# second verb and no branch anywhere that asks which shape the plugin directory is.
+_saout=$(_sa install)
+check 'install: on a bare machine it names the tree and where the path came from' 'yes' \
+    "$(printf '%s' "$_saout" | grep -q "^tree:     $_satree (the default path)" && printf yes)"
+check 'install: says the plugin directory is build output' 'yes' \
+    "$(printf '%s' "$_saout" | grep -q 'build output, like bin/' && printf yes)"
+check 'install: wrote hooks.json byte-for-byte' '' \
     "$(diff "$repo/hooks/hooks.json" "$_satree/hooks/hooks.json")"
-check 'standalone: wrote plugin.json byte-for-byte' '' \
+check 'install: wrote plugin.json byte-for-byte' '' \
     "$(diff "$repo/.claude-plugin/plugin.json" "$_satree/.claude-plugin/plugin.json")"
-check 'standalone: copied the running binary in, mode 755' '755' \
+check 'install: copied the running binary in, mode 755' '755' \
     "$(stat -c %a "$_satree/bin/tabstatus" 2>/dev/null || printf 755)"
-check 'standalone: and the copy is the same bytes' '' "$(cmp "$_sabin" "$_satree/bin/tabstatus" 2>&1)"
-check 'standalone: ran the copy it made before installing anything' 'yes' \
+check 'install: and the copy is the same bytes' '' "$(cmp "$_sabin" "$_satree/bin/tabstatus" 2>&1)"
+check 'install: ran the copy it made before it became the one hooks run' 'yes' \
     "$(printf '%s' "$_saout" | grep -q "^verify:   tabstatus $("$bin" version | awk '{print $2}')" && printf yes)"
-check 'standalone: left a marker naming the three files it generated' 'yes' \
+check 'install: left a marker naming the three files it generated' 'yes' \
     "$(printf '%s' "$_saout" | grep -q '^marker:   .tabstatus-generated (3 files, written first' && printf yes)"
-check 'standalone: then ran the ordinary install - settings.json' '{
+check 'install: then set the one key' '{
   "env": {
     "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"
   }
 }' "$(cat "$_sacfg/settings.json")"
-check 'standalone: and linked the skills entry at the tree' "$_satree" \
+check 'install: and linked the skills entry at the tree' "$_satree" \
     "$(readlink "$_sacfg/skills/claude-tabstatus")"
 # The generated tree has to be a tree Claude Code will load, which is exactly the
-# four entries the README's remote-install section lists.
-check 'standalone: the tree holds the four runtime entries and the marker' \
+# four entries the README's Install section lists.
+check 'install: the tree holds the four runtime entries and the marker' \
     '.claude-plugin/plugin.json
 .tabstatus-generated
 bin/tabstatus
 hooks/hooks.json' \
     "$(cd -- "$_satree" && find . -mindepth 1 \( -type f -o -type l \) | sed 's|^\./||' | LC_ALL=C sort)"
 
-# doctor, run from the BARE binary in $HOME - which is how a VM would run it. It
-# resolves the tree through the generated-tree fallback, because there is no
-# checkout above $tmp/sa-drop.
+# doctor, run from the BARE binary in $HOME - which is how a VM would run it. It finds
+# the tree through the skills symlink, because walking up from the executable is no
+# longer one of the answers: the binary you RUN and the directory Claude Code LOADS are
+# two different things now.
 _sadoc=$(_sa doctor)
-check 'doctor: reports standalone mode from a binary outside the tree' 'yes' \
-    "$(printf '%s' "$_sadoc" | grep -q '^mode:      standalone - .tabstatus-generated says' && printf yes)"
+check 'doctor: names the live tree and says it came from the symlink' "$_satree (from the plugin symlink)" \
+    "$(printf '%s' "$_sadoc" | sed -n 's/^tree:      //p')"
 check 'doctor: names the version and triple that generated the tree' 'yes' \
     "$(printf '%s' "$_sadoc" | grep -q "generated by tabstatus $("$bin" version | awk '{print $2}')" && printf yes)"
-check 'doctor: the tree binary is identical to the one running' 'yes' \
-    "$(printf '%s' "$_sadoc" | grep -q 'tree binary: identical to the one running' && printf yes)"
-check 'doctor: both embedded manifests match in the generated tree' '2' \
+check 'doctor: compares the tree binary with the running one, unconditionally' 'yes' \
+    "$(printf '%s' "$_sadoc" | grep -q 'identical to the one running this report' && printf yes)"
+check 'doctor: both embedded manifests match in the tree' '2' \
     "$(printf '%s' "$_sadoc" | grep -c '^embedded:  OK')"
-check 'doctor: the standalone install is healthy' 'yes' \
+check 'doctor: the install is healthy' 'yes' \
     "$(printf '%s' "$_sadoc" | grep -q 'env key:   OK' && printf '%s' "$_sadoc" | grep -q 'plugin:    OK' && printf yes)"
-# The stale-tree hazard, which is the one way to get a tree that disagrees with its
-# binary: edit a manifest in the tree and doctor points at the refresh command,
-# NOT at a rebuild - the remedies are opposite in the two modes.
+# The stale-tree hazard: edit a manifest in the tree and doctor points at ONE remedy -
+# install rewrites it - where it used to fork on a mode that no longer exists.
 printf 'edited\n' >>"$_satree/hooks/hooks.json"
-check 'doctor: a tree whose manifest was edited is WARNed, with the refresh remedy' 'yes' \
+check 'doctor: a tree whose manifest was edited is WARNed, with one remedy' 'yes' \
     "$(_sa doctor | grep -A1 '^embedded:  WARN hooks/hooks.json differs' \
-       | grep -q 'refresh it with .tabstatus standalone' && printf yes)"
+       | grep -q 'the tree is stale: .tabstatus install. rewrites it' && printf yes)"
+_sa install >/dev/null
 
-# Refresh: the embedded bytes win inside a tree we own, a file whose bytes CHANGED
-# says so, and a file an older version generated is pruned. That last one is why
-# the marker records a file list: without it an upgrade would silently leave a
-# stale file that nothing rewrites.
-mkdir -p "$_satree/hooks"
-printf '{}\n' >"$_satree/hooks/extra.json"
-printf '{\n  "marker_version": 1,\n  "written_by": "tabstatus standalone",\n  "tabstatus_version": "0.0.1",\n  "target": "x86_64-unknown-linux-musl",\n  "files": [\n    ".claude-plugin/plugin.json",\n    "bin/tabstatus",\n    "hooks/extra.json",\n    "hooks/hooks.json"\n  ]\n}\n' >"$_satree/.tabstatus-generated"
-_saout=$(_sa standalone)
-check 'standalone: refreshing says the tree already existed' 'yes' \
-    "$(printf '%s' "$_saout" | grep -q '^tree:.*(refreshed)' && printf yes)"
-check 'standalone: an edited manifest is overwritten and SAID SO' 'yes' \
-    "$(printf '%s' "$_saout" | grep -q 'wrote:    hooks/hooks.json.*REPLACED, was' && printf yes)"
-check 'standalone: and the file is the embedded bytes again' '' \
-    "$(diff "$repo/hooks/hooks.json" "$_satree/hooks/hooks.json")"
-check 'standalone: a file an older version generated is pruned and named' 'yes' \
-    "$(printf '%s' "$_saout" | grep -q '^pruned:   hooks/extra.json' && printf yes)"
-check 'standalone: and it is gone' '' "$(ls "$_satree/hooks/extra.json" 2>/dev/null)"
-check 'standalone: the install half is idempotent on a refresh' 'yes' \
-    "$(printf '%s' "$_saout" | grep -q 'already "1" - unchanged' \
-       && printf '%s' "$_saout" | grep -q 'symlink:  already correct' && printf yes)"
-
-# Every refusal. Each one leaves the directory untouched and exits 1, because the
-# alternative is writing a plugin tree over something that is not ours.
-_sanot=$tmp/sa-notours
-mkdir -p "$_sanot"
-printf 'mine\n' >"$_sanot/README"
-check 'standalone: refuses a non-empty directory with no marker' 'yes' \
-    "$(_sa standalone "$_sanot" | grep -q 'was not written by .tabstatus standalone' && printf yes)"
-check 'standalone: and writes nothing into it' 'README' "$(ls "$_sanot")"
-check 'standalone: exits 1 on that refusal' '1' \
-    "$(_sa standalone "$_sanot" >/dev/null 2>&1; printf %s $?)"
-# A checkout is refused even if a marker is dropped in it, because the marker is
-# the only evidence of ownership and a tracked tree must not be reachable by it.
-_sackout=$tmp/sa-checkout
-mkdir -p "$_sackout/.git"
-printf '{}\n' >"$_sackout/.tabstatus-generated"
-check 'standalone: refuses a checkout even with a marker in it' 'yes' \
-    "$(_sa standalone "$_sackout" | grep -q 'has a .git in it' && printf yes)"
-check 'standalone: and did not write a manifest there' '' \
-    "$(ls "$_sackout/hooks/hooks.json" 2>/dev/null)"
-# Under <config>/skills, install would be asked to symlink a directory to itself.
-check 'standalone: refuses a target under the skills directory' 'yes' \
-    "$(_sa standalone "$_sacfg/skills/claude-tabstatus" | grep -q 'symlink a directory to itself' && printf yes)"
-check 'standalone: a mistyped flag is not treated as a directory name' 'yes' \
-    "$(_sa standalone --force 2>&1 | grep -q 'unknown option --force' && printf yes)"
-check 'standalone: and materialised nothing called --force' '' "$(ls -d -- "--force" 2>/dev/null)"
+# THE MIGRATION. The live wiring before this change was
+# <config>/skills/claude-tabstatus -> the CHECKOUT, with a state_version 2 record whose
+# symlink_before.target is that same checkout. Both halves of that matter, and the
+# second one is invisible from the code: restoring the recorded target on a later
+# uninstall would rebuild the exact wiring this change exists to abolish.
+_mghome=$tmp/mg-home
+_mgcfg=$tmp/mg-config
+_mgdata=$tmp/mg-data
+_mgtree=$_mgdata/claude-tabstatus
+_mgco=$tmp/mg-checkout
+mkdir -p "$_mghome" "$tmp/mg-state" "$_mgcfg/skills" "$_mgco/.claude-plugin" "$_mgco/hooks" "$_mgco/.git"
+cp "$repo/.claude-plugin/plugin.json" "$_mgco/.claude-plugin/plugin.json"
+cp "$repo/hooks/hooks.json" "$_mgco/hooks/hooks.json"
+_mg() {
+    ( HOME=$_mghome CLAUDE_CONFIG_DIR=$_mgcfg XDG_DATA_HOME=$_mgdata \
+      CCTAB_STATE_DIR=$tmp/mg-state "$_sabin" "$@" </dev/null 2>&1 )
+}
+printf 'migration section: checkout %s -> tree %s\n' "$_mgco" "$_mgtree"
+ln -s "$_mgco" "$_mgcfg/skills/claude-tabstatus"
+printf '{\n  "env": {\n    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"\n  }\n}\n' >"$_mgcfg/settings.json"
+printf '{"state_version":2,"written_by":"tabstatus install","repo":"%s","settings_path":"%s","env_key":"CLAUDE_CODE_DISABLE_TERMINAL_TITLE","env_object_before":{"had":false},"env_key_before":{"had":false,"raw":null},"symlink_before":{"had":true,"target":"%s"}}\n' \
+    "$_mgco" "$_mgcfg/settings.json" "$_mgco" >"$_mgcfg/claude-tabstatus.state"
+# doctor FIRST, because doctor is what somebody runs when a tab misbehaves, and it is
+# therefore how the migration gets discovered.
+_mgdoc=$(_mg doctor)
+check 'doctor: a link pointing at a checkout is named as a checkout' 'yes' \
+    "$(printf '%s' "$_mgdoc" | grep -q '^plugin:    WARN .* points at a CHECKOUT, not at a generated tree' && printf yes)"
+check 'doctor: and says install repoints it' 'yes' \
+    "$(printf '%s' "$_mgdoc" | grep -q 'tabstatus install. repoints it' && printf yes)"
+check 'doctor: exits 0 on that config, because reporting is its whole job' '0' \
+    "$(_mg doctor >/dev/null 2>&1; printf %s $?)"
+# Now the install over it. LOUDLY: three aligned lines before any write, then the
+# repoint named as a repoint.
+_mgout=$(_mg install)
+check 'install: says what the link points at NOW, and calls it a checkout' 'yes' \
+    "$(printf '%s' "$_mgout" | grep -q "now  -> $_mgco (a checkout, not a generated tree)" && printf yes)"
+check 'install: and what it WILL point at' 'yes' \
+    "$(printf '%s' "$_mgout" | grep -q "will -> $_mgtree" && printf yes)"
+check 'install: says in plain words that the checkout becomes source' 'yes' \
+    "$(printf '%s' "$_mgout" | grep -q 'plugin.json are SOURCE from now on' && printf yes)"
+check 'install: the loud warning comes BEFORE the first write' 'yes' \
+    "$(printf '%s' "$_mgout" | grep -n 'will ->\|^marker:' | head -1 | grep -q 'will ->' && printf yes)"
+check 'install: the repoint is NAMED as one, not reported as a generic WARNING' 'yes' \
+    "$(printf '%s' "$_mgout" | grep -q '^symlink:  REPOINTED from the checkout to the generated tree' && printf yes)"
+check 'install: the link now points at the generated tree' "$_mgtree" \
+    "$(readlink "$_mgcfg/skills/claude-tabstatus")"
+check 'install: and the checkout was not modified by any of it' '' \
+    "$(diff "$repo/hooks/hooks.json" "$_mgco/hooks/hooks.json")"
+check 'install: the checkout gained no marker, no bin/ - nothing at all' '.claude-plugin/plugin.json
+hooks/hooks.json' \
+    "$(cd -- "$_mgco" && find . -mindepth 1 -type f | sed 's|^\./||' | LC_ALL=C sort)"
+check 'install: upgraded the v2 record and said so' 'yes' \
+    "$(printf '%s' "$_mgout" | grep -q 'state:    upgraded the record to state_version 3' && printf yes)"
+check 'install: the record keeps the prior state write-once' 'yes' \
+    "$(grep -q "\"symlink_before\": {\"had\": true, \"target\": \"$_mgco\"}" "$_mgcfg/claude-tabstatus.state" && printf yes)"
+check 'install: and now names the tree it owns' 'yes' \
+    "$(grep -q "\"tree\": \"$_mgtree\"" "$_mgcfg/claude-tabstatus.state" && printf yes)"
+check 'install: closes by saying which tree live sessions paint through' 'yes' \
+    "$(printf '%s' "$_mgout" | grep -q "^Live sessions paint through $_mgtree." && printf yes)"
+# THE HAZARD THAT IS NOT IN THE CODE: the recorded prior target is that checkout, and
+# putting it back would rebuild the wiring this change abolishes. Declined, and said.
+_mgun=$(_mg uninstall)
+check 'uninstall: declines to restore a recorded prior target that is a checkout' 'yes' \
+    "$(printf '%s' "$_mgun" | grep -q "the recorded prior target was the checkout at $_mgco" && printf yes)"
+check 'uninstall: so the link is removed rather than pointed back at it' '' \
+    "$(ls -d "$_mgcfg/skills/claude-tabstatus" 2>/dev/null)"
+check 'uninstall: and the checkout itself is untouched' 'yes' \
+    "$([ -f "$_mgco/hooks/hooks.json" ] && [ -d "$_mgco/.git" ] && printf yes)"
+check 'uninstall: the generated tree went, being the only thing that owns it' '' \
+    "$(ls -d "$_mgtree" 2>/dev/null)"
+# A link still pointing at a checkout when uninstall runs - somebody who never migrated.
+# Its tree is that checkout, and a checkout is never removable here whatever happens.
+rm -rf "$_mgcfg"; mkdir -p "$_mgcfg/skills"
+ln -s "$_mgco" "$_mgcfg/skills/claude-tabstatus"
+printf '{}\n' >"$_mgcfg/settings.json"
+_mgun=$(_mg uninstall)
+check 'uninstall: a tree with no marker is named and left alone' 'yes' \
+    "$(printf '%s' "$_mgun" | grep -q "carries no .tabstatus-generated, so it was not written by" && printf yes)"
+check 'uninstall: and a checkout is still whole afterwards' 'yes' \
+    "$([ -f "$_mgco/hooks/hooks.json" ] && [ -f "$_mgco/.claude-plugin/plugin.json" ] && printf yes)"
 
 # --- the tree does not have to be at the default path -----------------------
-# Everything above drives the DEFAULT location. `standalone <dir>` is documented,
-# and for `doctor` and `uninstall` to work from the scp'd copy afterwards, something
-# has to record WHERE the tree went: <config>/skills/claude-tabstatus, the symlink
-# install itself writes, is that record. Without reading it these two commands only
-# ever worked for the default path - so a tree anywhere else, or a default path that
-# moved because XDG_DATA_HOME is set in an interactive shell and not in
-# `ssh vm '...'`, left a live install neither command could touch, under advice
-# whose only effect was to write a SECOND tree and orphan the first.
+# `install --tree <dir>` is documented, and for `doctor` and `uninstall` to work from a
+# scp'd copy afterwards, something has to record WHERE the tree went:
+# <config>/skills/claude-tabstatus, the symlink install itself writes, is that record,
+# and the state record's `tree` field is the second one - for a link somebody repointed
+# by hand. Without either, these two commands only ever worked for the DEFAULT path, so
+# a tree anywhere else - or a default path that moved because XDG_DATA_HOME is set in an
+# interactive shell and not in `ssh vm '...'` - left a live install neither could touch.
 _sbhome=$tmp/sb-home
 _sbcfg=$tmp/sb-config
 _sbdata=$tmp/sb-data
@@ -1489,21 +1662,63 @@ _sb() {
     ( HOME=$_sbhome CLAUDE_CONFIG_DIR=$_sbcfg XDG_DATA_HOME=$_sbdata \
       CCTAB_STATE_DIR=$tmp/sb-state "$_sabin" "$@" </dev/null 2>&1 )
 }
-printf 'standalone elsewhere: tree %s, config %s\n' "$_sbtree" "$_sbcfg"
-_sb standalone "$_sbtree" >/dev/null
-check 'standalone <dir>: wrote the tree where it was told' 'yes' \
+printf 'install --tree section: tree %s, config %s\n' "$_sbtree" "$_sbcfg"
+_sb install --tree "$_sbtree" >/dev/null
+check 'install --tree: wrote the tree where it was told' 'yes' \
     "$([ -f "$_sbtree/.tabstatus-generated" ] && [ -x "$_sbtree/bin/tabstatus" ] && printf yes)"
-check 'standalone <dir>: and nothing at the default path' '' \
+check 'install --tree: and nothing at the default path' '' \
     "$(ls -d "$_sbdata/claude-tabstatus" 2>/dev/null)"
-check 'doctor: finds a tree that is not at the default path, from the skills link' "$_sbtree" \
-    "$(_sb doctor | sed -n 's/^repo:      //p')"
-check 'doctor: and reports standalone mode for it' 'yes' \
-    "$(_sb doctor | grep -q '^mode:      standalone - .tabstatus-generated says' && printf yes)"
+check 'doctor: finds a tree that is not at the default path, from the skills link' "$_sbtree (from the plugin symlink)" \
+    "$(_sb doctor | sed -n 's/^tree:      //p')"
 # The record survives the environment the tree's path was DERIVED from going away,
 # which is the difference between an interactive shell and `ssh vm '...'`.
-check 'doctor: the record survives XDG_DATA_HOME going away' "$_sbtree" \
+check 'doctor: the record survives XDG_DATA_HOME going away' "$_sbtree (from the plugin symlink)" \
     "$( ( HOME=$_sbhome CLAUDE_CONFIG_DIR=$_sbcfg CCTAB_STATE_DIR=$tmp/sb-state \
-          "$_sabin" doctor </dev/null 2>&1 ) | sed -n 's/^repo:      //p')"
+          "$_sabin" doctor </dev/null 2>&1 ) | sed -n 's/^tree:      //p')"
+# ...and a link removed by HAND leaves the tree findable through the state record,
+# which is the second half the record gained. Without it the tree is an orphan.
+mv "$_sbcfg/skills/claude-tabstatus" "$tmp/sb-savedlink"
+check 'doctor: a link removed by hand still finds the tree, from the record' "$_sbtree (from the state record)" \
+    "$(_sb doctor | sed -n 's/^tree:      //p')"
+mv "$tmp/sb-savedlink" "$_sbcfg/skills/claude-tabstatus"
+# A re-install with no --tree REUSES the marked tree the link points at rather than
+# silently moving the install back to the default path.
+check 'install: a second run reuses the marked tree the link points at' "$_sbtree (from the plugin symlink)" \
+    "$(_sb install | sed -n 's/^tree:     //p' | head -1)"
+
+# `install --tree` pointing somewhere ELSE moves the plugin between two trees that are
+# both ours, which is a fourth link case: calling that "a symlink this installer did not
+# create" was simply false, and the tree left behind is an orphan. An orphan is named at
+# the moment of the move, which is where it is actionable - and afterwards by both
+# commands whenever it is still DISCOVERABLE, which means the default path or the state
+# record's own tree field. A previous custom path is not discoverable and this does not
+# pretend otherwise: the record names the tree install owns, not a history of them.
+_orhome=$tmp/or-home
+_orcfg=$tmp/or-config
+_ordata=$tmp/or-data
+_ortree=$_ordata/claude-tabstatus
+_orelse=$tmp/or-elsewhere
+mkdir -p "$_orhome" "$tmp/or-state"
+_or() {
+    ( HOME=$_orhome CLAUDE_CONFIG_DIR=$_orcfg XDG_DATA_HOME=$_ordata \
+      CCTAB_STATE_DIR=$tmp/or-state "$_sabin" "$@" </dev/null 2>&1 )
+}
+printf 'orphan section: default %s, then moved to %s\n' "$_ortree" "$_orelse"
+_or install >/dev/null
+_orout=$(_or install --tree "$_orelse")
+check 'install --tree: moving between two of our own trees is not called a stranger' 'yes' \
+    "$(printf '%s' "$_orout" | grep -q '^symlink:  MOVED the plugin to a different generated tree' && printf yes)"
+check 'install --tree: and the tree left behind is named as an orphan' 'yes' \
+    "$(printf '%s' "$_orout" | grep -q "$_ortree is left behind and is now an orphan" && printf yes)"
+check 'doctor: names an orphan tree at the default path' 'yes' \
+    "$(_or doctor | grep -q "NOTE $_ortree is also a generated tree and is not the live one" && printf yes)"
+# uninstall removes the LIVE tree only - an orphan is not what the link points at, so
+# removing it would be reaching further than an undo should - but it says so.
+_orout=$(_or uninstall)
+check 'uninstall: removes the live tree, leaves the orphan, and names it' 'yes' \
+    "$([ ! -d "$_orelse" ] && [ -x "$_ortree/bin/tabstatus" ] \
+       && printf '%s' "$_orout" | grep -q "$_ortree is another generated tree and was NOT the live one" \
+       && printf yes)"
 
 # A difference with NO size difference, which is what a plain version bump looks
 # like: 0.1.0 and 0.2.0 are the same length. "(2842 vs 2842 bytes)" reads as a bug
@@ -1513,8 +1728,8 @@ cp "$tmp/sb-same.json" "$_sbtree/hooks/hooks.json"
 check 'doctor: a same-size difference says so instead of repeating the number' 'yes' \
     "$(_sb doctor | grep -q 'differs from the copy compiled in (same [0-9]* bytes, different content)' \
        && printf yes)"
-check 'standalone: and the refresh names it the same way' 'yes' \
-    "$(_sb standalone "$_sbtree" | grep -q 'REPLACED - same [0-9]* bytes, different content' && printf yes)"
+check 'install: and the refresh names it the same way' 'yes' \
+    "$(_sb install | grep -q 'REPLACED - same [0-9]* bytes, different content' && printf yes)"
 
 # A run killed between the marker and the last write - ENOSPC during the binary copy
 # on a small VM, a dropped ssh, an OOM. The marker is written FIRST, so this exact
@@ -1524,139 +1739,414 @@ _sbpart=$tmp/sb-partial
 mkdir -p "$_sbpart/hooks"
 cp "$_sbtree/.tabstatus-generated" "$_sbpart/.tabstatus-generated"
 "$_sabin" print-embedded hooks </dev/null >"$_sbpart/hooks/hooks.json"
-check 'standalone: a tree a killed run left behind is not refused' 'yes' \
-    "$(_sb standalone "$_sbpart" | grep -q '^tree:.*(refreshed)' && printf yes)"
-check 'standalone: and one re-run completes it' 'yes' \
+# ...through a config dir of its OWN, because an install repoints the skills link and
+# this one is about the TREE, not about moving the live install.
+_sp() {
+    ( HOME=$_sbhome CLAUDE_CONFIG_DIR=$tmp/sb-partcfg XDG_DATA_HOME=$_sbdata \
+      CCTAB_STATE_DIR=$tmp/sb-state "$_sabin" "$@" </dev/null 2>&1 )
+}
+check 'install: a tree a killed run left behind is not refused' 'yes' \
+    "$(_sp install --tree "$_sbpart" | grep -q '^tree:.*(refreshed)' && printf yes)"
+check 'install: and one re-run completes it' 'yes' \
     "$([ -x "$_sbpart/bin/tabstatus" ] && [ -f "$_sbpart/.claude-plugin/plugin.json" ] && printf yes)"
 # The ordering itself, from the outside: the marker is on disk before the binary is.
-check 'standalone: the marker is never newer than the binary it vouches for' 'yes' \
+check 'install: the marker is never newer than the binary it vouches for' 'yes' \
     "$([ ! "$_sbpart/.tabstatus-generated" -nt "$_sbpart/bin/tabstatus" ] && printf yes)"
 
-# Run from INSIDE the tree it is refreshing. Not "a SEPARATE tree" - it is the same
-# path, and the next line says (refreshed) - and not a checkout either.
-check 'standalone: refreshing the tree it runs from says exactly that' 'yes' \
-    "$( ( HOME=$_sbhome CLAUDE_CONFIG_DIR=$_sbcfg XDG_DATA_HOME=$_sbdata \
-          CCTAB_STATE_DIR=$tmp/sb-state "$_sbtree/bin/tabstatus" standalone "$_sbtree" \
+# Run THROUGH the installed tree, which is the ordinary re-install after a restart:
+# the copy in the tree is the running executable, so it is left exactly alone rather
+# than copied onto itself.
+check 'install: run from inside the tree leaves the running binary alone' 'yes' \
+    "$( ( HOME=$_sbhome XDG_DATA_HOME=$_sbdata \
+          CCTAB_STATE_DIR=$tmp/sb-state CLAUDE_CONFIG_DIR=$tmp/sb-partcfg \
+          "$_sbpart/bin/tabstatus" install --tree "$_sbpart" \
           </dev/null 2>&1 ) \
-       | grep -q '^mode:     standalone - refreshing the generated tree this binary is running from' \
-       && printf yes)"
-check 'standalone: and never calls a generated tree a checkout' '' \
-    "$( ( HOME=$_sbhome CLAUDE_CONFIG_DIR=$_sbcfg XDG_DATA_HOME=$_sbdata \
-          CCTAB_STATE_DIR=$tmp/sb-state "$_sbtree/bin/tabstatus" standalone "$_sbtree" \
-          </dev/null 2>&1 ) | grep '^mode:.*checkout')"
+       | grep -q 'unchanged - it IS the running binary' && printf yes)"
 
+# Every refusal. Each one leaves the directory untouched and exits 1, because the
+# alternative is writing a plugin tree over something that is not ours.
+_sanot=$tmp/sa-notours
+mkdir -p "$_sanot"
+printf 'mine\n' >"$_sanot/README"
+check 'install --tree: refuses a non-empty directory with no marker' 'yes' \
+    "$(_sa install --tree "$_sanot" | grep -q 'was not written by .tabstatus install' && printf yes)"
+check 'install --tree: and writes nothing into it' 'README' "$(ls "$_sanot")"
+check 'install --tree: exits 1 on that refusal' '1' \
+    "$(_sa install --tree "$_sanot" >/dev/null 2>&1; printf %s $?)"
+# The `rm -rf` hint is BOUNDED. It is the one message here a hurried operator copies,
+# and its subject is whatever they typed: `--tree /` printed `rm -rf /` and `--tree ~`
+# printed `rm -rf` on the home directory. So it is offered only for something that looks
+# like a stale tree of ours, and every other refusal stops at "pass a different
+# directory". All three are refused either way; only the remedy differs.
+_sanotours=$tmp/sa-notours-dir/claude-tabstatus
+mkdir -p "$_sanotours"
+printf 'mine\n' >"$_sanotours/README"
+check 'install --tree: a stale tree of ours by name does get the rm -rf hint' 'yes' \
+    "$(_sa install --tree "$_sanotours" | grep -q "rm -rf $_sanotours" && printf yes)"
+check 'install --tree: a directory that is not plausibly ours gets no rm -rf' '' \
+    "$(_sa install --tree "$_sanot" | grep -o 'rm -rf')"
+check 'install --tree: and still refuses it, and still says nothing changed' 'yes' \
+    "$(_sa install --tree "$_sanot" | grep -q 'Pass a different directory with .--tree.. Nothing' && printf yes)"
+check 'install --tree: `--tree /` never prints rm -rf /' '' \
+    "$(_sa install --tree / 2>&1 | grep -o 'rm -rf')"
+check 'install --tree: and refuses / anyway' 'yes' \
+    "$(_sa install --tree / 2>&1 | grep -q 'is not ours to overwrite' && printf yes)"
+# $HOME, with a file in it so the refusal is the non-empty one rather than "empty is
+# fine, go ahead" - which would have this case materialise a tree into it.
+_safake=$tmp/sa-fakehome
+mkdir -p "$_safake"; printf 'precious\n' >"$_safake/notes.txt"
+check 'install --tree: $HOME never appears after rm -rf either' '' \
+    "$( ( HOME=$_safake CLAUDE_CONFIG_DIR=$tmp/sa-fakecfg XDG_DATA_HOME=$tmp/sa-fakedata \
+          CCTAB_STATE_DIR=$tmp/sa-state "$_sabin" install --tree "$_safake" \
+          </dev/null 2>&1 ) | grep -o 'rm -rf')"
+check 'install --tree: and the home directory it refused is untouched' 'notes.txt' \
+    "$(ls "$_safake")"
+check 'install --tree: and / is provably untouched' '' \
+    "$(ls -d /.tabstatus-generated 2>/dev/null)"
+# A checkout is refused even if a marker is dropped in it, because the marker is
+# the only evidence of ownership and a tracked tree must not be reachable by it.
+_sackout=$tmp/sa-checkout
+mkdir -p "$_sackout/.git"
+printf '{}\n' >"$_sackout/.tabstatus-generated"
+check 'install --tree: refuses a checkout even with a marker in it' 'yes' \
+    "$(_sa install --tree "$_sackout" | grep -q 'has a .git in it' && printf yes)"
+check 'install --tree: and did not write a manifest there' '' \
+    "$(ls "$_sackout/hooks/hooks.json" 2>/dev/null)"
+# INSIDE a claude-tabstatus checkout, which is the last door by which the checkout
+# could become the plugin directory again. A plain .git above is NOT enough - $HOME
+# itself is in git on plenty of machines, and the default tree is three levels under it.
+check 'install --tree: refuses a directory inside this checkout' 'yes' \
+    "$(_sa install --tree "$repo/build/tree" | grep -q 'is inside the claude-tabstatus checkout' && printf yes)"
+check 'install --tree: and wrote nothing into the checkout' '' "$(ls -d "$repo/build" 2>/dev/null)"
+_sadots=$tmp/sa-dotfiles
+mkdir -p "$_sadots/.git"
+check 'install --tree: a plain git repo above is not a reason to refuse' 'yes' \
+    "$( ( HOME=$_sahome CLAUDE_CONFIG_DIR=$tmp/sa-dotcfg XDG_DATA_HOME=$tmp/sa-dotdata \
+          CCTAB_STATE_DIR=$tmp/sa-state "$_sabin" install \
+          --tree "$_sadots/.local/share/claude-tabstatus" </dev/null >/dev/null 2>&1 ); \
+       [ -x "$_sadots/.local/share/claude-tabstatus/bin/tabstatus" ] && printf yes)"
+# Under <config>/skills, install would be asked to symlink a directory to itself.
+check 'install --tree: refuses a target under the skills directory' 'yes' \
+    "$(_sa install --tree "$_sacfg/skills/claude-tabstatus" | grep -q 'symlink a directory to itself' && printf yes)"
 # A target that exists and is NOT a directory. This used to reach create_dir_all and
-# print `cannot create <path>: File exists (os error 17)` - which reads like a bug,
-# prints after the mode line as though work had begun, and lacks the closing sentence
-# every real refusal ends with.
+# print `cannot create <path>: File exists (os error 17)` - which reads like a bug and
+# lacks the closing sentence every real refusal ends with.
 printf 'mine\n' >"$tmp/sb-afile"
-check 'standalone: refuses a target that exists and is not a directory' 'yes' \
-    "$(_sb standalone "$tmp/sb-afile" | grep -q 'already exists and is not a directory' && printf yes)"
-check 'standalone: and that refusal ends like all the others' 'yes' \
-    "$(_sb standalone "$tmp/sb-afile" | grep -q 'Nothing has been changed.' && printf yes)"
-check 'standalone: the file it refused is untouched' 'mine' "$(cat "$tmp/sb-afile")"
-# The non-empty-unmarked refusal now names the remedy it never named: two suggestions
-# used to be "run install there" (it is not a checkout) and "pass a different
-# directory", and removing the directory - the actual fix - was left unsaid.
-check 'standalone: the unmarked-directory refusal names removing it' 'yes' \
-    "$(_sa standalone "$_sanot" | grep -q 'rm -rf ' && printf yes)"
+check 'install --tree: refuses a target that exists and is not a directory' 'yes' \
+    "$(_sb install --tree "$tmp/sb-afile" | grep -q 'already exists and is not a directory' && printf yes)"
+check 'install --tree: and that refusal ends like all the others' 'yes' \
+    "$(_sb install --tree "$tmp/sb-afile" | grep -q 'Nothing has been changed.' && printf yes)"
+check 'install --tree: the file it refused is untouched' 'mine' "$(cat "$tmp/sb-afile")"
+# A tree path whose parent cannot be written. Checked in the PREFLIGHT, so the failure
+# is named before the marker exists rather than landing mid-materialise.
+_sbro=$tmp/sb-rodata
+mkdir -p "$_sbro"; chmod 500 "$_sbro"
+check 'install --tree: refuses a tree path it cannot write, before writing anything' 'yes' \
+    "$(_sb install --tree "$_sbro/tree" | grep -q 'is not writable, and the plugin tree goes under it' && printf yes)"
+check 'install --tree: and nothing was created' '' "$(ls -d "$_sbro/tree" 2>/dev/null)"
+chmod 700 "$_sbro"
 
-# `standalone` from a CHECKOUT is the one write path where the two copies can
-# disagree and the compiled-in one wins. doctor WARNs about that drift in the same
-# checkout; this is the moment those bytes become live wiring, so it warns too.
+# --- the boundary of the generated tree -------------------------------------
+# `.tabstatus-generated` is the only evidence of ownership, and it is a plain file that
+# anything able to write the tree can edit - so "we wrote it" is not a bound on the blast
+# radius. `safe_relative` refuses `..`, a leading `/` and `.` in the marker STRING, and
+# says nothing about what those components RESOLVE to: a symlinked directory component
+# inside the tree took install's write and uninstall's unlink OUTSIDE the tree, silently,
+# and reported both as in-tree. Wider than the `remove_dir_all` this design removed.
+_bdhome=$tmp/bd-home
+_bdcfg=$tmp/bd-config
+_bddata=$tmp/bd-data
+_bdtree=$_bddata/claude-tabstatus
+_bdvictim=$tmp/bd-victim
+mkdir -p "$_bdhome" "$tmp/bd-state" "$_bdvictim"
+_bd() {
+    ( HOME=$_bdhome CLAUDE_CONFIG_DIR=$_bdcfg XDG_DATA_HOME=$_bddata \
+      CCTAB_STATE_DIR=$tmp/bd-state "$_sabin" "$@" </dev/null 2>&1 )
+}
+printf 'tree-boundary section: tree %s, victim %s\n' "$_bdtree" "$_bdvictim"
+_bd install >/dev/null
+printf 'theirs\n' >"$_bdvictim/hooks.json"
+printf 'theirs\n' >"$_bdvictim/tabstatus"
+# The WRITE side: <tree>/hooks replaced by a link out of the tree.
+rm -f "$_bdtree/hooks/hooks.json"; rmdir "$_bdtree/hooks"
+ln -s "$_bdvictim" "$_bdtree/hooks"
+_bdout=$(_bd install)
+check 'install: refuses to write through a symlinked component, and names it' 'yes' \
+    "$(printf '%s' "$_bdout" \
+       | grep -q "$_bdtree/hooks is not a directory, so hooks/hooks.json is not provably inside" \
+       && printf yes)"
+check 'install: and the file outside the tree is untouched' 'theirs' "$(cat "$_bdvictim/hooks.json")"
+# That failure is the FIRST write, and it lands under a header that may just have
+# announced a repoint - so it has to say the live wiring did not move.
+check 'install: a failure in the tree says the symlink and settings were not touched' 'yes' \
+    "$(printf '%s' "$_bdout" | grep -q 'was NOT touched, and neither were settings.json or the' && printf yes)"
+check 'install: and says a re-run resumes rather than refusing' 'yes' \
+    "$(printf '%s' "$_bdout" | grep -q 'so a re-run resumes into it' && printf yes)"
+check 'install: and the plugin link really is still where it was' "$_bdtree" \
+    "$(readlink "$_bdcfg/skills/claude-tabstatus")"
+rm -f "$_bdtree/hooks"; mkdir -p "$_bdtree/hooks"
+# The UNLINK side: <tree>/bin replaced by a link out of the tree, then uninstall. The
+# old code took $_bdvictim/tabstatus and called it a generated file of ours.
+rm -f "$_bdtree/bin/tabstatus"; rmdir "$_bdtree/bin"
+ln -s "$_bdvictim" "$_bdtree/bin"
+_bdout=$(_bd uninstall)
+check 'uninstall: does not unlink through a symlinked component' 'theirs' \
+    "$(cat "$_bdvictim/tabstatus")"
+check 'uninstall: and names the marker-listed file it left behind' 'yes' \
+    "$(printf '%s' "$_bdout" | grep -q '^tree:     LEFT a file the marker listed' && printf yes)"
+
+# --- --tree is normalised ONCE, before anything looks at it -----------------
+# Every check, every write and the RECORD used the raw string. A relative
+# `--tree skills/claude-tabstatus` run from <config> walked past the refusal whose whole
+# job is to keep the tree out of skills/ - that test is a component-prefix test - and the
+# symlink then got the relative string as its target, which resolves against the LINK's
+# directory: a dangling link, the env key set, "Done." and a tab nothing paints.
+_nmhome=$tmp/nm-home
+_nmcfg=$tmp/nm-config
+_nmdata=$tmp/nm-data
+mkdir -p "$_nmhome" "$tmp/nm-state" "$_nmcfg"
+_nm() {
+    _nmcwd=$1; shift
+    ( cd -- "$_nmcwd" && HOME=$_nmhome CLAUDE_CONFIG_DIR=$_nmcfg XDG_DATA_HOME=$_nmdata \
+      CCTAB_STATE_DIR=$tmp/nm-state "$_sabin" "$@" </dev/null 2>&1 )
+}
+printf 'normalisation section: config %s\n' "$_nmcfg"
+check 'install --tree: a RELATIVE path into skills/ is refused like an absolute one' 'yes' \
+    "$(_nm "$_nmcfg" install --tree skills/claude-tabstatus | grep -q 'symlink a directory to itself' && printf yes)"
+check 'install --tree: and no real directory was created at the link path' '' \
+    "$(ls -d "$_nmcfg/skills/claude-tabstatus" 2>/dev/null)"
+check 'install --tree: and settings.json was not created either' '' \
+    "$(ls "$_nmcfg/settings.json" 2>/dev/null)"
+check 'install --tree: .. is folded before any check runs' 'yes' \
+    "$(_nm "$tmp" install --tree "$_nmdata/../nm-config/skills/claude-tabstatus" \
+       | grep -q 'symlink a directory to itself' && printf yes)"
+# A DANGLING --tree used to answer NotFound to fs::metadata, read as "absent, go ahead",
+# and then fail EEXIST - the very errno refuse_target exists to replace, printed after
+# the header had announced a repoint that never happened.
+ln -s "$tmp/nm-nowhere" "$tmp/nm-dangling"
+check 'install --tree: a dangling symlink is a named refusal, not an errno' 'yes' \
+    "$(_nm "$tmp" install --tree "$tmp/nm-dangling" | grep -q 'is a symlink (-> .*), not a directory' && printf yes)"
+check 'install --tree: and it ends like every other refusal' 'yes' \
+    "$(_nm "$tmp" install --tree "$tmp/nm-dangling" | grep -q 'Nothing has been changed.' && printf yes)"
+check 'install --tree: the create errno never appears for it' '' \
+    "$(_nm "$tmp" install --tree "$tmp/nm-dangling" | grep -o 'File exists')"
+# A symlink to an EMPTY directory was accepted, materialised into the link's target, and
+# then unremovable - the removal cannot prove anything under a link is in the tree.
+mkdir -p "$tmp/nm-realdir"; ln -s "$tmp/nm-realdir" "$tmp/nm-link2"
+check 'install --tree: a symlink to an empty directory is refused too' 'yes' \
+    "$(_nm "$tmp" install --tree "$tmp/nm-link2" | grep -q 'is a symlink' && printf yes)"
+check 'install --tree: and nothing was written through it' '' "$(ls "$tmp/nm-realdir")"
+# A relative --tree that IS allowed becomes absolute in the link and in the record, so
+# the link resolves and uninstall reaches the same tree from any directory.
+_nm "$tmp" install --tree nm-rel/tree >/dev/null
+check 'install --tree: a relative path becomes absolute in the symlink' "$tmp/nm-rel/tree" \
+    "$(readlink "$_nmcfg/skills/claude-tabstatus")"
+check 'install --tree: so the link resolves and a hook can exec the binary' 'yes' \
+    "$([ -x "$_nmcfg/skills/claude-tabstatus/bin/tabstatus" ] && printf yes)"
+check 'install --tree: and the record holds the absolute path' 'yes' \
+    "$(grep -q "\"tree\": \"$tmp/nm-rel/tree\"" "$_nmcfg/claude-tabstatus.state" && printf yes)"
+mkdir -p "$tmp/nm-elsewhere/nm-rel/tree"; printf 'mine\n' >"$tmp/nm-elsewhere/nm-rel/tree/README"
+_nm "$tmp/nm-elsewhere" uninstall >/dev/null
+check 'uninstall: a cwd sharing the recorded name is not what gets removed' 'README' \
+    "$(ls "$tmp/nm-elsewhere/nm-rel/tree")"
+check 'uninstall: the real tree is the one that went' '' "$(ls -d "$tmp/nm-rel/tree" 2>/dev/null)"
+# A relative `tree` in the record can only come from a hand edit, and resolving it
+# against whatever directory uninstall runs in is how a tool removes files somewhere it
+# was never pointed at. Ignored.
+printf '{\n  "state_version": 3,\n  "tree": "nm-rel/tree"\n}\n' >"$_nmcfg/claude-tabstatus.state"
+check 'doctor: a relative tree in the record is ignored, not resolved against the cwd' 'yes' \
+    "$(_nm "$tmp" doctor | grep -q "^tree:      $_nmdata/claude-tabstatus (the default path)" && printf yes)"
+rm -f "$_nmcfg/claude-tabstatus.state"
+
+# --- what uninstall will ACTUALLY put back ----------------------------------
+# The record's first half is write-once on purpose, so from the second install onwards the
+# target being replaced and the target uninstall reads are different paths. "uninstall puts
+# the old target back." was printed for a target it would not put back, in exactly the case
+# the sentence exists for: live wiring being repointed.
+_prhome=$tmp/pr-home
+_prcfg=$tmp/pr-config
+_prdata=$tmp/pr-data
+mkdir -p "$_prhome" "$tmp/pr-state" "$tmp/pr-stranger"
+_pr() {
+    ( HOME=$_prhome CLAUDE_CONFIG_DIR=$_prcfg XDG_DATA_HOME=$_prdata \
+      CCTAB_STATE_DIR=$tmp/pr-state "$_sabin" "$@" </dev/null 2>&1 )
+}
+_pr install >/dev/null
+ln -sfn "$tmp/pr-stranger" "$_prcfg/skills/claude-tabstatus"
+_prout=$(_pr install)
+check 'install: repointing a stranger is still a loud WARNING' 'yes' \
+    "$(printf '%s' "$_prout" | grep -q '^symlink:  WARNING - repointed a symlink this installer did not create' && printf yes)"
+check 'install: and promises no undo the write-once record cannot deliver' '' \
+    "$(printf '%s' "$_prout" | grep -o 'uninstall puts the old target back.')"
+check 'install: it says what the record actually holds instead' 'yes' \
+    "$(printf '%s' "$_prout" | grep -q 'uninstall will NOT put this target back: the record is' && printf yes)"
+check 'install: naming that the first install found no link here' 'yes' \
+    "$(printf '%s' "$_prout" | grep -q 'says there was no link here before' && printf yes)"
+check 'uninstall: which is exactly what it then does' '' \
+    "$(_pr uninstall >/dev/null 2>&1; ls -d "$_prcfg/skills/claude-tabstatus" 2>/dev/null)"
+check 'uninstall: and the stranger directory is untouched' 'yes' \
+    "$([ -d "$tmp/pr-stranger" ] && printf yes)"
+# A FIRST install IS the one writing the record, so it still promises the undo it can
+# deliver - the sentence is not wrong, it was printed in the wrong case.
+mkdir -p "$tmp/pr2-config/skills" "$tmp/pr2-stranger"
+ln -s "$tmp/pr2-stranger" "$tmp/pr2-config/skills/claude-tabstatus"
+check 'install: a first install over a stranger does promise to put it back' 'yes' \
+    "$( ( HOME=$_prhome CLAUDE_CONFIG_DIR=$tmp/pr2-config XDG_DATA_HOME=$tmp/pr2-data \
+          CCTAB_STATE_DIR=$tmp/pr-state "$_sabin" install </dev/null 2>&1 ) \
+       | grep -q 'uninstall puts the old target back.' && printf yes)"
+
+# --- the key stays set and nothing paints -----------------------------------
+# uninstall can be exactly right and still leave the tab blank: the record says the key was
+# the USER'S before install ran, so it is kept - and the plugin that painted the replacement
+# is unlinked in the same run. That is late_failure's "a tab nothing paints", reached by
+# being scrupulous rather than by failing, and it was reported as a neutral "unchanged".
+_kyhome=$tmp/ky-home
+_kycfg=$tmp/ky-config
+mkdir -p "$_kyhome" "$tmp/ky-state" "$_kycfg"
+printf '{\n  "env": {\n    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"\n  }\n}\n' >"$_kycfg/settings.json"
+_ky() {
+    ( HOME=$_kyhome CLAUDE_CONFIG_DIR=$_kycfg XDG_DATA_HOME=$tmp/ky-data \
+      CCTAB_STATE_DIR=$tmp/ky-state "$_sabin" "$@" </dev/null 2>&1 )
+}
+_ky install >/dev/null
+_kyout=$(_ky uninstall)
+check 'uninstall: warns when it keeps a key that switches the title painting off' 'yes' \
+    "$(printf '%s' "$_kyout" | grep -q "NOTE that value switches Claude Code's OWN title painting off" && printf yes)"
+check 'uninstall: and says nothing will paint the tab' 'yes' \
+    "$(printf '%s' "$_kyout" | grep -q 'so nothing will' && printf yes)"
+check 'uninstall: and where to unset it' 'yes' \
+    "$(printf '%s' "$_kyout" | grep -q "unset it yourself in $_kycfg/settings.json" && printf yes)"
+check 'uninstall: the key really is still set' 'yes' \
+    "$(grep -q 'CLAUDE_CODE_DISABLE_TERMINAL_TITLE' "$_kycfg/settings.json" && printf yes)"
+# A value Claude Code does not read as "off" leaves no blank tab, so there is nothing to
+# warn about and nothing is said.
+rm -rf "$_kycfg" "$tmp/ky-data"; mkdir -p "$_kycfg"
+printf '{\n  "env": {\n    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "0"\n  }\n}\n' >"$_kycfg/settings.json"
+_ky install >/dev/null
+check 'uninstall: silent when the value it restores is not one that turns it off' '' \
+    "$(_ky uninstall | grep -o 'OWN title painting off')"
+
+# --- an emptied directory is a thing left behind ----------------------------
+# prune unlinked an older version's file and left its now-empty directory, which no later
+# marker lists - so `remove` never took it, uninstall could not take the tree down, and the
+# report said "which is now empty" over a directory still on disk.
+_eqhome=$tmp/eq-home
+_eqcfg=$tmp/eq-config
+_eqdata=$tmp/eq-data
+_eqtree=$_eqdata/claude-tabstatus
+mkdir -p "$_eqhome" "$tmp/eq-state"
+_eq() {
+    ( HOME=$_eqhome CLAUDE_CONFIG_DIR=$_eqcfg XDG_DATA_HOME=$_eqdata \
+      CCTAB_STATE_DIR=$tmp/eq-state "$_sabin" "$@" </dev/null 2>&1 )
+}
+_eq install >/dev/null
+mkdir -p "$_eqtree/old"; printf '{}\n' >"$_eqtree/old/legacy.json"
+printf '{\n  "marker_version": 1,\n  "files": [\n    ".claude-plugin/plugin.json",\n    "bin/tabstatus",\n    "hooks/hooks.json",\n    "old/legacy.json"\n  ]\n}\n' \
+    >"$_eqtree/.tabstatus-generated"
+_eqout=$(_eq install)
+check 'install: prunes a file an older version generated' 'yes' \
+    "$(printf '%s' "$_eqout" | grep -q '^pruned:   old/legacy.json' && printf yes)"
+check 'install: and the directory it emptied goes with it' '' "$(ls -d "$_eqtree/old" 2>/dev/null)"
+check 'uninstall: so the tree really does go' '' \
+    "$(_eq uninstall >/dev/null 2>&1; ls -d "$_eqtree" 2>/dev/null)"
+# When a directory DOES survive, the report says so and gives the honest instruction,
+# instead of calling the tree empty.
+_eq install >/dev/null
+mkdir -p "$_eqtree/theirs"
+_equn=$(_eq uninstall)
+check 'uninstall: never calls a tree empty while leaving a directory in it' '' \
+    "$(printf '%s' "$_equn" | grep -o 'which is now empty')"
+check 'uninstall: it says the directory survived' 'yes' \
+    "$(printf '%s' "$_equn" | grep -q 'the directory itself survived' && printf yes)"
+check 'uninstall: and names rm -rf for whoever wants it gone' 'yes' \
+    "$(printf '%s' "$_equn" | grep -q "rm -rf $_eqtree" && printf yes)"
+check 'uninstall: remove_dir, never remove_dir_all - it is still there' 'yes' \
+    "$([ -d "$_eqtree/theirs" ] && printf yes)"
+
+# install from a CHECKOUT is the one place the two copies of a manifest can disagree
+# and the compiled-in one wins. doctor WARNs about that drift; this is the moment those
+# bytes become live wiring, so install warns too.
 _sbdrift=$tmp/sb-drift
 mkdir -p "$_sbdrift/bin" "$_sbdrift/hooks" "$_sbdrift/.claude-plugin"
 cp -L "$_sabin" "$_sbdrift/bin/tabstatus"
 cp "$repo/.claude-plugin/plugin.json" "$_sbdrift/.claude-plugin/plugin.json"
 { cat "$repo/hooks/hooks.json"; printf '\n'; } >"$_sbdrift/hooks/hooks.json"
 _sbout=$( HOME=$_sbhome CLAUDE_CONFIG_DIR=$tmp/sb-driftcfg XDG_DATA_HOME=$tmp/sb-driftdata \
-          CCTAB_STATE_DIR=$tmp/sb-state "$_sbdrift/bin/tabstatus" standalone </dev/null 2>&1 )
-check 'standalone: warns when the checkout it runs from disagrees with the compiled-in copy' 'yes' \
-    "$(printf '%s' "$_sbout" | grep -q 'WARN hooks/hooks.json in that checkout differs from the copy compiled in' \
+          CCTAB_STATE_DIR=$tmp/sb-state "$_sbdrift/bin/tabstatus" install </dev/null 2>&1 )
+check 'install: warns when the checkout it runs from disagrees with the compiled-in copy' 'yes' \
+    "$(printf '%s' "$_sbout" | grep -q 'WARN hooks/hooks.json there differs from the copy compiled in' \
        && printf yes)"
-check 'standalone: and says which copy the tree will carry' 'yes' \
+check 'install: and says which copy the tree will carry' 'yes' \
     "$(printf '%s' "$_sbout" | grep -q 'the tree carries the COMPILED-IN copy' && printf yes)"
-check 'standalone: the drifted checkout was not written' 'yes' \
+check 'install: the drifted checkout was not written' 'yes' \
     "$(cmp -s "$_sbdrift/hooks/hooks.json" "$repo/hooks/hooks.json" || printf yes)"
+# doctor says the same thing about the SAME drift, on its own line, where it is
+# actionable: this binary would deploy the older copy.
+check 'doctor: source: names an unbuilt edit in the checkout the binary came out of' 'yes' \
+    "$( ( HOME=$_sbhome CLAUDE_CONFIG_DIR=$tmp/sb-driftcfg XDG_DATA_HOME=$tmp/sb-driftdata \
+          CCTAB_STATE_DIR=$tmp/sb-state "$_sbdrift/bin/tabstatus" doctor </dev/null 2>&1 ) \
+       | grep -q '^source:    WARN hooks/hooks.json in the checkout at' && printf yes)"
 
-# The install half failing AFTER the tree is written. install's refusals end
-# "Nothing has been changed.", which is true where install is the whole command and
-# false here - and it was the LAST line printed, straight after five lines reporting
-# a complete tree.
-_sbro=$tmp/sb-roconfig
-mkdir -p "$_sbro"
-check 'standalone: an install that fails after the tree was written says so' 'yes' \
-    "$(chmod 500 "$_sbro"
-       ( HOME=$_sbhome CLAUDE_CONFIG_DIR=$_sbro XDG_DATA_HOME=$tmp/sb-rodata \
-         CCTAB_STATE_DIR=$tmp/sb-state "$_sabin" standalone </dev/null 2>&1 ) \
-       | grep -q 'was written and verified, but the install did not happen' && printf yes
-       chmod 700 "$_sbro")"
-check 'standalone: and does not end by claiming nothing changed' '' \
-    "$(chmod 500 "$_sbro"
-       ( HOME=$_sbhome CLAUDE_CONFIG_DIR=$_sbro XDG_DATA_HOME=$tmp/sb-rodata \
-         CCTAB_STATE_DIR=$tmp/sb-state "$_sabin" standalone </dev/null 2>&1 ) \
-       | grep 'Nothing has been changed'
-       chmod 700 "$_sbro")"
-
-# The tree removed by hand, leaving a dangling link, a live env key and a state file.
-# doctor's whole contract is that it runs on the config that is broken, and uninstall
-# has to be able to clean this up; with the default path as the only fallback,
-# NEITHER could.
+# THE TREE DELETED BY HAND, leaving a dangling link, a live env key and a state file.
+# doctor's whole contract is that it runs on the config that is broken, and it has to
+# name BOTH live effects, because they differ: a session already running execs a missing
+# file, while a NEW session loads no plugin and the tab stays blank with no error.
 rm -rf "$_sbtree"
+_sbdoc=$(_sb doctor)
 check 'doctor: runs on a config whose tree was deleted by hand' 'yes' \
-    "$(_sb doctor | grep -q '^mode:      FAIL the plugin directory' && printf yes)"
+    "$(printf '%s' "$_sbdoc" | grep -q '^           FAIL the plugin directory is not there' && printf yes)"
+check 'doctor: names what an ALREADY RUNNING session does' 'yes' \
+    "$(printf '%s' "$_sbdoc" | grep -q 'execs a' && printf '%s' "$_sbdoc" | grep -q 'missing file - 127 per event' && printf yes)"
+check 'doctor: and what a NEW session does, which is different' 'yes' \
+    "$(printf '%s' "$_sbdoc" | grep -q 'the tab stays BLANK' && printf yes)"
 check 'doctor: and still exits 0, because reporting is its whole job' '0' \
     "$(_sb doctor >/dev/null 2>&1; printf %s $?)"
-check 'uninstall: cleans up after a tree that was deleted by hand' '{}' \
-    "$(_sb uninstall >/dev/null 2>&1; cat "$_sbcfg/settings.json")"
-check 'uninstall: and the dangling link went with it' '' \
-    "$(ls -d "$_sbcfg/skills/claude-tabstatus" 2>/dev/null)"
+# install HEALS it: the tree is rewritten at the path the link already names, and the
+# link is not touched.
+_sbout=$(_sb install)
+check 'install: heals a deleted tree at the path the link already names' 'yes' \
+    "$([ -x "$_sbtree/bin/tabstatus" ] && printf '%s' "$_sbout" | grep -q 'symlink:  already correct' && printf yes)"
+check 'install: and the link never moved' "$_sbtree" "$(readlink "$_sbcfg/skills/claude-tabstatus")"
+# A link pointing somewhere UNRELATED must NOT be reused as the tree - materialising
+# into somebody's directory would dead-end the whole install with no way forward. Only
+# a marker-carrying target is reusable; anything else falls through to the default path
+# and is repointed, loudly.
+rm -f "$_sbcfg/skills/claude-tabstatus"
+ln -s "$_sanot" "$_sbcfg/skills/claude-tabstatus"
+_sbout=$(_sb install)
+check 'install: an unrelated link target is not reused as the tree' "$_sbdata/claude-tabstatus" \
+    "$(readlink "$_sbcfg/skills/claude-tabstatus")"
+check 'install: and the repoint is a WARNING, since we did not create that link' 'yes' \
+    "$(printf '%s' "$_sbout" | grep -q '^symlink:  WARNING - repointed a symlink this installer did not create' && printf yes)"
+check 'install: the unrelated directory was not written into' 'README' "$(ls "$_sanot")"
+# A REAL DIRECTORY where the link goes is refused in the preflight, unchanged. This also
+# covers somebody replacing the link with their own checkout by hand.
+rm -f "$_sbcfg/skills/claude-tabstatus"
+mkdir -p "$_sbcfg/skills/claude-tabstatus"
+check 'install: refuses a real directory where the link goes' 'yes' \
+    "$(_sb install | grep -q 'a real directory, not a symlink' && printf yes)"
+rmdir "$_sbcfg/skills/claude-tabstatus"
 
-# uninstall from the bare binary: the default keeps the tree and NAMES it, because
-# a whole plugin directory left behind is not something to find by accident.
+# uninstall from the bare binary, which is the ordinary end of the bare-machine story.
 _saout=$(_sa uninstall)
-check 'uninstall: undoes the standalone install' '{}' "$(cat "$_sacfg/settings.json")"
+check 'uninstall: undoes the install' '{}' "$(cat "$_sacfg/settings.json")"
 check 'uninstall: removed the link' '' "$(ls -d "$_sacfg/skills/claude-tabstatus" 2>/dev/null)"
-check 'uninstall: keeps the generated tree but names it' 'yes' \
-    "$(printf '%s' "$_saout" | grep -q "tree:     $_satree was NOT removed" && printf yes)"
-check 'uninstall: the tree is still there' 'yes' "$([ -f "$_satree/hooks/hooks.json" ] && printf yes)"
-check 'uninstall: does not call a generated tree "the repo"' '' \
+check 'uninstall: removed the generated tree, since nothing else owns it' '' \
+    "$(ls -d "$_satree" 2>/dev/null)"
+check 'uninstall: and said which tree it removed' 'yes' \
+    "$(printf '%s' "$_saout" | grep -q "^tree:     removed the plugin tree $_satree" && printf yes)"
+check 'uninstall: never calls a generated tree "the repo"' '' \
     "$(printf '%s' "$_saout" | grep 'The repo itself')"
-# --purge-tree removes it, and only because it carries the marker. It is
-# remove_dir_all, so it also takes files `standalone` deliberately leaves alone -
-# three refresh runs teach the operator that their own files are safe in there. Under
-# a flag with `purge` in its name that is defensible; doing it SILENTLY is not.
-printf 'mine\n' >"$_satree/NOTES.txt"
-mkdir -p "$_satree/commands"
-printf 'mine\n' >"$_satree/commands/mine.md"
-_saout=$(_sa uninstall --purge-tree)
-check 'uninstall --purge-tree: names the files it did not generate' 'yes' \
-    "$(printf '%s' "$_saout" \
-       | grep -q 'went with it: NOTES.txt, commands/mine.md' && printf yes)"
-check 'uninstall --purge-tree: removes the generated tree' '' "$(ls -d "$_satree" 2>/dev/null)"
-check 'uninstall --purge-tree: says so instead of "was not touched"' '' \
-    "$(printf '%s' "$_saout" | grep 'was not touched')"
-# ...and never a checkout, decided in the preflight so nothing is undone first.
-_out=$(_ins uninstall --purge-tree)
-check 'uninstall --purge-tree: refuses a checkout' 'yes' \
-    "$(printf '%s' "$_out" | grep -q -- '--purge-tree only removes a tree' && printf yes)"
-check 'uninstall --purge-tree: the repo is still whole' 'yes' \
-    "$([ -f "$repo/hooks/hooks.json" ] && [ -f "$repo/.claude-plugin/plugin.json" ] && printf yes)"
 
-# THE assertion this whole section exists to protect: not one byte of a tracked
-# manifest was written by any install path above. install_preflight only READS
-# these two files, and `standalone` is the only verb that writes them - into a
-# directory that is absent, empty, or carries our marker.
+# THE assertion this whole section exists to protect, and it is STRONGER than it was,
+# because `install` is now the verb under suspicion: not one byte of a tracked manifest
+# was written by any install path above, and nothing any install LINKED holds a .git.
 check 'the repo hooks.json was never written by any install' '' \
-    "$(diff "$tmp/sa-repo-hooks.json" "$repo/hooks/hooks.json")"
+    "$(diff "$tmp/repo-hooks.json" "$repo/hooks/hooks.json")"
 check 'the repo plugin.json was never written by any install' '' \
-    "$(diff "$tmp/sa-repo-plugin.json" "$repo/.claude-plugin/plugin.json")"
-# doctor in the CHECKOUT reports the other mode, and the other remedy.
-_out=$(_ins doctor)
-check 'doctor: reports checkout mode in the repo' 'yes' \
-    "$(printf '%s' "$_out" | grep -q '^mode:      checkout - no .tabstatus-generated above' && printf yes)"
-check 'doctor: both embedded manifests match in the checkout' '2' \
-    "$(printf '%s' "$_out" | grep -c '^embedded:  OK')"
+    "$(diff "$tmp/repo-plugin.json" "$repo/.claude-plugin/plugin.json")"
+check 'no install left anything untracked in the checkout' '' \
+    "$(ls -d "$repo/build" "$repo/.tabstatus-generated" 2>/dev/null)"
 
 # --- cross-check against a real git ---------------------------------------
 # Everything above is hand-built, which is what keeps this suite dependency

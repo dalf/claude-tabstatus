@@ -469,102 +469,31 @@ sh scripts/build.sh          # needs cargo, or mise with a rust tool
 ```
 
 Then start a **new** Claude Code session. Updating later is `git pull`, a
-rebuild, and a new session - the installed plugin is a symlink to the clone, so
-there is nothing to reinstall.
+rebuild, **an install**, and a new session:
+
+```sh
+cd ~/code/claude-tabstatus && git pull && sh scripts/build.sh && ./bin/tabstatus install
+```
+
+On a machine with **no checkout** - a remote VM reached over ssh - it is the same
+verb with nothing else on it, because the two manifests Claude Code needs are
+compiled into the binary:
+
+```sh
+scp -C bin/tabstatus-x86_64-unknown-linux-musl vm:~/tabstatus
+ssh vm 'chmod +x ~/tabstatus && ~/tabstatus install && ~/tabstatus doctor'
+```
 
 The build step is temporary: binaries are not committed, and will ship as
 GitHub release assets so that installing needs no toolchain.
 
-On a machine with no checkout - a remote VM reached over ssh - copy **one file**
-and run it: see [Remote install](#remote-install-one-file-no-checkout).
+### The plugin directory is build output
 
-**No dependencies.** `bin/tabstatus` is a single binary - one executable, zero
-crates, nothing linked but libc - and it is both the hook and the installer. There is no `jq`, no Python, and no shell script left in the runtime
-path. Building it needs cargo; running it needs nothing. [Build](#build) covers
-the targets.
-
-Avoid changing configuration in other Claude Code sessions while the installer
-runs. It reads, merges and renames `settings.json`, and although it re-reads the
-file immediately before the rename and aborts if it changed, the safe habit is to
-install when nothing else is writing that file.
-
-```sh
-bin/tabstatus doctor      # is it linked, is the key set, what would this tab say
-bin/tabstatus version
-```
-
-`doctor` is the thing to run when a tab is not painting: it reports the plugin
-link, the env key, the terminal it detected, which end of the title the glyph
-therefore goes on, and the title this directory would render right now.
-
-Its `record:` lines cover [wait ownership](#wait-ownership): where the records live,
-how many there are, what each one holds in words rather than in wire format, and
-which of them the next `session-start` will reap and why.
-
-```text
-record:    /run/user/1000/claude-tabstatus (3 records, 1 stale)
-           8e6d6eb9-...: base working, session pid 3709427 live, waiting on 1 (aec99e1f raised 10s ago)
-           a1b2c3d4-...: base idle, session pid 4242 GONE, nothing waiting; STALE (pid 4242 is not
-           that process any more), the next session-start reaps it
-           notes.txt: not a record in any version's shape - treated as absent; not a name this
-           writes, so the reaper leaves it alone
-```
-
-A record it cannot parse is reported as such rather than as a healthy idle one, which
-is what it used to do: an empty file, a binary one, a *newer* version's record and one
-too big to be a record each printed the same line as an idle session, so the report
-was the wrong place to look when something was wrong.
-
-It also answers the one question every other line renders as healthy - **can a record
-be written at all?** A state directory that is readable but not writable records no
-wait, so a subagent's `PostToolUse` finds none to clear and paints nothing, and the
-tab stays orange until the Task returns. That is the whole defect this layer exists to
-fix, back in silence, under a report that says `nothing recorded, which is also what a
-session that has raised no dialog leaves behind`:
-
-```text
-record:    /run/user/1000/claude-tabstatus (1 record, 0 stale)
-           FAIL not writable - no wait is ever recorded, so a subagent's dialog stays
-           orange until the Task returns
-```
-
-Two things about that report are deliberate. It is **read-only** - the command you
-run when something is already wrong must not be the command that deletes the
-evidence, so it names the stale files instead of taking them, and the verdicts come
-from the same function the reaper calls so the two cannot drift. The one exception is
-the writability probe above, which creates and immediately unlinks a file named for
-its own pid; that destroys no evidence, and a report that cannot answer the question
-is worse than useless. And when there is nowhere to keep a record it says so, with
-the reason:
-
-```text
-record:    disabled - no CCTAB_STATE_DIR and no XDG_RUNTIME_DIR
-           so every edge falls back to the stateless answer, which is the behaviour
-           from before wait ownership existed
-```
-
-That line exists because "disabled" is the silent answer to almost every question
-this layer can raise: a tab behaving exactly as it did before wait ownership is
-indistinguishable from a layer that is working correctly.
-
-### Remote install: one file, no checkout
-
-Claude Code will not load a plugin that is not a directory holding
-`.claude-plugin/plugin.json` and `hooks/hooks.json`, so deploying used to mean
-shipping a tree. The two manifests are 3.2 KB between them, so they are compiled
-**into** the binary with `include_str!` and `standalone` writes them back out:
-
-```sh
-scp -C bin/tabstatus-x86_64-unknown-linux-musl vm:~/tabstatus
-ssh vm 'chmod +x ~/tabstatus && ~/tabstatus standalone && ~/tabstatus doctor'
-```
-
-`-C`, because `scp` does not compress by default and one file is not automatically
-fewer bytes than the tarball it replaces: the raw binary is 635 KB against the old
-four-entry tarball's 303 KB, and `gzip -9` of it is 314 KB. The whole wire cost of
-shipping one file instead of a tree is about 11 KB, with the flag. Without it, 2.1x.
-
-That is the whole install. `standalone` materialises
+**`install` never links your checkout. It writes a plugin directory and links
+that.** `hooks/hooks.json` and `.claude-plugin/plugin.json` are *source*: tracked
+files you read, diff and edit, and they reach a running session the way
+`src/main.rs` does - through a build. `scripts/build.sh` compiles them into the
+binary with `include_str!`, and `install` writes them back out into
 
 ```text
 ~/.local/share/claude-tabstatus/
@@ -574,19 +503,122 @@ That is the whole install. `standalone` materialises
     .tabstatus-generated            the marker: version, target triple, file list
 ```
 
-then runs the ordinary `install` against it - the same three writes, the same
-preflight, the same output. The tree goes in `$XDG_DATA_HOME/claude-tabstatus`,
-or `$HOME/.local/share/claude-tabstatus`; `standalone <dir>` puts it anywhere
-else. Then start a **new** Claude Code session, as ever.
+then sets the env key and points `~/.claude/skills/claude-tabstatus` at **that**.
+The tree goes in `$XDG_DATA_HOME/claude-tabstatus`, or
+`$HOME/.local/share/claude-tabstatus`; `install --tree <dir>` puts it anywhere
+else. One code path, in a checkout and on a bare VM alike - there is no second
+verb and no mode.
 
-`doctor` and `uninstall` find that tree again from **`<config>/skills/claude-tabstatus`**,
-the symlink `install` itself wrote, before falling back to the default path. That
-record is what makes `<dir>` a real option rather than one that quietly costs you
-both commands - and it is also what makes them work when the default path *moves*,
-because `XDG_DATA_HOME` is set in an interactive shell and not in `ssh vm '...'`.
-The link is followed even when it dangles: a tree deleted by hand leaves a live env
-key and a state file behind it, and that is exactly the broken config `doctor` exists
-to explain and `uninstall` has to clean up.
+It used to be a symlink **to the clone**, and that had to change:
+
+- `git checkout` of a working branch whose `hooks.json` is broken broke **every
+  prompt in every running session**, instantly. Deployment must be an explicit
+  act, not a side effect of changing branches.
+- `git pull` did something subtler and worse, because `bin/` is gitignored: you
+  got the **new** `hooks.json` live at once while `bin/` still held the **old**
+  binary - new hook edges pointing at a binary that had never heard of them. One
+  rebuild plus one `install` moves both together, so that state is unreachable.
+
+Nothing in the checkout is written by any install path, and the test suite asserts
+that as a byte comparison after every install it performs. `bin/` keeps its job:
+it is still the binary you *run*, and `./bin/tabstatus install` is the documented
+command. It simply stops being the binary *hooks* run.
+
+`-C` on the `scp`, because it does not compress by default and one file is not
+automatically fewer bytes than the tarball it replaces: the raw binary is 680 KB
+against the old four-entry tarball's 303 KB, and `gzip -9` of it is 334 KB. The
+whole wire cost of shipping one file instead of a tree is about 31 KB, with the
+flag. Without it, 2.2x.
+
+### Migrating from a checkout symlink
+
+If `~/.claude/skills/claude-tabstatus` currently points at your clone, one
+`install` moves it, and it **says so before it writes anything**:
+
+```text
+plugin:   /home/me/.claude/skills/claude-tabstatus
+          now  -> /home/me/code/claude-tabstatus (a checkout, not a generated tree)
+          will -> /home/me/.local/share/claude-tabstatus
+          That checkout stops being the live plugin. Its hooks.json and
+          plugin.json are SOURCE from now on; `tabstatus install` is what
+          deploys them. Nothing in it is modified.
+```
+
+A silent repoint of live wiring is the wrong behaviour whatever it is for.
+`doctor` names the same thing, which is how it gets discovered - `doctor` is what
+you run when a tab misbehaves:
+
+```text
+plugin:    WARN /home/me/.claude/skills/claude-tabstatus points at a CHECKOUT, not at a generated tree:
+           /home/me/code/claude-tabstatus
+           That is the wiring from before the plugin directory became build
+           output - a `git checkout` there changes what every running session
+           runs. `tabstatus install` repoints it at a generated tree.
+```
+
+It is safe to run **while sessions are live**, and two mechanics make that true
+rather than hopeful. The symlink is repointed with a temp link and `rename(2)`,
+not `unlink` then `symlink`: `rename` over a symlink is atomic, so the name
+resolves to the old target or the new one and never to *nothing* - a hook firing
+in that window would exec a missing file, and a non-zero `PreToolUse` hook
+**blocks a tool**. The binary is copied to a temp file in the tree's own `bin/`,
+**exec'd there**, and only then renamed onto `bin/tabstatus`, so the live hook
+path is never absent for the length of a 680 KB copy and nothing becomes live
+wiring without having been run first.
+
+One thing an uninstall will **not** do afterwards: put the checkout link back.
+The state record's `symlink_before.target` is written once, at the first install,
+and on a machine that was wired the old way it names the clone - so restoring it
+would rebuild exactly the arrangement this change exists to abolish. It is
+declined by name:
+
+```text
+symlink:  removed /home/me/.claude/skills/claude-tabstatus
+          (was -> /home/me/.local/share/claude-tabstatus)
+          the recorded prior target was the checkout at /home/me/code/claude-tabstatus;
+          a checkout is no longer a plugin directory, so the link is
+          removed rather than pointed back at it.
+```
+
+That write-once record is also why `install` no longer promises an undo it cannot
+deliver. When it replaces a link it did not create it used to say "uninstall puts
+the old target back." - true on a *first* install, which is the run that writes the
+record, and false on every one after it, because from then on the target being
+replaced and the target `uninstall` reads are different paths. It was printed in
+exactly the case it exists for: live wiring being repointed. It now says what the
+record actually holds:
+
+```text
+symlink:  WARNING - repointed a symlink this installer did not create
+          /home/me/.claude/skills/claude-tabstatus
+          was  /home/me/somewhere/else
+          now  /home/me/.local/share/claude-tabstatus
+          uninstall will NOT put this target back: the record is
+          write-once, so it restores /home/me/first-install-found-this - what the
+          FIRST install found here.
+```
+
+### If you delete the tree but keep the link
+
+The two live effects differ, and `doctor` names both, because only naming both
+answers the question:
+
+```text
+tree:      /home/me/.local/share/claude-tabstatus (from the plugin symlink)
+           FAIL the plugin directory is not there.
+           A session already running has its hooks registered and now execs a
+           missing file - 127 per event, and a PreToolUse 127 can block a tool.
+           A NEW session loads no plugin at all and the tab stays BLANK, with no
+           error anywhere, because env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE is still set.
+           `tabstatus install` writes it back.
+```
+
+`install` heals it *in place*: the link already names where the tree belongs, so
+the tree is rewritten there and the link is not touched. An
+`install --tree <somewhere>` you chose once is not silently abandoned for the
+default path.
+
+### How the generated tree is written
 
 `include_str!` rather than a crate. It is a std macro, it costs no dependency,
 and it is the direct analogue of Go's `//go:embed`: the JSON becomes a rustc
@@ -595,39 +627,87 @@ with the tree it was built from. `rust-embed` and `include_dir` solve a differen
 problem - globbing an asset tree and iterating it at runtime - and both are
 proc-macro crates. Two `include_str!` lines execute nothing at build time.
 
-**Two copies of a tracked file can drift, so which one wins is decided by
-location, not by age.** In a checkout the *file* is the truth and the binary is
-the stale thing; in a generated tree the *binary* is the truth and the tree is
-the stale thing. `install` never reads the embedded copies and never writes a
-manifest, so **no install path can touch a tracked file** - running `install` in
-a checkout does exactly what it always did. `standalone` is the only verb that
-writes a manifest, and only into a directory that is absent, empty, or already
-carries `.tabstatus-generated`. Anything else is refused by name:
+**Ownership is positive evidence, never inference.** A tree `install` generated
+carries `.tabstatus-generated`; a directory without it is refused rather than
+written into. That is the marker's only job now - it used to double as a mode
+discriminator, and there is one shape of plugin directory left, so it does not.
 
 ```text
 error: /home/me/notes already exists, is not empty, and carries no
-       .tabstatus-generated - so it was not written by `tabstatus standalone` and
-       is not ours to overwrite. If it is a checkout, run `tabstatus install`
-       there. If it is nothing you need, remove it - `rm -rf /home/me/notes` - and
-       re-run. Otherwise pass a different directory. Nothing has been changed.
+       .tabstatus-generated - so it was not written by `tabstatus install` and is
+       not ours to overwrite. Pass a different directory with `--tree`. Nothing has
+       been changed.
 ```
 
-A directory with a `.git` in it is refused a second time, even if a marker
-appears there, and a target under `<config>/skills/` is refused too, because
-`install` would then be asked to symlink a directory to itself. A path that exists
-and is *not a readable directory* is a fourth named refusal rather than an errno
-from `create_dir_all` three lines later.
+That refusal used to end with a copy-pasteable `rm -rf <whatever you typed>`, and
+the subject of that sentence is an argument - so `--tree /` printed `rm -rf /`,
+`--tree ~` printed it on the home directory, and a slipped `--tree ..` printed it
+on a parent full of somebody's work. The refusal itself was right and wrote
+nothing; the defect was that the suggested remedy for a typo was unrecoverable, in
+the one message a hurried operator copies. The hint is now offered **only** for a
+directory that looks like a stale tree of ours - named `claude-tabstatus`, or
+sitting exactly where the default one would - and never for `$HOME` or for anything
+fewer than three levels down, whatever it is called:
 
-**The marker is written first, before either manifest and before the binary copy.**
-It is the only evidence of ownership the refusal above accepts, so a run killed in
-that window - ENOSPC during the 635 KB copy on a small VM, a dropped ssh, an OOM -
-must not leave a populated directory with no marker in it: that shape was classified
-as somebody else's and refused *forever*, on exactly the machine this verb exists
-for, and only `rm -rf` recovered it. One write, before the files, makes every partial
-state re-enterable by construction. `read_marker` already tolerates a marker it
-cannot parse and a stale file list, so the early write costs nothing.
+```text
+error: /home/me/.local/share/claude-tabstatus already exists, is not empty, and
+       carries no .tabstatus-generated - ... If it is nothing you need, remove it -
+       `rm -rf /home/me/.local/share/claude-tabstatus` - and re-run. Pass a
+       different directory with `--tree`. Nothing has been changed.
+```
 
-Inside a tree it does own, `standalone` rewrites **every** generated file
+A directory with a `.git` in it is refused a second time even if a marker appears
+there, a directory **inside** this checkout is refused a third time - that is the
+last door by which the clone could become the plugin directory again, and it looks
+for a `.git` beside a `.claude-plugin/plugin.json` specifically, because plenty of
+people keep `$HOME` itself in git and the default tree lives three levels under
+it - and a target under `<config>/skills/` is refused too, because `install` would
+then be asked to symlink a directory to itself. A path that exists and is *not a
+readable directory* is a named refusal rather than an errno from `create_dir_all`
+three lines later, and so is a path that exists as a **symlink**: a dangling one
+answered `NotFound` to `fs::metadata`, read as "absent, go ahead", and then failed
+`File exists (os error 17)` - the exact errno these refusals exist to replace,
+printed *after* the header had announced a repoint that never happened. A symlink
+to a real empty directory was worse than a bad error, because it was accepted: the
+tree landed in the link's target and nothing could ever prove which files under it
+were ours to remove. Whether the tree or its nearest existing parent is
+**writable** is checked in the preflight as well, so a failure lands before the
+marker exists rather than half way through materialising.
+
+**`--tree` is made absolute and lexically normalised once, before anything looks at
+it.** Everything downstream compares that path, writes through it and *records* it,
+and a raw argument defeated all three. `--tree skills/claude-tabstatus` run from
+`<config>` walked straight past the refusal whose whole job is to keep the tree out
+of `skills/`, because that test is a component-prefix test on the string; the
+symlink then got the relative string as its target, which resolves against the
+*link's* directory rather than the shell's, so the link dangled while the env key
+was set and `install` said "Done."; and the record kept the relative string, so a
+later `uninstall` run from somewhere else removed files from whatever happened to be
+named that there. `fs::canonicalize` is the wrong tool here - it resolves symlinks,
+and it fails on a path that does not exist yet, which the tree usually does not - so
+`.` and `..` are folded textually. A `tree` field in the record that is not absolute
+can only come from a hand edit and is ignored rather than resolved.
+
+**The marker is written first, before the binary and before either manifest.** It
+is the only evidence of ownership the refusal above accepts, so a run killed in
+that window - ENOSPC during the 680 KB copy on a small VM, a dropped ssh, an OOM -
+must not leave a populated directory with no marker in it: that shape was
+classified as somebody else's and refused *forever*, and only `rm -rf` recovered
+it. One write, before the files, makes every partial state re-enterable by
+construction.
+
+**Then the binary, and only then the manifests.** That order is the opposite of
+what it was, and it flipped for a reason that only applies now that the tree is
+live wiring. A refresh has no quiet moment, so one hook event somewhere may see a
+half-updated pair - and of the two possible in-between states only one is
+harmless. A **new binary with old manifests** paints every edge the old
+`hooks.json` can name. An **old binary with new manifests** is the broken one: a
+new edge word reaches `edge.rs`, which maps what it does not recognise to
+`Edge::Unknown` and paints the *idle* glyph, so the tab goes quietly wrong rather
+than loudly. On a first install into an empty directory the order is indifferent,
+so binary-first is right in both cases.
+
+Inside a tree it does own, `install` rewrites **every** generated file
 unconditionally and prunes the ones an older version generated. The alternative -
 "leave what is already there" - is the upgrade that silently does nothing: a
 release adding a twelfth hook edge would install cleanly against an old
@@ -640,51 +720,79 @@ wrote:    hooks/hooks.json (2842 bytes, REPLACED, was 2851 bytes)
 pruned:   hooks/extra.json (generated by an older version)
 ```
 
-Upgrading is the same two commands: `scp -C` the newer binary over `~/tabstatus`,
-run `~/tabstatus standalone`, start a new session. Before it installs anything,
-`standalone` **execs the copy it just made** and refuses if it does not answer with
-the expected version - which turns a `noexec` mount and a lost exec bit into one
-refusal at install time instead of eleven hooks failing silently in every later
-session. It does *not* cover a wrong architecture and does not claim to: the copy is
+A re-install whose binary is **byte-identical** to the running one skips the copy
+and says `unchanged - identical bytes`, so a no-op install genuinely does not
+disturb live wiring rather than renaming a fresh inode over a file eleven hooks
+are executing for no reason at all. Before any copy becomes that file, `install`
+**execs it** and refuses if it does not answer with the expected version - which
+turns a `noexec` mount and a lost exec bit into one refusal at install time
+instead of eleven hooks failing silently in every later session. It does *not*
+cover a wrong architecture and does not claim to: the copy is
 `std::env::current_exe`, so it is by construction the same architecture as the
 process running the check.
 
-`doctor` states which mode it is in, so its remedies are unambiguous:
+Two concurrent installs are benign by construction rather than by locking: every
+write is a same-directory temp file with a pid-suffixed name plus `rename(2)`, so
+no file is ever torn, no temp name collides and no path is ever missing. Two runs
+of the same version are a no-op; two *different* versions can leave a mixed tree,
+which one more install repairs. A lockfile would be disproportionate for a
+one-user tool.
+
+`doctor` says where the plugin directory is and how it worked that out, because
+the repo is no longer the answer and there are three places it can come from:
 
 ```text
-mode:      standalone - .tabstatus-generated says this tree was materialised from a binary,
-           so the BINARY is the truth here
+tree:      /home/me/.local/share/claude-tabstatus (from the plugin symlink)
            generated by tabstatus 0.1.0 (x86_64-unknown-linux-musl)
-           tree binary: identical to the one running
+binary:    OK   /home/me/.local/share/claude-tabstatus/bin/tabstatus
+           WARN the live tree is running a different build of tabstatus than this one
+                (same 680496 bytes, different content)
+           deploy this build: tabstatus install
+source:    OK   /home/me/code/claude-tabstatus - both manifests match the copies compiled in
 embedded:  OK   .claude-plugin/plugin.json matches the copy compiled in
 embedded:  WARN hooks/hooks.json differs from the copy compiled in (2842 vs 2851 bytes)
-           this tree was generated, so the BINARY is the truth: refresh it with
-           `tabstatus standalone`
+           the tree is stale: `tabstatus install` rewrites it
 ```
 
-Two byte counts are the detail that makes that line actionable without a diff -
-except when they are the same number, which is the commonest case of all: 0.1.0 and
-0.2.0 are the same length, so a plain version bump makes `plugin.json` differ at
-identical size. That reads as `same 438 bytes, different content` rather than
-`(438 vs 438 bytes)`, which would look like a bug in the report rather than the
-answer. `standalone` says it the same way: `REPLACED - same 438 bytes, different
-content`.
+The `binary:` comparison is **unconditional**, which it was not: it used to be
+reachable only for a remotely installed tree, so the commonest real case of all -
+`./bin/tabstatus doctor` in the checkout after a rebuild, asking whether the
+running build has actually been deployed - never reached it. `source:` is the
+other half of that question and the only part of the old two-mode report that was
+ever actionable: do the manifests in the checkout this binary came out of still
+match the copies compiled **into** it? A mismatch means somebody edited
+`hooks.json` and has not rebuilt, so an install from there would deploy the older
+copy. `WARN`, never `FAIL` - a mid-edit working tree is a normal state and the
+command people run daily must not cry wolf over it. `install` prints the same
+warning at the moment those bytes become live wiring.
 
-and in a checkout the same comparison gets the opposite advice - `this is a
-checkout, so the FILE is the truth: rebuild with sh scripts/build.sh`. It is a
-`WARN`, never a `FAIL`: a mid-edit `hooks/hooks.json` is a normal working-tree
-state and the command people run daily must not cry wolf over it. The one way to
-get a genuinely stale tree is to `scp` a newer binary straight over
-`<tree>/bin/tabstatus` and skip `standalone`; that is what the `tree binary:`
-line catches, and `doctor` also compares the marker's target triple against the
-running one, which covers a tree materialised by one architecture and later run
-by another.
+Two byte counts are the detail that makes a drift line actionable without a diff -
+except when they are the same number, which is the commonest case of all: 0.1.0
+and 0.2.0 are the same length, so a plain version bump makes `plugin.json` differ
+at identical size. That reads as `same 438 bytes, different content` rather than
+`(438 vs 438 bytes)`, which would look like a bug in the report rather than the
+answer. The install path says it the same way: `REPLACED - same 438 bytes,
+different content`.
+
+`doctor` and `uninstall` find the tree from **`<config>/skills/claude-tabstatus`**,
+the symlink `install` itself wrote, then from the state record's `tree` field, then
+from the default path. Walking up from the running executable is deliberately
+**not** one of the answers: `./bin/tabstatus doctor` in a checkout would find
+`.claude-plugin/plugin.json` above itself and report that the plugin is this
+checkout - the exact wiring being abolished, restated by the tool as fact. The
+binary you *run* and the directory Claude Code *loads* are two different things
+now, and only the config directory knows the second one. The link is followed even
+when it dangles, and the record covers what the link cannot: a link repointed or
+removed by hand would otherwise leave the tree an orphan that nothing can name.
+`doctor` names an orphan when it finds one.
 
 **The binary is `x86_64-unknown-linux-musl`.** On an aarch64 machine it fails at
 `exec` with the kernel's own *Exec format error* before a line of this program
 runs, so nothing in it can improve that message. The fix is an
 `aarch64-unknown-linux-musl` entry in `scripts/build.sh`'s `TARGETS`; until then,
-check `uname -m` on the VM first.
+check `uname -m` on the VM first. `doctor` also compares the marker's target
+triple against the running one, which covers a tree materialised by one
+architecture and later run by another.
 
 Three layers keep the embedded copies honest, and the worst outcome - a stale
 embedded `hooks.json` silently disagreeing with the repo - is caught by all
@@ -703,18 +811,44 @@ is why the zero-dependency claim stays trivially true.
 
 ### install and uninstall are ordered, both ways
 
-`install` writes `settings.json` **first** and the plugin symlink **last**;
-`uninstall` is the mirror, settings first and the link last. The reason is the
-half-state between the two writes: the env key switches Claude Code's own title
-painting off and the plugin paints the replacement, so "key set, plugin gone" is
-the one combination that paints **no tab title at all**. Both halves therefore
-preflight every refusal - the repo shape, `bin/tabstatus`, the `skills` directory
-and its writability, `settings.json`'s shape, mode and parent, a `settings.json`
-symlink that does not resolve, and whether there is a state record proving the key
-is ours - so nothing between the two writes can decide to stop. A `settings.json`
-with duplicate members at the top level or inside `env` is refused too: this tool
-resolves first-wins and `JSON.parse` resolves last-wins, so editing it could set a
-key Claude Code never reads.
+`install` writes the **tree** first, then `settings.json`, then the plugin symlink
+**last**; `uninstall` is the mirror - settings first, the link next, the tree last.
+
+The reason for the last two is the half-state between them: the env key switches
+Claude Code's own title painting off and the plugin paints the replacement, so
+"key set, plugin gone" is the one combination that paints **no tab title at all**.
+The tree goes before both because it is **inert until the symlink points at it**,
+so an abort anywhere before that last step leaves a first-time user exactly as
+they were. And the symlink swap is the only irreversible step - it is the one write
+that changes what code a running session executes - so it goes last *and* after
+the copy in the tree has been exec'd, which is what proves the new target works.
+
+Both halves preflight every refusal - the tree's ownership and writability, the
+`skills` directory and its writability, `settings.json`'s shape, mode and parent, a
+`settings.json` symlink that does not resolve, and whether there is a state record
+proving the key is ours - so nothing between the writes can decide to stop, and
+every refusal still honestly ends **"Nothing has been changed."** A
+`settings.json` with duplicate members at the top level or inside `env` is refused
+too: this tool resolves first-wins and `JSON.parse` resolves last-wins, so editing
+it could set a key Claude Code never reads.
+
+What is preflighted cannot fail between the writes; what is left is a full disk or
+a tampered tree, and both land at the **first** write - directly under a header that
+may have just announced, in three loud lines, that the live plugin link "will ->"
+somewhere new. The bare OS error alone leaves the only question that matters
+unanswered, so the failure answers it:
+
+```text
+error: /home/me/.local/share/claude-tabstatus/hooks is not a directory, so
+hooks/hooks.json is not provably inside the plugin tree ... Refusing.
+
+The plugin symlink /home/me/.claude/skills/claude-tabstatus was NOT touched, and
+neither were settings.json or the state record at
+/home/me/.claude/claude-tabstatus.state - so live sessions still paint through
+whatever the header above printed as `now`, and nothing has become live wiring.
+Part of /home/me/.local/share/claude-tabstatus may have been written. It carries
+.tabstatus-generated, so a re-run resumes into it rather than refusing.
+```
 
 ## Uninstall
 
@@ -722,29 +856,99 @@ key Claude Code never reads.
 ~/code/claude-tabstatus/bin/tabstatus uninstall
 ~/code/claude-tabstatus/bin/tabstatus uninstall --force            # no state record: remove anyway
 ~/code/claude-tabstatus/bin/tabstatus uninstall --restore-backup   # roll settings.json back wholesale
-~/tabstatus uninstall --purge-tree                                # also delete a generated tree
+~/code/claude-tabstatus/bin/tabstatus uninstall --keep-tree        # leave the plugin tree on disk
 ```
 
-`--purge-tree` exists only for a [remote install](#remote-install-one-file-no-checkout):
-it removes the materialised tree itself, and it is accepted only for a directory
-carrying `.tabstatus-generated`. Against a checkout it is refused in the preflight,
-before anything is undone - your source is not the uninstaller's to delete. The
-default leaves the tree alone and *names* it, because a whole plugin directory left
-in `~/.local/share` is not something to find by accident.
+**It removes the plugin tree by default**, because nothing else owns it: leaving it
+behind leaves a whole plugin directory in `~/.local/share` that nothing will ever
+mention again. `--keep-tree` opts out and names the `rm -rf` that finishes the job.
 
-It is `remove_dir_all`, so it also takes files `standalone` deliberately *does not*
-touch - prune only ever removes what the marker lists, so a few refresh runs teach
-you by behaviour that your own files are safe in that directory. Under a flag with
-`purge` in its name that is defensible; doing it silently is not, so the report names
-them: `removed the generated tree <path> (2 files it did not generate went with it:
-NOTES.txt, commands/mine.md)`.
+It is conservative, and the two rules are what make removing it by default
+defensible. Only a directory carrying `.tabstatus-generated` is touched at all - a
+link still pointing at a **checkout** is named and left alone, because that is
+somebody's source - and within a tree it does own, only the files the marker lists
+plus the directories those leave empty. Anything else is **named and kept**:
+
+```text
+tree:     removed 3 generated files from /home/me/.local/share/claude-tabstatus, which was
+          left in place because it holds 1 file nothing here generated: NOTES.txt
+```
+
+It removes the **live** tree, the one the symlink points at, and nothing else. An
+`install --tree <somewhere else>` leaves the previous tree behind as an orphan, and
+both commands name one whenever it is still discoverable - the default path, or the
+`tree` field of the state record:
+
+```text
+tree:     /home/me/.local/share/claude-tabstatus is another generated tree and was NOT
+          the live one, so it is left behind. Remove it with `rm -rf ...`.
+```
+
+`install` names it at the moment of the move too, which is where it is actionable. A
+previous *custom* path is not discoverable afterwards and this does not pretend
+otherwise: the record names the tree an install owns, not a history of them.
+
+There is no `remove_dir_all` anywhere on a path this program derived from a
+symlink. Prune only ever removes what the marker lists, so a few refresh runs
+teach you by behaviour that your own files are safe in that directory, and
+`uninstall` keeps that promise rather than breaking it at the last moment. If you
+want the whole directory gone including your own files, `rm -rf <the path it just
+named>` is the honest instruction - and when the directory survives with nothing
+this report can name in it, only empty subdirectories, it says exactly that rather
+than claiming the tree "is now empty" over a directory still on disk.
+
+**A marker-listed path is checked on disk, not just as a string.** The marker is
+plain text in a directory anything able to write the tree can edit, so "we wrote it"
+is not a bound on the blast radius. `safe_relative` rejects `..`, a leading `/` and
+`.`, and a string made entirely of ordinary components still resolves through
+whatever is on disk: with `<tree>/bin` replaced by a symlink, `bin/tabstatus` named
+a file in *somebody else's* directory, and both operations here reached it -
+`remove_file` unlinked it, and the atomic write, whose temp file is created in the
+destination's parent, created and renamed inside it. Outside the tree, silently, and
+reported as inside it. One helper is now the only way those paths are built: the
+tree root and every directory component of the path must be a real directory, and a
+component that is a link is refused by name. Missing components are created one at a
+time with `create_dir`, never `create_dir_all`, which would accept an existing
+symlink-to-directory as "already there" and reopen the hole from the write side. The
+path's *ancestors* are deliberately not checked - `~/.local` is a symlink on any
+machine with a dotfile manager - because what this defends is the boundary of the
+tree, not the route to it.
+
+```text
+tree:     LEFT a file the marker listed - /home/me/.local/share/claude-tabstatus/bin is
+          not a directory, so bin/tabstatus is not provably inside the plugin tree
+          /home/me/.local/share/claude-tabstatus - following it would write to, or
+          unlink, a file outside. Refusing.
+```
+
+Pruning also takes the directories it empties. An older version's
+`old/legacy.json` left an empty `old/` that no later marker lists, so `remove` never
+took it and the tree could never come down.
 
 The uninstaller is an undo, not a delete: it puts back whatever
 `claude-tabstatus.state` says was there before. If you had already set
 `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` yourself, your value comes back, byte for
 byte - the state file records the value's original *text*. If that record is
 missing and the key is present, the key is left alone unless you pass `--force`,
-because there is then no way to tell it apart from your own setting.
+because there is then no way to tell it apart from your own setting. The one
+recorded thing it declines to restore is a prior symlink target that is a
+**checkout**; see [Migrating from a checkout symlink](#migrating-from-a-checkout-symlink).
+
+Being right about that key can still leave you with a blank tab, and it says so.
+If the record shows the key was already set to something Claude Code reads as "do
+not paint the title" *before* `install` ran, `uninstall` correctly keeps your value -
+and it unlinks the plugin that painted the replacement in the same run. That is the
+"a tab nothing paints" state the install path spells out in full when a late write
+fails, reached here by being scrupulous rather than by failing, and it used to be
+reported as a neutral `unchanged`:
+
+```text
+settings: env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE already holds the value install found - unchanged
+          NOTE that value switches Claude Code's OWN title painting off, and the
+          plugin that painted the replacement is unlinked below - so nothing will
+          paint the tab. It was already set when install ran, so claude-tabstatus keeps
+          it; unset it yourself in /home/me/.claude/settings.json if that was not deliberate.
+```
 
 It also removes the wait-ownership records - `records:  removed
 /run/user/1000/claude-tabstatus (2 record(s))` - which is the only other thing the
@@ -756,16 +960,21 @@ anything else, only the records go and it says so.
 
 ## What it changes
 
-Three things, and nothing else:
+Four things, and nothing else:
 
-1. One key in `~/.claude/settings.json`:
+1. A generated plugin tree at `$XDG_DATA_HOME/claude-tabstatus`, or
+   `$HOME/.local/share/claude-tabstatus` - [build output](#the-plugin-directory-is-build-output),
+   like `bin/`, written from the copies compiled into the binary.
+2. One key in `~/.claude/settings.json`:
    `env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE = "1"`.
-2. A symlink `~/.claude/skills/claude-tabstatus` pointing at this repo. A
-   directory there containing `.claude-plugin/plugin.json` auto-loads; there is
-   no marketplace entry and no `enabledPlugins` line. There is deliberately no
-   `SKILL.md`, so the plugin costs essentially no model context.
-3. `~/.claude/claude-tabstatus.state`, a small JSON record of what was there
-   before, written once and removed by `uninstall`.
+3. A symlink `~/.claude/skills/claude-tabstatus` pointing at **that tree**, never
+   at your checkout. A directory there containing `.claude-plugin/plugin.json`
+   auto-loads; there is no marketplace entry and no `enabledPlugins` line. There
+   is deliberately no `SKILL.md`, so the plugin costs essentially no model
+   context.
+4. `~/.claude/claude-tabstatus.state`, a small JSON record in two halves: what was
+   there before (written once, never rewritten) and which tree this install owns
+   (rewritten every install, because `--tree` moves it). `uninstall` removes it.
 
 Plus one thing that is not configuration: the running plugin keeps a small
 per-session record under `$XDG_RUNTIME_DIR/claude-tabstatus` (see
@@ -1376,9 +1585,12 @@ Everything the runtime half reads, in one place:
 | `CCTAB_STATE_DIR` | `$XDG_RUNTIME_DIR/claude-tabstatus` | where the per-session wait record lives. Unset **and** no `XDG_RUNTIME_DIR` means no record at all, and every edge falls back to the stateless answer. **Use a dedicated directory:** `session-start` reaps in it. It deletes only files it can prove are its own records ([wait ownership](#wait-ownership)), but it is still the wrong place to keep anything else |
 | `CCTAB_NOW` | unset | test only: pins the epoch the tmux record and the state record carry |
 
-`XDG_DATA_HOME` is read by `standalone` alone, for where the generated tree goes -
-`$XDG_DATA_HOME/claude-tabstatus`, falling back to `$HOME/.local/share/claude-tabstatus`.
-The runtime half never looks at it.
+`XDG_DATA_HOME` is read by `install` alone, for where the [generated plugin
+tree](#the-plugin-directory-is-build-output) goes - `$XDG_DATA_HOME/claude-tabstatus`,
+falling back to `$HOME/.local/share/claude-tabstatus`, and `install --tree <dir>`
+overrides both. The runtime half never looks at it. Anything that exercises
+`install` or `uninstall` must redirect it along with `HOME`, `CLAUDE_CONFIG_DIR` and
+`CCTAB_STATE_DIR`: it is the one that decides where a real 680 KB tree lands.
 
 `CLAUDE_PID` is exported into every hook subprocess and is how `session-start`
 and `session-end` find the pty. `XDG_RUNTIME_DIR` is read for the state
@@ -1401,8 +1613,17 @@ control.
 
 `bin/` is **build output and is gitignored.** It holds a binary per platform plus
 `bin/tabstatus`, a relative symlink to the one for this machine - that is the
-path `hooks/hooks.json` invokes. A fresh clone has no `bin/` until you build,
-and `tabstatus install` refuses rather than half-installing.
+binary you **run**, and `./bin/tabstatus install` is the documented command. It is
+no longer the binary *hooks* run: `install` copies it into the
+[generated plugin tree](#the-plugin-directory-is-build-output), and
+`hooks/hooks.json` invokes the copy there. A fresh clone has no `bin/` until you
+build.
+
+`hooks/hooks.json` and `.claude-plugin/plugin.json` are **source, not deployed
+files**. They are compiled into the binary with `include_str!`, so editing one is a
+rustc rebuild input - and, exactly like editing `src/main.rs`, it reaches a running
+session only after a rebuild and an `install`. That is the whole point: stale source
+is stale source, and there is no reason the JSONs should be special.
 
 Binaries ship as **GitHub release assets** rather than in git history, so that
 installing needs no toolchain. The [Test workflow](.github/workflows/test.yml)
@@ -1439,7 +1660,7 @@ triple's binary behind while a verify read fully green.
 
 | Target | State |
 |---|---|
-| `x86_64-unknown-linux-musl` | **default**, 589 KB, static-pie |
+| `x86_64-unknown-linux-musl` | **default**, 680 KB, static-pie |
 | `x86_64-unknown-linux-gnu` | builds |
 | `x86_64-pc-windows-gnu` | **does not build**, see below |
 
@@ -1474,7 +1695,7 @@ sh tests/run.sh
 CCTAB_TEST_BIN=target/release/tabstatus sh tests/run.sh   # a build you just made
 ```
 
-513 assertions, and what they drive is `bin/tabstatus` - the same binary
+596 assertions, and what they drive is `bin/tabstatus` - the same binary
 `hooks/hooks.json` invokes, so a stale committed binary fails here rather than in
 somebody's tab. The suite used to run the shell implementation under three shells
 in four locales, because its answer depended on both; a binary has no
@@ -1490,7 +1711,7 @@ all - that `repair` answers differently from `String::from_utf8_lossy` on a
 truncated sequence, for one.
 
 ```sh
-cargo test   # 163 tests, beside the 513 assertions and the 312 corpus cases
+cargo test   # 168 tests, beside the 596 assertions and the 312 corpus cases
 ```
 
 The state section pins `CLAUDE_PID` per case rather than inheriting it, and that is
@@ -1501,18 +1722,33 @@ used to land in records two cases assert byte for byte, and the declared gate wa
 in the one environment it is actually invoked from. It is not unset globally, because
 the headless-guard and pty sections need the ambient one.
 
-The standalone section performs a **real** install: it drops a bare copy of the
-binary in a directory with no plugin tree above it - the shape of a binary scp'd to
-a VM - and runs `standalone`, `doctor`, the refusals, a refresh and
-`uninstall --purge-tree` against it. It pins four variables, and the fourth is the
-one that catches people out. `HOME`, `CLAUDE_CONFIG_DIR` and `XDG_DATA_HOME` are
-what the installer reads, but `state::purge` resolves the record directory from
-`XDG_RUNTIME_DIR` / `CCTAB_STATE_DIR` **alone**, so an `uninstall` with only the
-first three redirected deletes the *real* wait records of whoever is running it.
-Harmless and self-healing - a session with no record degrades to the stateless
-answer and the next edge writes another - but any script or session exercising
-`uninstall` should redirect `CCTAB_STATE_DIR` as well, exactly as this suite does
-per case.
+The install sections perform **real** installs, which is why what they pin matters
+more than in any other part of this suite. `install` now materialises a 680 KB
+plugin tree, so **four** variables have to be redirected and each one covers
+something the others do not. `HOME` and `CLAUDE_CONFIG_DIR` are where the key, the
+link and the record go. `XDG_DATA_HOME` is where the **tree** goes, and it is the
+newest of the four and the one that would otherwise reach a real
+`~/.local/share/claude-tabstatus` on any machine where that variable is set - it
+happens to be unset on the machine this was written on, so the bug would not have
+shown locally. It is unset once at the top of the file and pinned per case as well.
+`CCTAB_STATE_DIR` is the one that is not derived from any of the others:
+`state::purge` resolves the record directory from `XDG_RUNTIME_DIR` /
+`CCTAB_STATE_DIR` **alone**, so an `uninstall` with only the first three redirected
+deletes the *real* wait records of whoever is running it. Harmless and
+self-healing - a session with no record degrades to the stateless answer and the
+next edge writes another - but any script or session exercising `uninstall` should
+redirect all four, exactly as this suite does.
+
+One section drops a **bare copy** of the binary in a directory with no plugin tree
+above it - the shape of a binary scp'd to a VM - and drives a first install,
+`doctor`, every refusal, a refresh and `uninstall` against it. Another rebuilds the
+**pre-change wiring** exactly: a skills symlink pointing at a checkout and a
+`state_version 2` record whose `symlink_before.target` is that same checkout, then
+asserts the loud repoint, that the checkout gains nothing at all, and that a later
+`uninstall` declines to point the link back at it. The load-bearing assertion of
+the whole file is at the end of that section and is stronger than it was, because
+`install` is now the verb under suspicion: not one byte of a tracked manifest was
+written by any install path above, and nothing any install *linked* holds a `.git`.
 
 Eighty-one of the assertions are the tmux section, and they drive a PRIVATE
 tmux server - `tmux -L cctabprobe -f /dev/null`, killed afterwards, with no

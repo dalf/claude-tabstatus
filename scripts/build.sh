@@ -5,8 +5,10 @@
 #   sh scripts/build.sh --all           every target listed in TARGETS
 #
 # bin/ holds a binary per platform, plus bin/tabstatus, a relative
-# symlink to the one for this machine - that is the path hooks/hooks.json
-# invokes, so a user needs no toolchain to install the plugin.
+# symlink to the one for this machine - that is the binary you RUN to install,
+# so a user needs no toolchain. It is not the path hooks.json invokes: install
+# copies it into the generated plugin tree, and hooks.json invokes the copy
+# there, so a git checkout cannot change what a running session executes.
 #
 # bin/ is gitignored build output; binaries ship as GitHub release assets.
 # bin/sources.sha256 and bin/sources.cksum are the staleness guard. Git does not

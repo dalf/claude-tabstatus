@@ -1,11 +1,13 @@
 //! The two manifests Claude Code needs on disk, compiled into the binary.
 //!
 //! Claude Code will not load a plugin that is not a directory with
-//! `.claude-plugin/plugin.json` and `hooks/hooks.json` in it, so shipping this
-//! tool to a remote machine used to mean shipping a tree. The runtime set is four
-//! entries and two of them are small JSON files, so they are carried HERE and
-//! `standalone` writes them back out - the remote install becomes one scp and one
-//! run.
+//! `.claude-plugin/plugin.json` and `hooks/hooks.json` in it. Those two files are
+//! SOURCE - tracked files you read, diff and edit - and they reach a running session
+//! the way `src/main.rs` does: through a build. They are carried HERE, and `install`
+//! writes them back out into a directory it generates (`src/tree.rs`), so the plugin
+//! directory is build output like `bin/` and a `git checkout` cannot change what a
+//! running session executes. The same two files being compiled in is also what makes
+//! a remote install one scp and one run.
 //!
 //! `include_str!`, not a crate. It is a std macro, it costs no dependency, and it
 //! is the direct analogue of Go's `//go:embed`: the asset becomes a rustc rebuild
@@ -41,8 +43,8 @@ pub const PLUGIN_JSON: &str = include_str!("../.claude-plugin/plugin.json");
 pub const HOOKS_JSON: &str = include_str!("../hooks/hooks.json");
 
 /// Every manifest a generated tree needs, as `(relative path, contents)`. The
-/// single enumeration: `standalone` writes this list, `doctor` compares it, and
-/// the marker records it.
+/// single enumeration: `install` writes this list, `doctor` compares it, and the
+/// marker records it.
 pub const MANIFESTS: [(&str, &str); 2] =
     [(PLUGIN_JSON_PATH, PLUGIN_JSON), (HOOKS_JSON_PATH, HOOKS_JSON)];
 
@@ -141,7 +143,7 @@ mod tests {
     /// The embedded hooks.json has to be the wiring `tests/run.sh` pins, and the
     /// one thing that can be checked without reparsing the table is that every
     /// edge is invoked through `${CLAUDE_PLUGIN_ROOT}/bin/tabstatus` - the path
-    /// `standalone` materialises.
+    /// `install` materialises.
     #[test]
     fn the_embedded_hooks_invoke_the_path_a_generated_tree_provides() {
         let n = HOOKS_JSON.matches("${CLAUDE_PLUGIN_ROOT}/bin/tabstatus").count();

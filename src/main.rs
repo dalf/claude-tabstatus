@@ -49,10 +49,10 @@ mod manage;
 mod payload;
 mod render;
 mod settings;
-mod standalone;
 mod state;
 mod text;
 mod tmux;
+mod tree;
 
 use config::Config;
 use edge::{Edge, Paint};
