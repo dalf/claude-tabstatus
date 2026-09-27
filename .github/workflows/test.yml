@@ -51,6 +51,7 @@ jobs:
             binary="$GITHUB_WORKSPACE/bin/tabstatus-$target"
             CCTAB_TEST_BIN="$binary" python3 tests/test_payload.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_elicitation.py
+            CCTAB_TEST_BIN="$binary" python3 tests/test_tmux_status.py
             CCTAB_TEST_BIN="$binary" sh tests/run.sh
             sh tests/corpus/replay.sh "$binary"
           done

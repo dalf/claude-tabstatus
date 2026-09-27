@@ -339,7 +339,7 @@ fn usage() {
         "      --restore-backup         roll settings.json back to the pre-install copy\n",
         "      --keep-tree              leave the generated plugin tree on disk\n",
         "  tabstatus doctor             report what is installed and what would paint\n",
-        "  tabstatus tmux-format        print the two tmux format strings we install\n",
+        "  tabstatus tmux-format        print the two outer-tab tmux format strings\n",
         "  tabstatus tmux-arm <tty>     re-arm one Konsole tab; tmux's client-attached\n",
         "                               hook runs this, so a reattach is armed again\n",
         "  tabstatus version\n",
@@ -1588,7 +1588,7 @@ fn uninstall(c: &Ctx, force: bool, restore_backup: bool, keep_tree: bool) -> Res
     unlink_the_plugin(c, &prior)?;
     remove_state(c)?;
     remove_records();
-    // The tmux server's own set-titles pair, which SessionStart saved aside. Only
+    // The tmux title pair and window formats, which SessionStart saved aside. Only
     // uninstall restores it: the options are server-wide, so a SessionEnd doing it
     // would unpaint the other claude windows still running.
     for line in tmux::uninstall() {

@@ -1136,6 +1136,12 @@ glyph once it is stale, and nothing at all once it is old. **No process runs, no
 hook fires and nothing is notified**; the only input that moved is tmux's own
 clock.
 
+All tmux paints write raw OSC directly to the pane's verified terminal through
+`/proc/$CLAUDE_PID/fd/1`. Claude Code 2.1.274 wraps hook `terminalSequence` OSCs
+in tmux passthrough, which bypasses `pane_title`; using that JSON delivery path
+would leave the startup idle record unchanged. A missing or redirected terminal
+is a silent no-op. The non-tmux JSON delivery path is unchanged.
+
 That is worth much more than tmux convenience. The wrong titles in [Known
 limitations](#known-limitations) are all the same shape - an edge that paints
 with no matching un-paint. Inside tmux every one of them heals itself.
@@ -1173,18 +1179,63 @@ The session loop `#{S:…}` is deliberately absent: one terminal tab shows one
 attached session, and looping every session would put another tab's claudes into
 this tab's title.
 
+The **tmux window list** also shows each window's pane indicators before its
+existing label, for example `🟠⚪ 2:editor*`. Both the current and background
+window formats are decorated, so a waiting Claude remains visible while you work
+in another window. Only windows where Claude runs `SessionStart` are changed.
+Window names and `automatic-rename` are untouched; custom labels, flags and styles
+continue through the original formats. The outer terminal keeps the session-wide
+aggregate shown above.
+
+For a theme with rounded tabs or embedded colours, place
+`#{T:@cctab_window_strip}` inside the styled body of both window formats. For example:
+
+```tmux
+set -g window-status-format "#[fg=white,bg=colour238] #{T:@cctab_window_strip} #I:#W "
+set -g window-status-current-format "#[fg=black,bg=cyan,bold] #{T:@cctab_window_strip} #I:#W "
+```
+
+The plugin recognizes this explicit placement and does not prepend another
+strip. If the window already has the plugin's local decorators, reload your
+configuration and remove those two local overrides from inside that window:
+
+```sh
+tmux source-file ~/.tmux.conf
+tmux set-option -wu -t "$TMUX_PANE" window-status-format
+tmux set-option -wu -t "$TMUX_PANE" window-status-current-format
+```
+
+Uninstall preserves these custom formats; the strip reference becomes empty
+when its shared option is removed, leaving the window label and styles intact.
+
+An optional [reference tmux configuration](examples/tmux.conf) includes rounded
+tabs, a dark status badge with a light active label, and `repository@branch`
+labels for Claude panes. Shell panes keep their usual window names. In split
+windows the label follows the active pane, while the strip includes every Claude
+pane. Copy the settings you want into `~/.tmux.conf`; the plugin does not install
+this configuration. The colours are a provisional example, not a required theme.
+
+This is another view of the existing three states, with the same TTLs, rather
+than a new background-work state or alert. [Issue #19](https://github.com/dalf/claude-tabstatus/issues/19)
+is not explicitly placed in the [roadmap](https://github.com/dalf/claude-tabstatus/issues/16);
+this implementation leaves the state-contract decisions in
+[issue #10](https://github.com/dalf/claude-tabstatus/issues/10) unchanged.
+
 ### What is configured at runtime
 
-`SessionStart` does it, in **one** `tmux` invocation, so you need no
-`~/.tmux.conf` edit:
+`SessionStart` configures the outer title in one `tmux` batch, then reads and
+decorates its window's two status formats. You need no `~/.tmux.conf` edit:
 
 ```text
 set -s @cctab_gw/@cctab_ga/@cctab_gi     the three glyphs
 set -s @cctab_tw/@cctab_ta/@cctab_tg     the three TTLs, in seconds
 set -s @cctab_title                      the generated strip-and-label format
 set -s @cctab_string                     the set-titles-string we installed
+set -s @cctab_window_strip               the generated strip for one window
 set -g set-titles on
 set -g set-titles-string '#{s|^ ||:#{T:@cctab_title}}'
+set -w -t <window> window-status-format          a strip plus the saved normal format
+set -w -t <window> window-status-current-format  a strip plus the saved current format
 ```
 
 In Konsole mode only, two more - this binary's path, and the hook that re-arms a
@@ -1196,8 +1247,8 @@ set-hook -t <our session> 'client-attached[1971]' \
     'run-shell -b "'\''#{@cctab_exe}'\''  tmux-arm '\''#{client_tty}'\''"'
 ```
 
-`tabstatus tmux-format` prints the last two lines' values, if you would rather
-pin them in your own config than have them set at runtime.
+`tabstatus tmux-format` prints the outer `set-titles-string` and generated title
+format, if you would rather pin them in your own config than have them set at runtime.
 
 The glyphs and the TTLs travel as *options* rather than as text spliced into the
 format, because an option's value is substituted **literally**: measured,
@@ -1210,12 +1261,12 @@ title. (`select-pane -T`, which this plugin never uses, expands its argument at
 set time and must never carry a location.)
 
 **The hot path execs nothing.** Only `SessionStart` runs `tmux`, and `SessionEnd`
-only in Konsole mode. Measured here: one `tmux set-option` costs 2.84ms against a
-0.37ms fork floor, and the whole twelve-command `SessionStart` batch costs 3.1ms
-end to end - thirteen commands and 4.9ms in Konsole mode, where it also lists the
-clients and writes the arming. The cost is the fork and the socket round trip, not
-the commands, which is why batching is free and why a per-tool-call `tmux`
-invocation would have been a tenfold regression on a binary that runs in 370µs.
+only in Konsole mode. Before window-list support, measured here: one
+`tmux set-option` cost 2.84ms against a 0.37ms fork floor, and the title-only
+`SessionStart` batch cost 3.1ms end to end. Those are historical measurements,
+not timings for the additional window-format queries and installation batch.
+That extra work happens only at `SessionStart`; ordinary state paints still
+write the pane carrier without invoking `tmux`.
 
 ### What you must have on
 
@@ -1297,6 +1348,23 @@ because the `title: OK` test cannot catch it (the same `SessionStart` rewrites
 `@cctab_string`, so those two always agree).
 
 ### Save and restore
+
+For each decorated window, `SessionStart` saves the original normal and current
+status formats independently, including whether each was explicitly local or
+inherited. Repeated starts do not replace those backups. While installed, each
+decorator uses the saved label format; changing a global format takes effect in
+that window after the decorator is removed.
+
+`tabstatus uninstall` restores tracked windows across every session on the tmux
+server. An originally local format is restored exactly, including an empty
+value; an originally inherited format is unset locally so inheritance resumes.
+If you replace either decorator yourself, later starts and uninstall preserve
+your replacement. Ordinary windows and global window formats are not changed.
+If saved metadata is incomplete, or an edited format still uses the plugin's
+saved values, uninstall reports that it could not finish restoration and retains
+the shared tmux options instead of removing data the label still needs.
+`SessionEnd` clears its pane's indicator; decorators remain until uninstall so
+other Claude panes in the same window continue to work.
 
 `SessionStart` copies your own `set-titles` and `set-titles-string` into
 `@cctab_prev_titles` / `@cctab_prev_string` **before** it overwrites them, and
@@ -1385,9 +1453,6 @@ set-titles-string is not ours any more` - so start a new claude session, or
 
 ### Deliberately not built
 
-- **The tmux status line.** A glyph per window in `window-status-format` uses
-  exactly this carrier and the cell expression drops into it unchanged, but the
-  target here is the *tab*, and the status line is your real estate.
 - **A fourth glyph for background work**, and **OSC 9;4 progress**. The record
   reserves the `g` key for the first, and the state layer's `subagent-stop` edge is
   already the un-painter it needs; the seam is designed in full at the bottom of
@@ -1506,11 +1571,12 @@ invocation, no arming.
   `CCTAB_TERMINAL=konsole` is the explicit answer, and `CCTAB_TERMINAL=<anything
   else>` is how a leaked `KONSOLE_*` is turned off. It is also the only way to
   know, over ssh or inside tmux, that the tab at the far end is Konsole's.
-- **`session-start` and `session-end` are Linux-only.** They resolve the pty
+- **`session-start`, `session-end`, and all tmux paints are Linux-only.** They resolve the pty
   through `/proc/$CLAUDE_PID/fd/1`, which macOS and Git Bash do not have, so on
   those platforms Konsole arming does not happen (fine, they are not Konsole)
   and, more importantly, the title is not cleared at the end of a session while
-  `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` is set.
+  `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` is set. Tmux pane records cannot be updated
+  there through this direct-write path either.
 - **`claude -p` typed straight at a terminal is retitled too.** Its stdout
   really is that tab's pty, so a one-shot run arms the tab, retitles it and
   restores it at `SessionEnd`. Only the redirected or piped form
@@ -1672,8 +1738,8 @@ overrides both. The runtime half never looks at it. Anything that exercises
 `install` or `uninstall` must redirect it along with `HOME`, `CLAUDE_CONFIG_DIR` and
 `CCTAB_STATE_DIR`: it is the one that decides where a real 680 KB tree lands.
 
-`CLAUDE_PID` is exported into every hook subprocess and is how `session-start`
-and `session-end` find the pty. `XDG_RUNTIME_DIR` is read for the state
+`CLAUDE_PID` is exported into every hook subprocess and is how `session-start`,
+`session-end`, and tmux state paints find the pty. `XDG_RUNTIME_DIR` is read for the state
 directory - deliberately with no `$HOME` fallback, because that would put a record
 inside the golden corpus's fixture `HOME` and make every case carrying a
 `session_id` order-dependent. That it reaches a *hook* subprocess at all is
@@ -1840,12 +1906,19 @@ written by any install path above, and nothing any install *linked* holds a `.gi
 
 Eighty-one of the assertions are the tmux section, and they drive a PRIVATE
 tmux server - `tmux -L cctabprobe -f /dev/null`, killed afterwards, with no
-client ever attached, so no pty is touched and the user's own server is never
+client ever attached; only disposable pane ptys are written, and the user's own server is never
 listed, configured or killed. They are SKIPPED, never failed, where there is no
 `tmux` binary. What they cannot see is tmux re-EMITTING the title to an attached
 client, which needs a pty this suite cannot allocate; what they do assert is the
 whole of the server side, including that re-rendering the same paint after a wait
 gives a different answer with no process running and no hook firing.
+
+`tests/test_tmux_status.py` adds isolated private-server tests for window-list
+rendering, split panes, background windows, TTL decay and exact format restoration.
+It drives ordinary hook updates directly into disposable pane terminals, then
+attaches a disposable PTY client and checks the displayed status text,
+excluding outer-title escape sequences so they cannot satisfy the assertion.
+Each test uses a unique socket and isolated configuration directories.
 
 Two of the assertions exist only to guard the committed binaries: `bin/` carries
 a digest including `src/*.rs`, `Cargo.toml` and `Cargo.lock` it was built from, *per triple built*

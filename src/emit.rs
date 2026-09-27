@@ -1,14 +1,18 @@
 //! The two delivery mechanisms, because neither one covers every edge.
 //!
-//!   * Most edges print ONE line of JSON carrying `terminalSequence`, and Claude
-//!     Code emits the bytes to its own terminal. Only notification/title OSCs
+//!   * Outside tmux, most edges print ONE line of JSON carrying `terminalSequence`,
+//!     and Claude Code emits the bytes to its terminal. Only notification/title OSCs
 //!     (0, 1, 2, 9, 99, 777) and BEL are permitted there; anything else is
 //!     silently dropped.
-//!   * session-start and session-end write the pty DIRECTLY, because
+//!   * Inside tmux every painting edge writes raw OSC to the verified pane pty.
+//!     Claude Code 2.1.274 wraps terminalSequence OSCs in tmux passthrough, which
+//!     bypasses pane_title instead of updating our carrier. No verified pty means
+//!     silence, never a JSON fallback that could leak the carrier to the outer tab.
+//!   * session-start and session-end also write the pty DIRECTLY, because
 //!     `terminalSequence` cannot carry them: SessionStart is too early - the TUI
 //!     writer is not mounted yet, so the sequence is dropped - and the Konsole
-//!     arming sequence is OSC 50, which is not on the allowlist above. Those two
-//!     edges resolve the pty through /proc, so they are Linux-only.
+//!     arming sequence is OSC 50, which is not on the allowlist above. All direct
+//!     writes resolve the pty through /proc, so they are Linux-only.
 
 use crate::config::{Config, Terminal};
 use std::ffi::OsString;
@@ -55,6 +59,16 @@ pub fn json_line(title: &str) -> io::Result<()> {
     escape_into(&mut out, title);
     out.push_str("\\u0007\",\"suppressOutput\":true}\n");
     write_stdout(out.as_bytes())
+}
+
+/// Update tmux's pane-title carrier without Claude Code's OSC passthrough layer.
+/// Reuses the session pty guard and executes no subprocess on the hot path.
+pub fn pane_title(title: &str, cfg: &Config) -> io::Result<()> {
+    let mut out = Vec::with_capacity(title.len() + 5);
+    out.extend_from_slice(b"\x1b]0;");
+    out.extend_from_slice(title.as_bytes());
+    out.push(0x07);
+    write_pty(cfg, &out)
 }
 
 /// Append `s` as the contents of a JSON string literal: `"` and `\` escaped, and

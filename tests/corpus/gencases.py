@@ -5,7 +5,7 @@
 
 This generator deliberately reproduces the historical shell oracle. After it,
 run refreeze_fixed.py against the current binary to apply named fixes (including
-structural parsing fix-g); historical IDs do not necessarily describe the fixed
+structural parsing fix-g and tmux transport fix-h); historical IDs do not necessarily describe the fixed
 expectation. Do not add diverge flags to exempt parser regressions.
 
 Every case in cases.jsonl is a fully reproducible invocation:
@@ -623,22 +623,22 @@ TMX = "/tmp/tmux-1000/default,1234,0"
 NOW = "1700000000"
 for e in ("working", "waiting", "idle"):
     C("tmux-record-" + e, [e], env=E(CCTAB_DRY_RUN=None, TMUX=TMX, CCTAB_NOW=NOW),
-      note="the state travels as a letter, because a glyph cannot be sliced back "
-           "out of a title: #{=1:} counts COLUMNS and returns empty for an emoji")
+      note="historical record case: fix-h requires a verified CLAUDE_PID tty; "
+           "without one, tmux painting is silent instead of emitting JSON")
 C("tmux-record-without-a-pane", ["working"],
   env=E(CCTAB_DRY_RUN=None, TMUX=TMX, TMUX_PANE=None, CCTAB_NOW=NOW),
-  note="$TMUX_PANE only targets the cold-path commands; the record needs none")
+  note="TMUX_PANE targets cold-path commands; fix-h still requires CLAUDE_PID "
+       "to deliver a carrier, and none is supplied here")
 C("tmux-record-with-an-ssh-prefix", ["waiting"],
   env=E(CCTAB_DRY_RUN=None, TMUX=TMX, CCTAB_NOW=NOW, SSH_CONNECTION="1 2 3 4",
         CCTAB_HOST="srv"),
-  note="the record carries the location the tab would have shown, prefix and all")
+  note="fix-h: an ssh location prefix does not bypass the missing session tty")
 C("tmux-record-is-not-affected-by-glyph-pos", ["working"],
   env=E(CCTAB_DRY_RUN=None, TMUX=TMX, CCTAB_NOW=NOW, CCTAB_GLYPH_POS="suffix"),
-  note="the glyph is gone from the record, so its position cannot reach it - "
-       "inside tmux CCTAB_GLYPH_POS only picks which end of the TAB the strip is on")
+  note="fix-h: glyph position does not bypass the missing session tty")
 C("tmux-record-ignores-a-glyph-override", ["idle"],
   env=E(CCTAB_DRY_RUN=None, TMUX=TMX, CCTAB_NOW=NOW, CCTAB_GLYPH_IDLE="[..]"),
-  note="the override reaches the tab through a tmux option, never through the record")
+  note="fix-h: a glyph override does not bypass the missing session tty")
 C("tmux-dry-run-is-still-the-title", ["idle"], env=E(TMUX=TMX, CCTAB_NOW=NOW),
   note="THE guard: move the record into render::compose and this case plus the "
        "eight in section 3 all flip, and all nine start carrying a real clock")
@@ -657,7 +657,7 @@ C("tmux-sty-only-is-untagged", ["working"],
        "there is no decay to buy and it gets nothing")
 C("tmux-and-sty-together-is-tmux", ["working"],
   env=E(CCTAB_DRY_RUN=None, TMUX=TMX, STY="1234.pts-0.host", CCTAB_NOW=NOW),
-  note="tmux-inside-screen is the plausible order, and then the record is right")
+  note="tmux wins over STY; fix-h therefore requires a session tty and is silent here")
 C("tmux-terminal-override-konsole", ["idle"],
   env=E(TMUX=TMX, CCTAB_TERMINAL="konsole"),
   note="KONSOLE_* does not survive ssh, so inside tmux this is the only honest "

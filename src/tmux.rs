@@ -30,17 +30,17 @@
 //!
 //! THE HOT PATH EXECS NOTHING. Only SessionStart runs tmux, and SessionEnd only
 //! in Konsole mode. Measured on this machine: one `tmux set-option` costs 2.84ms
-//! against a 0.37ms fork floor, and the whole twelve-command SessionStart batch
-//! costs 3.1ms end to end - thirteen commands and 4.9ms in Konsole mode, where it
+//! against a 0.37ms fork floor. The original twelve-command title batch measured
+//! 3.1ms end to end - thirteen commands and 4.9ms in Konsole mode, where it
 //! also lists the clients and writes the arming. The cost is the fork and the
 //! socket round trip, not the commands, which is why batching is free and why a
 //! per-tool-call exec would be a tenfold regression on a binary that runs in
-//! 370us.
+//! 370us. Window decoration adds cold SessionStart queries to preserve option
+//! scopes; those queries do not run on tool events.
 //!
-//! WHAT IS DELIBERATELY NOT BUILT: the tmux STATUS LINE. A glyph per window in
-//! `window-status-format` uses this same carrier and [`cell`] drops into it
-//! unchanged, but the target here is the TAB, and a status line is the user's
-//! own real estate. Left as a seam.
+//! The window list uses the same pane cells before each window's existing label.
+//! Only windows that start Claude receive local format decorators. Window names,
+//! automatic renaming, global window formats and the outer aggregate stay intact.
 
 use crate::config::{self, Config, GlyphPos, Terminal};
 use crate::edge::{Glyph, Paint};
@@ -76,6 +76,31 @@ const OPT_STRING: &str = "@cctab_string";
 const OPT_SAVED: &str = "@cctab_saved";
 const OPT_PREV_STRING: &str = "@cctab_prev_string";
 const OPT_PREV_TITLES: &str = "@cctab_prev_titles";
+const OPT_WINDOW_STRIP: &str = "@cctab_window_strip";
+
+/// Each local decorator has independent ownership and inheritance metadata, so
+/// a user can replace one format without preventing restoration of the other.
+struct WindowFormat {
+    option: &'static str,
+    saved: &'static str,
+    previous: &'static str,
+    local: &'static str,
+}
+
+const WINDOW_FORMATS: [WindowFormat; 2] = [
+    WindowFormat {
+        option: "window-status-format",
+        saved: "@cctab_window_format_saved",
+        previous: "@cctab_prev_window_format",
+        local: "@cctab_prev_window_format_local",
+    },
+    WindowFormat {
+        option: "window-status-current-format",
+        saved: "@cctab_window_current_saved",
+        previous: "@cctab_prev_window_current",
+        local: "@cctab_prev_window_current_local",
+    },
+];
 /// This binary's own path, for the re-arm hook to run. An option because an
 /// option's value is substituted LITERALLY, which is what spares the hook every
 /// layer of quoting; see [`ARM_HOOK`].
@@ -141,6 +166,21 @@ fn title_format(pos: GlyphPos) -> String {
         GlyphPos::Suffix => format!("{label} {strip}"),
         GlyphPos::Prefix | GlyphPos::Both => format!("{strip} {label}"),
     }
+}
+
+/// T expands the strip's clock; E expands the original format without adding a
+/// strftime pass to the user's label. No separator remains when no pane has a
+/// live carrier. A split window has one cell per Claude pane, including inactive
+/// panes, just as the outer aggregate does.
+fn window_status_format(previous: &str) -> String {
+    format!("#{{?#{{==:#{{T:{OPT_WINDOW_STRIP}}},}},,#{{T:{OPT_WINDOW_STRIP}}} }}#{{E:{previous}}}")
+}
+
+/// A user can explicitly place the strip inside a themed label. Removing the
+/// strip option leaves that label intact, whereas removing a saved original
+/// still referenced through E:previous would erase the label itself.
+fn window_format_uses_saved_label(value: &str) -> bool {
+    WINDOW_FORMATS.iter().any(|f| value.contains(f.previous))
 }
 
 /// What `set-titles-string` itself holds: a pointer at [`title_format`], plus the
@@ -303,10 +343,10 @@ fn ttl_of(raw: Option<&OsStr>, default: u32) -> u32 {
     }
 }
 
-/// Configure the server, once, in ONE exec.
+/// Configure the server title in one batch, then decorate this pane's window.
 ///
-/// The save of the user's own `set-titles` pair is the FIRST command in the
-/// batch and is guarded by "only if nothing is saved yet", so a second claude
+/// The user's own `set-titles` pair is saved before that pair is replaced,
+/// guarded by "only if nothing is saved yet", so a second claude
 /// starting later cannot record OUR string as the user's. tmux serialises
 /// commands on one event loop, so the batch is atomic with respect to every
 /// other claude on the server; measured, fifty concurrent installers left the
@@ -330,6 +370,7 @@ pub fn session_start(cfg: &Config) {
     set(&mut c, OPT_TA, &ttl("CCTAB_TTL_WAITING", DEFAULT_TTL_WAITING));
     set(&mut c, OPT_TG, &ttl("CCTAB_TTL_GONE", DEFAULT_TTL_GONE));
     set(&mut c, OPT_TITLE, &fmt);
+    set(&mut c, OPT_WINDOW_STRIP, &format!("#{{P:{}}}", cell()));
     set(&mut c, OPT_STRING, sts);
     c.arg(";").arg("if").arg("-F").arg(format!("#{{==:#{{{OPT_SAVED}}},}}")).arg(format!(
         "set -Fs {OPT_PREV_STRING} \"#{{set-titles-string}}\" ; \
@@ -362,6 +403,64 @@ pub fn session_start(cfg: &Config) {
             t.target(&mut c);
             c.arg(HOOK);
         }
+    }
+    run(c);
+    install_window_status(t);
+}
+
+/// Decorate only the pane's actual window. Without a known pane, tmux's default
+/// target could be an unrelated client window, so leave the window list alone.
+fn window_id(t: &Tmux) -> Option<String> {
+    let pane = t.pane.as_ref()?.to_str()?;
+    if !pane.starts_with('%') || !digits(pane[1..].as_bytes()) {
+        return None;
+    }
+    let fields = ask(t, &["#{window_id}"]).ok()?;
+    let id = fields.into_iter().next()?;
+    valid_window_id(&id).then_some(id)
+}
+
+fn valid_window_id(id: &str) -> bool {
+    id.starts_with('@') && digits(id[1..].as_bytes())
+}
+
+/// show without -A reports only explicitly local values. Keeping the option
+/// name distinguishes an explicit empty string from an inherited value.
+fn local_window_option(id: &str, option: &str) -> Result<bool, Fail> {
+    let mut c = Command::new("tmux");
+    c.args(["show-options", "-wq", "-t", id, option]);
+    capture(c).map(|s| !s.is_empty())
+}
+
+fn install_window_status(t: &Tmux) {
+    let Some(id) = window_id(t) else { return };
+    let mut c = Command::new("tmux");
+    for f in &WINDOW_FORMATS {
+        let Ok(local) = local_window_option(&id, f.option) else { return };
+        if c.get_args().next().is_some() {
+            c.arg(";");
+        }
+        // This server-side guard makes overlapping SessionStart hooks save the
+        // original once. Format values are expanded AFTER command parsing, so
+        // quotes, newlines and semicolons in a user's format remain plain data.
+        // Repeated starts leave user edits to an installed decorator untouched.
+        c.args(["if-shell", "-F", "-t", &id]);
+        let unsaved = format!("#{{&&:#{{==:#{{{}}},}},#{{==:#{{{}}},}}}}", f.saved, f.local);
+        let independent = format!(
+            "#{{&&:#{{==:#{{m:*@cctab_prev_window_*,#{{{}}}}},0}},#{{==:#{{m:*{OPT_WINDOW_STRIP}*,#{{{}}}}},0}}}}",
+            f.option, f.option,
+        );
+        // If an ownership marker was lost, never save our existing wrapper as
+        // its own original: E:previous would then recurse into itself.
+        c.arg(format!("#{{&&:{unsaved},{independent}}}"));
+        c.arg(format!(
+            "set -Fw -t {id} -- {} \"#{{{}}}\" ; \
+             set -w -t {id} -- {} {} ; \
+             set -w -t {id} -- {} 1 ; \
+             set -w -t {id} -- {} \"{}\"",
+            f.previous, f.option, f.local, if local { "1" } else { "0" },
+            f.saved, f.option, window_status_format(f.previous),
+        ));
     }
     run(c);
 }
@@ -580,6 +679,117 @@ fn capture(mut c: Command) -> Result<String, Fail> {
 
 // --- uninstall ---------------------------------------------------------------
 
+/// Restore tracked windows across the whole server, including other sessions
+/// and linked windows. Values travel as argv or format expansions, never as
+/// interpolated user text in tmux command strings.
+fn restore_window_status() -> Result<Vec<String>, Fail> {
+    let mut list = Command::new("tmux");
+    list.args(["list-windows", "-a", "-F", "#{window_id}"]);
+    let ids: std::collections::BTreeSet<_> = capture(list)?
+        .lines().filter(|id| valid_window_id(id)).map(str::to_owned).collect();
+    let mut restored = 0;
+    let mut kept = 0;
+    for id in ids {
+        let target = Tmux { pane: Some(OsString::from(&id)) };
+        for f in &WINDOW_FORMATS {
+            // The raw previous value goes last, preserving embedded/trailing
+            // newlines. Read the current raw value separately for the same reason.
+            let fields = ask(&target, &[
+                &format!("#{{{}}}", f.saved),
+                &format!("#{{{}}}", f.local),
+                &format!("#{{{}}}", f.previous),
+            ])?;
+            let current = ask(&target, &[&format!("#{{{}}}", f.option)])?;
+            if fields[0] != "1" {
+                if window_format_uses_saved_label(&current[0]) {
+                    return Err(Fail::NoAnswer);
+                }
+                continue;
+            }
+            let mut c = Command::new("tmux");
+            if current[0] == window_status_format(f.previous) {
+                // An absent original is not an explicitly empty original. If
+                // metadata is incomplete, retain the wrapper and shared options
+                // rather than inventing a label or changing its inheritance.
+                if !local_window_option(&id, f.saved)?
+                    || !local_window_option(&id, f.previous)?
+                    || !local_window_option(&id, f.local)?
+                    || (fields[1] != "0" && fields[1] != "1")
+                    || window_format_uses_saved_label(&fields[2]) {
+                    return Err(Fail::NoAnswer);
+                }
+                c.arg("set");
+                if fields[1] == "1" {
+                    c.args(["-w", "-t", &id, "--", f.option, &fields[2]]);
+                } else {
+                    c.args(["-wu", "-t", &id, "--", f.option]);
+                }
+                restored += 1;
+            } else {
+                // An edited wrapper may still depend on our saved original;
+                // removing that would damage the user's edited label. An
+                // explicit strip-only placement is independent: after uninstall
+                // its missing strip expands to nothing and its label remains.
+                if window_format_uses_saved_label(&current[0]) {
+                    return Err(Fail::NoAnswer);
+                }
+                // The user replaced or unset our wrapper after installation.
+                // Preserve that choice while taking our saved metadata away.
+                kept += 1;
+            }
+            for option in [f.saved, f.previous, f.local] {
+                if c.get_args().next().is_some() {
+                    c.arg(";");
+                }
+                c.args(["set", "-wu", "-t", &id, "--", option]);
+            }
+            capture(c)?;
+        }
+    }
+    Ok(if restored != 0 || kept != 0 {
+        vec![format!("tmux:     window list: reset {restored} owned format(s); kept {kept} user edit(s).")]
+    } else {
+        Vec::new()
+    })
+}
+
+fn report_window_status(t: &Tmux) -> String {
+    let Some(id) = window_id(t) else {
+        return "           window list: WARN no known TMUX_PANE; no window format is selected for decoration".to_owned();
+    };
+    let target = Tmux { pane: Some(OsString::from(id)) };
+    let mut installed = 0;
+    let mut custom = 0;
+    let mut changed = 0;
+    for f in &WINDOW_FORMATS {
+        let Ok(values) = ask(&target, &[
+            &format!("#{{{}}}", f.saved),
+            &format!("#{{{}}}", f.option),
+        ]) else {
+            return "           window list: WARN could not read this window's formats".to_owned();
+        };
+        if values[0] == "1" && values[1] == window_status_format(f.previous) {
+            installed += 1;
+        } else if values[1].contains(OPT_WINDOW_STRIP)
+            && !window_format_uses_saved_label(&values[1]) {
+            custom += 1;
+        } else if values[0] == "1" {
+            changed += 1;
+        }
+    }
+    if installed + custom == 2 {
+        if custom > 0 {
+            "           window list: OK   current and background indicators active, with custom theme placement".to_owned()
+        } else {
+            "           window list: OK   current and background formats show this window's Claude panes".to_owned()
+        }
+    } else if custom > 0 || changed > 0 {
+        format!("           window list: INFO {installed} decorator(s), {custom} custom placement(s); {changed} user override(s) preserved")
+    } else {
+        "           window list: WARN formats are not decorated; start a Claude session in this pane".to_owned()
+    }
+}
+
 /// Put `set-titles` and `set-titles-string` back the way SessionStart found them,
 /// and remove every option we wrote.
 ///
@@ -617,7 +827,12 @@ pub fn uninstall() -> Vec<String> {
     // and said nothing about it. Their records stay in their pane titles and then
     // show up raw in whatever title the restored string renders - the hazard
     // doctor already names.
-    let mut out: Vec<String> = Vec::new();
+    // Window wrappers depend on our server glyph options, so restore their
+    // original labels before removing that shared data.
+    let mut out = match restore_window_status() {
+        Ok(lines) => lines,
+        Err(_) => return vec!["tmux:     could not finish window-format restoration; shared title options were left intact.".to_owned()],
+    };
     let others = saved[2].matches('1').count();
     if others > 0 {
         out.push(format!(
@@ -740,7 +955,7 @@ pub fn uninstall() -> Vec<String> {
 }
 
 /// Every option SessionStart writes, so that uninstall cannot forget one.
-const OURS: [&str; 12] = [
+const OURS: [&str; 13] = [
     OPT_GW,
     OPT_GA,
     OPT_GI,
@@ -753,6 +968,7 @@ const OURS: [&str; 12] = [
     OPT_PREV_STRING,
     OPT_PREV_TITLES,
     OPT_EXE,
+    OPT_WINDOW_STRIP,
 ];
 
 /// Read several options in ONE invocation, one per line.
@@ -790,7 +1006,7 @@ fn split_first_line(s: &str) -> (&str, &str) {
 
 // --- doctor ------------------------------------------------------------------
 
-/// Everything about the tmux situation, in two execs.
+/// Inspect server title settings, clients, and this pane's window decorators.
 pub fn report(cfg: &Config) -> Vec<String> {
     let mut out = Vec::new();
     if config::flag("CCTAB_NO_TMUX") {
@@ -987,6 +1203,7 @@ pub fn report(cfg: &Config) -> Vec<String> {
         shown_ttl("CCTAB_TTL_WAITING", DEFAULT_TTL_WAITING),
         shown_ttl("CCTAB_TTL_GONE", DEFAULT_TTL_GONE)
     ));
+    out.push(report_window_status(&t));
     out
 }
 
@@ -1114,6 +1331,27 @@ mod tests {
     }
 
     #[test]
+    fn window_decorators_keep_time_expansion_out_of_the_original_label() {
+        for f in &WINDOW_FORMATS {
+            let wrapper = window_status_format(f.previous);
+            assert!(wrapper.ends_with(&format!("#{{E:{}}}", f.previous)));
+            assert!(!wrapper.contains(&format!("#{{T:{}}}", f.previous)));
+            assert!(wrapper.contains(&format!("#{{T:{OPT_WINDOW_STRIP}}}")));
+            assert!(!wrapper.contains("window_name"));
+            assert!(!wrapper.contains("rename"));
+        }
+    }
+
+    #[test]
+    fn window_targets_are_numeric_ids_not_interpolated_names() {
+        assert!(valid_window_id("@0"));
+        assert!(valid_window_id("@123"));
+        for invalid in ["", "@", "%0", "@1;kill-server", "a window", "@1\n"] {
+            assert!(!valid_window_id(invalid), "{invalid:?}");
+        }
+    }
+
+    #[test]
     fn the_three_states_each_decay_into_the_idle_glyph_and_then_into_nothing() {
         let c = cell();
         // working and waiting each have their own deadline, idle has none.
@@ -1159,7 +1397,8 @@ mod tests {
         // Every option SessionStart writes has to be in OURS or uninstall leaks it,
         // and @cctab_exe is the one this slice added.
         assert!(OURS.contains(&OPT_EXE));
-        assert_eq!(OURS.len(), 12);
+        assert!(OURS.contains(&OPT_WINDOW_STRIP));
+        assert_eq!(OURS.len(), 13);
     }
 
     #[test]

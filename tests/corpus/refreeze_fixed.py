@@ -91,22 +91,26 @@ FIXED = {
     "pty-session-start-konsole-in-tmux":
         "fix-f: the ONE pre-existing divergence - inside tmux the pty gets the "
         "record, not a glyph, and CCTAB_NOW pins its epoch",
+    # (h) Claude Code 2.1.274 passes terminalSequence OSCs through tmux instead
+    # of updating pane_title. Every tmux paint now uses the guarded direct tty
+    # route. These eight historical record cases have no CLAUDE_PID, so their
+    # specified answer is silence, never a JSON carrier fallback.
     "tmux-record-working":
-        "fix-f: the record carries the state as a letter",
+        "fix-h: tmux working without a verified session tty is silent",
     "tmux-record-waiting":
-        "fix-f: the record carries the state as a letter",
+        "fix-h: tmux waiting without a verified session tty is silent",
     "tmux-record-idle":
-        "fix-f: the record carries the state as a letter",
+        "fix-h: tmux idle without a verified session tty is silent",
     "tmux-record-without-a-pane":
-        "fix-f: the record needs no $TMUX_PANE",
+        "fix-h: missing TMUX_PANE does not bypass the verified session tty guard",
     "tmux-record-with-an-ssh-prefix":
-        "fix-f: the record carries the location the tab would have shown",
+        "fix-h: an ssh prefix does not bypass the verified session tty guard",
     "tmux-record-is-not-affected-by-glyph-pos":
-        "fix-f: no glyph in the record, so no position in it either",
+        "fix-h: glyph position does not enable a tmux JSON carrier fallback",
     "tmux-record-ignores-a-glyph-override":
-        "fix-f: an override reaches the tab through a tmux option, not the record",
+        "fix-h: glyph overrides do not enable a tmux JSON carrier fallback",
     "tmux-and-sty-together-is-tmux":
-        "fix-f: tmux wins when both are set",
+        "fix-h: tmux wins over STY and requires a verified session tty",
     "tmux-terminal-override-konsole":
         "fix-f: CCTAB_TERMINAL=konsole is the only Konsole signal that survives ssh",
     "tmux-terminal-override-is-not-konsole":

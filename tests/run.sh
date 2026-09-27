@@ -13,8 +13,8 @@
 # has no interpreter and, since the length cap became locale-independent, no
 # locale dependence either, so that whole axis is gone.
 #
-# Every assertion runs the binary through CCTAB_DRY_RUN=1, or with CLAUDE_PID
-# unset, so nothing here can ever write an escape sequence to a real terminal.
+# Assertions use CCTAB_DRY_RUN=1 or unset CLAUDE_PID, except the tmux carrier
+# checks which name only a disposable private-server pane's PID.
 #
 # CLAUDE_PID is NOT unset globally - the headless-guard and pty sections need the
 # ambient one, and removing it costs 34 assertions. The state section, which is the
@@ -2811,7 +2811,7 @@ rm -rf "$_sd"
 # Everything below drives a PRIVATE server, `tmux -L cctabprobe -f /dev/null`,
 # and kills it afterwards. The user's own server is never listed, attached,
 # configured or killed, `-f /dev/null` means no ~/.tmux.conf is read, and no
-# client is ever attached, so no pty is touched.
+# client is ever attached. Only this private server's disposable pane ptys are touched.
 #
 # WHAT THIS CANNOT SEE: tmux RE-EMITTING the title to an attached client. That
 # needs a pty, which this suite cannot allocate (the corpus can, and does, for
@@ -2833,12 +2833,23 @@ else
     # tm <args> -- a command on the private server
     tm() { tmux -L "$ts" -f /dev/null "$@"; }
     # trec <edge> <cwd> <epoch> -- the record the binary emits inside tmux,
-    # taken from the binary's OWN hook line so the test and the product cannot
-    # drift apart.
+    # captured from its real direct tty write in a separate disposable session.
+    # This must not replay JSON: Claude's tmux passthrough bypasses pane_title.
     trec() {
-        (cd -- "$2" && HOME=$tmp TMUX="$tsock,1,0" TMUX_PANE=%0 CCTAB_NOW=$3 \
-            "$bin" "$1" </dev/null) \
-            | sed 's/.*terminalSequence":"\\u001b]0;//; s/\\u0007".*//'
+        tput_title record-capture:0.0 ''
+        (cd -- "$2" && HOME=$tmp TMUX="$tsock,1,0" TMUX_PANE=$trec_pane \
+            CLAUDE_PID=$trec_pid CCTAB_NOW=$3 "$bin" "$1" </dev/null >/dev/null)
+        _i=0
+        while [ "$_i" -lt 60 ]; do
+            _record=$(tm display-message -p -t record-capture:0.0 '#{pane_title}')
+            if [ -n "$_record" ]; then
+                printf '%s\n' "$_record"
+                return 0
+            fi
+            sleep 0.1 2>/dev/null || sleep 1
+            _i=$((_i + 1))
+        done
+        return 1
     }
     # tput_title <pane> <record> -- write the record from INSIDE the pane, which
     # is the only route that reaches pane_title, and wait for it to land.
@@ -2867,6 +2878,9 @@ else
 
     tmux -V >/dev/null 2>&1
     tm new-session -d -s t -n w0 -x 200 -y 50 /bin/sh
+    tm new-session -d -s record-capture -n collector /bin/sh
+    trec_pid=$(tm display-message -p -t record-capture:0.0 '#{pane_pid}')
+    trec_pane=$(tm display-message -p -t record-capture:0.0 '#{pane_id}')
     # A user who already has both of these set, so the save and restore have
     # something real to preserve.
     TUSER='MY OWN #{pane_title} TITLE'

@@ -359,3 +359,34 @@ against the current binary. Unit tests in src/payload.rs and subprocess tests in
 tests/test_payload.py additionally cover nested metadata, late and escaped keys,
 duplicate/type rejection, input limits and state preservation on rejected input.
 Run: python3 tests/test_payload.py (or set CCTAB_TEST_BIN for another build).
+
+
+Amendment, direct tmux carrier delivery (fix-h)
+-----------------------------------------------
+Claude Code 2.1.274 wraps hook terminalSequence OSCs in tmux passthrough, so they
+bypass pane_title rather than updating the state carrier. All tmux paints now
+write raw OSC to the session tty verified through /proc/$CLAUDE_PID/fd/1, as the
+session-start/end paths already did. Missing or redirected ttys are silent; there
+is no terminalSequence fallback that could leak a raw carrier to the outer tab.
+
+Exactly eight existing pipe cases have no CLAUDE_PID and now expect empty stdout:
+
+  tmux-record-working / -waiting / -idle
+  tmux-record-without-a-pane
+  tmux-record-with-an-ssh-prefix
+  tmux-record-is-not-affected-by-glyph-pos
+  tmux-record-ignores-a-glyph-override
+  tmux-and-sty-together-is-tmux
+
+Their historical IDs remain stable and their fixed fields name fix-h. The other
+304 cases, including non-tmux JSON, dry-run output and existing direct-pty cases,
+are unchanged. The shell oracle and cases.jsonl.before-fixes remain historical.
+Regeneration still runs gencases.py followed by refreeze_fixed.py; its named fix-h
+entries replace these eight oracle expectations with the new transport contract.
+
+Positive coverage of working/waiting/idle carrier delivery is in
+tests/test_tmux_status.py. It invokes actual hook subprocesses with a disposable
+pane shell's CLAUDE_PID and observes pane_title and native window rendering;
+it does not replay JSON output to manufacture terminal delivery. The same suite
+covers missing and redirected pid ttys. Run it with python3 tests/test_tmux_status.py
+(or set CCTAB_TEST_BIN for another build).

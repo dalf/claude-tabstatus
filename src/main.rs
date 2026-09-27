@@ -126,9 +126,8 @@ fn paint(edge: Edge) -> io::Result<()> {
 
     // Inside tmux an OSC 0 emitted in a pane never reaches the outer terminal: it
     // sets `pane_title`, and tmux re-emits a title of its OWN. So inside tmux the
-    // same sequence stops being a tab title and becomes the record
-    // `tmux::title_format` reads back - the ONE branch tmux puts on the hot path,
-    // and it execs nothing.
+    // same sequence becomes the record `tmux::title_format` reads back. Both
+    // carrier composition and direct pane delivery execute no subprocess.
     let payload = match cfg.tmux {
         Some(_) => tmux::carrier(paint, &composed.place),
         None => composed.title,
@@ -146,6 +145,9 @@ fn paint(edge: Edge) -> io::Result<()> {
             tmux::session_end(&cfg);
             r
         }
+        // Claude Code may wrap terminalSequence in tmux passthrough, which
+        // bypasses pane_title. Our carrier must reach the pane's pty as raw OSC.
+        Paint::Line(_) if cfg.tmux.is_some() => emit::pane_title(&payload, &cfg),
         Paint::Line(_) => emit::json_line(&payload),
     }
 }
