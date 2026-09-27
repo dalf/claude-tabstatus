@@ -270,11 +270,11 @@ class ElicitationTests(unittest.TestCase):
 
     def test_previous_state_versions_migrate_without_losing_permission_waits(self):
         self.state.mkdir()
-        for tag in ("cts1", "cts2"):
+        for tag in ("cts1", "cts2", "cts3"):
             session = tag
             (self.state / session).write_text(tag + "\nb w\nw owner:1000000\n")
             self.assertEqual(self.start(session=session), "WAITING")
-            self.assertTrue(self.record(session).startswith(b"cts3\n"))
+            self.assertTrue(self.record(session).startswith(b"cts4\n"))
             self.assertIn(b"owner:1000000", self.record(session))
             self.assertEqual(self.finish(session=session), "")
             self.assertEqual(self.send("working", session=session, agent_id="owner"), "WORKING")

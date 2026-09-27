@@ -1,0 +1,5303 @@
+{
+  "schema_version": 1,
+  "description": "Authored state/wait semantics, independent of historical shell output. Every step declares persisted base/owners/epochs, logical overlay, paint intent and retained displayed state. Synthetic unless explicitly marked as a documented capture reconstruction.",
+  "scenarios": [
+    {
+      "id": "capture_s4_reconstruction",
+      "description": "Reconstruct the documented s4 background permission/ghost-stop timeline.",
+      "provenance": {
+        "kind": "capture-derived-reconstruction",
+        "source": "src/state.rs module header, slice3/log/s4, and the_captured_subagent_sequence_ends_orange_and_then_restores_the_base unit test.",
+        "claude_version": "unknown: not retained in the source account",
+        "conditions": "Reconstructed from the published event timeline; original sanitized capture artifact unavailable here. Payload fields are reconstructed, not copied from a live capture. Relative fractional offsets are retained as metadata; subprocess epochs use integer seconds."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "main stops while background agent runs",
+          "now": 1000068,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop",
+            "background_tasks": [
+              {
+                "type": "subagent",
+                "status": "running",
+                "id": "aec99e1f4bda1972b"
+              }
+            ]
+          },
+          "expect": {
+            "record": "absent",
+            "base": "idle",
+            "waits": [],
+            "tombstones": [],
+            "logical": "idle",
+            "paint": "idle",
+            "displayed": "idle"
+          },
+          "capture_offset_seconds": 68.946
+        },
+        {
+          "name": "background permission dialog appears",
+          "now": 1000069,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "aec99e1f4bda1972b"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "agent:aec99e1f4bda1972b",
+                "raised": 1000069
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          },
+          "capture_offset_seconds": 69.96
+        },
+        {
+          "name": "six-second backstop does not add an anonymous owner",
+          "now": 1000075,
+          "edge": "notify",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "agent:aec99e1f4bda1972b",
+                "raised": 1000069
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          },
+          "capture_offset_seconds": 75.983
+        },
+        {
+          "name": "ghost summarizer stop cannot clear dialog",
+          "now": 1000098,
+          "edge": "subagent-stop",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "SubagentStop",
+            "agent_id": "a8e90c10430da8891",
+            "agent_type": ""
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "agent:aec99e1f4bda1972b",
+                "raised": 1000069
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          },
+          "capture_offset_seconds": 98.459
+        },
+        {
+          "name": "matching tool completion restores idle base",
+          "now": 1000107,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "aec99e1f4bda1972b"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [],
+            "tombstones": [],
+            "logical": "idle",
+            "paint": "idle",
+            "displayed": "idle"
+          },
+          "capture_offset_seconds": 107.496
+        },
+        {
+          "name": "later matching stop is now silent",
+          "now": 1000110,
+          "edge": "subagent-stop",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "SubagentStop",
+            "agent_id": "aec99e1f4bda1972b"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [],
+            "tombstones": [],
+            "logical": "idle",
+            "paint": "silent",
+            "displayed": "idle"
+          },
+          "capture_offset_seconds": 110.23
+        }
+      ]
+    },
+    {
+      "id": "overlap_reverse_completions",
+      "description": "Two agents overlap; reverse completion and injected prompt preserve the remaining wait.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "agent a waits",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "agent b waits",
+          "now": 1002,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "b"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:b",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main tool cannot erase either agent",
+          "now": 1003,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:b",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "second agent completes first",
+          "now": 1004,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUseFailure",
+            "agent_id": "b"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "injected completion prompt is not human recovery",
+          "now": 1005,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "<task-notification>agent b finished</task-notification>"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main stops with agent still running",
+          "now": 1006,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop",
+            "background_tasks": [
+              {
+                "id": "a"
+              }
+            ]
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "first agent completes last and restores idle",
+          "now": 1007,
+          "edge": "subagent-stop",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "SubagentStop",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [],
+            "tombstones": [],
+            "logical": "idle",
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        }
+      ]
+    },
+    {
+      "id": "main_and_agent_owners",
+      "description": "Main completion clears only main; agent completion restores the current working base.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "main permission",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "main",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "agent permission",
+          "now": 1002,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "main",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:a",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main tool answers its own wait",
+          "now": 1003,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "matching agent tool answers final wait",
+          "now": 1004,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "permission_backstop_both_orders",
+      "description": "Permission backstop coalesces with attributable waits in either arrival order.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "unattributable backstop arrives first",
+          "now": 1001,
+          "edge": "notify",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "unknown-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "duplicate backstop does not refresh permission clock",
+          "now": 1002,
+          "edge": "notify",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Notification",
+            "notification_type": "worker_permission_prompt"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "unknown-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "named request replaces permission unknown",
+          "now": 1003,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1003
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "late backstop adds no duplicate",
+          "now": 1009,
+          "edge": "notify",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Notification",
+            "notification_type": "agent_needs_input"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1003
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "named completion clears the only wait",
+          "now": 1010,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "unknown_notification_ownership",
+      "description": "Issue6: anonymous MCP and permission notices survive unrelated completions and remain separate.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "MCP notice with no identity",
+          "now": 1001,
+          "edge": "notify",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Notification",
+            "notification_type": "elicitation_dialog"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "notification-mcp",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "permission notice has separate provenance",
+          "now": 1002,
+          "edge": "notify",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "notification-mcp",
+                "raised": 1001
+              },
+              {
+                "owner": "unknown-permission",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "unrelated tool cannot consume unknowns",
+          "now": 1003,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "other"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "notification-mcp",
+                "raised": 1001
+              },
+              {
+                "owner": "unknown-permission",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "named permission replaces only permission backstop",
+          "now": 1004,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "notification-mcp",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:a",
+                "raised": 1004
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "matching completion leaves MCP notice",
+          "now": 1005,
+          "edge": "subagent-stop",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "SubagentStop",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "notification-mcp",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "unrelated ghost stop preserves lone MCP notice",
+          "now": 1006,
+          "edge": "subagent-stop",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "SubagentStop",
+            "agent_id": "ghost"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "notification-mcp",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "injected prompt also preserves lone MCP notice",
+          "now": 1007,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "<task-notification/>"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "notification-mcp",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "ordinary main tool invokes documented anonymous recovery",
+          "now": 1008,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUseFailure"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "stop_background_distinctions",
+      "description": "Absent, null and nonempty background_tasks preserve others; explicit empty invokes recovery.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "agent wait",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "MCP notification",
+          "now": 1002,
+          "edge": "notify",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Notification",
+            "notification_type": "elicitation_url_dialog"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              },
+              {
+                "owner": "notification-mcp",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main wait joins",
+          "now": 1003,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              },
+              {
+                "owner": "notification-mcp",
+                "raised": 1002
+              },
+              {
+                "owner": "main",
+                "raised": 1003
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "Stop always removes main wait but absent tasks says no more",
+          "now": 1004,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              },
+              {
+                "owner": "notification-mcp",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "null background tasks is absent information",
+          "now": 1005,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "StopFailure",
+            "background_tasks": null
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              },
+              {
+                "owner": "notification-mcp",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "nonempty background tasks preserves waits",
+          "now": 1006,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop",
+            "background_tasks": [
+              {}
+            ]
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              },
+              {
+                "owner": "notification-mcp",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "idle nudge without background field also preserves waits",
+          "now": 1007,
+          "edge": "notify",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Notification",
+            "notification_type": "idle_prompt"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              },
+              {
+                "owner": "notification-mcp",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "explicit empty tasks retires permission and notification waits",
+          "now": 1008,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop",
+            "background_tasks": []
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [],
+            "tombstones": [],
+            "logical": "idle",
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        }
+      ]
+    },
+    {
+      "id": "prompt_recovery_requires_human_content",
+      "description": "Missing, empty, null and tag-leading prompts do not retire a wait; a human prompt does.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "unknown permission",
+          "now": 1001,
+          "edge": "notify",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Notification",
+            "notification_type": "agent_needs_input"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "unknown-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "prompt missing",
+          "now": 1002,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "unknown-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "prompt empty",
+          "now": 1003,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": ""
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "unknown-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "prompt null",
+          "now": 1004,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": null
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "unknown-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "tag-leading prompt",
+          "now": 1005,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "<human-looking-but-conservative>"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "unknown-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "actual human prompt is recovery",
+          "now": 1006,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "continue"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "another anonymous notice starts a fresh wait",
+          "now": 1007,
+          "edge": "notify",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "unknown-permission",
+                "raised": 1007
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "whitespace is not trimmed: leading space counts as human recovery",
+          "now": 1008,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": " <task-notification/>"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "interruption_without_a_hook",
+      "description": "Esc/decline/interruption with no event cannot mutate state or repaint; next human prompt recovers.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "agent dialog",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "user interrupts but no hook is delivered",
+          "now": 1002,
+          "observation": true,
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "even elapsed time alone does not run lazy state expiry",
+          "now": 3000,
+          "observation": true,
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "next human prompt processes expiry and resumes work",
+          "now": 3001,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "try again"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "per_owner_expiry_and_stale_display",
+      "description": "Expiry is per owner and strict age>TTL; silent expiry persists without repainting the stale display.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {
+        "CCTAB_TTL_WAITING": "10"
+      },
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "older owner",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "newer owner",
+          "now": 1005,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "b"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:b",
+                "raised": 1005
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "at old owner TTL boundary both remain",
+          "now": 1011,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "unrelated"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:b",
+                "raised": 1005
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "one second past old TTL only old wait expires",
+          "now": 1012,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "unrelated"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:b",
+                "raised": 1005
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "new owner equality boundary remains",
+          "now": 1015,
+          "edge": "subagent-stop",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "SubagentStop",
+            "agent_id": "ghost"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:b",
+                "raised": 1005
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "expired owner completion cannot clear an already expired owner so stays silent",
+          "now": 1016,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "b"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "raising TTL cannot resurrect persisted expiry; main paints current base",
+          "now": 1017,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          },
+          "env": {
+            "CCTAB_TTL_WAITING": "100"
+          }
+        }
+      ]
+    },
+    {
+      "id": "clock_rollback_and_ttl_zero",
+      "description": "Clock rollback is not expiry; zero TTL keeps a wait through ordinary long elapsed times.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {
+        "CCTAB_TTL_WAITING": "0"
+      },
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "owned wait",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "clock rolls backward",
+          "now": 900,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "other"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "long elapsed time with TTL zero",
+          "now": 1000000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "other"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "matching completion still retires wait",
+          "now": 1000001,
+          "edge": "subagent-stop",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "SubagentStop",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "duplicate_named_request_refreshes_own_clock",
+      "description": "Repeated permission request refreshes only its owner; late backstop refreshes no ownership clock.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {
+        "CCTAB_TTL_WAITING": "10"
+      },
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "a waits",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "b waits",
+          "now": 1002,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "b"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:b",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "same owner asserts a fresh permission request",
+          "now": 1008,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1008
+              },
+              {
+                "owner": "agent:b",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "backstop does not refresh either owner",
+          "now": 1009,
+          "edge": "notify",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Notification",
+            "notification_type": "permission_prompt"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1008
+              },
+              {
+                "owner": "agent:b",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "only b expires",
+          "now": 1013,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "other"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1008
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "a completion restores work",
+          "now": 1014,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "late_permission_request_has_no_tombstone",
+      "description": "Permission completions have no request identity: result-before-request does not suppress a later dialog.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "early completion of an unrecorded agent",
+          "now": 1001,
+          "edge": "subagent-stop",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "SubagentStop",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "main idle without wait",
+          "now": 1002,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [],
+            "tombstones": [],
+            "logical": "idle",
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        },
+        {
+          "name": "late delivered permission request is still a dialog",
+          "now": 1003,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1003
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "matching completion restores idle base",
+          "now": 1004,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [],
+            "tombstones": [],
+            "logical": "idle",
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        },
+        {
+          "name": "duplicate completion is silent",
+          "now": 1005,
+          "edge": "subagent-stop",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "SubagentStop",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [],
+            "tombstones": [],
+            "logical": "idle",
+            "paint": "silent",
+            "displayed": "idle"
+          }
+        }
+      ]
+    },
+    {
+      "id": "reset_compaction_and_quiescent_end",
+      "description": "Compaction preserves state; an ordinary restart clears it; quiescent session end removes state and clears paint.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "agent wait",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "direct MCP wait",
+          "now": 1002,
+          "edge": "elicitation",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Elicitation",
+            "mcp_server_name": "mcp",
+            "elicitation_id": "one"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              },
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "one",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "midturn compact is not a reset",
+          "now": 1003,
+          "edge": "session-start",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "SessionStart",
+            "source": "compact"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              },
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "one",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "ordinary resume resets all owners",
+          "now": 1004,
+          "edge": "session-start",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "SessionStart",
+            "source": "resume"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [],
+            "tombstones": [],
+            "logical": "idle",
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        },
+        {
+          "name": "new human turn",
+          "now": 1005,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "new task"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "quiescent end removes record and clears title",
+          "now": 1006,
+          "edge": "session-end",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "SessionEnd"
+          },
+          "expect": {
+            "record": "absent",
+            "base": "idle",
+            "waits": [],
+            "tombstones": [],
+            "logical": "idle",
+            "paint": "clear",
+            "displayed": "cleared"
+          }
+        },
+        {
+          "name": "late nonowning agent event cannot recreate ended record",
+          "now": 1007,
+          "edge": "subagent-stop",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "SubagentStop",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "absent",
+            "base": "idle",
+            "waits": [],
+            "tombstones": [],
+            "logical": "idle",
+            "paint": "silent",
+            "displayed": "cleared"
+          }
+        }
+      ]
+    },
+    {
+      "id": "nested_metadata_cannot_impersonate_envelope",
+      "description": "Nested or stringified metadata never redirects session, owner or notification classification.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "top-level owner wins over nested metadata",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "owner",
+            "tool_input": {
+              "agent_id": "fake",
+              "session_id": "other",
+              "notification_type": "permission_prompt"
+            }
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:owner",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "nested owner cannot make main completion belong to owner",
+          "now": 1002,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "tool_response": {
+              "agent_id": "owner",
+              "session_id": "other"
+            }
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:owner",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "nested waiting classification inside unknown notification is ignored",
+          "now": 1003,
+          "edge": "notify",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Notification",
+            "notification_type": "agent_completed",
+            "details": {
+              "notification_type": "permission_prompt"
+            },
+            "message": "{\"session_id\":\"other\",\"agent_id\":\"owner\"}"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:owner",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "escaped top-level owner is decoded exactly",
+          "now": 1004,
+          "edge": "working",
+          "raw": "{\"session_id\":\"s1\",\"hook_event_name\":\"PostToolUse\",\"agent_\\u0069d\":\"ow\\u006eer\"}",
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "rejected_json_is_a_state_and_paint_noop",
+      "description": "Duplicate recognized keys, wrong types, malformed input and multiple documents cannot mutate state.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "existing live wait",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "duplicate owner fields reject whole payload",
+          "now": 1002,
+          "edge": "working",
+          "raw": "{\"session_id\":\"s1\",\"agent_id\":\"a\",\"agent_id\":null}",
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "wrong owner type rejects whole payload",
+          "now": 1003,
+          "edge": "working",
+          "raw": "{\"session_id\":\"s1\",\"agent_id\":42}",
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "truncated envelope rejects whole payload",
+          "now": 1004,
+          "edge": "session-end",
+          "raw": "{\"session_id\":\"s1\",",
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "multiple objects reject whole payload",
+          "now": 1005,
+          "edge": "idle",
+          "raw": "{\"session_id\":\"s1\"}{}",
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "nonarray background tasks cannot imply quiet stop",
+          "now": 1006,
+          "edge": "idle",
+          "raw": "{\"session_id\":\"s1\",\"background_tasks\":{}}",
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "real matching completion still works",
+          "now": 1007,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "equivalent_json_notification_layouts",
+      "description": "Compact, spaced, multiline and escaped field spellings have the same notification meaning.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "compact notification",
+          "now": 1001,
+          "edge": "notify",
+          "raw": "{\"session_id\":\"s1\",\"notification_type\":\"permission_prompt\"}",
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "unknown-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "spaced notification",
+          "now": 1002,
+          "edge": "notify",
+          "raw": "{ \"session_id\" : \"s1\", \"notification_type\" : \"permission_prompt\" }",
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "unknown-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "multiline notification",
+          "now": 1003,
+          "edge": "notify",
+          "raw": "{\n \"session_id\": \"s1\",\n \"notification_type\":\n \"permission_prompt\"\n}",
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "unknown-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "escaped recognized field and value",
+          "now": 1004,
+          "edge": "notify",
+          "raw": "{\"session_id\":\"s1\",\"notification_\\u0074ype\":\"permission_\\u0070rompt\"}",
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "unknown-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main tool recovery",
+          "now": 1005,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "bounded_permission_overflow",
+      "description": "Eight attributable waits plus one fixed-clock overflow keep waiting instead of evicting unrelated owners.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "permission owner 1",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a1"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a1",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "permission owner 2",
+          "now": 1002,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a2"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a1",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:a2",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "permission owner 3",
+          "now": 1003,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a3"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a1",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:a2",
+                "raised": 1002
+              },
+              {
+                "owner": "agent:a3",
+                "raised": 1003
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "permission owner 4",
+          "now": 1004,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a4"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a1",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:a2",
+                "raised": 1002
+              },
+              {
+                "owner": "agent:a3",
+                "raised": 1003
+              },
+              {
+                "owner": "agent:a4",
+                "raised": 1004
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "permission owner 5",
+          "now": 1005,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a5"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a1",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:a2",
+                "raised": 1002
+              },
+              {
+                "owner": "agent:a3",
+                "raised": 1003
+              },
+              {
+                "owner": "agent:a4",
+                "raised": 1004
+              },
+              {
+                "owner": "agent:a5",
+                "raised": 1005
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "permission owner 6",
+          "now": 1006,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a6"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a1",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:a2",
+                "raised": 1002
+              },
+              {
+                "owner": "agent:a3",
+                "raised": 1003
+              },
+              {
+                "owner": "agent:a4",
+                "raised": 1004
+              },
+              {
+                "owner": "agent:a5",
+                "raised": 1005
+              },
+              {
+                "owner": "agent:a6",
+                "raised": 1006
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "permission owner 7",
+          "now": 1007,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a7"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a1",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:a2",
+                "raised": 1002
+              },
+              {
+                "owner": "agent:a3",
+                "raised": 1003
+              },
+              {
+                "owner": "agent:a4",
+                "raised": 1004
+              },
+              {
+                "owner": "agent:a5",
+                "raised": 1005
+              },
+              {
+                "owner": "agent:a6",
+                "raised": 1006
+              },
+              {
+                "owner": "agent:a7",
+                "raised": 1007
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "permission owner 8",
+          "now": 1008,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a8"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a1",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:a2",
+                "raised": 1002
+              },
+              {
+                "owner": "agent:a3",
+                "raised": 1003
+              },
+              {
+                "owner": "agent:a4",
+                "raised": 1004
+              },
+              {
+                "owner": "agent:a5",
+                "raised": 1005
+              },
+              {
+                "owner": "agent:a6",
+                "raised": 1006
+              },
+              {
+                "owner": "agent:a7",
+                "raised": 1007
+              },
+              {
+                "owner": "agent:a8",
+                "raised": 1008
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "ninth owner creates bounded overflow without evicting a live owner",
+          "now": 1009,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a9"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a1",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:a2",
+                "raised": 1002
+              },
+              {
+                "owner": "agent:a3",
+                "raised": 1003
+              },
+              {
+                "owner": "agent:a4",
+                "raised": 1004
+              },
+              {
+                "owner": "agent:a5",
+                "raised": 1005
+              },
+              {
+                "owner": "agent:a6",
+                "raised": 1006
+              },
+              {
+                "owner": "agent:a7",
+                "raised": 1007
+              },
+              {
+                "owner": "agent:a8",
+                "raised": 1008
+              },
+              {
+                "owner": "overflow",
+                "raised": 1009
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "further request does not refresh overflow",
+          "now": 1010,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a10"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a1",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:a2",
+                "raised": 1002
+              },
+              {
+                "owner": "agent:a3",
+                "raised": 1003
+              },
+              {
+                "owner": "agent:a4",
+                "raised": 1004
+              },
+              {
+                "owner": "agent:a5",
+                "raised": 1005
+              },
+              {
+                "owner": "agent:a6",
+                "raised": 1006
+              },
+              {
+                "owner": "agent:a7",
+                "raised": 1007
+              },
+              {
+                "owner": "agent:a8",
+                "raised": 1008
+              },
+              {
+                "owner": "overflow",
+                "raised": 1009
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "untracked completion cannot clear aggregate",
+          "now": 1011,
+          "edge": "subagent-stop",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "SubagentStop",
+            "agent_id": "a9"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a1",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:a2",
+                "raised": 1002
+              },
+              {
+                "owner": "agent:a3",
+                "raised": 1003
+              },
+              {
+                "owner": "agent:a4",
+                "raised": 1004
+              },
+              {
+                "owner": "agent:a5",
+                "raised": 1005
+              },
+              {
+                "owner": "agent:a6",
+                "raised": 1006
+              },
+              {
+                "owner": "agent:a7",
+                "raised": 1007
+              },
+              {
+                "owner": "agent:a8",
+                "raised": 1008
+              },
+              {
+                "owner": "overflow",
+                "raised": 1009
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "quiet stop clears known permissions but preserves overflow",
+          "now": 1012,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop",
+            "background_tasks": []
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "overflow",
+                "raised": 1009
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "human prompt recovers aggregate",
+          "now": 1013,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "continue"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "direct_request_permission_interop",
+      "description": "Permission overlap, keyed notification coalescing and direct result-before-start preserve exact owners.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "permission request",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "direct request",
+          "now": 1002,
+          "edge": "elicitation",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Elicitation",
+            "mcp_server_name": "mcp",
+            "elicitation_id": "one",
+            "mode": "form"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              },
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "one",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "keyed notification coalesces without refreshing direct clock",
+          "now": 1003,
+          "edge": "notify",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Notification",
+            "notification_type": "elicitation_dialog",
+            "mcp_server_name": "mcp",
+            "elicitation_id": "one"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              },
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "one",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "duplicate start does not refresh direct clock",
+          "now": 1004,
+          "edge": "elicitation",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Elicitation",
+            "mcp_server_name": "mcp",
+            "elicitation_id": "one"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              },
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "one",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "MCP result leaves permission owner intact",
+          "now": 1005,
+          "edge": "elicitation-result",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "ElicitationResult",
+            "mcp_server_name": "mcp",
+            "elicitation_id": "one",
+            "action": "accept"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "one",
+                "raised": 1005
+              }
+            ],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "replayed direct start is suppressed by tombstone",
+          "now": 1006,
+          "edge": "elicitation",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Elicitation",
+            "mcp_server_name": "mcp",
+            "elicitation_id": "one"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "one",
+                "raised": 1005
+              }
+            ],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "permission completion restores working",
+          "now": 1007,
+          "edge": "subagent-stop",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "SubagentStop",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "one",
+                "raised": 1005
+              }
+            ],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "result before start records exact tombstone silently",
+          "now": 1008,
+          "edge": "elicitation-result",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "ElicitationResult",
+            "mcp_server_name": "mcp",
+            "elicitation_id": "early",
+            "action": "cancel"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "one",
+                "raised": 1005
+              },
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "early",
+                "raised": 1008
+              }
+            ],
+            "logical": "working",
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "late start cannot resurrect completed exact identity",
+          "now": 1009,
+          "edge": "elicitation",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Elicitation",
+            "mcp_server_name": "mcp",
+            "elicitation_id": "early"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "one",
+                "raised": 1005
+              },
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "early",
+                "raised": 1008
+              }
+            ],
+            "logical": "working",
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "ordinary reset clears completed identity history",
+          "now": 1010,
+          "edge": "session-start",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "SessionStart",
+            "source": "startup"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [],
+            "tombstones": [],
+            "logical": "idle",
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        }
+      ]
+    },
+    {
+      "id": "anonymous_direct_and_notification_recovery",
+      "description": "Anonymous direct request is independent from notification fallback and survives main/quiet-stop recovery.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "anonymous direct request",
+          "now": 1001,
+          "edge": "elicitation",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Elicitation",
+            "mcp_server_name": "mcp"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-direct-mcp",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "identity-free notification remains independent",
+          "now": 1002,
+          "edge": "notify",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Notification",
+            "notification_type": "elicitation_dialog"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-direct-mcp",
+                "raised": 1001
+              },
+              {
+                "owner": "notification-mcp",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "anonymous direct replay does not refresh aggregate",
+          "now": 1003,
+          "edge": "elicitation",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Elicitation",
+            "mcp_server_name": "mcp"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-direct-mcp",
+                "raised": 1001
+              },
+              {
+                "owner": "notification-mcp",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "notification replay refreshes its own clock",
+          "now": 1004,
+          "edge": "notify",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Notification",
+            "notification_type": "elicitation_url_dialog"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-direct-mcp",
+                "raised": 1001
+              },
+              {
+                "owner": "notification-mcp",
+                "raised": 1004
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main progress only recovers notification",
+          "now": 1005,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-direct-mcp",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "quiet stop still preserves direct aggregate",
+          "now": 1006,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop",
+            "background_tasks": []
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "anonymous-direct-mcp",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "unidentified result cannot retire anonymous direct",
+          "now": 1007,
+          "edge": "elicitation-result",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "ElicitationResult",
+            "action": "accept"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "anonymous-direct-mcp",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "human recovery finally clears aggregate",
+          "now": 1008,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "continue"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "tombstone_expiry_does_not_refresh_on_replay",
+      "description": "Completion tombstones retain first epoch, expire after TTL, and do not clear unrelated permission waits.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {
+        "CCTAB_TTL_WAITING": "10"
+      },
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "completion before direct request",
+          "now": 1001,
+          "edge": "elicitation-result",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "ElicitationResult",
+            "mcp_server_name": "mcp",
+            "elicitation_id": "one",
+            "action": "decline"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "one",
+                "raised": 1001
+              }
+            ],
+            "logical": "working",
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "duplicate completion leaves epoch unchanged",
+          "now": 1002,
+          "edge": "elicitation-result",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "ElicitationResult",
+            "mcp_server_name": "mcp",
+            "elicitation_id": "one",
+            "action": "decline"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "one",
+                "raised": 1001
+              }
+            ],
+            "logical": "working",
+            "paint": "silent",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "independent permission request",
+          "now": 1003,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "a"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1003
+              }
+            ],
+            "tombstones": [
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "one",
+                "raised": 1001
+              }
+            ],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "direct start at TTL equality is still suppressed",
+          "now": 1011,
+          "edge": "elicitation",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Elicitation",
+            "mcp_server_name": "mcp",
+            "elicitation_id": "one"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1003
+              }
+            ],
+            "tombstones": [
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "one",
+                "raised": 1001
+              }
+            ],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "one second past tombstone TTL request can be new",
+          "now": 1012,
+          "edge": "elicitation",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Elicitation",
+            "mcp_server_name": "mcp",
+            "elicitation_id": "one"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:a",
+                "raised": 1003
+              },
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "one",
+                "raised": 1012
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "human prompt retires both and tombstones direct identity",
+          "now": 1013,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "continue"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [
+              {
+                "owner": "direct-mcp",
+                "server": "mcp",
+                "id": "one",
+                "raised": 1013
+              }
+            ],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "invalid_permission_owner_reserved",
+      "description": "A supplied unusable permission owner stays an independent anonymous request; only explicit recovery retires it.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "unusable owner must be conservatively anonymous request",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "-"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "uncorrelated repeated malformed request retains first aggregate epoch",
+          "now": 1002,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "-"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main Stop with absent tasks cannot clear anonymous request",
+          "now": 1003,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "unrelated agent completion cannot identify anonymous request",
+          "now": 1004,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "other"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "invalid supplied completion cannot inherit main recovery",
+          "now": 1005,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "-"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main tool progress cannot identify malformed request owner",
+          "now": 1006,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "human prompt recovers anonymous request",
+          "now": 1007,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "continue"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "invalid_permission_owner_punctuated",
+      "description": "A supplied unusable permission owner stays an independent anonymous request; only explicit recovery retires it.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "unusable owner must be conservatively anonymous request",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "../agent"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "uncorrelated repeated malformed request retains first aggregate epoch",
+          "now": 1002,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "../agent"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main Stop with absent tasks cannot clear anonymous request",
+          "now": 1003,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "unrelated agent completion cannot identify anonymous request",
+          "now": 1004,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "other"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "invalid supplied completion cannot inherit main recovery",
+          "now": 1005,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "../agent"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main tool progress cannot identify malformed request owner",
+          "now": 1006,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "human prompt recovers anonymous request",
+          "now": 1007,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "continue"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "invalid_permission_owner_oversized",
+      "description": "A supplied unusable permission owner stays an independent anonymous request; only explicit recovery retires it.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "unusable owner must be conservatively anonymous request",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "uncorrelated repeated malformed request retains first aggregate epoch",
+          "now": 1002,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main Stop with absent tasks cannot clear anonymous request",
+          "now": 1003,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "unrelated agent completion cannot identify anonymous request",
+          "now": 1004,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "other"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "invalid supplied completion cannot inherit main recovery",
+          "now": 1005,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main tool progress cannot identify malformed request owner",
+          "now": 1006,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "human prompt recovers anonymous request",
+          "now": 1007,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "continue"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "invalid_permission_owner_unicode",
+      "description": "A supplied unusable permission owner stays an independent anonymous request; only explicit recovery retires it.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "unusable owner must be conservatively anonymous request",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "é"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "uncorrelated repeated malformed request retains first aggregate epoch",
+          "now": 1002,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "é"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main Stop with absent tasks cannot clear anonymous request",
+          "now": 1003,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "unrelated agent completion cannot identify anonymous request",
+          "now": 1004,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "other"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "invalid supplied completion cannot inherit main recovery",
+          "now": 1005,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "é"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main tool progress cannot identify malformed request owner",
+          "now": 1006,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "human prompt recovers anonymous request",
+          "now": 1007,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "continue"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "absent_and_null_permission_owner_is_main",
+      "description": "Missing, null and empty agent IDs represent the main loop rather than malformed supplied identities.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Authored from the documented state/wait contract; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human starts work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "missing owner is main",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "main",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "Stop removes main wait even without tasks field",
+          "now": 1002,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [],
+            "tombstones": [],
+            "logical": "idle",
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        },
+        {
+          "name": "null owner is main",
+          "now": 1003,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": null
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "main",
+                "raised": 1003
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main completion recovers null owner",
+          "now": 1004,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "empty owner is absent metadata",
+          "now": 1005,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": ""
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "main",
+                "raised": 1005
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main completion recovers empty owner",
+          "now": 1006,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        }
+      ]
+    },
+    {
+      "id": "known_permission_then_anonymous",
+      "description": "Anonymous permission and known request coexist in either arrival order; named completion clears only its own request.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Issue8 review regression for direct malformed-owner requests; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human begins work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "named request waits",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "known"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:known",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "malformed owner request cannot be suppressed as a notification",
+          "now": 1002,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "invalid/id"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "agent:known",
+                "raised": 1001
+              },
+              {
+                "owner": "anonymous-permission",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "matching named completion must leave anonymous request waiting",
+          "now": 1003,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "known"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main tool progress is not anonymous completion evidence",
+          "now": 1004,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "Stop without task information preserves anonymous request",
+          "now": 1005,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "explicit quiet Stop invokes anonymous permission recovery",
+          "now": 1006,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop",
+            "background_tasks": []
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [],
+            "tombstones": [],
+            "logical": "idle",
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        }
+      ]
+    },
+    {
+      "id": "anonymous_permission_then_known",
+      "description": "Anonymous permission and known request coexist in either arrival order; named completion clears only its own request.",
+      "provenance": {
+        "kind": "synthetic",
+        "source": "Issue8 review regression for direct malformed-owner requests; not captured traffic.",
+        "claude_version": "not applicable",
+        "conditions": "Sequential isolated hook subprocesses, no terminal/MCP service; controlled integer clock."
+      },
+      "env": {},
+      "steps": [
+        {
+          "name": "human begins work",
+          "now": 1000,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "go"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [],
+            "tombstones": [],
+            "logical": "working",
+            "paint": "working",
+            "displayed": "working"
+          }
+        },
+        {
+          "name": "malformed owner raises independent anonymous request",
+          "now": 1001,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "invalid/id"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "later named request cannot replace anonymous request",
+          "now": 1002,
+          "edge": "waiting",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PermissionRequest",
+            "agent_id": "known"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              },
+              {
+                "owner": "agent:known",
+                "raised": 1002
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "waiting",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "matching named completion must leave anonymous request waiting",
+          "now": 1003,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse",
+            "agent_id": "known"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "main tool progress is not anonymous completion evidence",
+          "now": 1004,
+          "edge": "working",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "PostToolUse"
+          },
+          "expect": {
+            "record": "present",
+            "base": "working",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "Stop without task information preserves anonymous request",
+          "now": 1005,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop"
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [
+              {
+                "owner": "anonymous-permission",
+                "raised": 1001
+              }
+            ],
+            "tombstones": [],
+            "logical": "waiting",
+            "paint": "silent",
+            "displayed": "waiting"
+          }
+        },
+        {
+          "name": "explicit quiet Stop invokes anonymous permission recovery",
+          "now": 1006,
+          "edge": "idle",
+          "payload": {
+            "session_id": "s1",
+            "hook_event_name": "Stop",
+            "background_tasks": []
+          },
+          "expect": {
+            "record": "present",
+            "base": "idle",
+            "waits": [],
+            "tombstones": [],
+            "logical": "idle",
+            "paint": "idle",
+            "displayed": "idle"
+          }
+        }
+      ]
+    }
+  ]
+}

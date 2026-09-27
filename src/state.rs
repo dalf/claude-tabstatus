@@ -56,9 +56,9 @@
 //!     subagent - the capture's 68.946 `Stop` lists the very agent that raises the
 //!     dialog one second later. An EMPTY one is retained as a recovery heuristic
 //!     for stale agent and unknown waits, not correlation with an MCP response.
-//!   * its own expiry, `CCTAB_TTL_WAITING`, the same knob tmux decays an orange
-//!     title with, so inside tmux the record and the title stop lying at the same
-//!     moment. PER WAIT, not per record: one epoch shared by the whole list let
+//!   * its own expiry, `CCTAB_TTL_WAITING`, checked on eligible hooks. Tmux title
+//!     decay shares the setting but independently ages its last paint. PER WAIT,
+//!     not per record: one epoch shared by the whole list let
 //!     every later dialog push a stale wait's clock forward, and a session raising
 //!     dialogs more often than the TTL then never expired it at all.
 //!
@@ -80,7 +80,7 @@
 //! walk and is therefore genuinely cheaper than a painting edge.
 //!
 //! WHEN IT IS ABSENT the binary behaves EXACTLY as it did stateless: no
-//! `XDG_RUNTIME_DIR` (and no `CCTAB_STATE_DIR`), an unusable directory, or a
+//! `XDG_RUNTIME_DIR` (and no `CCTAB_STATE_DIR`), failure to create the directory, or a
 //! payload with no `session_id` all leave [`Session::open`] returning `None`, and
 //! `main` then runs the stateless `Edge::resolve` path. The golden corpus tests
 //! that path - its environment sets neither
@@ -126,10 +126,11 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-/// The wire tag. Version 3 correlates direct elicitations; versions 1 and 2 remain
-/// readable. A later shape can change it so this version ignores new records
+/// The wire tag. Version 4 distinguishes anonymous permission requests from
+/// notification backstops; versions 1–3 remain readable. A later shape changes it
+/// so this version ignores new records
 /// rather than misreading them.
-const TAG: &str = "cts3";
+const TAG: &str = "cts4";
 
 /// The prefix every version's tag shares, which is what lets this one tell "a
 /// NEWER version's record, leave it alone" from "not one of ours at all".
@@ -258,6 +259,10 @@ pub enum Owner {
     ///   * its own expiry.
     /// A subagent's completion cannot identify the owner, even for a lone wait.
     Unknown,
+    /// A permission request supplied an unusable agent identity. This is direct
+    /// evidence of a dialog, independent of notification backstops and named
+    /// requests. Keep one aggregate until human prompt, quiet Stop, expiry or reset.
+    AnonymousPermission,
     /// An MCP elicitation notification with no known owner. Kept separate from
     /// permission backstops so an unrelated permission dialog cannot replace it.
     UnknownElicitation,
@@ -275,8 +280,9 @@ pub enum Owner {
 impl Owner {
     /// Who this payload is attributable to.
     ///
-    /// `agent_id` or the main loop; unknown owners are only introduced by the
-    /// `Notification` backstop, which cannot attribute what it is reporting.
+    /// `agent_id` or the main loop. Callers must separately guard unusable
+    /// supplied IDs: they cannot prove main-thread progress, and permission
+    /// requests with them must retain an unknown owner.
     fn of(p: &Payload) -> Owner {
         match p.agent_id().map(str::as_bytes).and_then(id_str) {
             Some(id) => Owner::Agent(id),
@@ -288,6 +294,7 @@ impl Owner {
         match self {
             Owner::Main => "-",
             Owner::Unknown => "?",
+            Owner::AnonymousPermission => "?p",
             Owner::UnknownElicitation => "?!",
             Owner::AnonymousElicitation => "!?",
             Owner::Overflow => "!+",
@@ -300,6 +307,7 @@ impl Owner {
         match word {
             "-" => Some(Owner::Main),
             "?" => Some(Owner::Unknown),
+            "?p" => Some(Owner::AnonymousPermission),
             "?!" => Some(Owner::UnknownElicitation),
             "!?" => Some(Owner::AnonymousElicitation),
             "!+" => Some(Owner::Overflow),
@@ -398,7 +406,7 @@ fn id_str(raw: &[u8]) -> Option<String> {
 /// writing `g` or `n` (see the SEAM) does not confuse this one:
 ///
 /// ```text
-///   cts3
+///   cts4
 ///   b i                                        base = w | a | i
 ///   p 3709427 84460384                         the session's (pid, start time)
 ///   w aec99e1f4bda1972b:1790380630 -:1790380631
@@ -406,12 +414,13 @@ fn id_str(raw: &[u8]) -> Option<String> {
 ///
 /// Each `w` word is one wait: its owner, a colon, and the epoch at which THAT wait
 /// was raised. An absent `w` line means nothing is waiting. `-` is the main loop
-/// and `?` is an unknown permission owner; `?!` is an unidentified notification,
+/// and `?` is an unknown permission notification; `?p` is an anonymous permission
+/// request. `?!` is an unidentified MCP notification,
 /// `!?` an anonymous direct request, and `!+` an overflow aggregate. A direct
 /// identity is `!<hex-server>.<hex-id>`. The optional `e` line stores completed
 /// direct identities in the same owner:epoch shape, independently bounded to
-/// eight. None of these markers can be an agent id. The cts3 tag prevents older
-/// readers from silently dropping elicitation words. An absent `p` line means
+/// eight. None of these markers can be an agent id. The cts4 tag prevents older
+/// readers from silently dropping anonymous permission requests. An absent `p` line means
 /// the reaper falls back to mtime for this file.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Record {
@@ -458,7 +467,7 @@ impl Record {
     /// a wait that had already been declared dead.
     fn parse(text: &str) -> Option<Record> {
         let mut lines = text.lines();
-        if !matches!(lines.next(), Some(TAG | "cts1" | "cts2")) {
+        if !matches!(lines.next(), Some(TAG | "cts1" | "cts2" | "cts3")) {
             return None;
         }
         let mut r = Record::fresh();
@@ -498,10 +507,10 @@ impl Record {
     /// Drop the waits whose own clock has run out, and say whether any went.
     ///
     /// A wait nothing ever cleared must not hold the tab orange forever: a
-    /// subagent killed mid-dialog fires no `SubagentStop`. The horizon is the same
-    /// `CCTAB_TTL_WAITING` tmux decays an orange title with, so inside tmux the
-    /// record and the title stop lying at the same moment, off one knob and one
-    /// grammar - including its `0` = never sentinel.
+    /// subagent killed mid-dialog fires no `SubagentStop`. The horizon uses the
+    /// same `CCTAB_TTL_WAITING` setting as tmux title decay, including `0` = never.
+    /// Record expiry needs an eligible hook; tmux independently ages the most
+    /// recently painted carrier, so these clocks need not expire together.
     fn expire(&mut self, now: u64, ttl: u64) -> bool {
         let before = self.waits.len();
         let completed_before = self.completed.len();
@@ -577,8 +586,9 @@ impl Record {
         self.waits.push(Wait { who: o, raised: now });
     }
 
-    /// Whether the only permission wait is unattributable. Independent MCP
-    /// elicitations do not prevent a later owned permission wait replacing it.
+    /// Whether the only permission backstop candidate is unattributable.
+    /// Anonymous direct permission and MCP waits do not participate in this
+    /// notification deduplication and remain independent.
     fn lone_unknown(&self) -> bool {
         let mut permissions = self.waits.iter().filter(|w| w.who.permission());
         matches!(permissions.next(), Some(w) if w.who == Owner::Unknown)
@@ -696,9 +706,9 @@ fn nothing_running(p: &Payload) -> bool {
 /// fires 20ms earlier and clears its wait properly.
 ///
 /// So the prompt must be present and must not begin with `<`. That is deliberately
-/// broader than the one spelling measured: every injected prompt shape Claude Code
-/// has is an XML-ish tag, and a human prompt that happens to start with `<` costs
-/// only this one retirement condition, out of four.
+/// broader than the one spelling measured. It is a recovery heuristic, not
+/// authentication of human input; a human prompt beginning with `<` also loses
+/// this recovery path. The check uses the first character without trimming.
 ///
 fn at_the_prompt(p: &Payload) -> bool {
     p.hook_event_name() == Some("UserPromptSubmit")
@@ -814,11 +824,10 @@ impl Session {
     /// new one. So after taking the lock we check that we hold the inode the path
     /// names NOW, and retry when we do not.
     ///
-    /// BLOCKING, and safe to be: the critical section is one small read, one small
-    /// write and a rename on a tmpfs, so a waiter waits microseconds against a 5s
-    /// hook timeout - and `flock` is released by closing the fd, so a holder that
-    /// aborts (`panic = "abort"` is in the release profile) or is SIGKILLed frees
-    /// it by exiting. There is no state in which a hook can hold this forever.
+    /// BLOCKING: the normal critical section is one small read, one small write
+    /// and a rename. Closing the fd or exiting releases the lock, including an
+    /// abort or SIGKILL. There is no lock-acquisition timeout here; a suspended
+    /// holder or stalled filesystem can delay another hook indefinitely.
     ///
     /// Creation-capable edges atomically create an empty file before taking the
     /// lock. This closes the first-update race too: two direct requests must not
@@ -958,7 +967,16 @@ impl Session {
                 Some(paint)
             }
             Edge::Working => self.progress(Owner::of(p), p),
-            Edge::Waiting => self.wait(Owner::of(p)),
+            Edge::Waiting => {
+                let owner = Owner::of(p);
+                // A supplied identity that cannot name an agent is not evidence
+                // of a main-thread request. Keep an unattributed permission wait
+                // rather than letting an ordinary main Stop retire it. `-` is
+                // reserved for Main in the record, despite matching the ID grammar.
+                let unusable = p.agent_id().is_some()
+                    && (owner == Owner::Main || p.agent_id() == Some("-"));
+                self.wait(if unusable { Owner::AnonymousPermission } else { owner })
+            }
             Edge::Idle => self.free(p),
             Edge::SubagentStop => self.agent_gone(Owner::of(p)),
             Edge::Elicitation => self.elicitation_start(p, false),
@@ -1038,8 +1056,9 @@ impl Session {
                 }
                 now.base = Glyph::Working;
             }
-            // Only direct lifecycle methods construct these owners.
-            Owner::AnonymousElicitation | Owner::Elicitation(_) | Owner::Overflow => return None,
+            // These owners cannot prove attributable progress.
+            Owner::AnonymousPermission | Owner::AnonymousElicitation
+            | Owner::Elicitation(_) | Owner::Overflow => return None,
         }
         self.write_if_changed(&was, &mut now);
         // A wait somebody else still holds keeps the tab: this is the second half
@@ -1065,7 +1084,12 @@ impl Session {
         // reverse arrival order is handled by `Record::raise`.
         // Elicitations are independent of permission dialogs. A generic
         // backstop is redundant only when a permission wait already exists.
-        if !(o == Owner::Unknown && now.waits.iter().any(|w| w.who.permission())) {
+        let duplicate_anonymous = o == Owner::AnonymousPermission
+            && now.waits.iter().any(|w| w.who == o);
+        // Without an identity, another malformed request cannot be correlated
+        // with this aggregate. Keep the first epoch so repeats cannot extend it.
+        if !duplicate_anonymous
+            && !(o == Owner::Unknown && now.waits.iter().any(|w| w.who.permission())) {
             now.raise(o, self.now);
         }
         self.write_if_changed(&was, &mut now);
@@ -1531,7 +1555,7 @@ pub fn survey() -> Survey {
 //       the record, so a miss costs a plain location and never a stall.
 //     * it is the first field worth writing on an edge that would otherwise not
 //       write, so it is also the first one that has to reckon with
-//       `write_if_changed`'s contract - and with `MAX_RECORD`, which is 4096, so
+//       `write_if_changed`'s contract - and with `MAX_RECORD`, which is 8192, so
 //       the title has to be capped well inside it.
 //   The cap and the elision then belong to `render::compose`, not here.
 //
@@ -1638,7 +1662,7 @@ mod tests {
         )
     }
 
-    /// A `Stop` that says nothing is running, which retires every wait.
+    /// A `Stop` that retires permission and notification waits, not direct MCP waits.
     fn quiet_stop() -> Payload {
         payload(r#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[]}"#)
     }
@@ -1815,7 +1839,7 @@ mod tests {
             Some(Paint::Line(Glyph::Waiting))
         );
         let origin = f.origin_line();
-        let held = format!("cts3\nb i\n{origin}w aec99e1f4bda1972b:1000000\n");
+        let held = format!("cts4\nb i\n{origin}w aec99e1f4bda1972b:1000000\n");
         assert_eq!(f.record(), held);
         // 98.459 the GHOST SubagentStop, for an agent that owns nothing.
         let ghost = agent_stop("a8e90c10430da8891");
@@ -1826,7 +1850,7 @@ mod tests {
             f.session(&agent).resolve(Edge::Working, &agent),
             Some(Paint::Line(Glyph::Idle))
         );
-        assert_eq!(f.record(), format!("cts3\nb i\n{origin}"));
+        assert_eq!(f.record(), format!("cts4\nb i\n{origin}"));
     }
 
     #[test]
@@ -1851,7 +1875,7 @@ mod tests {
         assert_eq!(f.session(&main).resolve(Edge::Working, &main), None);
         assert_eq!(
             f.record(),
-            format!("cts3\nb w\n{}w aaa:1000000\n", f.origin_line())
+            format!("cts4\nb w\n{}w aaa:1000000\n", f.origin_line())
         );
         // ...and when the agent resolves it, the base that comes back is the
         // WORKING one this turn established, not a guess.
@@ -1870,7 +1894,7 @@ mod tests {
         f.session(&main).resolve(Edge::Waiting, &main);
         assert_eq!(
             f.record(),
-            format!("cts3\nb i\n{}w aaa:1000000 -:1000000\n", f.origin_line())
+            format!("cts4\nb i\n{}w aaa:1000000 -:1000000\n", f.origin_line())
         );
         // Answering the main one leaves the agent's dialog on screen, so the tab
         // stays orange. A single owner slot would have got this wrong whichever
@@ -1911,7 +1935,7 @@ mod tests {
             f.session(&main).resolve(Edge::Idle, &main),
             Some(Paint::Line(Glyph::Idle))
         );
-        assert_eq!(f.record(), format!("cts3\nb i\n{}", f.origin_line()));
+        assert_eq!(f.record(), format!("cts4\nb i\n{}", f.origin_line()));
     }
 
     /// The fix for the stale AGENT wait: a `Stop` that says nothing is running
@@ -1928,7 +1952,7 @@ mod tests {
             f.session(&quiet).resolve(Edge::Idle, &quiet),
             Some(Paint::Line(Glyph::Idle))
         );
-        assert_eq!(f.record(), format!("cts3\nb i\n{}", f.origin_line()));
+        assert_eq!(f.record(), format!("cts4\nb i\n{}", f.origin_line()));
     }
 
     /// And the other main-thread retirement: you cannot type at the prompt while a
@@ -1950,7 +1974,7 @@ mod tests {
         assert_eq!(f.session(&injected).resolve(Edge::Working, &injected), None);
         assert_eq!(
             f.record(),
-            format!("cts3\nb w\n{}w aaa:1000000\n", f.origin_line())
+            format!("cts4\nb w\n{}w aaa:1000000\n", f.origin_line())
         );
         // The user typing does.
         let prompt = user_prompt();
@@ -1958,7 +1982,7 @@ mod tests {
             f.session(&prompt).resolve(Edge::Working, &prompt),
             Some(Paint::Line(Glyph::Working))
         );
-        assert_eq!(f.record(), format!("cts3\nb w\n{}", f.origin_line()));
+        assert_eq!(f.record(), format!("cts4\nb w\n{}", f.origin_line()));
     }
 
     /// The defect a SHARED epoch caused: unrelated later dialogs refreshed a stale
@@ -1978,7 +2002,7 @@ mod tests {
         }
         assert_eq!(
             f.record(),
-            format!("cts3\nb i\n{}w aaa:1000000 bbb:1000008\n", f.origin_line())
+            format!("cts4\nb i\n{}w aaa:1000000 bbb:1000008\n", f.origin_line())
         );
         // aaa is 9s old against a 3s horizon and goes; bbb is 1s old and stays, so
         // the tab is still correctly orange and nothing paints.
@@ -1990,8 +2014,29 @@ mod tests {
         // the TTL later cannot resurrect a wait already declared dead.
         assert_eq!(
             f.record(),
-            format!("cts3\nb i\n{}w bbb:1000008\n", f.origin_line())
+            format!("cts4\nb i\n{}w bbb:1000008\n", f.origin_line())
         );
+    }
+
+    #[test]
+    fn an_unusable_permission_owner_is_anonymous_not_main() {
+        for id in ["-".to_owned(), "?".to_owned(), "a/b".to_owned(), "a".repeat(65)] {
+            let f = Fixture::new("invalid_permission_owner");
+            let request = payload(&format!(
+                r#"{{"session_id":"s1","hook_event_name":"PermissionRequest","agent_id":"{id}"}}"#
+            ));
+            assert_eq!(f.session(&request).resolve(Edge::Waiting, &request),
+                Some(Paint::Line(Glyph::Waiting)));
+            assert_eq!(f.record(), format!("cts4\nb i\n{}w ?p:1000000\n", f.origin_line()));
+            let stop = payload(r#"{"session_id":"s1","hook_event_name":"Stop"}"#);
+            assert_eq!(f.session(&stop).resolve(Edge::Idle, &stop), None);
+            let unrelated = agent_stop("other");
+            assert_eq!(f.session(&unrelated).resolve(Edge::SubagentStop, &unrelated), None);
+            let human = user_prompt();
+            assert_eq!(f.session(&human).resolve(Edge::Working, &human),
+                Some(Paint::Line(Glyph::Working)));
+            assert!(!f.record().contains("\nw "));
+        }
     }
 
     #[test]
@@ -2004,7 +2049,7 @@ mod tests {
         );
         assert_eq!(
             f.record(),
-            format!("cts3\nb i\n{}w ?:1000000\n", f.origin_line())
+            format!("cts4\nb i\n{}w ?:1000000\n", f.origin_line())
         );
         // A `Stop` with a live subagent still says nothing about it.
         let busy = main_ev();
@@ -2019,7 +2064,7 @@ mod tests {
             f.session(&quiet).resolve(Edge::Idle, &quiet),
             Some(Paint::Line(Glyph::Idle))
         );
-        assert_eq!(f.record(), format!("cts3\nb i\n{}", f.origin_line()));
+        assert_eq!(f.record(), format!("cts4\nb i\n{}", f.origin_line()));
     }
 
     /// The `?` used to survive `Stop` AND the 3s nudge, so once the user had dealt
@@ -2063,7 +2108,7 @@ mod tests {
         f.session(&agent).resolve(Edge::Waiting, &agent);
         assert_eq!(
             f.record(),
-            format!("cts3\nb i\n{}w aaa:1000000\n", f.origin_line())
+            format!("cts4\nb i\n{}w aaa:1000000\n", f.origin_line())
         );
         assert_eq!(
             f.session(&agent).resolve(Edge::Working, &agent),
@@ -2083,7 +2128,7 @@ mod tests {
             f.session(&stop).resolve(Edge::SubagentStop, &stop),
             Some(Paint::Line(Glyph::Idle))
         );
-        assert_eq!(f.record(), format!("cts3\nb i\n{}", f.origin_line()));
+        assert_eq!(f.record(), format!("cts4\nb i\n{}", f.origin_line()));
     }
 
     /// A lone unknown wait provides no evidence linking it to a stopping agent.
@@ -2106,7 +2151,7 @@ mod tests {
             f.session(&prompt).resolve(Edge::Working, &prompt);
             let notification = notify(kind);
             f.session(&notification).resolve(Edge::Notify, &notification);
-            let held = format!("cts3\nb w\n{}w ?!:1000000\n", f.origin_line());
+            let held = format!("cts4\nb w\n{}w ?!:1000000\n", f.origin_line());
             assert_eq!(f.record(), held);
             for (edge, event) in [
                 (Edge::Working, agent_ev("unrelated")),
@@ -2140,7 +2185,7 @@ mod tests {
             }
             assert_eq!(Record::parse(&f.record()).unwrap().waits.len(), 2);
             assert_eq!(f.session(&permission).resolve(Edge::Working, &permission), None);
-            assert_eq!(f.record(), format!("cts3\nb i\n{}w ?!:1000000\n", f.origin_line()));
+            assert_eq!(f.record(), format!("cts4\nb i\n{}w ?!:1000000\n", f.origin_line()));
         }
     }
 
@@ -2157,9 +2202,9 @@ mod tests {
             assert_eq!(Record::parse(&f.record()).unwrap().waits.len(), 2);
             let owner = agent_ev("aaa");
             f.session(&owner).resolve(Edge::Waiting, &owner);
-            assert_eq!(f.record(), format!("cts3\nb i\n{}w ?!:1000000 aaa:1000000\n", f.origin_line()));
+            assert_eq!(f.record(), format!("cts4\nb i\n{}w ?!:1000000 aaa:1000000\n", f.origin_line()));
             assert_eq!(f.session(&owner).resolve(Edge::Working, &owner), None);
-            assert_eq!(f.record(), format!("cts3\nb i\n{}w ?!:1000000\n", f.origin_line()));
+            assert_eq!(f.record(), format!("cts4\nb i\n{}w ?!:1000000\n", f.origin_line()));
         }
     }
 
@@ -2193,7 +2238,7 @@ mod tests {
         }
         let prompt = user_prompt();
         f.session(&prompt).resolve(Edge::Working, &prompt);
-        assert!(f.record().starts_with("cts3\n"));
+        assert!(f.record().starts_with("cts4\n"));
         assert!(!f.record().contains("\nw "));
     }
 
@@ -2226,7 +2271,7 @@ mod tests {
         );
         // Reset, AND claimed: the origin is what lets another session's reaper
         // tell this file from a dead session's.
-        assert_eq!(f.record(), format!("cts3\nb i\n{}", f.origin_line()));
+        assert_eq!(f.record(), format!("cts4\nb i\n{}", f.origin_line()));
         let end = payload(r#"{"session_id":"s1","hook_event_name":"SessionEnd"}"#);
         assert_eq!(
             f.session(&end).resolve(Edge::SessionEnd, &end),
@@ -2248,7 +2293,7 @@ mod tests {
         // its first tool call.
         let main = main_tool();
         f.session(&main).resolve(Edge::Working, &main);
-        assert_eq!(f.record(), format!("cts3\nb w\n{origin}"));
+        assert_eq!(f.record(), format!("cts4\nb w\n{origin}"));
 
         // With no `CLAUDE_PID` there is no origin to claim, so a fresh session's
         // `SessionStart` has nothing to say that the ABSENCE of a file does not
@@ -2270,10 +2315,10 @@ mod tests {
     fn a_write_stamps_an_origin_the_record_is_missing() {
         let f = Fixture::new("restamp");
         fs::create_dir_all(&f.dir).expect("a writable state dir");
-        fs::write(f.dir.join("s1"), "cts3\nb i\n").expect("a writable state dir");
+        fs::write(f.dir.join("s1"), "cts4\nb i\n").expect("a writable state dir");
         let main = main_tool();
         f.session(&main).resolve(Edge::Working, &main);
-        assert_eq!(f.record(), format!("cts3\nb w\n{}", f.origin_line()));
+        assert_eq!(f.record(), format!("cts4\nb w\n{}", f.origin_line()));
     }
 
     #[test]
@@ -2284,7 +2329,7 @@ mod tests {
         let before = f.record();
         assert_eq!(
             before,
-            format!("cts3\nb i\n{}w aaa:1000000\n", f.origin_line())
+            format!("cts4\nb i\n{}w aaa:1000000\n", f.origin_line())
         );
         let start =
             payload(r#"{"session_id":"s1","hook_event_name":"SessionStart","source":"compact"}"#);
@@ -2320,16 +2365,16 @@ mod tests {
             assert_eq!(Record::parse(text), None, "{text:?}");
         }
         // Our tag with nothing usable under it IS ours, and reads as fresh.
-        assert_eq!(Record::parse("cts3\nb\nw\n"), Some(Record::fresh()));
+        assert_eq!(Record::parse("cts4\nb\nw\n"), Some(Record::fresh()));
         // A base letter this version cannot paint - the purple seam - degrades to
         // idle, and a reserved key is skipped rather than failing the parse.
-        let r = Record::parse("cts3\nb p\ng aaa bbb\nn 5 a title\nw -:999\n")
+        let r = Record::parse("cts4\nb p\ng aaa bbb\nn 5 a title\nw -:999\n")
             .expect("our own tag parses");
         assert_eq!(r.base, Glyph::Idle);
         assert_eq!(r.waits, vec![Wait { who: Owner::Main, raised: 999 }]);
         // A `w` word in the older single-epoch shape is dropped rather than read
         // with an invented clock, so such a record degrades to "nothing waiting".
-        let old = Record::parse("cts3\nb w\nw 1790459815 aec99e1f\n").expect("our own tag");
+        let old = Record::parse("cts4\nb w\nw 1790459815 aec99e1f\n").expect("our own tag");
         assert_eq!(old.waits, Vec::new());
     }
 
@@ -2344,13 +2389,13 @@ mod tests {
             fs::write(&p, body).expect("a writable state dir");
             p
         };
-        assert!(matches!(stored_at(&at("ours", b"cts3\nb w\n")), Stored::Ours(_)));
+        assert!(matches!(stored_at(&at("ours", b"cts4\nb w\n")), Stored::Ours(_)));
         assert!(matches!(stored_at(&at("later", b"cts9\nb w\n")), Stored::Future));
         assert!(matches!(stored_at(&at("empty", b"")), Stored::Alien));
         assert!(matches!(stored_at(&at("bin", b"\x00\x01\x02junk")), Stored::Alien));
         // Our tag on its own IS ours - an empty record - because temp-then-rename
         // means a half-written record is not a shape that can reach the disk.
-        assert!(matches!(stored_at(&at("bare", b"cts3")), Stored::Ours(_)));
+        assert!(matches!(stored_at(&at("bare", b"cts4")), Stored::Ours(_)));
         assert!(matches!(stored_at(&at("torn", b"ct")), Stored::Alien));
         assert!(matches!(
             stored_at(&at("big", &vec![b'x'; MAX_RECORD + 1])),
@@ -2426,7 +2471,7 @@ mod tests {
                 completed: Vec::new(),
             }
             .render(),
-            "cts3\nb w\np 42 7\nw ab-c_D:99\n"
+            "cts4\nb w\np 42 7\nw ab-c_D:99\n"
         );
     }
 
@@ -2492,9 +2537,9 @@ mod tests {
         // No origin at all - a record from before this field. Freshly written, so
         // the mtime rule keeps it: mtime cannot prove a session dead, so it must
         // not be the rule that reaps a young file. Aged, it goes.
-        let anon = write("anon", "cts3\nb w\n");
+        let anon = write("anon", "cts4\nb w\n");
         assert_eq!(verdict(&anon), None);
-        let old_anon = write("oldanon", "cts3\nb w\n");
+        let old_anon = write("oldanon", "cts4\nb w\n");
         age(&old_anon);
         assert!(verdict(&old_anon).is_some());
         // A `.tmp` from a crashed write, same rule - and a FRESH one must survive,
@@ -2656,8 +2701,8 @@ mod tests {
         let f = Fixture::new("purge");
         fs::create_dir_all(&f.dir).expect("a writable state dir");
         for (name, body) in [
-            ("s1", "cts3\nb w\n"),
-            ("s2", "cts3\nb i\n"),
+            ("s1", "cts4\nb w\n"),
+            ("s2", "cts4\nb i\n"),
             ("s2.99.tmp", "half"),
             ("notes.txt", "mine"),
         ] {
@@ -2673,7 +2718,7 @@ mod tests {
         assert_eq!(left, vec!["notes.txt".to_owned()]);
         // With only our own files in it, the directory goes too.
         fs::remove_file(f.dir.join("notes.txt")).expect("our own file");
-        fs::write(f.dir.join("s3"), "cts3\nb i\n").expect("a writable state dir");
+        fs::write(f.dir.join("s3"), "cts4\nb i\n").expect("a writable state dir");
         assert_eq!(purge(), Some((f.dir.clone(), 1, true)));
         assert!(!f.dir.exists());
         // And an absent directory is not a failure, just nothing to do.

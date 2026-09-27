@@ -320,9 +320,9 @@ fn ttl(key: &str, default: u32) -> String {
     ttl_secs(key, default).to_string()
 }
 
-/// The same TTL as a NUMBER, because `state` measures an outstanding wait against
-/// `CCTAB_TTL_WAITING` too - so that inside tmux the record and the title stop
-/// lying at the same moment, off one knob and one grammar.
+/// The same TTL as a NUMBER for state wait expiry. State and tmux share the
+/// setting and grammar, but expire independently: state on an eligible hook,
+/// the tmux carrier against its last paint time.
 pub fn ttl_secs(key: &str, default: u32) -> u64 {
     u64::from(ttl_of(config::var(key).as_deref(), default))
 }

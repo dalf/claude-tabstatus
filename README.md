@@ -55,12 +55,11 @@ Some of that is less obvious than it looks:
   were waiting on, because a background subagent's tool call firing in the main
   session must not repaint over a dialog you are looking at. A matcher could not
   do either: a matcher sees only `tool_name`. Wait ownership, below, is the whole
-  of that distinction. The cost of the edge is the process
-  spawn, about 0.61ms measured, so 900 tool calls in a heavy session cost ~0.55s
-  spread over minutes - invisible beside the tool calls themselves. The payload
-  carries the whole `tool_response`, hundreds of KB on a large read, and only its
-  first 8 KiB is ever searched; the rest is drained unread, so a 4 MB response
-  costs 2.4ms instead of the 165ms the shell version spent on 1 MB.
+  of that distinction. The payload carries the whole `tool_response`, which can
+  be hundreds of KB on a large read. The shared reader buffers and parses the
+  complete envelope up to 16 MiB, skipping unneeded values; larger input is
+  drained and rejected. Work grows with the input size. Earlier timings for the
+  prefix-scanning reader do not measure this parser.
 - **`PreToolUse` is matched to exactly the two tools that always block on you.**
   Unmatched, it would paint waiting on every tool call. `PermissionRequest`
   fires for both of those tools anyway, 11-19ms later, so this edge is really
@@ -148,6 +147,12 @@ background-work semantics, or the separate settings-file editor.
 
 ### Wait ownership
 
+The [state and wait-ownership contract](docs/state-contract.md) specifies the
+supported transitions, recovery policies, persistence guarantees and limitations.
+Its [versioned semantic traces](tests/fixtures/state-contract-v1.json) assert the
+base, outstanding owners, clocks, emitted update and displayed indicator after
+every event, independently of the historical golden oracle.
+
 The model here is partly taken from
 [Yannis-Adn/terminal-addons](https://github.com/Yannis-Adn/terminal-addons) (MIT),
 whose `wt-tab-status` keeps one state file per session holding a state *and the
@@ -190,7 +195,7 @@ The rules, in full:
 
 | edge | what it does to the record | what it paints |
 |---|---|---|
-| `waiting` | adds this owner (`agent_id`, or the main loop), with its own epoch | 🟠 always |
+| `waiting` | adds the usable `agent_id`, or the main loop when absent; a supplied unusable/reserved ID becomes an independent anonymous permission wait | 🟠 always |
 | `waiting` from a permission/input `Notification` | adds an unknown permission owner `?` unless a permission wait already exists; an owned permission wait replaces that anonymous permission backstop | 🟠 always |
 | `waiting` from an MCP `Notification` | adds an anonymous backstop `?!`; a complete server/request identity instead shares its direct wait | 🟠 unless an identified request has already completed |
 | `elicitation` | adds a wait keyed by server/request ID, or an anonymous direct wait | 🟠 unless that key has already completed |
@@ -225,9 +230,10 @@ Four consequences worth naming:
   `"prompt":"<task-notification>..."`, which the *product* injects when an async
   agent finishes, and with two agents running the first one's completion would then
   retire the second one's live dialog. So the prompt must be present and must not
-  begin with `<` - deliberately broader than the one spelling measured, because
-  every injected prompt shape is an XML-ish tag, and the injected event is redundant
-  anyway: that agent's own `SubagentStop` fires 20ms earlier.
+  begin with `<` (without trimming whitespace) - a heuristic based on the captured
+  injected prompt, not proof of human authorship. A human prompt beginning with `<` also
+  fails this recovery check. In the capture, that agent's own `SubagentStop`
+  fires 20ms earlier and already handles its completion.
 
 **An overlay nothing can lift is worse than no overlay at all.** While any wait is
 held, neither `working` nor `idle` paints - that is the whole mechanism - so a wait
@@ -314,7 +320,7 @@ silent because they cannot prove what is outstanding.
 
 "Absent" is not "empty", and that asymmetry is deliberate in both directions. A
 `Notification` carries no `background_tasks` at all, and a Claude Code that renamed
-the member would carry none either, so a missing array leaves every wait standing -
+the member would carry none either, so a missing array preserves non-main waits -
 the conservative answer. A *non-empty* one leaves them standing for the same reason,
 which is exactly the capture's 68.946 `Stop`.
 
@@ -330,10 +336,10 @@ a wait already declared dead.
 **A stale record is normal, not exceptional.** A session killed with `SIGKILL`
 fires no `SessionEnd`, so the record has three independent bounds and no daemon:
 
-- An outstanding **wait** older than `CCTAB_TTL_WAITING` (900s - the same knob, and
-  the same grammar, that tmux decays an orange title with, so inside tmux the
-  record and the title stop lying at the same moment), measured **per wait** against
-  that wait's own epoch.
+- An outstanding **wait** older than `CCTAB_TTL_WAITING` (900s), measured **per
+  wait** against that wait's own epoch. State expiry requires a subsequent
+  eligible hook. Tmux title decay uses the same setting and grammar, but follows
+  its own carrier clock.
 - A **`SessionStart` in any session reaps the others**, by asking whether the
   process that wrote each record is still running. Every write stamps the record
   with `$CLAUDE_PID` *and that pid's start time* - field 22 of `/proc/<pid>/stat` -
@@ -401,6 +407,11 @@ launched simultaneously with main's `Stop`: **76 of 400 lost the clear**, and 36
 400 in the reverse direction lost the wait. With the lock, 0 of 1200 across three
 runs, and five concurrent sessions never touch each other's file.
 
+These locks serialize record updates, not terminal writes after the locks are
+released. `SessionEnd` is cleanup after a session has stopped issuing hooks; it
+unlinks the session path without this lock. Concurrent teardown and new hooks
+reusing the same session ID have no ordering guarantee.
+
 Two details of the lock are load-bearing. It is taken on the record path, and
 because `write_if_changed` renames over that path the inode can change under a
 waiter - which would leave it holding an exclusive lock on an unlinked inode while a
@@ -413,14 +424,15 @@ std (1.89), so this costs no dependency; it
 is the reason `rust-version` moved from 1.74 to 1.89.
 
 ```text
-cts3                                           the tag: version 3 of the wire
+cts4                                           the tag: version 4 of the wire
 b i                                            base = w | a | i
 p 3709427 84460384                             the session's (pid, start time)
 w aec99e1f4bda1972b:1790380630 -:1790380631    one wait per word: owner, then epoch
 ```
 
-`-` is the main loop, `?` an unknown permission/input owner, and `?!` an anonymous
-MCP notification backstop. `!?` is an anonymous direct request, `!+` an overflow
+`-` is the main loop, `?` an unknown permission/input notification, `?p` an anonymous
+permission request with an unusable supplied owner, and `?!` an anonymous
+MCP notification backstop. `!?` is an anonymous direct MCP request, `!+` an overflow
 aggregate, and `!<hex-server>.<hex-request>` an identified request. The optional
 `e` line holds completed request keys with their completion epochs. An `agent_id` is
 accepted only as `[A-Za-z0-9_-]{1,64}` - the same test that stops a `session_id`
@@ -429,12 +441,18 @@ letter this version cannot paint reads as idle, so a newer version's record
 degrades rather than being misread; and a record this version did not *change* is
 not rewritten, so it keeps the fields it did not understand.
 
-Version 1 (`cts1`) and version 2 (`cts2`) records remain readable and become `cts3`
+Versions 1–3 (`cts1`, `cts2`, `cts3`) remain readable and become `cts4`
 on the next state change. Version 1 `?` waits lack provenance and retain the permission-backstop
 deduplication policy; the original notification kind cannot be recovered.
-Older binaries cannot read `cts3` records and may overwrite them on a state
-transition. Use the updated binary for all hooks; mixed versions do not preserve
-the new wait policy.
+The `cts4` tag prevents recent older binaries from interpreting `?p` as an invalid
+owner and dropping a live wait: their ordinary update guards leave the record
+untouched. Session teardown and older releases without those guards remain outside
+that guarantee. Use the updated binary for all hooks.
+
+Anonymous permission requests remain independent of named requests and notification
+backstops. They keep their first epoch and survive main tool activity and agent
+completion. A human prompt, explicit quiet Stop (`background_tasks: []`), expiry,
+or session reset/end can clear them.
 
 **What it costs, per edge - and how to re-measure it.** This section used to carry
 remembered numbers, and they did not reproduce: a per-edge cost of tens of
@@ -1774,7 +1792,8 @@ is stale source, and there is no reason the JSONs should be special.
 Binaries ship as **GitHub release assets** rather than in git history, so that
 installing needs no toolchain. The [Test workflow](.github/workflows/test.yml)
 builds both Linux targets and runs Rust unit tests, the shell integration suite
-(including tmux), and the golden corpus on every branch push and pull request.
+(including tmux), the semantic state traces and persistence checks, and the golden
+corpus on every branch push and pull request.
 The tested binaries are also available as workflow artifacts.
 
 Pushing a Git tag runs the [Release workflow](.github/workflows/release.yml).
