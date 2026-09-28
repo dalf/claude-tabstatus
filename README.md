@@ -1465,7 +1465,8 @@ active pane, `all` also passes background windows, every inner ESC has to be
 doubled - but turning it on lets any program in any pane write arbitrary bytes to
 your terminal, which is not a decision a tab-title plugin should be taking for
 you. `CCTAB_TERMINAL` also works outside tmux, which is the same fix for a plain
-ssh out of a Konsole tab.
+ssh out of a Konsole tab, and `doctor` names that remedy there too, not only
+inside a multiplexer.
 
 **A reattach is re-armed.** The arming goes to the ptys `list-clients` names, so
 an arming sent while *detached* reaches nobody, and on reattach tmux replays the
