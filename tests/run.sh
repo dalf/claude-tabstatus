@@ -506,6 +506,21 @@ check 'a path location needs no external command' '⚪ ~/code/bug_fedora' \
     "$(cd -- "$tmp/code/bug_fedora" && PATH= HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
 check 'an elided path needs no external command' '⚪ …/four/five/six/seven/eight' \
     "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && PATH= HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+# An empty PATH only proves the answer survives having nothing to run; it cannot see
+# a fork that happens and fails. scripts/bench-hot.sh can - it runs every hot edge
+# under a tracer and requires zero clone/vfork/execve - and it also times the four of
+# them against a baseline binary. It is opt-in because it is the only thing in this
+# file that costs seconds rather than milliseconds; with no baseline argument it
+# compares this binary against ITSELF, which still gates the forks and still says
+# whether the machine is quiet enough for a paired timing to mean anything.
+if [ "${CCTAB_BENCH-}" = 1 ]; then
+    _bench=$(CCTAB_BENCH_BIN=$bin sh "$repo/scripts/bench-hot.sh" 2>&1)
+    printf '%s\n' "$_bench"
+    check 'the hot edges stay inside the budget and fork nothing' 'RESULT: PASS' \
+        "$(printf '%s\n' "$_bench" | tail -1)"
+else
+    printf 'SKIP  the hot-path gate (CCTAB_BENCH=1 runs scripts/bench-hot.sh)\n'
+fi
 
 # --- JSON-hostile names ---------------------------------------------------
 # The sanitizer is slice 1's, but slice 2 gave it three new ways to be fed: a

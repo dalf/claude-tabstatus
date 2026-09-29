@@ -37,6 +37,7 @@ carries the management verbs (`install`, `uninstall`, `doctor`, `version`,
 | `.claude-plugin/plugin.json` | the plugin manifest. **Source**, compiled in like `hooks.json` |
 | `scripts/build.sh` | builds `bin/` and its source digests |
 | `scripts/bench-state.sh` | measures what the state layer costs per edge |
+| `scripts/bench-hot.sh` | the hot-path gate: times the four hot edges against a baseline binary inside a 50 µs band, and requires zero forks under a tracer; `CCTAB_BENCH=1 sh tests/run.sh` runs it |
 | `tests/` | integration suites, fixtures, the golden corpus and the shell oracle (see [Tests](#tests)) |
 | `examples/tmux.conf` | an optional tmux configuration users can copy |
 | `docs/` | design and contract documents (see [Documentation map](#documentation-map)) |
@@ -361,6 +362,9 @@ limitation it closes; the pre-fix freeze is kept as `cases.jsonl.before-fixes`.
 sh scripts/bench-state.sh                      # bin/tabstatus, state layer against itself switched off
 sh scripts/bench-state.sh <baseline-binary>    # ...and against another build
 CCTAB_BENCH_EXECS=200 CCTAB_BENCH_ROUNDS=21 sh scripts/bench-state.sh
+sh scripts/bench-hot.sh                        # the hot-path GATE, self against self
+sh scripts/bench-hot.sh <baseline-binary>      # ...against a pre-refactor build
+CCTAB_BENCH=1 sh tests/run.sh                  # the suite runs the gate too
 ```
 
 `CCTAB_BENCH_BIN` picks the binary under test (default `bin/tabstatus`). Arms are
@@ -424,7 +428,11 @@ tag each time.
 | [docs/state-contract.md](docs/state-contract.md) | contributors | the normative state record and transition rules |
 | [docs/indicator-semantics.md](docs/indicator-semantics.md) | contributors, curious users | what each colour means and the precedence between them |
 | [docs/history.md](docs/history.md) | anyone | slices 1-7 and the shell-to-Rust port, with its comparison table |
+| [docs/backend-architecture.md](docs/backend-architecture.md) | contributors | the backend abstraction: how a terminal, a multiplexer and an operating system plug in without any of the three learning about the others; the migration table and what was dropped as superseded by #28 |
+| [docs/backend-scouting.md](docs/backend-scouting.md) | contributors | findings, not design: what Windows, KDE and macOS would actually need, as a dated snapshot with markers where #28 answered a question |
 | [docs/research/terminal-capability-matrix.md](docs/research/terminal-capability-matrix.md) | contributors | the cross-terminal capability matrix every row in `src/surface/rows.rs` cites, each claim marked verified or inferred |
+| [docs/research/portability-census.md](docs/research/portability-census.md) | contributors | the measured portability census, kept as history with a re-measured header |
+| [docs/research/dbus_notify.rs](docs/research/dbus_notify.rs) | contributors | a dependency-free, hand-rolled D-Bus `Notify` call: the measurement behind the D-Bus decision |
 | [COMPARISON.md](COMPARISON.md) | anyone | how this project relates to similar ones |
 | [tests/corpus/USAGE.txt](tests/corpus/USAGE.txt) | contributors | the golden corpus tools |
 

@@ -1268,6 +1268,10 @@ you chose once is not silently abandoned for the default path.
 
 ## The three axes
 
+The design behind this section, and the evidence under it, are in
+[docs/backend-architecture.md](backend-architecture.md) and
+[docs/backend-scouting.md](backend-scouting.md).
+
 Three things decide what a paint looks like and where it goes, and they are
 independent: the **platform** this binary was built for, the **surface** - the leaf
 terminal drawing the tab - and the **multiplexer**, if any, between them.
@@ -1611,7 +1615,20 @@ live in a script:
 ```sh
 sh scripts/bench-state.sh                      # the layer against itself, switched off
 sh scripts/bench-state.sh <baseline-binary>    # ...and against another build
+sh scripts/bench-hot.sh                        # the hot-path GATE, self against self
+sh scripts/bench-hot.sh <baseline-binary>      # ...against a pre-refactor build
+CCTAB_BENCH=1 sh tests/run.sh                  # the suite runs the gate too
 ```
+
+`bench-hot.sh` is the same method turned into a **gate**. It times the four hot edges
+against a baseline binary inside a 50 µs band - measured, not guessed: twelve null
+runs where both arms are the same binary put the worst delta at ±23 µs, so the band
+is twice that. And it does the half that is not a timing at all: it runs every hot
+edge under a tracer and requires **zero** `clone`/`vfork`/`execve` beyond the
+binary's own exec, bare and tmux-shaped, with a positive control first so that a
+tracer seeing nothing cannot pass a binary that forks. The backend design rejected a
+vtable, a capability registry, a per-paint probe and a D-Bus dependency on the hot
+path's budget; this is what keeps those rejections true.
 
 It interleaves every arm within each round, reports the spread as well as the
 minimum, and gives the **median of the per-round paired deltas** rather than a
