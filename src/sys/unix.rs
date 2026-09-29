@@ -21,6 +21,10 @@ pub const HAS_MODES: bool = true;
 /// [`session_tty`] can resolve a pty - through `/proc`, so on Linux.
 pub const HAS_SESSION_TTY: bool = true;
 
+/// [`set_session_title`] has no console to title: a Unix terminal takes its title
+/// as bytes on the pty, through [`session_tty`].
+pub const HAS_SESSION_CONSOLE: bool = false;
+
 /// Bytes back into an `OsStr` - the inverse of [`OsStr::as_encoded_bytes`]. On
 /// Unix any byte string is an `OsStr`, so this borrows and never alters a byte.
 pub fn os_str_from_bytes(b: &[u8]) -> Cow<'_, OsStr> {
@@ -246,6 +250,13 @@ pub fn session_tty(claude_pid: &OsStr) -> Option<File> {
     // Asking whether it is writable and opening it are the same question; ask it
     // once.
     OpenOptions::new().write(true).open(&target).ok()
+}
+
+/// The console route to the session's title, which Unix does not have: `Ok(false)`,
+/// "not painted", with no system call. Nothing calls it here - see
+/// [`HAS_SESSION_CONSOLE`] - and it exists so both backends offer the same API.
+pub fn set_session_title(_claude_pid: &OsStr, _title: &str) -> io::Result<bool> {
+    Ok(false)
 }
 
 /// Write to a pty NAMED BY tmux - an attached client's terminal - under the same

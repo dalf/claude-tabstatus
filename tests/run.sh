@@ -2865,11 +2865,12 @@ else
         return 1
     }
     # tsession_start <cwd> [env...] -- the real SessionStart edge, against the
-    # private server. CLAUDE_PID is unset, so no pty is written.
+    # private server. CLAUDE_PID is unset, so no pty is written - explicitly: run
+    # inside a Claude session, an inherited one names the developer's own tab.
     tsession_start() {
         _d=$1
         shift
-        (cd -- "$_d" && env HOME=$tmp TMUX="$tsock,1,0" TMUX_PANE=%0 "$@" \
+        (cd -- "$_d" && env -u CLAUDE_PID HOME=$tmp TMUX="$tsock,1,0" TMUX_PANE=%0 "$@" \
             "$bin" session-start </dev/null >/dev/null 2>&1)
     }
     # trender [pane] -- what tmux would send the outer terminal right now
@@ -3240,7 +3241,7 @@ else
               "$bin" working </dev/null)"
     check 'and then execs no tmux at all' 'off' \
         "$(tm set -g set-titles off
-           cd -- "$tmp/plain" && HOME=$tmp TMUX="$tsock,1,0" TMUX_PANE=%0 \
+           cd -- "$tmp/plain" && env -u CLAUDE_PID HOME=$tmp TMUX="$tsock,1,0" TMUX_PANE=%0 \
               CCTAB_NO_TMUX=1 "$bin" session-start </dev/null >/dev/null 2>&1
            tm show -gv set-titles)"
     check 'screen gets nothing, deliberately' \

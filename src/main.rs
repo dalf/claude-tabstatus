@@ -24,8 +24,9 @@
 //!
 //! Absence below that is `Option`, and in exactly two places absence and failure
 //! are deliberately the same answer - `git::first_line` (no HEAD vs. an unreadable
-//! one, so the walk climbs past it) and `emit::session_tty` (no hook subprocess
-//! vs. an unresolvable fd 1). Both reproduce the reference implementation, and
+//! one, so the walk climbs past it) and `sys::session_tty` (no hook subprocess
+//! vs. an unresolvable fd 1; on Windows `sys::set_session_title`'s `Ok(false)`, a
+//! refused guard). Both reproduce the reference implementation, and
 //! telling them apart would change what paints, so it belongs to a slice allowed
 //! to change behaviour. `panic = "abort"` is in the release profile, so nothing
 //! here indexes or unwraps.

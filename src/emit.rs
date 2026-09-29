@@ -8,14 +8,15 @@
 //!     Claude Code 2.1.274 wraps terminalSequence OSCs in tmux passthrough, which
 //!     bypasses pane_title instead of updating our carrier. No verified pty means
 //!     silence, never a JSON fallback that could leak the carrier to the outer tab.
-//!   * session-start and session-end also write the pty DIRECTLY, because
+//!   * session-start and session-end also paint DIRECTLY, because
 //!     `terminalSequence` cannot carry them: SessionStart is too early - the TUI
 //!     writer is not mounted yet, so the sequence is dropped - and the Konsole
-//!     arming sequence is OSC 50, which is not on the allowlist above. All direct
-//!     writes resolve the pty through /proc, so they are Linux-only: elsewhere
-//!     they find no pty and paint nothing. On Windows the first title therefore
-//!     arrives with the first `terminalSequence` edge, and session-end leaves
-//!     the last one standing.
+//!     arming sequence is OSC 50, which is not on the allowlist above. On Linux the
+//!     bytes go to the pty, resolved through /proc. On Windows there is no pty but
+//!     there is the console Claude Code runs in, and its TITLE is set instead
+//!     ([`sys::set_session_title`]), which the pseudo console forwards to the tab as
+//!     an OSC 0; the Konsole arming has no console form and is not sent. Both are
+//!     behind a headless guard, and elsewhere (macOS) nothing is painted.
 
 use crate::config::{Config, Terminal};
 use crate::sys;
@@ -120,7 +121,7 @@ pub fn session_start(title: &str, cfg: &Config) -> io::Result<()> {
     out.extend_from_slice(b"\x1b]0;");
     out.extend_from_slice(title.as_bytes());
     out.push(0x07);
-    write_pty(cfg, &out)
+    write_session(cfg, &out, title)
 }
 
 /// Restore the tab and blank its title, in one write.
@@ -135,7 +136,21 @@ pub fn session_end(cfg: &Config) -> io::Result<()> {
         out.extend_from_slice(KONSOLE_RESTORE);
     }
     out.extend_from_slice(b"\x1b]0;\x07");
-    write_pty(cfg, &out)
+    write_session(cfg, &out, "")
+}
+
+/// Deliver session-start or session-end: `bytes` to the pty - or, where the session's
+/// tab is a console rather than a pty (Windows), `title` alone as that console's
+/// title. Never inside tmux there: the title is then tmux's carrier, not a tab's.
+fn write_session(cfg: &Config, bytes: &[u8], title: &str) -> io::Result<()> {
+    if sys::HAS_SESSION_CONSOLE {
+        return match (cfg.claude_pid.as_deref(), &cfg.tmux) {
+            // Refused or painted, it is not a failure: see `write_pty`.
+            (Some(pid), None) => sys::set_session_title(pid, title).map(drop),
+            _ => Ok(()),
+        };
+    }
+    write_pty(cfg, bytes)
 }
 
 /// Write to the session's pty, resolved by [`sys::session_tty`] under the

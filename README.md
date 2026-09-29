@@ -666,6 +666,25 @@ ownership](#wait-ownership) and the purple background indicator work there as on
 Linux, with the per-session record under `%LOCALAPPDATA%\claude-tabstatus` and the
 same lock guarantees; `doctor` shows the record and each session's liveness.
 
+`session-start` and `session-end`, which the hook protocol cannot carry, reach the
+tab on Windows as a **console title** rather than bytes on a pty: the hook leaves
+its own hidden console, attaches to Claude Code's (`$CLAUDE_PID`), calls
+`SetConsoleTitleW` - the idle title, or an empty one at the end - and detaches;
+the pseudo console under Windows Terminal forwards that as an OSC 0. The headless
+guard is three proofs, and any "no" paints nothing: `$CLAUDE_PID` is a running
+ancestor of the hook; its current stdout, read out of its PEB, is a character
+device (refusing `> file` and `| jq`); and, once attached, that handle is a screen
+buffer of that console (refusing `> NUL`). The console part is abandoned after
+**250ms**, and a console call it left in flight is cancelled (within another
+50ms) so the hook can exit, so a terminal that has stopped reading output cannot
+hold a hook past `SessionEnd`'s 1s budget. A Ctrl+C in Claude's console while a
+hook is attached is ignored by the hook, and so is a Ctrl+Break - except in the
+instant between the attach and the hook's handler taking effect, which no
+in-process order closes: one landing there ends that hook, not Claude, and the
+title is not set. Where the PEB read is denied - endpoint security software, a
+32-bit or WOW64 claude - nothing is painted. The Konsole arming has no console
+form and is not sent.
+
 ### The plugin directory is build output
 
 **`install` never links your checkout. It writes a plugin directory and links
@@ -1694,18 +1713,29 @@ invocation, no arming.
   `CCTAB_TERMINAL=konsole` is the explicit answer, and `CCTAB_TERMINAL=<anything
   else>` is how a leaked `KONSOLE_*` is turned off. It is also the only way to
   know, over ssh or inside tmux, that the tab at the far end is Konsole's.
-- **`session-start`, `session-end`, and all tmux paints are Linux-only.** They resolve the pty
-  through `/proc/$CLAUDE_PID/fd/1`, which macOS and Git Bash do not have, so on
-  those platforms Konsole arming does not happen (fine, they are not Konsole)
-  and, more importantly, the title is not cleared at the end of a session while
-  `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` is set. Tmux pane records cannot be updated
-  there through this direct-write path either.
+- **`session-start` and `session-end` paint on Linux (the pty) and native Windows
+  (the console title); tmux paints stay Linux-only; macOS paints nothing
+  directly.** Linux resolves the pty through `/proc/$CLAUDE_PID/fd/1`, which
+  macOS does not have, so there the title is not cleared at the end of a session
+  while `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` is set. Konsole arming happens only on
+  Linux (fine, the others are not Konsole), and tmux pane records cannot be
+  updated through the direct-write path anywhere else.
 - **`claude -p` typed straight at a terminal is retitled too.** Its stdout
   really is that tab's pty, so a one-shot run arms the tab, retitles it and
   restores it at `SessionEnd`. Only the redirected or piped form
   (`claude -p ... | jq`, or a call from a script) is detected as headless and
   skipped. A `-p` run killed before `SessionEnd` leaves the tab armed, as
-  above.
+  above. The same holds on Windows, where `> file`, `| jq` and `> NUL` are
+  skipped.
+- **Under Windows Terminal a console title enters Claude's output stream at
+  once.** If Claude is midway through writing a split escape sequence at that
+  moment - possible for the `SessionStart` of `/clear`, `/resume` or a fork, not
+  at startup - a few characters of it could print. The window is about a
+  millisecond, and a VT write would share it.
+- **On Windows, a terminal that is not reading output is not painted.** The hook
+  abandons Claude's console after 250ms (cancelling a call left in flight, so it
+  still exits within about 300ms), and the tab keeps its previous title - at
+  `SessionEnd`, the last one.
 - Konsole's tab bar elides from the left, so a very narrow tab could in
   principle clip the leading dot. Measured budget is ~49-60 columns. A local
   title is ~27-37 columns; over ssh the host prefix adds its own width, which is
@@ -1862,7 +1892,8 @@ overrides both. The runtime half never looks at it. Anything that exercises
 `CCTAB_STATE_DIR`: it is the one that decides where a real 680 KB tree lands.
 
 `CLAUDE_PID` is exported into every hook subprocess and is how `session-start`,
-`session-end`, and tmux state paints find the pty. `XDG_RUNTIME_DIR` is read for the state
+`session-end`, and tmux state paints find the pty - on Windows, the console whose
+title they set. `XDG_RUNTIME_DIR` is read for the state
 directory - deliberately with no `$HOME` fallback, because that would put a record
 inside the golden corpus's fixture `HOME` and make every case carrying a
 `session_id` order-dependent. That it reaches a *hook* subprocess at all is
@@ -2005,13 +2036,30 @@ cargo test race_control -- --ignored --nocapture   # stops at the first lost upd
 cargo test race_400 -- --ignored --nocapture       # 400 rounds, with and without the lock
 ```
 
+On Windows, `tests/conpty.rs` runs `session-start` and `session-end` end to end. It
+makes a pseudo console - kernel32's, the inbox conhost; `CCTAB_TEST_CONPTY_DLL`
+names a ConPTY package's `conpty.dll` instead (VS Code ships one), the modern
+ConPTY a Windows Terminal tab runs on - starts a stand-in claude inside it, and has
+that spawn the real binary as Claude Code does: through Git Bash
+(`CCTAB_TEST_GIT_BASH` overrides its path), `CREATE_NO_WINDOW`, stdio on pipes. It
+asserts the exact titles reaching the pseudo console's output - the idle title,
+identical to the `terminalSequence` one for the same directory, then an empty one,
+and no OSC 50 - and none for a stand-in redirected to a file or to `NUL`, or for a
+`CLAUDE_PID` on the same console that is not the hook's ancestor.
+`CCTAB_TEST_CONPTY_SHOW=1` with `--nocapture` prints each stream. The developer's
+own tab is never a target: the stand-in starts from an environment without the
+ambient `CLAUDE_PID`, and no test calls `set_session_title` with an ancestor of the
+test process, whose ancestors include the terminal the tests were started from.
+
 The state section pins `CLAUDE_PID` per case rather than inheriting it, and that is
 a gate property rather than tidiness: the layer reads that variable to stamp a
 record's origin, so run from inside a Claude Code session - which is how this project
 is developed, and the only place a developer would run it - the ambient session's pid
 used to land in records two cases assert byte for byte, and the declared gate was RED
 in the one environment it is actually invoked from. It is not unset globally, because
-the headless-guard and pty sections need the ambient one.
+the headless-guard and pty sections need the ambient one. The two tmux
+`session-start` cases do unset it (`env -u CLAUDE_PID`): inherited, it named the
+developer's own tab, and their carrier was written into it.
 
 The install sections perform **real** installs, which is why what they pin matters
 more than in any other part of this suite. `install` now materialises a 680 KB
