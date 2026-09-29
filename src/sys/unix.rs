@@ -2,8 +2,9 @@
 //! handful of questions whose ANSWER differs: a process's start time and its
 //! liveness, the session's pty, the record's origin key, and the variable naming
 //! the state directory. Those are `cfg`-selected in place - Linux reads `/proc`,
-//! macOS calls `libc` - and everything else on this page is shared, which is why
-//! the divergent items sit next to each other rather than in a file of their own.
+//! macOS calls `libc` - and everything else on this page is shared. WHY THEY SIT
+//! NEXT TO EACH OTHER rather than in a file of their own is the last section here,
+//! because it has been asked and it deserves an answer and not an assertion.
 //!
 //! ONLY THE SYSTEM CALL IS `cfg`-SELECTED. Every decision either side makes - the
 //! errno-to-liveness mapping, the packing of a start time into the one number a
@@ -11,6 +12,79 @@
 //! test run, because there is no Mac in this project's CI to run a macOS branch on
 //! and an untested branch is how a wrong answer ships. The `cfg` bodies are a call
 //! and a `?`; they contain no test of their own.
+//!
+//! THE LINE IS `libc`, NOT THE PLATFORM. That is the rule, and it is the one to follow
+//! when adding anything here. An item that names a `libc` symbol is a CALL, and it
+//! carries its own `#[cfg(target_os = "macos")]`: `libc` is a
+//! `[target.'cfg(target_os = "macos")'.dependencies]` entry, so on a Linux build the
+//! crate does not exist and naming it is a hard error. An item that names no `libc`
+//! symbol is a DECISION, and it is compiled on both under
+//! `#[cfg(any(target_os = "macos", test))]`. `EPERM` and `ESRCH` are written out by
+//! hand for exactly that reason - spelling them `libc::EPERM` would move
+//! `liveness_from_kill` to the wrong side of the line - and the macOS-only assert
+//! beside them is what checks the two numbers against the real ones on a build that
+//! has them.
+//!
+//! WHY THIS IS ONE FILE AND NOT THREE. The mix reads like two files wedged into one,
+//! and the answer is still no. Four reasons, each measured rather than assumed.
+//!
+//! THE COUNT IS SMALLER THAN IT LOOKS. Of the 28 `#[cfg]` sites, 14 are the mix: SEVEN
+//! questions with two answers - [`ORIGIN_KEY`], [`RUNTIME_DIR_VAR`], [`NO_STATE_DIR`],
+//! [`kernel_hostname_file`], [`process_start_time`], [`process_alive`] and `fd1_path`.
+//! The first four are a constant or a one-expression function and now sit in one
+//! 47-line run, two of them under a SINGLE doc comment that explains both answers at
+//! once - which a split would have to duplicate or cut in half. The other three are a
+//! system call each. Of the remaining 14 sites, seven are the `any(macos, test)`
+//! decisions, which are one body compiled on both and so the opposite of a mix; one is
+//! a Linux-only parse; two are macOS-only declarations with no counterpart anywhere
+//! (`mod abi` and the errno assert); four are the test module and its three Linux-only
+//! tests. Seven forks in a thousand lines, in two clusters, is not the file the
+//! attribute count describes.
+//!
+//! THE ADJACENCY IS THE PROOF, and it is the real argument. Linux
+//! [`process_start_time`] and macOS [`process_start_time`] are 48 lines apart, and
+//! `bsdinfo_start` - the pure function both of them are stripped down to - is 107
+//! lines below that, so that the two kernels being asked the SAME question is
+//! something a reviewer checks by scrolling. `proc_spells_a_pid_canonically_...`
+//! exists only to show the two answer one string identically. Across three files each
+//! of those becomes a claim in a comment instead of something the eye can check.
+//!
+//! THE PROPERTY WORTH PROTECTING IS ALREADY COMPILER-ENFORCED, and a split would
+//! WEAKEN it. `mod tests` below carries no `target_os` gate and names every
+//! dual-compiled item, so mistagging one is a build failure and not a silent skip:
+//! retag `bsdinfo_start` as macOS-only and the Linux test run answers
+//! `error[E0425]: cannot find function bsdinfo_start`, five times. Under a
+//! `#[cfg(target_os = "macos")] mod macos;` the same mistake - a decision written into
+//! the macOS half with its own test beside it - compiles clean on Linux and executes
+//! nothing. The guard is the un-gated test module, and moving the decisions away from
+//! it is what would remove the guard.
+//!
+//! AND std's OWN SHAPE AGREES. `sys/fs/unix.rs` is longer than this page with more
+//! `target_os` forks in it, and std interleaves them in place; where std does give an
+//! OS a file of its own - `sys/random/apple.rs` - it is a subsystem with a separate
+//! implementation, not a handful of divergent answers. std nests, but its
+//! `sys/pal/unix/` children are subsystems and not operating systems. By that
+//! criterion this file is a `fs/unix.rs`.
+//!
+//! WHAT A THIRD UNIX WOULD COST, which is the test any layout here has to pass.
+//! FreeBSD widens `any(target_os = "macos", test)` by one term and adds one arm to
+//! three questions. Under a per-OS split it would ALSO have to move
+//! `liveness_from_kill` and `pid_to_ask_about` back out of a file named for macOS,
+//! because they are facts about `kill(2)` that every BSD shares and not macOS facts at
+//! all. The seam that looks tidiest today is the one that would have to be undone.
+//!
+//! THE ONE THING THAT WAS GENUINELY FILE-SHAPED has been named rather than moved:
+//! `mod abi`, the two `proc_info.h` declarations and the seven asserts that pin their
+//! layout. Those have no Linux counterpart, so they had nothing to be adjacent to, and
+//! one `#[cfg]` on the module replaced ten on its items. If they ever do leave this
+//! file, that module is already the boundary and nothing else has to move with them.
+//!
+//! THE ACCEPTANCE GATE for any change to this file, and the cheapest one there is: the
+//! leaf names of `cargo test -- --list` must come back unchanged. A decision that
+//! stops being compiled still reports success, because a test that does not exist
+//! cannot fail. The `unix` guard is load-bearing the same way, and it comes free from
+//! `#[cfg(unix)] mod unix;` in [`super`] rather than from anything written here:
+//! `cfg(test)` is true on Windows too, and `parse_pid` reads `OsStrExt::as_bytes`.
 
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
