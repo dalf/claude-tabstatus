@@ -71,6 +71,92 @@ impl Paint {
     }
 }
 
+
+/// Whether this run ENTERED, REMAINED IN or LEFT the state that asks for your
+/// attention - the waiting glyph, the one a dialog puts up.
+///
+/// A [`Paint`] cannot answer that question, which is why this type exists: the
+/// first waiting edge of a turn and the fiftieth produce byte-identical paints,
+/// so a bell driven off the paint rings on every `PostToolUse` that follows a
+/// dialog and an indicator driven off it never learns the dialog closed.
+///
+/// `Unknown` is the STATELESS fallback and it is not a defect. [`Edge::resolve`]
+/// is reached whenever a missing session id or an absent state directory
+/// "select the stateless resolver", and `docs/state-contract.md` already says
+/// what that resolver gives up in the same breath: it "cannot protect
+/// overlapping owners", because a run with no record has nothing to compare
+/// itself against. No memory, no transition, and saying so is the same
+/// degradation the contract already accepts for wait ownership.
+///
+/// It is a VALUE and not an `Option<Transition>` because the absence has to be
+/// unignorable: three variants would force the stateless path to invent
+/// `Entered` - ringing on every repeated edge, the storm #14 exists to prevent -
+/// or `Remained`, which never rings at all. Both are wrong answers wearing the
+/// clothes of facts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Transition {
+    Entered,
+    Remained,
+    Left,
+    Unknown,
+}
+
+/// What to paint, and what painting it changed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Resolved {
+    pub paint: Paint,
+    /// Read by NOTHING on the paint path yet, deliberately: this seam landed inert
+    /// so that the 312-case corpus proves the output did not move, and #14 is the
+    /// first thing that will ring on `Transition::Entered`.
+    ///
+    /// It carries no `#[allow(dead_code)]`, and that is checked rather than
+    /// assumed: the derived `Debug` above counts as a read of every field, so an
+    /// attribute here would suppress nothing today and would silently absorb the
+    /// day this really does die.
+    pub transition: Transition,
+}
+
+impl Resolved {
+    /// The answer of a run with no record behind THIS answer: the stateless
+    /// resolver, and equally the stateful paths that could not take the lock or
+    /// that read nothing at all. What they have in common is the only thing that
+    /// matters here - no previous state was seen, so no comparison was made.
+    pub fn stateless(paint: Paint) -> Resolved {
+        Resolved { paint, transition: Transition::Unknown }
+    }
+
+    /// The answer of a run that read a record. The caller passes the one bit it
+    /// alone knows - whether the session was ALREADY asking for attention - and
+    /// must read that bit before it mutates the record, because every stateful
+    /// path mutates the live record in place.
+    pub fn stateful(was_waiting: bool, paint: Paint) -> Resolved {
+        let transition = match (was_waiting, paint.glyph() == Some(Glyph::Waiting)) {
+            (false, true) => Transition::Entered,
+            (true, false) => Transition::Left,
+            // Both the repeated dialog edge that must not ring twice and the
+            // ordinary working edge that never rang: neither one changes whether
+            // the session is asking for you.
+            (true, true) | (false, false) => Transition::Remained,
+        };
+        Resolved { paint, transition }
+    }
+}
+
+/// Every assertion that predates the transition asserts on the PAINT, in both
+/// this module's tests and `state.rs`'s, and they say so with one token rather
+/// than with a `map` that would bury what they are pinning. The transition has
+/// its own tests, which name it.
+#[cfg(test)]
+pub(crate) trait JustPaint {
+    fn paint(self) -> Option<Paint>;
+}
+
+#[cfg(test)]
+impl JustPaint for Option<Resolved> {
+    fn paint(self) -> Option<Paint> {
+        self.map(|r| r.paint)
+    }
+}
 impl Edge {
     pub fn parse(arg: Option<&OsStr>) -> Edge {
         match arg.map(OsStr::as_encoded_bytes) {
@@ -100,10 +186,17 @@ impl Edge {
         )
     }
 
+    /// The decision of a run with no record: the paint below, and
+    /// [`Transition::Unknown`], which is what "stateless" means here and not a
+    /// gap to be filled in later.
+    pub fn resolve(self, payload: &Payload) -> Option<Resolved> {
+        Some(Resolved::stateless(self.paint(payload)?))
+    }
+
     /// The edge plus its payload, resolved to a single decision. `None` means
     /// emit nothing at all - which is not an empty title, that would blank the
     /// tab - and it is reached before the location walk is ever spent.
-    pub fn resolve(self, payload: &Payload) -> Option<Paint> {
+    fn paint(self, payload: &Payload) -> Option<Paint> {
         match self {
             Edge::Working => {
                 // PostToolUse is registered unmatched, so a SUBAGENT's tool calls
@@ -228,8 +321,8 @@ mod tests {
     #[test]
     fn an_unknown_edge_paints_the_idle_form_as_a_hook_line() {
         let p = Payload::empty();
-        assert_eq!(Edge::Unknown.resolve(&p), Some(Paint::Line(Glyph::Idle)));
-        assert_eq!(Edge::Idle.resolve(&p), Some(Paint::Line(Glyph::Idle)));
+        assert_eq!(Edge::Unknown.resolve(&p).paint(), Some(Paint::Line(Glyph::Idle)));
+        assert_eq!(Edge::Idle.resolve(&p).paint(), Some(Paint::Line(Glyph::Idle)));
     }
 
     #[test]
@@ -249,9 +342,9 @@ mod tests {
     #[test]
     fn session_end_paints_no_glyph_and_session_start_paints_idle() {
         let p = Payload::empty();
-        assert_eq!(Edge::SessionEnd.resolve(&p), Some(Paint::SessionEnd));
+        assert_eq!(Edge::SessionEnd.resolve(&p).paint(), Some(Paint::SessionEnd));
         assert_eq!(Paint::SessionEnd.glyph(), None);
-        assert_eq!(Edge::SessionStart.resolve(&p), Some(Paint::SessionStart));
+        assert_eq!(Edge::SessionStart.resolve(&p).paint(), Some(Paint::SessionStart));
         assert_eq!(Paint::SessionStart.glyph(), Some(Glyph::Idle));
     }
 
@@ -261,42 +354,42 @@ mod tests {
             &br#"{"source":"compact"}"#[..],
             &br#"{"source": "compact"}"#[..],
         ] {
-            assert_eq!(Edge::SessionStart.resolve(&payload(line)), None);
+            assert_eq!(Edge::SessionStart.resolve(&payload(line)).paint(), None);
         }
         // Every valid JSON whitespace spelling has the same meaning.
         let p = payload(br#"{"source":  "compact"}"#);
-        assert_eq!(Edge::SessionStart.resolve(&p), None);
+        assert_eq!(Edge::SessionStart.resolve(&p).paint(), None);
     }
 
     #[test]
     fn a_subagent_stop_paints_nothing_without_a_state_directory() {
         let p = payload(br#"{"agent_id":"abc","hook_event_name":"SubagentStop"}"#);
-        assert_eq!(Edge::SubagentStop.resolve(&p), None);
-        assert_eq!(Edge::SubagentStop.resolve(&Payload::empty()), None);
+        assert_eq!(Edge::SubagentStop.resolve(&p).paint(), None);
+        assert_eq!(Edge::SubagentStop.resolve(&Payload::empty()).paint(), None);
     }
 
     #[test]
     fn stateless_elicitation_observes_requests_but_cannot_resolve_them() {
         for mode in [None, Some("form"), Some("url")] {
             let p = payload(serde_json::json!({"hook_event_name":"Elicitation","mode":mode}).to_string().as_bytes());
-            assert_eq!(Edge::Elicitation.resolve(&p), Some(Paint::Line(Glyph::Waiting)));
-            assert_eq!(Edge::ElicitationResult.resolve(&p), None);
+            assert_eq!(Edge::Elicitation.resolve(&p).paint(), Some(Paint::Line(Glyph::Waiting)));
+            assert_eq!(Edge::ElicitationResult.resolve(&p).paint(), None);
         }
         for p in [Payload::empty(), payload(br#"{"hook_event_name":"Elicitation","mode":"unknown"}"#), payload(br#"{"hook_event_name":"ElicitationResult","action":"accept"}"#)] {
-            assert_eq!(Edge::Elicitation.resolve(&p), None);
-            assert_eq!(Edge::ElicitationResult.resolve(&p), None);
+            assert_eq!(Edge::Elicitation.resolve(&p).paint(), None);
+            assert_eq!(Edge::ElicitationResult.resolve(&p).paint(), None);
         }
     }
 
     #[test]
     fn a_subagent_working_edge_paints_nothing() {
         let p = payload(br#"{"hook_event_name":"PostToolUse","agent_id":"abc"}"#);
-        assert_eq!(Edge::Working.resolve(&p), None);
+        assert_eq!(Edge::Working.resolve(&p).paint(), None);
         let p = payload(br#"{"hook_event_name":"PostToolUse"}"#);
-        assert_eq!(Edge::Working.resolve(&p), Some(Paint::Line(Glyph::Working)));
+        assert_eq!(Edge::Working.resolve(&p).paint(), Some(Paint::Line(Glyph::Working)));
         // An empty value must not silence the edge for the whole session.
         let p = payload(br#"{"agent_id":""}"#);
-        assert_eq!(Edge::Working.resolve(&p), Some(Paint::Line(Glyph::Working)));
+        assert_eq!(Edge::Working.resolve(&p).paint(), Some(Paint::Line(Glyph::Working)));
     }
 
     #[test]
@@ -304,7 +397,7 @@ mod tests {
         for kind in WAITING_KINDS {
             let line = format!(r#"{{"notification_type": "{kind}"}}"#).into_bytes();
             assert_eq!(
-                Edge::Notify.resolve(&payload(&line)),
+                Edge::Notify.resolve(&payload(&line)).paint(),
                 Some(Paint::Line(Glyph::Waiting)),
                 "{}",
                 kind
@@ -318,7 +411,7 @@ mod tests {
             br#"{"notification_type":"permission_prompt","x":"\"notification_type\":\"idle_prompt\""}"#,
         );
         // The escaped copy cannot match, so this one is orange.
-        assert_eq!(Edge::Notify.resolve(&p), Some(Paint::Line(Glyph::Waiting)));
+        assert_eq!(Edge::Notify.resolve(&p).paint(), Some(Paint::Line(Glyph::Waiting)));
         assert!(Payload::from_bytes(
             br#"{"notification_type":"permission_prompt","also":1,"notification_type":"idle_prompt"}"#,
         ).is_err());
@@ -333,7 +426,7 @@ mod tests {
             &b""[..],
         ] {
             assert_eq!(
-                Edge::Notify.resolve(&payload(line)),
+                Edge::Notify.resolve(&payload(line)).paint(),
                 None,
                 "{}",
                 String::from_utf8_lossy(line)
@@ -349,9 +442,33 @@ mod tests {
         line.extend_from_slice(br#"","notification_type":"agent_needs_input"}"#);
         line.push(b'\n');
         assert_eq!(
-            Edge::Notify.resolve(&payload_with_newline(&line)),
+            Edge::Notify.resolve(&payload_with_newline(&line)).paint(),
             Some(Paint::Line(Glyph::Waiting))
         );
+    }
+
+    /// The other half of #14's seam: a run with no record cannot compare, and
+    /// `Unknown` is that answer rather than a guess at one. Every stateless edge
+    /// that paints reports it, including the two the state layer hands back
+    /// unchanged when it has read nothing - `session-end`, which deletes the
+    /// record, and an edge word this version does not know.
+    #[test]
+    fn the_stateless_path_reports_an_unknown_transition() {
+        let p = Payload::empty();
+        for edge in [
+            Edge::Waiting,
+            Edge::Working,
+            Edge::Idle,
+            Edge::SessionStart,
+            Edge::SessionEnd,
+            Edge::Unknown,
+        ] {
+            assert_eq!(
+                edge.resolve(&p).map(|r| r.transition),
+                Some(Transition::Unknown),
+                "{edge:?}"
+            );
+        }
     }
 
     // Test helpers: a Payload built from bytes rather than from stdin.

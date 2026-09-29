@@ -118,7 +118,7 @@
 //     session's OWN record, so five concurrent sessions never contend.
 
 use crate::clock;
-use crate::edge::{Edge, Glyph, Notification, Paint};
+use crate::edge::{Edge, Glyph, Notification, Paint, Resolved};
 use crate::payload::{Payload, MAX_ELICITATION_ID_BYTES};
 use crate::sys;
 use std::ffi::OsStr;
@@ -655,6 +655,16 @@ impl Record {
         s
     }
 
+    /// Whether a tab standing on this record is showing the waiting glyph.
+    ///
+    /// ONE spelling, because six paths capture it and a `Transition` is only as
+    /// honest as their agreement: every path that paints orange has a wait
+    /// outstanding, and every path that stops painting orange has just retired the
+    /// last one, so "is a wait held" is exactly "is this session asking for you".
+    fn asking(&self) -> bool {
+        !self.waits.is_empty()
+    }
+
     fn paint(&self, glyph: Glyph) -> Paint {
         if self.background.is_some() {
             Paint::LineWithBackground(if glyph == Glyph::Idle { Glyph::Background } else { glyph })
@@ -993,32 +1003,37 @@ impl Session {
     /// The edges the state layer has nothing to say about defer to
     /// [`Edge::resolve`], so there is exactly one place each of those decisions
     /// lives.
-    pub fn resolve(&self, edge: Edge, p: &Payload) -> Option<Paint> {
+    pub fn resolve(&self, edge: Edge, p: &Payload) -> Option<Resolved> {
         match edge {
             // A session starting over must not inherit the previous run's waits:
             // `--resume` and `--clear` both land here, and neither one leaves a
             // dialog on screen. A mid-turn compaction re-fire is filtered by
             // `Edge::resolve` BEFORE this, and so resets nothing.
             Edge::SessionStart => {
-                let paint = edge.resolve(p)?;
+                let paint = edge.resolve(p)?.paint;
                 let mut claimed = Record::claimed();
                 let Some(lock) = self.lock(claimed.origin.is_some()) else {
                     self.reap();
-                    return Some(paint);
+                    return Some(Resolved::stateless(paint));
                 };
-                let (was, _) = self.load();
+                let (was, live) = self.load();
+                // Starting over drops every wait, so a record still holding a live
+                // one is a tab going from orange back to white.
+                let waiting = live.asking();
                 self.write_if_changed(&was, &mut claimed);
                 // Released before the scan: the reaper never touches our own file,
                 // so holding it across a 256-entry walk would only delay the
                 // session's own next hook.
                 drop(lock);
                 self.reap();
-                Some(paint)
+                Some(Resolved::stateful(waiting, paint))
             }
             Edge::SessionEnd => {
-                let paint = edge.resolve(p)?;
+                let paint = edge.resolve(p)?.paint;
                 self.remove();
-                Some(paint)
+                // This edge reads no record - it deletes the file - and an unpaint
+                // is not the path to add a read to for a fact nothing consumes.
+                Some(Resolved::stateless(paint))
             }
             Edge::Working => self.progress(Owner::of(p), p),
             Edge::Waiting => {
@@ -1051,7 +1066,7 @@ impl Session {
     }
 
     /// `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`: something ran.
-    fn progress(&self, o: Owner, p: &Payload) -> Option<Paint> {
+    fn progress(&self, o: Owner, p: &Payload) -> Option<Resolved> {
         // A supplied but unusable agent id is not evidence of main-thread
         // progress and must not inherit its cross-owner recovery permissions.
         if (o == Owner::Main && p.agent_id().is_some()) || p.agent_id() == Some("-") {
@@ -1059,6 +1074,7 @@ impl Session {
         }
         let _lock = self.lock(o == Owner::Main)?;
         let (was, mut now) = self.load();
+        let waiting = now.asking();
         match &o {
             Owner::Agent(_) => {
                 // THE FIX. A subagent's tool call paints nothing - that filter is
@@ -1118,16 +1134,17 @@ impl Session {
         // A wait somebody else still holds keeps the tab: this is the second half
         // of the fix, and the half that matters most. Stateless, a main-thread
         // PostToolUse repainted blue over a subagent's open dialog.
-        now.waits.is_empty().then_some(now.paint(now.base))
+        now.waits.is_empty().then(|| Resolved::stateful(waiting, now.paint(now.base)))
     }
 
     /// `PermissionRequest`, `PreToolUse` on the two tools that always block, and
     /// the `Notification` backstop: a dialog is up.
-    fn wait(&self, o: Owner) -> Option<Paint> {
+    fn wait(&self, o: Owner) -> Option<Resolved> {
         let Some(_lock) = self.lock(true) else {
-            return Some(self.unpersisted_wait());
+            return Some(Resolved::stateless(self.unpersisted_wait()));
         };
         let (was, mut now) = self.load();
+        let waiting = now.asking();
         // The backstop fires ~6s after the dialog for a PermissionRequest already
         // reported - capture: PermissionRequest(aec99e) at 69.960, then
         // Notification permission_prompt at 75.983 for the SAME dialog. Adding an
@@ -1149,7 +1166,7 @@ impl Session {
         self.write_if_changed(&was, &mut now);
         // Always orange, whatever the base: a dialog on screen is the truth, and
         // repainting refreshes the tmux carrier's epoch, which restarts the decay.
-        Some(now.paint(Glyph::Waiting))
+        Some(Resolved::stateful(waiting, now.paint(Glyph::Waiting)))
     }
 
     /// A failed write lock still permits a conservative orange paint. Preserve
@@ -1163,7 +1180,7 @@ impl Session {
     }
 
     /// `Stop`, `StopFailure`, and the idle nudge: the main loop is free.
-    fn free(&self, p: &Payload) -> Option<Paint> {
+    fn free(&self, p: &Payload) -> Option<Resolved> {
         // Live 2.1.274 captures establish main Stop as a complete parent-session
         // registry snapshot, including the automatic turn after a task finishes.
         // SubagentStop may still list its own finishing task; never infer that
@@ -1175,9 +1192,10 @@ impl Session {
             // A genuinely fresh quiet session needs no record. An inaccessible
             // or contended existing record must never be mutated without a lock.
             return matches!(fs::symlink_metadata(&self.path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-                .then_some(Paint::Line(if snapshot == Some(false) { Glyph::Background } else { Glyph::Idle }));
+                .then(|| Resolved::stateless(Paint::Line(if snapshot == Some(false) { Glyph::Background } else { Glyph::Idle })));
         };
         let (was, mut now) = self.load();
+        let waiting = now.asking();
         now.base = Glyph::Idle;
         match snapshot {
             Some(false) => now.background = Some(self.now),
@@ -1206,11 +1224,11 @@ impl Session {
         // Never paint idle over an outstanding dialog. A changed background
         // fact may need an orange refresh so tmux retains the correct fallback.
         if now.waits.is_empty() {
-            Some(now.paint(Glyph::Idle))
+            Some(Resolved::stateful(waiting, now.paint(Glyph::Idle)))
         } else if was.background.is_some() != now.background.is_some() {
             // Keep orange while updating tmux's fallback when this snapshot
             // first discovers background work, or proves it has ended.
-            Some(now.paint(Glyph::Waiting))
+            Some(Resolved::stateful(waiting, now.paint(Glyph::Waiting)))
         } else {
             None
         }
@@ -1224,24 +1242,25 @@ impl Session {
     /// the capture has a `SubagentStop` for `a8e90c10` nine seconds before the user
     /// answered `aec99e1f`'s dialog, so a `SubagentStop` that owns nothing is inert,
     /// including when the outstanding dialog has no identifiable owner.
-    fn agent_gone(&self, o: Owner) -> Option<Paint> {
+    fn agent_gone(&self, o: Owner) -> Option<Resolved> {
         let Owner::Agent(_) = o else {
             return None;
         };
         let _lock = self.lock(false)?;
         let (was, mut now) = self.load();
+        let waiting = now.asking();
         if !now.clear(&o) {
             self.write_if_changed(&was, &mut now);
             return None;
         }
         self.write_if_changed(&was, &mut now);
-        now.waits.is_empty().then_some(now.paint(now.base))
+        now.waits.is_empty().then(|| Resolved::stateful(waiting, now.paint(now.base)))
     }
 
     /// Direct starts and identified notification backstops share one exact key.
     /// An unidentified notification remains independent: without identity there
     /// is no evidence that it duplicates any active or completed direct request.
-    fn elicitation_start(&self, p: &Payload, notification: bool) -> Option<Paint> {
+    fn elicitation_start(&self, p: &Payload, notification: bool) -> Option<Resolved> {
         if !notification && (p.hook_event_name() != Some("Elicitation") || !p.elicitation_mode_supported()) {
             return None;
         }
@@ -1253,9 +1272,10 @@ impl Session {
         let Some(_lock) = self.lock(true) else {
             // Painting a request is harmless without persistence; resolving one
             // without persistence is not, so results below instead stay silent.
-            return Some(self.unpersisted_wait());
+            return Some(Resolved::stateless(self.unpersisted_wait()));
         };
         let (was, mut now) = self.load();
+        let waiting = now.asking();
         if now.completed.iter().any(|w| w.who == owner) {
             self.write_if_changed(&was, &mut now);
             return None;
@@ -1266,10 +1286,10 @@ impl Session {
             now.raise(owner, self.now);
         }
         self.write_if_changed(&was, &mut now);
-        Some(now.paint(Glyph::Waiting))
+        Some(Resolved::stateful(waiting, now.paint(Glyph::Waiting)))
     }
 
-    fn elicitation_result(&self, p: &Payload) -> Option<Paint> {
+    fn elicitation_result(&self, p: &Payload) -> Option<Resolved> {
         if p.hook_event_name() != Some("ElicitationResult")
             || !p.elicitation_mode_supported()
             || !matches!(p.action(), Some("accept" | "decline" | "cancel")) {
@@ -1279,10 +1299,12 @@ impl Session {
         // A failed lock must never lead to an unlocked removal or tombstone.
         let _lock = self.lock(true)?;
         let (was, mut now) = self.load();
+        let waiting = now.asking();
         let cleared = now.clear(&owner);
         now.complete(owner, self.now);
         self.write_if_changed(&was, &mut now);
-        (cleared && now.waits.is_empty()).then_some(now.paint(now.base))
+        (cleared && now.waits.is_empty())
+            .then(|| Resolved::stateful(waiting, now.paint(now.base)))
     }
 }
 
@@ -1762,6 +1784,7 @@ pub fn survey() -> Survey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edge::{JustPaint, Transition};
     use std::ffi::OsString;
     use std::sync::Mutex;
 
@@ -1914,7 +1937,7 @@ mod tests {
             f.session(&main).resolve(Edge::Working, &main);
             for (server, id) in [("one", "A"), ("one", "B"), ("two", "A")] {
                 let request = elicitation(server, id, None);
-                assert_eq!(f.session(&request).resolve(Edge::Elicitation, &request), Some(Paint::Line(Glyph::Waiting)));
+                assert_eq!(f.session(&request).resolve(Edge::Elicitation, &request).paint(), Some(Paint::Line(Glyph::Waiting)));
             }
             let first = elicitation("one", "A", Some(action));
             assert_eq!(f.session(&first).resolve(Edge::ElicitationResult, &first), None);
@@ -1922,7 +1945,7 @@ mod tests {
             let second = elicitation("one", "B", Some(action));
             assert_eq!(f.session(&second).resolve(Edge::ElicitationResult, &second), None);
             let third = elicitation("two", "A", Some(action));
-            assert_eq!(f.session(&third).resolve(Edge::ElicitationResult, &third), Some(Paint::Line(Glyph::Working)));
+            assert_eq!(f.session(&third).resolve(Edge::ElicitationResult, &third).paint(), Some(Paint::Line(Glyph::Working)));
             assert_eq!(Record::parse(&f.record()).unwrap().completed.len(), 3);
         }
     }
@@ -1949,7 +1972,7 @@ mod tests {
         assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result), None);
         assert_eq!(Record::parse(&f.record()).unwrap().waits[0].who, Owner::AnonymousElicitation);
         let prompt = user_prompt();
-        assert_eq!(f.session(&prompt).resolve(Edge::Working, &prompt), Some(Paint::Line(Glyph::Working)));
+        assert_eq!(f.session(&prompt).resolve(Edge::Working, &prompt).paint(), Some(Paint::Line(Glyph::Working)));
         assert!(Record::parse(&f.record()).unwrap().waits.is_empty());
     }
 
@@ -1965,7 +1988,7 @@ mod tests {
         assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result), None);
         assert_eq!(f.record(), completed);
         std::env::set_var("CCTAB_NOW", "1000901");
-        assert_eq!(f.session(&request).resolve(Edge::Elicitation, &request), Some(Paint::Line(Glyph::Waiting)));
+        assert_eq!(f.session(&request).resolve(Edge::Elicitation, &request).paint(), Some(Paint::Line(Glyph::Waiting)));
         let raised = f.record();
         std::env::set_var("CCTAB_NOW", "1000902");
         f.session(&request).resolve(Edge::Elicitation, &request);
@@ -1981,10 +2004,10 @@ mod tests {
         f.session(&request).resolve(Edge::Elicitation, &request);
         assert_eq!(Record::parse(&f.record()).unwrap().waits.len(), 1);
         let result = elicitation("server", "A", Some("decline"));
-        assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result), Some(Paint::Line(Glyph::Idle)));
+        assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result).paint(), Some(Paint::Line(Glyph::Idle)));
         assert_eq!(f.session(&identified).resolve(Edge::Notify, &identified), None);
         let unidentified = notify("elicitation_url_dialog");
-        assert_eq!(f.session(&unidentified).resolve(Edge::Notify, &unidentified), Some(Paint::Line(Glyph::Waiting)));
+        assert_eq!(f.session(&unidentified).resolve(Edge::Notify, &unidentified).paint(), Some(Paint::Line(Glyph::Waiting)));
         let record = Record::parse(&f.record()).unwrap();
         assert_eq!(record.waits.len(), 1);
         assert_eq!(record.waits[0].who, Owner::UnknownElicitation);
@@ -2022,19 +2045,19 @@ mod tests {
         // 68.946 Stop, with the subagent already launched and LISTED in
         // background_tasks, which is why this one retires nothing.
         assert_eq!(
-            f.session(&main).resolve(Edge::Idle, &main),
+            f.session(&main).resolve(Edge::Idle, &main).paint(),
             Some(Paint::LineWithBackground(Glyph::Background))
         );
         // 69.960 the subagent's PermissionRequest.
         assert_eq!(
-            f.session(&agent).resolve(Edge::Waiting, &agent),
+            f.session(&agent).resolve(Edge::Waiting, &agent).paint(),
             Some(Paint::LineWithBackground(Glyph::Waiting))
         );
         // 75.983 the 6s backstop for the SAME dialog: still orange, and it must
         // not add an owner nothing can clear.
         let backstop = notify("permission_prompt");
         assert_eq!(
-            f.session(&backstop).resolve(Edge::Notify, &backstop),
+            f.session(&backstop).resolve(Edge::Notify, &backstop).paint(),
             Some(Paint::LineWithBackground(Glyph::Waiting))
         );
         let origin = f.origin_line();
@@ -2046,7 +2069,7 @@ mod tests {
         assert_eq!(f.record(), held);
         // 107.496 you approved: the subagent's own PostToolUse restores the base.
         assert_eq!(
-            f.session(&agent).resolve(Edge::Working, &agent),
+            f.session(&agent).resolve(Edge::Working, &agent).paint(),
             Some(Paint::LineWithBackground(Glyph::Background))
         );
         assert_eq!(f.record(), format!("cts5\nb i\ng 1000000\n{origin}"));
@@ -2079,7 +2102,7 @@ mod tests {
         // ...and when the agent resolves it, the base that comes back is the
         // WORKING one this turn established, not a guess.
         assert_eq!(
-            f.session(&agent).resolve(Edge::Working, &agent),
+            f.session(&agent).resolve(Edge::Working, &agent).paint(),
             Some(Paint::Line(Glyph::Working))
         );
     }
@@ -2101,7 +2124,7 @@ mod tests {
         let mainwork = main_tool();
         assert_eq!(f.session(&mainwork).resolve(Edge::Working, &mainwork), None);
         assert_eq!(
-            f.session(&agent).resolve(Edge::Working, &agent),
+            f.session(&agent).resolve(Edge::Working, &agent).paint(),
             Some(Paint::Line(Glyph::Working))
         );
     }
@@ -2112,7 +2135,7 @@ mod tests {
         let agent = agent_ev("aaa");
         let main = main_ev();
         f.session(&agent).resolve(Edge::Waiting, &agent);
-        assert_eq!(f.session(&main).resolve(Edge::Idle, &main), Some(Paint::LineWithBackground(Glyph::Waiting)));
+        assert_eq!(f.session(&main).resolve(Edge::Idle, &main).paint(), Some(Paint::LineWithBackground(Glyph::Waiting)));
         // The idle nudge is the same transition and is guarded the same way. It
         // matters because this user's `messageIdleNotifThresholdMs` is 3000. Its
         // payload carries no `background_tasks` at all, so it cannot retire
@@ -2131,7 +2154,7 @@ mod tests {
         // this Stop's array is deliberately NON-empty to prove that.
         f.session(&main).resolve(Edge::Waiting, &main);
         assert_eq!(
-            f.session(&main).resolve(Edge::Idle, &main),
+            f.session(&main).resolve(Edge::Idle, &main).paint(),
             Some(Paint::LineWithBackground(Glyph::Background))
         );
         assert_eq!(f.record(), format!("cts5\nb i\ng 1000000\n{}", f.origin_line()));
@@ -2148,7 +2171,7 @@ mod tests {
         f.session(&agent).resolve(Edge::Waiting, &agent);
         let quiet = quiet_stop();
         assert_eq!(
-            f.session(&quiet).resolve(Edge::Idle, &quiet),
+            f.session(&quiet).resolve(Edge::Idle, &quiet).paint(),
             Some(Paint::Line(Glyph::Idle))
         );
         assert_eq!(f.record(), format!("cts5\nb i\n{}", f.origin_line()));
@@ -2178,7 +2201,7 @@ mod tests {
         // The user typing does.
         let prompt = user_prompt();
         assert_eq!(
-            f.session(&prompt).resolve(Edge::Working, &prompt),
+            f.session(&prompt).resolve(Edge::Working, &prompt).paint(),
             Some(Paint::Line(Glyph::Working))
         );
         assert_eq!(f.record(), format!("cts5\nb w\n{}", f.origin_line()));
@@ -2208,7 +2231,7 @@ mod tests {
         std::env::set_var("CCTAB_NOW", "1000009");
         std::env::set_var("CCTAB_TTL_WAITING", "3");
         let main = main_ev();
-        assert_eq!(f.session(&main).resolve(Edge::Idle, &main), Some(Paint::LineWithBackground(Glyph::Waiting)));
+        assert_eq!(f.session(&main).resolve(Edge::Idle, &main).paint(), Some(Paint::LineWithBackground(Glyph::Waiting)));
         // And the expiry was PERSISTED rather than recomputed for ever, so raising
         // the TTL later cannot resurrect a wait already declared dead.
         assert_eq!(
@@ -2224,7 +2247,7 @@ mod tests {
             let request = payload(&format!(
                 r#"{{"session_id":"s1","hook_event_name":"PermissionRequest","agent_id":"{id}"}}"#
             ));
-            assert_eq!(f.session(&request).resolve(Edge::Waiting, &request),
+            assert_eq!(f.session(&request).resolve(Edge::Waiting, &request).paint(),
                 Some(Paint::Line(Glyph::Waiting)));
             assert_eq!(f.record(), format!("cts5\nb i\n{}w ?p:1000000\n", f.origin_line()));
             let stop = payload(r#"{"session_id":"s1","hook_event_name":"Stop"}"#);
@@ -2232,7 +2255,7 @@ mod tests {
             let unrelated = agent_stop("other");
             assert_eq!(f.session(&unrelated).resolve(Edge::SubagentStop, &unrelated), None);
             let human = user_prompt();
-            assert_eq!(f.session(&human).resolve(Edge::Working, &human),
+            assert_eq!(f.session(&human).resolve(Edge::Working, &human).paint(),
                 Some(Paint::Line(Glyph::Working)));
             assert!(!f.record().contains("\nw "));
         }
@@ -2243,7 +2266,7 @@ mod tests {
         let f = Fixture::new("unknown");
         let backstop = notify("agent_needs_input");
         assert_eq!(
-            f.session(&backstop).resolve(Edge::Notify, &backstop),
+            f.session(&backstop).resolve(Edge::Notify, &backstop).paint(),
             Some(Paint::Line(Glyph::Waiting))
         );
         assert_eq!(
@@ -2252,7 +2275,7 @@ mod tests {
         );
         // A `Stop` with a live subagent still says nothing about it.
         let busy = main_ev();
-        assert_eq!(f.session(&busy).resolve(Edge::Idle, &busy), Some(Paint::LineWithBackground(Glyph::Waiting)));
+        assert_eq!(f.session(&busy).resolve(Edge::Idle, &busy).paint(), Some(Paint::LineWithBackground(Glyph::Waiting)));
         // No evidence connects this agent to the notification's unknown owner.
         let agent = agent_ev("aaa");
         let held = f.record();
@@ -2260,7 +2283,7 @@ mod tests {
         assert_eq!(f.record(), held);
         let quiet = quiet_stop();
         assert_eq!(
-            f.session(&quiet).resolve(Edge::Idle, &quiet),
+            f.session(&quiet).resolve(Edge::Idle, &quiet).paint(),
             Some(Paint::Line(Glyph::Idle))
         );
         assert_eq!(f.record(), format!("cts5\nb i\n{}", f.origin_line()));
@@ -2282,13 +2305,13 @@ mod tests {
             let f = Fixture::new("unknownkinds");
             let backstop = notify(kind);
             assert_eq!(
-                f.session(&backstop).resolve(Edge::Notify, &backstop),
+                f.session(&backstop).resolve(Edge::Notify, &backstop).paint(),
                 Some(Paint::Line(Glyph::Waiting)),
                 "{kind}"
             );
             let quiet = quiet_stop();
             assert_eq!(
-                f.session(&quiet).resolve(Edge::Idle, &quiet),
+                f.session(&quiet).resolve(Edge::Idle, &quiet).paint(),
                 Some(Paint::Line(Glyph::Idle)),
                 "{kind}"
             );
@@ -2310,7 +2333,7 @@ mod tests {
             format!("cts5\nb i\n{}w aaa:1000000\n", f.origin_line())
         );
         assert_eq!(
-            f.session(&agent).resolve(Edge::Working, &agent),
+            f.session(&agent).resolve(Edge::Working, &agent).paint(),
             Some(Paint::Line(Glyph::Idle))
         );
     }
@@ -2324,7 +2347,7 @@ mod tests {
         // arrives. SubagentStop is the only signal left.
         let stop = agent_stop("aaa");
         assert_eq!(
-            f.session(&stop).resolve(Edge::SubagentStop, &stop),
+            f.session(&stop).resolve(Edge::SubagentStop, &stop).paint(),
             Some(Paint::Line(Glyph::Idle))
         );
         assert_eq!(f.record(), format!("cts5\nb i\n{}", f.origin_line()));
@@ -2363,7 +2386,7 @@ mod tests {
                 assert_eq!(f.session(&event).resolve(edge, &event), None, "{kind}");
                 assert_eq!(f.record(), held, "{kind}");
             }
-            assert_eq!(f.session(&prompt).resolve(Edge::Working, &prompt), Some(Paint::Line(Glyph::Working)));
+            assert_eq!(f.session(&prompt).resolve(Edge::Working, &prompt).paint(), Some(Paint::Line(Glyph::Working)));
             assert!(!f.record().contains("\nw "));
         }
     }
@@ -2419,7 +2442,7 @@ mod tests {
                 assert_eq!(f.session(&unrelated).resolve(Edge::Working, &unrelated), None);
             } else {
                 let main = main_tool();
-                assert_eq!(f.session(&main).resolve(Edge::Working, &main), Some(Paint::Line(Glyph::Working)));
+                assert_eq!(f.session(&main).resolve(Edge::Working, &main).paint(), Some(Paint::Line(Glyph::Working)));
             }
             assert!(!f.record().contains("\nw "));
         }
@@ -2452,7 +2475,7 @@ mod tests {
         std::env::set_var("CCTAB_NOW", "1000901");
         let main = main_ev();
         assert_eq!(
-            f.session(&main).resolve(Edge::Idle, &main),
+            f.session(&main).resolve(Edge::Idle, &main).paint(),
             Some(Paint::LineWithBackground(Glyph::Background))
         );
     }
@@ -2465,7 +2488,7 @@ mod tests {
         let start =
             payload(r#"{"session_id":"s1","hook_event_name":"SessionStart","source":"resume"}"#);
         assert_eq!(
-            f.session(&start).resolve(Edge::SessionStart, &start),
+            f.session(&start).resolve(Edge::SessionStart, &start).paint(),
             Some(Paint::SessionStart)
         );
         // Reset, AND claimed: the origin is what lets another session's reaper
@@ -2473,7 +2496,7 @@ mod tests {
         assert_eq!(f.record(), format!("cts5\nb i\n{}", f.origin_line()));
         let end = payload(r#"{"session_id":"s1","hook_event_name":"SessionEnd"}"#);
         assert_eq!(
-            f.session(&end).resolve(Edge::SessionEnd, &end),
+            f.session(&end).resolve(Edge::SessionEnd, &end).paint(),
             Some(Paint::SessionEnd)
         );
         assert_eq!(f.record(), "");
@@ -3277,10 +3300,10 @@ mod tests {
         let report = survey();
         let line = report.records.iter().find(|(n, _)| n == "s1").map(|(_, w)| w.clone());
         assert!(line.as_deref().is_some_and(|w| w.contains("waiting on 1")), "{line:?}");
-        assert_eq!(s2.resolve(Edge::Working, &other), Some(Paint::Line(Glyph::Idle)), "s2 is not blocked");
+        assert_eq!(s2.resolve(Edge::Working, &other).paint(), Some(Paint::Line(Glyph::Idle)), "s2 is not blocked");
         drop(held);
         let painted = rx.recv_timeout(Duration::from_secs(10)).expect("released, it proceeds");
-        assert_eq!(painted, Some(Paint::Line(Glyph::Idle)));
+        assert_eq!(painted.paint(), Some(Paint::Line(Glyph::Idle)));
         waiter.join().expect("join");
         assert!(!f.record().contains("\nw "));
     }
@@ -3469,5 +3492,33 @@ mod tests {
         let without = race_rounds(&f, true, 400, false);
         eprintln!("400 rounds, lost (clear, wait, eight-way of 50): with the lock {with:?}, without {without:?}");
         assert_eq!(with, [0, 0, 0]);
+    }
+
+    /// #14's whole reason for this seam. Every assertion above this one is about
+    /// the PAINT, and the paint is exactly what cannot tell a dialog going up from
+    /// a dialog that is still up: the two orange edges below are byte-identical,
+    /// which is why a backend that rings on the paint rings on every repeat.
+    #[test]
+    fn the_stateful_path_reports_entering_remaining_in_and_leaving_the_wait() {
+        let f = Fixture::new("transition-waiting");
+        let work = main_tool();
+        let ask = payload(r#"{"session_id":"s1","hook_event_name":"PermissionRequest"}"#);
+        // Working over working: nothing a bell would fire for.
+        assert_eq!(
+            f.session(&work).resolve(Edge::Working, &work).map(|r| r.transition),
+            Some(Transition::Remained)
+        );
+        let up = f.session(&ask).resolve(Edge::Waiting, &ask);
+        let still_up = f.session(&ask).resolve(Edge::Waiting, &ask);
+        assert_eq!(up.paint(), Some(Paint::Line(Glyph::Waiting)));
+        assert_eq!(up.paint(), still_up.paint(), "the paint cannot tell these apart");
+        assert_eq!(up.map(|r| r.transition), Some(Transition::Entered));
+        assert_eq!(still_up.map(|r| r.transition), Some(Transition::Remained));
+        // The dialog is answered: the same edge that unpaints orange is the one a
+        // persistent indicator has to be cleared on.
+        let done = quiet_stop();
+        let gone = f.session(&done).resolve(Edge::Idle, &done);
+        assert_eq!(gone.paint(), Some(Paint::Line(Glyph::Idle)));
+        assert_eq!(gone.map(|r| r.transition), Some(Transition::Left));
     }
 }

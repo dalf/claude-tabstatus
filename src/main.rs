@@ -57,7 +57,7 @@ mod text;
 mod tree;
 
 use config::Config;
-use edge::{Edge, Paint};
+use edge::{Edge, Paint, Resolved};
 use mux::{tmux, Channel};
 use payload::Payload;
 use std::ffi::OsString;
@@ -116,7 +116,11 @@ fn paint(edge: Edge) -> io::Result<()> {
         Some(session) => session.resolve(edge, &payload),
         None => edge.resolve(&payload),
     };
-    let Some(paint) = resolved else {
+    // The transition the stateful path computed is CARRIED here and read by
+    // nothing: #14's backends are what will ring on `Entered` and coalesce
+    // `Remained`, and landing the seam inert is what lets the 312-case corpus
+    // prove that threading it changed no byte of output.
+    let Some(Resolved { paint, .. }) = resolved else {
         return Ok(());
     };
 
