@@ -11,23 +11,35 @@ use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::fs::{FileTypeExt, OpenOptionsExt};
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::{Component, Path, PathBuf, Prefix};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
+use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER,
-    ERROR_SHARING_VIOLATION, FILETIME, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE,
+    CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, ERROR_ACCESS_DENIED,
+    ERROR_INVALID_PARAMETER, ERROR_SHARING_VIOLATION, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+    STILL_ACTIVE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     FileIdInfo, FileRenameInfoEx, FindClose, FindFirstFileW, GetDriveTypeW,
-    GetFileInformationByHandleEx, GetVolumeInformationByHandleW, LockFileEx, MoveFileExW,
-    SetFileInformationByHandle, DELETE, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
-    LOCKFILE_EXCLUSIVE_LOCK, WIN32_FIND_DATAW,
+    GetFileInformationByHandleEx, GetFileType, GetVolumeInformationByHandleW, LockFileEx,
+    MoveFileExW, SetFileInformationByHandle, DELETE, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+    FILE_RENAME_INFO, FILE_TYPE_CHAR, LOCKFILE_EXCLUSIVE_LOCK, WIN32_FIND_DATAW,
 };
+use windows_sys::Win32::System::Console::{
+    AttachConsole, FreeConsole, GetConsoleScreenBufferInfo, SetConsoleCtrlHandler,
+    SetConsoleTitleW, CONSOLE_SCREEN_BUFFER_INFO,
+};
+use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::System::Threading::{
-    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, IsWow64Process, OpenProcess,
+    PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
 };
-use windows_sys::Win32::System::IO::{DeviceIoControl, OVERLAPPED};
+use windows_sys::Win32::System::IO::{CancelSynchronousIo, DeviceIoControl, OVERLAPPED};
 
 use super::FileId;
 
@@ -40,8 +52,12 @@ pub const HAS_RECORD_LOCK: bool = true;
 /// nothing, so a report must not print a mode it did not read.
 pub const HAS_MODES: bool = false;
 
-/// [`session_tty`] never resolves a console.
+/// [`session_tty`] never resolves: there is no pty. The session's tab is a console
+/// here, reached by [`set_session_title`].
 pub const HAS_SESSION_TTY: bool = false;
+
+/// [`set_session_title`] can title the console Claude Code runs in.
+pub const HAS_SESSION_CONSOLE: bool = true;
 
 /// Bytes back into an `OsStr` - the inverse of [`OsStr::as_encoded_bytes`].
 ///
@@ -981,7 +997,12 @@ fn probe(pid: u32) -> Probe {
             _ => Probe::Unknown,
         };
     }
-    let process = Process(h);
+    probe_open(&Process(h))
+}
+
+/// [`probe`], on a handle already open for at least `PROCESS_QUERY_LIMITED_INFORMATION`
+/// - so a caller asking something else of the same process asks it of the same one.
+fn probe_open(process: &Process) -> Probe {
     let mut code = 0u32;
     // SAFETY: an open process handle and a live u32.
     if unsafe { GetExitCodeProcess(process.0, &mut code) } == 0 {
@@ -1010,11 +1031,307 @@ impl Drop for Process {
     }
 }
 
-/// No pty to resolve: a hook cannot name Claude Code's console from here, so
-/// session-start and session-end paint nothing directly and the hook-protocol
-/// `terminalSequence` path does the painting.
+/// No pty to resolve: Windows has no device a title can be written to as bytes.
+/// session-start and session-end title the console instead, through
+/// [`set_session_title`]; tmux, which does not exist natively here, finds nothing.
 pub fn session_tty(_claude_pid: &OsStr) -> Option<File> {
     None
+}
+
+/// How far up its parent chain a hook looks for `$CLAUDE_PID`. Measured under Git
+/// Bash: tabstatus.exe, `usr\bin\bash.exe`, Git's `bin\bash.exe` launcher, claude.exe -
+/// three hops.
+const ANCESTOR_HOPS: usize = 8;
+
+/// How long [`set_session_title`] waits on Claude's console. Detaching, attaching and
+/// titling take about 1ms; but AttachConsole waits on the console server, which a
+/// terminal that is not draining its output holds for as long as it stalls
+/// (measured: 3.6s of a 4s stall, under the inbox conhost and OpenConsole alike),
+/// and SessionEnd's whole hook budget is 1s.
+const CONSOLE_BUDGET: Duration = Duration::from_millis(250);
+
+/// How long an overrun [`set_session_title`] then spends cancelling the console call
+/// it left in flight, see [`abandon`]. Cancelling one takes about 5ms (measured).
+const CANCEL_BUDGET: Duration = Duration::from_millis(50);
+
+/// Set the title of the console Claude Code runs in - the session's tab, under
+/// Windows Terminal - for the two edges `terminalSequence` cannot carry. `Ok(true)`
+/// painted, `Ok(false)` deliberately did not, and `Err` is the paint itself failing
+/// or overrunning [`CONSOLE_BUDGET`].
+///
+/// A title set through the console API is console state, and a pseudo console
+/// forwards every change to its terminal as an OSC 0 - measured through Windows
+/// Terminal 1.24's own OpenConsole.exe and the ConPTY package's 1.25
+/// (`ESC ] 0 ; title ESC \`), and the inbox conhost (`... BEL`), the empty title
+/// included. It is the channel Claude Code's own `process.title` uses; it needs
+/// neither the buffer's VT mode nor its code page, which bytes written into Claude's
+/// output would; and it composes with the `terminalSequence` titles Claude writes,
+/// which update the same state.
+///
+/// A hook is NOT in that console: Claude Code spawns it with `windowsHide`, which is
+/// CREATE_NO_WINDOW, so it runs in a hidden console of its own that reaches no tab
+/// (measured). So this leaves that console, attaches to Claude's for one call, and
+/// leaves again - which works as well for a hook that inherited Claude's console, or
+/// that has none.
+///
+/// THE HEADLESS GUARD, the Windows form of Unix's "fd 1 is a tty", is three proofs,
+/// and any "no" paints nothing:
+///   1. `claude_pid` is a LIVE ANCESTOR of this process: the parent chain is walked
+///      up from here, each hop running and created no later than its child, so a
+///      stale or recycled pid, a sibling, and every unrelated process are refused.
+///   2. That process's standard output - read out of its PEB, the one place Windows
+///      records it, current as of any `SetStdHandle` - is a character device. That
+///      refuses `claude -p > file` and `claude -p | jq` before any console is touched.
+///   3. Once attached, that same handle is a screen buffer of the console attached,
+///      which refuses NUL, a character device too. Asked any earlier, a console call
+///      on it answers for the CALLER's console (measured).
+///
+/// What it cannot prove: that a terminal shows the console - a hidden one is harmless
+/// to title - or that the process is claude.exe rather than whatever spawned this
+/// hook and draws on that console, which is what the README's hand fix relies on.
+///
+/// Bounded: the console part runs on a worker thread given [`CONSOLE_BUDGET`]. One
+/// that overruns it is abandoned and its console call cancelled ([`abandon`]), so
+/// the hook can exit: process exit waits for a console call in flight, and a stalled
+/// terminal holds that call for as long as it stalls. Nothing of Claude's console
+/// changes but its title, and this process's standard handles - the pipes the hook
+/// protocol runs over - are untouched.
+pub fn set_session_title(claude_pid: &OsStr, title: &str) -> io::Result<bool> {
+    let Some(pid) = parse_pid(claude_pid) else { return Ok(false) };
+    if !is_live_ancestor(pid) {
+        return Ok(false);
+    }
+    let Some(stdout) = char_stdout_of(pid) else { return Ok(false) };
+    let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
+    on_console_worker(move |abandoned| title_console(pid, &stdout, &title, abandoned))
+}
+
+/// Run `work` on a worker thread for at most [`CONSOLE_BUDGET`], then [`abandon`] it:
+/// its answer, or `TimedOut`. `work` is handed the flag an abandon raises, to check
+/// before each console call it makes.
+fn on_console_worker<F>(work: F) -> io::Result<bool>
+where
+    F: FnOnce(&AtomicBool) -> io::Result<bool> + Send + 'static,
+{
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&abandoned);
+    let (tx, rx) = mpsc::channel();
+    let worker = thread::Builder::new().spawn(move || {
+        let _ = tx.send(work(&flag));
+    })?;
+    match rx.recv_timeout(CONSOLE_BUDGET) {
+        Ok(painted) => painted,
+        Err(_) => {
+            abandon(&worker, &abandoned);
+            Err(io::ErrorKind::TimedOut.into())
+        }
+    }
+}
+
+/// Stop an overrun worker from holding up process exit, within [`CANCEL_BUDGET`].
+///
+/// A thread inside a console call when the process exits keeps it from exiting until
+/// that call returns - 3.7s of a 4s stall, measured, when the stall began after the
+/// attach (one that began before it leaves the worker in AttachConsole, which does
+/// not). `CancelSynchronousIo` ends such a call at once (measured, ~5ms). It is
+/// repeated because the worker may be between two calls when first asked; the flag
+/// keeps it from starting another, and its `Detach` from calling FreeConsole, which
+/// the exit does anyway. Should a call not yield in time the hook still exits, late.
+fn abandon(worker: &JoinHandle<()>, abandoned: &AtomicBool) {
+    abandoned.store(true, Ordering::SeqCst);
+    let start = Instant::now();
+    while !worker.is_finished() && start.elapsed() < CANCEL_BUDGET {
+        // SAFETY: a thread handle std keeps open for the JoinHandle's lifetime; this
+        // cancels only that thread's synchronous I/O, and failing does nothing.
+        unsafe { CancelSynchronousIo(worker.as_raw_handle()) };
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The part of [`set_session_title`] that runs attached to Claude's console, on the
+/// worker [`on_console_worker`] runs. Once `abandoned`, it makes no further call.
+fn title_console(
+    pid: u32,
+    stdout: &OwnedHandle,
+    title: &[u16],
+    abandoned: &AtomicBool,
+) -> io::Result<bool> {
+    let live = || !abandoned.load(Ordering::SeqCst);
+    // SAFETY: no pointers; each call changes this process's own console state only.
+    unsafe {
+        // Ctrl+C typed into Claude's console while this is attached reaches this
+        // process too, and ends it with 0xC000013A (measured). The ignore FLAG, not a
+        // handler: AttachConsole discards every handler registered before it, even
+        // one registered with no console at all, and keeps the flag (measured).
+        SetConsoleCtrlHandler(None, 1);
+        // AttachConsole refuses a process that has a console (error 5), and a hook
+        // has one. Our standard handles are pipes, which this leaves as they are.
+        FreeConsole();
+        if !live() || AttachConsole(pid) == 0 {
+            // Abandoned already, or no console at all - a detached or GUI parent -
+            // so no tab.
+            return Ok(false);
+        }
+    }
+    let _detach = Detach(abandoned);
+    // SAFETY: a function of the documented signature, never removed. Registered after
+    // the attach, the only place a handler takes effect, for Ctrl+Break, which the
+    // flag does not cover. That leaves a Ctrl+Break unhandled from the moment the
+    // console knows this process until this line - the tail of AttachConsole - and
+    // one landing there ends the hook with 0xC000013A: measured under a Ctrl+Break
+    // every 200us, about one hook in two; a key would have to land in that sliver.
+    // Claude and its console are untouched; the title is simply not set. No
+    // in-process order closes it.
+    unsafe { SetConsoleCtrlHandler(Some(swallow), 1) };
+    // SAFETY: an all-zero CONSOLE_SCREEN_BUFFER_INFO is valid; filled or refused.
+    let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
+    // SAFETY: a live handle this process owns, and a live out-parameter.
+    if !live() || unsafe { GetConsoleScreenBufferInfo(stdout.as_raw_handle(), &mut info) } == 0 {
+        return Ok(false);
+    }
+    // SAFETY: a NUL-terminated UTF-16 string that outlives the call.
+    if !live() || unsafe { SetConsoleTitleW(title.as_ptr()) } == 0 {
+        return if live() { Err(io::Error::last_os_error()) } else { Ok(false) };
+    }
+    Ok(true)
+}
+
+/// Every control event that arrives once it is registered, swallowed while attached
+/// to Claude's console (see [`title_console`] for the gap before). A close still ends
+/// the process once this returns, which is harmless here.
+unsafe extern "system" fn swallow(_event: u32) -> i32 {
+    1
+}
+
+/// Leave whatever console this process is attached to, on every return path - unless
+/// the call was abandoned: a FreeConsole on a stalled console blocks like any other
+/// call, and the exit that follows detaches anyway.
+struct Detach<'a>(&'a AtomicBool);
+
+impl Drop for Detach<'_> {
+    fn drop(&mut self) {
+        if !self.0.load(Ordering::SeqCst) {
+            // SAFETY: no arguments; detaches this process only.
+            unsafe { FreeConsole() };
+        }
+    }
+}
+
+/// `$CLAUDE_PID` as a pid: 1-10 ASCII digits, in range, not zero - else nothing.
+fn parse_pid(raw: &OsStr) -> Option<u32> {
+    let b = raw.as_encoded_bytes();
+    if b.is_empty() || b.len() > 10 || !b.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(b).ok()?.parse().ok().filter(|&p| p != 0)
+}
+
+/// Whether `pid` is a live ancestor of this process within [`ANCESTOR_HOPS`]. A hop
+/// whose recorded parent is YOUNGER than it has outlived that parent, whose pid went
+/// to a newer process: nothing above it is ours, and the walk stops there.
+fn is_live_ancestor(pid: u32) -> bool {
+    let Some((mut born, mut parent)) = hop(std::process::id()) else { return false };
+    for _ in 0..ANCESTOR_HOPS {
+        let Some((parent_born, grandparent)) = hop(parent) else { return false };
+        if parent_born > born {
+            return false;
+        }
+        if parent == pid {
+            return true;
+        }
+        (born, parent) = (parent_born, grandparent);
+    }
+    false
+}
+
+/// A RUNNING process's creation time and the pid that created it, from one handle,
+/// so the answer cannot mix two processes.
+fn hop(pid: u32) -> Option<(u64, u32)> {
+    let p = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let Probe::Running(created) = probe_open(&p) else { return None };
+    Some((created, u32::try_from(basic_info(&p)?.parent).ok()?))
+}
+
+/// The standard output of `pid`, duplicated into this process, when it is a character
+/// device - the Windows `/proc/<pid>/fd/1`. The PEB offsets are the 64-bit layout
+/// (`PEB.ProcessParameters` at 0x20, and `StandardOutput` at 0x28 in that), stable
+/// since NT; a WOW64 process keeps its current handles in its 32-bit copy, and a
+/// 32-bit build cannot use these offsets, so both are refused.
+fn char_stdout_of(pid: u32) -> Option<OwnedHandle> {
+    if !cfg!(target_pointer_width = "64") {
+        return None;
+    }
+    let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ | PROCESS_DUP_HANDLE;
+    let p = open_process(pid, access)?;
+    let mut wow = 0;
+    // SAFETY: an open process handle and a live BOOL.
+    if unsafe { IsWow64Process(p.0, &mut wow) } == 0 || wow != 0 {
+        return None;
+    }
+    let params = read_word(&p, basic_info(&p)?.peb.checked_add(0x20)?)?;
+    let handle = read_word(&p, params.checked_add(0x28)?)?;
+    if handle == 0 {
+        return None;
+    }
+    let mut dup: HANDLE = std::ptr::null_mut();
+    // SAFETY: a process handle opened with PROCESS_DUP_HANDLE, a handle value that is
+    // only ever interpreted in that process, and a live out-parameter.
+    let ok = unsafe {
+        DuplicateHandle(p.0, handle as HANDLE, GetCurrentProcess(), &mut dup, 0, 0, DUPLICATE_SAME_ACCESS)
+    };
+    if ok == 0 {
+        return None;
+    }
+    // SAFETY: a handle this process now owns, closed exactly once, by the drop.
+    let dup = unsafe { OwnedHandle::from_raw_handle(dup) };
+    // SAFETY: a live handle.
+    (unsafe { GetFileType(dup.as_raw_handle()) } == FILE_TYPE_CHAR).then_some(dup)
+}
+
+fn open_process(pid: u32, access: u32) -> Option<Process> {
+    // SAFETY: no pointers; a null handle is the failure.
+    let h = unsafe { OpenProcess(access, 0, pid) };
+    (!h.is_null()).then(|| Process(h))
+}
+
+/// `PROCESS_BASIC_INFORMATION` (winternl.h), spelled out so the PEB stays an address
+/// and no windows-sys feature is needed for the pointer types.
+#[repr(C)]
+#[derive(Default)]
+struct BasicInfo {
+    exit_status: i32,
+    peb: usize,
+    affinity: usize,
+    base_priority: i32,
+    pid: usize,
+    parent: usize,
+}
+
+fn basic_info(p: &Process) -> Option<BasicInfo> {
+    let mut info = BasicInfo::default();
+    let mut len = 0u32;
+    // SAFETY: an open process handle; `info` is exactly the size passed.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            p.0,
+            ProcessBasicInformation,
+            (&mut info as *mut BasicInfo).cast(),
+            std::mem::size_of::<BasicInfo>() as u32,
+            &mut len,
+        )
+    };
+    (status >= 0).then_some(info)
+}
+
+/// One pointer-sized word of another process's memory, or nothing.
+fn read_word(p: &Process, at: usize) -> Option<usize> {
+    let (mut word, mut got) = (0usize, 0usize);
+    let size = std::mem::size_of::<usize>();
+    // SAFETY: reads into a live usize exactly its size; a bad address fails the call.
+    let ok = unsafe {
+        ReadProcessMemory(p.0, at as *const _, (&mut word as *mut usize).cast(), size, &mut got)
+    };
+    (ok != 0 && got == size).then_some(word)
 }
 
 /// tmux client ptys do not exist on native Windows.
@@ -1113,6 +1430,107 @@ mod tests {
         assert!(probe_dir_link(unc, &d).is_err());
         assert!(names(&d).is_empty(), "{:?}", names(&d));
         let _ = fs::remove_dir_all(&d);
+    }
+
+    /// `$CLAUDE_PID` is a decimal pid or nothing: no sign, no space, not zero, in range.
+    #[test]
+    fn a_claude_pid_is_decimal_digits_in_range_and_not_zero() {
+        for bad in ["", "0", "00", "abc", "-1", "+1", " 12", "12 ", "1e3", "4294967296", "12345678901"] {
+            assert_eq!(parse_pid(OsStr::new(bad)), None, "{bad:?}");
+        }
+        assert_eq!(parse_pid(OsStr::new("4")), Some(4));
+        assert_eq!(parse_pid(OsStr::new("4294967295")), Some(u32::MAX));
+    }
+
+    /// A child that stays alive, with the given standard output, until its stdin closes.
+    fn held_child(stdout: Stdio) -> std::process::Child {
+        Command::new(std::env::current_exe().expect("exe"))
+            .args(["--exact", "sys::windows::tests::hold_the_image_until_stdin_closes"])
+            .args(["--ignored", "--test-threads=1"])
+            .env("CCTAB_TEST_HOLD", "1")
+            .stdin(Stdio::piped())
+            .stdout(stdout)
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn")
+    }
+
+    /// Guard 1. The process that started this test is an ancestor; this process, a
+    /// child it spawned - running, then exited - and a pid nothing has are not.
+    /// Nothing here touches a console.
+    #[test]
+    fn only_a_running_ancestor_passes_the_walk() {
+        let me = std::process::id();
+        let (_, parent) = hop(me).expect("this process");
+        assert!(is_live_ancestor(parent), "the process that started this test");
+        assert!(!is_live_ancestor(me), "not its own ancestor");
+        assert!(!is_live_ancestor(u32::MAX), "no such pid");
+        let mut child = held_child(Stdio::null());
+        let pid = child.id();
+        assert!(!is_live_ancestor(pid), "a child is not an ancestor");
+        drop(child.stdin.take());
+        child.wait().expect("wait");
+        assert!(!is_live_ancestor(pid), "nor once it has exited");
+    }
+
+    /// Guard 2 reads another process's CURRENT standard output out of its PEB: a file
+    /// and a pipe are refused before any console is touched, and NUL - a character
+    /// device - is not, which is why guard 3 exists.
+    #[test]
+    fn a_stdout_that_is_a_file_or_a_pipe_is_refused_and_nul_needs_the_third_proof() {
+        let d = scratch("stdout");
+        let file = fs::File::create(d.join("out")).expect("file");
+        let nul = OpenOptions::new().write(true).open("NUL").expect("NUL");
+        for (stdout, what, char_device) in [
+            (Stdio::from(file), "a file", false),
+            (Stdio::piped(), "a pipe", false),
+            (Stdio::from(nul), "NUL", true),
+        ] {
+            let mut child = held_child(stdout);
+            assert_eq!(char_stdout_of(child.id()).is_some(), char_device, "{what}");
+            drop(child.stdin.take());
+            child.wait().expect("wait");
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The whole function, on everything a unit test may offer it: a non-pid, a pid
+    /// nothing has, a child. Each is refused - `Ok(false)` - before any console call.
+    /// It is NEVER called here with an ancestor: this test's ancestors include the
+    /// terminal it was started from, which that would retitle. tests/conpty.rs paints,
+    /// inside a pseudo console of its own.
+    #[test]
+    fn set_session_title_refuses_everything_but_an_ancestor() {
+        for raw in ["", "0", "not-a-pid", "4294967295"] {
+            assert!(!set_session_title(OsStr::new(raw), "x").expect("no error"), "{raw:?}");
+        }
+        let mut child = held_child(Stdio::null());
+        let pid = child.id().to_string();
+        assert!(!set_session_title(OsStr::new(&pid), "x").expect("no error"), "a child");
+        drop(child.stdin.take());
+        child.wait().expect("wait");
+    }
+
+    /// The worker's bound, without a console: a prompt answer comes back as it is, and
+    /// one stuck in synchronous I/O - a read of a pipe nobody writes, standing in for a
+    /// console call on a stalled terminal - is cancelled and has FINISHED by the time
+    /// `TimedOut` returns, so it cannot hold up the hook's exit.
+    #[test]
+    fn an_overrun_console_worker_is_cancelled_before_it_times_out() {
+        assert!(on_console_worker(|_| Ok(true)).expect("answered"));
+        let (mut r, w) = std::io::pipe().expect("pipe");
+        let (tx, rx) = mpsc::channel();
+        let t = Instant::now();
+        let got = on_console_worker(move |abandoned| {
+            let read = r.read(&mut [0u8; 1]);
+            let _ = tx.send(read.is_err());
+            Ok(!abandoned.load(Ordering::SeqCst))
+        });
+        let took = t.elapsed();
+        assert_eq!(got.expect_err("overran").kind(), io::ErrorKind::TimedOut);
+        assert_eq!(rx.try_recv(), Ok(true), "the read was cancelled and the worker is done");
+        assert!(took < CONSOLE_BUDGET + CANCEL_BUDGET + Duration::from_millis(100), "{took:?}");
+        drop(w);
     }
 
     /// `remove_dir_link` is for links. On a real directory - even an empty one, which

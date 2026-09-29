@@ -38,6 +38,15 @@
 //! and no reader ever meets it; identity is `FILE_ID_INFO` from a handle; and the
 //! replace is a POSIX-semantics rename, the only kind that replaces a file its writer
 //! holds open. [`replaces_open_files`] says where that kind exists.
+//!
+//! And THE SESSION'S TAB, for the two edges `terminalSequence` cannot carry. On Unix
+//! it is a pty, resolved by [`session_tty`] and written as bytes. On Windows it is
+//! the console Claude Code runs in, and [`set_session_title`] sets that console's
+//! title, which the pseudo console forwards to the terminal as an OSC 0. Each backend
+//! has both functions; the one with nothing to reach says so (`None`, `Ok(false)`),
+//! and [`HAS_SESSION_TTY`] and [`HAS_SESSION_CONSOLE`] say which route exists. Both
+//! routes sit behind the same HEADLESS GUARD - paint only a terminal that provably
+//! belongs to this session - documented at each.
 
 #[cfg(unix)]
 mod unix;
@@ -55,8 +64,9 @@ pub use imp::{
     os_str_from_bytes, os_string_from_vec, probe_dir_link, process_alive, process_start_time,
     remove_dir_command, remove_dir_link, replace_dir_link, replace_file, replace_running,
     replaces_open_files, reserved_name, same_path, same_process, session_tty, set_mode,
-    sweep_replaced, with_mode, write_tty, DIR_LINK, HAS_MODES, HAS_RECORD_LOCK, HAS_SESSION_TTY,
-    HAS_UNLINK_RUNNING, NO_STATE_DIR, ORIGIN_KEY, RUNTIME_DIR_VAR,
+    set_session_title, sweep_replaced, with_mode, write_tty, DIR_LINK, HAS_MODES,
+    HAS_RECORD_LOCK, HAS_SESSION_CONSOLE, HAS_SESSION_TTY, HAS_UNLINK_RUNNING, NO_STATE_DIR,
+    ORIGIN_KEY, RUNTIME_DIR_VAR,
 };
 
 /// What identifies a file independently of its name: device and inode on Unix, the
@@ -91,6 +101,13 @@ mod tests {
         assert_eq!(HAS_RECORD_LOCK, proven);
         assert_eq!(HAS_MODES, mode(&m).is_some());
         assert_eq!(HAS_MODES, is_executable(&m).is_some());
+        // Without a console route the function answers "not painted" for anything,
+        // our own pid included - so a caller branching on the constant and one calling
+        // the function agree.
+        if !HAS_SESSION_CONSOLE {
+            let me = std::process::id().to_string();
+            assert!(!set_session_title(OsStr::new(&me), "x").expect("no error"));
+        }
     }
 
     /// The record lock excludes another locker - a second handle, in this very

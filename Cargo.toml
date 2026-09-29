@@ -26,9 +26,18 @@ serde_json = "1"
 # of a name - and for the state record: a file's identity from a handle, a
 # one-byte lock, a POSIX-semantics replace, and the volume's rename capability.
 # System_Threading for a process's creation time, which is a record origin's start
-# time there. Declarations only; no Unix build sees this crate.
+# time there. And for session-start and session-end, which title the console Claude
+# Code runs in: System_Console to attach to it and set its title, and - for the
+# headless guard - Wdk_System_Threading (a process's parent and its PEB) and
+# System_Diagnostics_Debug (reading its standard output handle out of that PEB).
+# Declarations only; no Unix build sees this crate.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Wdk_System_Threading", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Threading"] }
+
+# Tests only (tests/conpty.rs): CreateProcessW takes SECURITY_ATTRIBUTES, and an
+# optional ConPTY package's conpty.dll is loaded by name.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_System_LibraryLoader"] }
 
 [[bin]]
 name = "tabstatus"

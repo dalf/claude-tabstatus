@@ -2619,6 +2619,19 @@ fn report_runtime() {
         implied
     ));
     match config::var_nonempty("CLAUDE_PID") {
+        // The same test `emit::write_session` makes: inside tmux the title is tmux's
+        // carrier, so no console is titled.
+        Some(p) if sys::HAS_SESSION_CONSOLE && tmux::Tmux::detect().is_some() => say(&format!(
+            "pty:       CLAUDE_PID={} - no pty here, and inside tmux no console title is \
+             set either, so session-start and session-end paint nothing directly",
+            String::from_utf8_lossy(p.as_encoded_bytes())
+        )),
+        Some(p) if sys::HAS_SESSION_CONSOLE => say(&format!(
+            "pty:       CLAUDE_PID={} - no pty here: session-start and session-end set the \
+             title of its console instead, when it is a 64-bit process, an ancestor of \
+             the hook, and its stdout is that console",
+            String::from_utf8_lossy(p.as_encoded_bytes())
+        )),
         Some(p) if !sys::HAS_SESSION_TTY => say(&format!(
             "pty:       CLAUDE_PID={} - but this platform has no pty to resolve from it, so \
              session-start and session-end paint nothing directly",
