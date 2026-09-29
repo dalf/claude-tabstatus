@@ -12,16 +12,15 @@
 //!     `terminalSequence` cannot carry them: SessionStart is too early - the TUI
 //!     writer is not mounted yet, so the sequence is dropped - and the Konsole
 //!     arming sequence is OSC 50, which is not on the allowlist above. All direct
-//!     writes resolve the pty through /proc, so they are Linux-only.
+//!     writes resolve the pty through /proc, so they are Linux-only: elsewhere
+//!     they find no pty and paint nothing. On Windows the first title therefore
+//!     arrives with the first `terminalSequence` edge, and session-end leaves
+//!     the last one standing.
 
 use crate::config::{Config, Terminal};
-use std::ffi::OsString;
+use crate::sys;
 use std::fmt::Write as _;
-use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::FileTypeExt;
-use std::path::Path;
 
 /// Every byte this program prints on the paint path goes through here, and the
 /// failure goes UP: `main` is the one place it becomes exit 0.
@@ -139,61 +138,15 @@ pub fn session_end(cfg: &Config) -> io::Result<()> {
     write_pty(cfg, &out)
 }
 
-/// Write to a pty NAMED BY tmux - an attached client's terminal - under the same
-/// guard [`session_tty`] applies to fd 1: under /dev/pts or /dev/tty, a character
-/// device, and writable. A failure is nothing to report: the client may have
-/// detached between the listing and the write.
-pub fn tty_write(path: &Path, bytes: &[u8]) {
-    // A byte prefix, not `Path::starts_with`, for the reason `session_tty` gives:
-    // /dev/ttyS0 is a single component.
-    let name = path.as_os_str().as_bytes();
-    if !(name.starts_with(b"/dev/pts/") || name.starts_with(b"/dev/tty")) {
-        return;
-    }
-    if !path.metadata().is_ok_and(|m| m.file_type().is_char_device()) {
-        return;
-    }
-    if let Ok(mut f) = OpenOptions::new().write(true).open(path) {
-        let _ = f.write_all(bytes);
-    }
-}
-
+/// Write to the session's pty, resolved by [`sys::session_tty`] under the
+/// headless guard documented there.
 fn write_pty(cfg: &Config, bytes: &[u8]) -> io::Result<()> {
-    match session_tty(cfg) {
+    match cfg.claude_pid.as_deref().and_then(sys::session_tty) {
         Some(mut tty) => tty.write_all(bytes),
         // No pty is not a failure: a redirected `claude -p` has no tab, and there
         // is nothing to report to a hook whose output is a protocol.
         None => Ok(()),
     }
-}
-
-/// Resolve the session's pty from the environment. Hook subprocesses are detached,
-/// with fd 0 on /dev/null and `exec 3>/dev/tty` failing, so /dev/tty is no use
-/// here; `CLAUDE_PID` is exported into every hook subprocess.
-///
-/// THE HEADLESS GUARD: unless fd 1 of that pid resolves to a writable character
-/// device under /dev/pts or /dev/tty, do nothing rather than retitle an unrelated
-/// terminal - which covers a redirected `claude -p` and every platform with no
-/// /proc. `None` is therefore both "no tab to paint" and "fd 1 would not resolve",
-/// deliberately the same answer: painting on a guess is the one outcome that
-/// retitles somebody else's terminal.
-fn session_tty(cfg: &Config) -> Option<File> {
-    let mut link = OsString::from("/proc/");
-    link.push(cfg.claude_pid.as_ref()?);
-    link.push("/fd/1");
-    let target = std::fs::read_link(Path::new(&link)).ok()?;
-    // A byte prefix, not `Path::starts_with`: /dev/ttyS0 is a single component, so
-    // component matching would reject the serial consoles this is meant to allow.
-    let bytes = target.as_os_str().as_bytes();
-    if !(bytes.starts_with(b"/dev/pts/") || bytes.starts_with(b"/dev/tty")) {
-        return None;
-    }
-    if !target.metadata().ok()?.file_type().is_char_device() {
-        return None;
-    }
-    // Asking whether it is writable and opening it are the same question; ask it
-    // once.
-    OpenOptions::new().write(true).open(&target).ok()
 }
 
 #[cfg(test)]

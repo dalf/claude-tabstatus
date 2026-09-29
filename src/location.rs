@@ -9,9 +9,9 @@
 
 use crate::config::Config;
 use crate::git;
+use crate::sys;
 use crate::text;
 use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// The two forms of the current directory. They differ, and the difference is
@@ -91,13 +91,21 @@ fn logical_pwd(inherited: Option<&OsStr>, real: Option<&Path>) -> PathBuf {
 
 /// bash's `same_file(path, ".")`: same device and inode, symlinks followed. False
 /// when either stat fails, which is what rejects a stale or nonexistent `$PWD`.
+///
+/// Where the platform offers no file identity (Windows), the two canonical paths
+/// stand in for it: canonicalization follows symlinks just as the stat does.
 fn same_dir_as_cwd(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
     let (a, b) = match (std::fs::metadata(path), std::fs::metadata(".")) {
         (Ok(a), Ok(b)) => (a, b),
         _ => return false,
     };
-    a.dev() == b.dev() && a.ino() == b.ino()
+    match (sys::file_id(&a), sys::file_id(&b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => match (std::fs::canonicalize(path), std::fs::canonicalize(".")) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => false,
+        },
+    }
 }
 
 pub fn place(c: &Cwd, cfg: &Config) -> Place {
@@ -115,7 +123,7 @@ pub fn place(c: &Cwd, cfg: &Config) -> Place {
                 .unwrap_or_else(|| strip_git_suffix(last_component(&c.logical)));
             // The display boundary for the repo name: it came from a path, so it
             // may not be valid UTF-8. The branch crossed already, in `git`.
-            let mut out = text::repair(name.as_bytes());
+            let mut out = text::repair(name);
             // A repo checked out at / has no label to show.
             if out.is_empty() {
                 out.push('/');
@@ -129,68 +137,86 @@ pub fn place(c: &Cwd, cfg: &Config) -> Place {
     }
 }
 
+/// A path separator, as a byte of a path's encoded form: `/`, and on Windows `\`
+/// too. Both are ASCII, so no byte of a multi-byte character can match.
+fn is_sep(b: u8) -> bool {
+    std::path::is_separator(b as char)
+}
+
 /// The path's last component, as a tab label wants it: exactly ONE trailing slash
 /// is tolerated and nothing else is normalised.
 ///
 /// Close to `Path::file_name` but deliberately not it: `file_name` normalises
 /// EVERY trailing slash away, so a `GIT_DIR` a user spelled `/a///.git` by hand
 /// would still yield `a` where this yields nothing.
-fn last_component(path: &Path) -> &OsStr {
-    let b = path.as_os_str().as_bytes();
-    let b = b.strip_suffix(b"/").unwrap_or(b);
-    let b = match b.iter().rposition(|&c| c == b'/') {
+///
+/// Bytes rather than `&OsStr`: the only consumer is `text::repair`, and a slice
+/// of an `OsStr` has no safe, portable way back into one.
+fn last_component(path: &Path) -> &[u8] {
+    let b = path.as_os_str().as_encoded_bytes();
+    let b = match b.split_last() {
+        Some((&c, rest)) if is_sep(c) => rest,
+        _ => b,
+    };
+    match b.iter().rposition(|&c| is_sep(c)) {
         Some(i) => &b[i + 1..],
         None => b,
-    };
-    OsStr::from_bytes(b)
+    }
 }
 
 /// [`last_component`], unless it is nothing a tab can be named after. `/`, `.`,
 /// `..` and nothing-at-all are all `None`, which is `place`'s signal to fall back
 /// to the working directory.
-fn label(path: &Path) -> Option<&OsStr> {
-    let name = last_component(path);
-    match name.as_bytes() {
+fn label(path: &Path) -> Option<&[u8]> {
+    match last_component(path) {
         b"" | b"." | b".." => None,
-        _ => Some(name),
+        name => Some(name),
     }
 }
 
 /// `repo.git` -> `repo`, so the working directory of a bare checkout names the
 /// tab after the repository rather than after its `.git`.
-fn strip_git_suffix(name: &OsStr) -> &OsStr {
-    let b = name.as_bytes();
-    OsStr::from_bytes(b.strip_suffix(b".git").unwrap_or(b))
+fn strip_git_suffix(name: &[u8]) -> &[u8] {
+    name.strip_suffix(b".git").unwrap_or(name)
 }
 
 /// `~` for HOME itself, `~/x/y` beneath it, and anything outside HOME left
 /// absolute.
 ///
-/// The prefix test insists on the `/` that follows HOME, so `/home/alex` cannot
-/// claim `/home/alex2`, and it is taken on path BYTES rather than through
-/// `Path::starts_with`, which would silently normalise a doubled slash that a
-/// `$PWD` kept verbatim can still hold.
+/// The prefix test insists on the `/` (on Windows, `/` or `\`) that follows HOME,
+/// so `/home/alex` cannot claim `/home/alex2`, and it is taken on path BYTES rather
+/// than through `Path::starts_with`, which would silently normalise a doubled
+/// slash that a `$PWD` kept verbatim can still hold.
+///
+/// Every separator comes out as `/`. On Unix that is every byte `is_sep` matches, so
+/// nothing changes; on Windows `C:\x` and the `C:/x` Git Bash hands a program are the
+/// same directory and now paint the same text - and `\` is a byte `render` DELETES as
+/// JSON-hostile, so a native-shell cwd used to paint `C:Usersalexcode`. The HOME
+/// prefix is compared after the same mapping, so either spelling of either abbreviates.
 fn abbreviate(logical: &Path, home: Option<&Path>) -> Vec<u8> {
-    let l = logical.as_os_str().as_bytes();
+    let slashed = |p: &Path| -> Vec<u8> {
+        p.as_os_str().as_encoded_bytes().iter().map(|&c| if is_sep(c) { b'/' } else { c }).collect()
+    };
+    let l = slashed(logical);
     let home = match home {
-        Some(h) => h.as_os_str().as_bytes(),
-        None => return l.to_vec(),
+        Some(h) => slashed(h),
+        None => return l,
     };
     if l == home {
         return b"~".to_vec();
     }
-    if let Some(rest) = l.strip_prefix(home) {
+    if let Some(rest) = l.strip_prefix(&home[..]) {
         if rest.starts_with(b"/") {
             let mut out = b"~".to_vec();
             out.extend_from_slice(rest);
             return out;
         }
     }
-    l.to_vec()
+    l
 }
 
 /// The host name, in order: `CCTAB_HOST` overrides outright, `/proc` is the
-/// fork-free path, `$HOSTNAME` is next (bash sets it, dash and ash do not), and
+/// fork-free path (where there is one - [`sys::kernel_hostname_file`]), `$HOSTNAME` is next (bash sets it, dash and ash do not), and
 /// `hostname` is the last resort and the ONLY fork in this binary.
 ///
 /// `None` means no name resolved, and what to paint instead is the caller's
@@ -202,15 +228,17 @@ pub fn hostname(cfg: &Config) -> Option<String> {
 
 fn hostname_raw(cfg: &Config) -> Option<Vec<u8>> {
     if let Some(h) = &cfg.host_override {
-        return Some(h.as_bytes().to_vec());
+        return Some(h.as_encoded_bytes().to_vec());
     }
-    // A one-line system file, read the same way git's own metadata is.
-    git::first_line(Path::new("/proc/sys/kernel/hostname"))
+    // A one-line system file, read the same way git's own metadata is - where
+    // the platform has one.
+    sys::kernel_hostname_file()
+        .and_then(git::first_line)
         .filter(|h| !h.is_empty())
         .or_else(|| {
             cfg.hostname_env
                 .as_ref()
-                .map(|h| h.as_bytes().to_vec())
+                .map(|h| h.as_encoded_bytes().to_vec())
                 .filter(|h| !h.is_empty())
         })
         .or_else(hostname_command)
@@ -227,9 +255,10 @@ fn hostname_command() -> Option<Vec<u8>> {
         return None;
     }
     // Command substitution strips every trailing newline, and a name that is
-    // nothing but newlines is no name.
+    // nothing but newlines is no name. Windows' `hostname.exe` ends its line with
+    // CRLF, and there the CR belongs to the line ending too.
     let mut v = out.stdout;
-    while v.last() == Some(&b'\n') {
+    while v.last().is_some_and(|&c| sys::is_line_end(c)) {
         v.pop();
     }
     (!v.is_empty()).then_some(v)
@@ -239,15 +268,22 @@ fn hostname_command() -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    /// An absolute path on this platform: `/x` on Unix, and `C:\x` on Windows,
+    /// where a bare `/x` is not absolute.
+    fn abs(s: &str) -> PathBuf {
+        let cwd = std::env::current_dir().expect("a cwd");
+        cwd.ancestors().last().expect("a root").join(s)
+    }
+
     #[test]
     fn a_stale_or_relative_pwd_is_replaced_by_getcwd() {
-        let real = Path::new("/real/cwd");
-        let p = |pwd: &str| logical_pwd(Some(OsStr::new(pwd)), Some(real));
+        let real = abs("real/cwd");
+        let p = |pwd: &OsStr| logical_pwd(Some(pwd), Some(&real));
         // None of these names the cwd by device and inode.
-        assert_eq!(p("relative/dir"), real);
-        assert_eq!(p("."), real);
-        assert_eq!(p(""), real);
-        assert_eq!(p("/no/such/directory/anywhere"), real);
+        assert_eq!(p(OsStr::new("relative/dir")), real);
+        assert_eq!(p(OsStr::new(".")), real);
+        assert_eq!(p(OsStr::new("")), real);
+        assert_eq!(p(abs("no/such/directory/anywhere").as_os_str()), real);
     }
 
     #[test]
@@ -271,13 +307,14 @@ mod tests {
 
     #[test]
     fn an_absolute_pwd_survives_a_getcwd_that_failed() {
-        let got = logical_pwd(Some(OsStr::new("/gone/away")), None);
-        assert_eq!(got, PathBuf::from("/gone/away"));
+        let gone = abs("gone/away");
+        let got = logical_pwd(Some(gone.as_os_str()), None);
+        assert_eq!(got, gone);
     }
 
     #[test]
     fn the_label_is_the_last_component_with_one_trailing_slash_tolerated() {
-        let l = |s: &str| last_component(Path::new(s)).to_str().expect("ascii").to_owned();
+        let l = |s: &str| String::from_utf8(last_component(Path::new(s)).to_vec()).expect("ascii");
         assert_eq!(l("/a/b/repo"), "repo");
         assert_eq!(l("/a/b/repo/"), "repo");
         assert_eq!(l("repo"), "repo");
@@ -296,9 +333,9 @@ mod tests {
         for s in ["/", "", "//", "/a//", "/a/.", "/a/..", ".", ".."] {
             assert_eq!(label(Path::new(s)), None, "{:?}", s);
         }
-        assert_eq!(label(Path::new("/a/repo")), Some(OsStr::new("repo")));
+        assert_eq!(label(Path::new("/a/repo")), Some(&b"repo"[..]));
         // `.git` is stripped only on the FALLBACK, never on the label itself.
-        assert_eq!(label(Path::new("/a/r.git")), Some(OsStr::new("r.git")));
+        assert_eq!(label(Path::new("/a/r.git")), Some(&b"r.git"[..]));
     }
 
     #[test]
@@ -307,14 +344,14 @@ mod tests {
         // last component, with `.git` off and NO second filtering pass. A $PWD of
         // `/x/.` therefore labels the tab `.`, which the reference implementation
         // does too - it is reproduced here rather than fixed.
-        fn fallback(s: &str) -> &OsStr {
+        fn fallback(s: &str) -> &[u8] {
             strip_git_suffix(last_component(Path::new(s)))
         }
-        assert_eq!(fallback("/x/repo"), OsStr::new("repo"));
-        assert_eq!(fallback("/x/repo.git"), OsStr::new("repo"));
-        assert_eq!(fallback("/x/."), OsStr::new("."));
-        assert_eq!(fallback("/x/.."), OsStr::new(".."));
-        assert_eq!(fallback("/"), OsStr::new(""));
+        assert_eq!(fallback("/x/repo"), b"repo");
+        assert_eq!(fallback("/x/repo.git"), b"repo");
+        assert_eq!(fallback("/x/."), b".");
+        assert_eq!(fallback("/x/.."), b"..");
+        assert_eq!(fallback("/"), b"");
     }
 
     #[test]
@@ -331,8 +368,24 @@ mod tests {
         assert_eq!(a("/home/alex", None), "/home/alex");
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_backslash_after_home_is_a_component_boundary_on_windows() {
+        let a = |cwd: &str, home: &str| {
+            String::from_utf8(abbreviate(Path::new(cwd), Some(Path::new(home)))).expect("ascii")
+        };
+        assert_eq!(a(r"C:\Users\alex\code", r"C:\Users\alex"), "~/code");
+        assert_eq!(a(r"C:\Users\alex2\code", r"C:\Users\alex"), "C:/Users/alex2/code");
+        // Git Bash hands a program `C:/...`; either spelling of either side matches.
+        assert_eq!(a("C:/Users/alex/code", r"C:\Users\alex"), "~/code");
+        assert_eq!(a(r"C:\Users\alex", "C:/Users/alex"), "~");
+        assert_eq!(last_component(Path::new(r"C:\code\repo\")), b"repo");
+    }
+
+    #[cfg(unix)]
     #[test]
     fn an_invalid_byte_in_a_path_survives_as_a_replacement_character() {
+        use std::os::unix::ffi::OsStrExt;
         let cwd = Path::new(OsStr::from_bytes(b"/home/alex/b\xffd"));
         let home = Path::new("/home/alex");
         assert_eq!(text::repair(&abbreviate(cwd, Some(home))), "~/b\u{fffd}d");

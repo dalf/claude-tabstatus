@@ -17,10 +17,10 @@
 //! into a visible U+FFFD rather than thrown away for the default.
 
 use crate::edge::Glyph;
+use crate::sys;
 use crate::text;
 use crate::tmux::Tmux;
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 pub fn var(key: &str) -> Option<OsString> {
@@ -39,7 +39,7 @@ pub fn flag(key: &str) -> bool {
 /// variable, and anything set is repaired rather than rejected.
 fn var_or(key: &str, default: &str) -> String {
     match var(key) {
-        Some(v) => text::repair(v.as_bytes()),
+        Some(v) => text::repair(v.as_encoded_bytes()),
         None => default.to_owned(),
     }
 }
@@ -71,7 +71,7 @@ pub enum Terminal {
 impl Terminal {
     /// What `CCTAB_TERMINAL` says, or `None` when it says nothing.
     fn from_override(raw: Option<&OsStr>) -> Option<Terminal> {
-        let v = raw.map(OsStr::as_bytes)?;
+        let v = raw.map(OsStr::as_encoded_bytes)?;
         Some(if v.eq_ignore_ascii_case(b"konsole") {
             Terminal::Konsole
         } else {
@@ -111,7 +111,7 @@ pub enum GlyphPos {
 
 impl GlyphPos {
     fn parse(raw: Option<&OsStr>, terminal: Terminal) -> GlyphPos {
-        match raw.map(OsStr::as_bytes) {
+        match raw.map(OsStr::as_encoded_bytes) {
             Some(b"suffix") => GlyphPos::Suffix,
             Some(b"both") => GlyphPos::Both,
             // An unrecognised value falls through to prefix rather than failing.
@@ -140,7 +140,7 @@ impl Cap {
     /// `1000` as 1000, where all three have to fall back to the default. The
     /// grammar is the behaviour, and the corpus pins every arm of it.
     fn parse(raw: Option<&OsStr>, default: usize, floor: usize) -> Cap {
-        let n = match raw.map(OsStr::as_bytes) {
+        let n = match raw.map(OsStr::as_encoded_bytes) {
             Some(b"0") => return Cap::Off,
             Some(b)
                 if (1..=3).contains(&b.len())
@@ -191,8 +191,9 @@ pub struct Config {
     /// `hostname`, and neither may happen on a session that will paint no prefix.
     pub host_override: Option<OsString>,
     pub hostname_env: Option<OsString>,
-    /// `$HOME` with one trailing slash removed, which a `$HOME` that carries one
-    /// needs or the home directory renders as its own full path.
+    /// `$HOME` (`%USERPROFILE%` on Windows without one) with one trailing slash
+    /// removed, which a `$HOME` that carries one needs or the home directory
+    /// renders as its own full path.
     pub home: Option<PathBuf>,
     pub pwd: Option<OsString>,
     pub git_dir: Option<OsString>,
@@ -207,7 +208,7 @@ impl Config {
     pub fn from_env() -> Config {
         let terminal = Terminal::detect();
         Config {
-            dry_run: var("CCTAB_DRY_RUN").is_some_and(|v| v.as_bytes() == b"1"),
+            dry_run: var("CCTAB_DRY_RUN").is_some_and(|v| v.as_encoded_bytes() == b"1"),
             terminal,
             glyph_pos: GlyphPos::parse(var_nonempty("CCTAB_GLYPH_POS").as_deref(), terminal),
             ellipsis: var_or("CCTAB_ELLIPSIS", DEFAULT_ELLIPSIS),
@@ -228,7 +229,7 @@ impl Config {
             ssh: flag("SSH_CONNECTION") || flag("SSH_TTY"),
             host_override: var_nonempty("CCTAB_HOST"),
             hostname_env: var("HOSTNAME"),
-            home: var_nonempty("HOME").as_deref().and_then(home_dir),
+            home: home_var().as_deref().and_then(home_dir),
             pwd: var("PWD"),
             git_dir: var_nonempty("GIT_DIR"),
             claude_pid: var_nonempty("CLAUDE_PID"),
@@ -282,18 +283,31 @@ impl Config {
     }
 }
 
-/// `$HOME` with ONE trailing slash removed - not every one, and not a
+/// `$HOME`, or the platform's fallback ([`sys::home_fallback`]): nothing on Unix,
+/// `%USERPROFILE%` on Windows, where native shells leave `HOME` unset. The fallback
+/// is consulted only when `HOME` is absent, so a Windows shell that does export
+/// `HOME` (Git Bash, MSYS) is taken at its word. Every reader of the home directory
+/// goes through here - the location, the config directory, the default tree - so
+/// they cannot disagree about where home is.
+pub fn home_var() -> Option<OsString> {
+    var_nonempty("HOME").or_else(sys::home_fallback)
+}
+
+/// `$HOME` with ONE trailing separator removed - not every one, and not a
 /// normalisation: this only has to stop a `HOME` that carries a slash from
 /// missing the prefix test in `location`. `HOME=/` therefore abbreviates nothing,
 /// which is the same answer as an unset `HOME`: there is no prefix left to
-/// replace with `~`.
+/// replace with `~`. The separator is `/`, and on Windows `\` as well.
 fn home_dir(raw: &OsStr) -> Option<PathBuf> {
-    let b = raw.as_bytes();
-    let trimmed = b.strip_suffix(b"/").unwrap_or(b);
+    let b = raw.as_encoded_bytes();
+    let trimmed = match b.split_last() {
+        Some((&c, rest)) if std::path::is_separator(c as char) => rest,
+        _ => b,
+    };
     if trimmed.is_empty() {
         return None;
     }
-    Some(PathBuf::from(OsStr::from_bytes(trimmed).to_owned()))
+    Some(PathBuf::from(&*sys::os_str_from_bytes(trimmed)))
 }
 
 #[cfg(test)]
@@ -363,8 +377,10 @@ mod tests {
         assert_eq!(cap(Some("8"), 32, 8), Cap::Max(8));
     }
 
+    #[cfg(unix)]
     #[test]
     fn invalid_utf8_in_a_cap_is_not_a_number() {
+        use std::os::unix::ffi::OsStrExt;
         let raw = OsStr::from_bytes(b"3\xff");
         assert_eq!(Cap::parse(Some(raw), 32, 8), Cap::Max(32));
     }
@@ -393,5 +409,14 @@ mod tests {
         assert_eq!(h("/home/a/"), Some(PathBuf::from("/home/a")));
         assert_eq!(h("/"), None);
         assert_eq!(h("relative"), Some(PathBuf::from("relative")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_home_loses_one_trailing_backslash() {
+        let h = |s: &str| home_dir(OsStr::new(s));
+        assert_eq!(h(r"C:\Users\a\"), Some(PathBuf::from(r"C:\Users\a")));
+        assert_eq!(h(r"C:\Users\a"), Some(PathBuf::from(r"C:\Users\a")));
+        assert_eq!(h(r"\"), None);
     }
 }

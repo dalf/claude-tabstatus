@@ -118,11 +118,10 @@
 
 use crate::edge::{Edge, Glyph, Notification, Paint};
 use crate::payload::{Payload, MAX_ELICITATION_ID_BYTES};
-use crate::tmux;
+use crate::{sys, tmux};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -197,7 +196,7 @@ impl Origin {
     /// `/proc` entry - the only way to assert the live case against a process that
     /// is certainly running.
     fn mine_from(pid: u32) -> Option<Origin> {
-        Some(Origin { pid, start: start_time(pid)? })
+        Some(Origin { pid, start: sys::process_start_time(pid)? })
     }
 
     fn parse(rest: &str) -> Option<Origin> {
@@ -220,23 +219,16 @@ impl Origin {
     /// keeping a dead session's record, if a new process were handed the same pid
     /// inside the same 10ms start tick, which needs 4194304 intervening spawns
     /// (`pid_max`) at `CLK_TCK` 100, both measured on this machine.
+    ///
+    /// Where the platform cannot tell whether the pid is running at all (Windows),
+    /// unknown counts as alive, so the reaper keeps the record rather than guess.
     fn alive(self) -> bool {
-        start_time(self.pid) == Some(self.start)
+        sys::process_start_time(self.pid) == Some(self.start)
+            || sys::process_alive(self.pid).is_none()
     }
 }
 
-/// Field 22 of `/proc/<pid>/stat`: the process start time, in clock ticks since
-/// boot.
-///
-/// Parsed after the LAST `") "`, never by splitting the whole line on spaces.
-/// Field 2 is the executable name in parentheses and may itself contain both -
-/// measured on this machine, `/proc/1259713/stat` holds `(npm exec chrome...)`, so
-/// the naive split reads the wrong field for exactly the processes a `claude`
-/// session spawns. The tail begins at field 3, so field 22 is its 20th word.
-fn start_time(pid: u32) -> Option<u64> {
-    let raw = fs::read_to_string(format!("/proc/{}/stat", itoa(u64::from(pid)))).ok()?;
-    digits(raw.rsplit_once(") ")?.1.split(' ').nth(19)?)
-}
+// The start time is `sys::process_start_time`: field 22 of `/proc/<pid>/stat`.
 
 /// Who owns a wait.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -765,7 +757,18 @@ fn at_the_prompt(p: &Payload) -> bool {
 /// the failure that turned out not to exist, and removed - it would also have made
 /// the golden corpus's pty cases, which set `CLAUDE_PID` to a live helper, write
 /// records into the real `/run/user/<uid>`.
+///
+/// Where the platform has no file identity (Windows) there is nowhere, whatever
+/// the environment says: [`Session::lock`] cannot prove it holds the live record
+/// there, so the layer is OFF rather than on-and-failing. Deciding it here, before
+/// anything is created, is what makes `None` mean the stateless version in full -
+/// `main` drains stdin as it did, no empty record file is left behind to make
+/// every later edge decline, and `purge` cannot empty a directory shared with a
+/// WSL install. [`survey`] names the reason.
 pub fn dir() -> Option<PathBuf> {
+    if !sys::HAS_FILE_ID {
+        return None;
+    }
     if let Some(d) = crate::config::var_nonempty("CCTAB_STATE_DIR") {
         return Some(PathBuf::from(d));
     }
@@ -791,13 +794,7 @@ impl Session {
         let id = p.session_id().map(str::as_bytes).and_then(id_str)?;
         // Mode 0700 on creation rather than a check afterwards: inside
         // XDG_RUNTIME_DIR, itself 0700 and owned by us, there is nobody to race.
-        if !dir.is_dir()
-            && fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&dir)
-                .is_err()
-        {
+        if !dir.is_dir() && sys::create_private_dir(&dir).is_err() {
             return None;
         }
         let mut path = dir.clone();
@@ -875,10 +872,15 @@ impl Session {
                 .open(&self.path)
                 .ok()?;
             f.lock().ok()?;
-            let held = f.metadata().ok()?;
+            // No file identity (Windows) means the lock cannot be proven to be on
+            // the live record. `dir()` already keeps the layer off there, so this
+            // is the backstop: fail closed rather than apply an unverified
+            // transition. `LockFileEx` is mandatory rather than advisory, so
+            // Windows needs its own lock design before this layer can be enabled.
+            let held = sys::file_id(&f.metadata().ok()?)?;
             match fs::symlink_metadata(&self.path) {
                 Ok(m) if m.is_file() && m.len() <= MAX_RECORD as u64
-                    && (m.dev(), m.ino()) == (held.dev(), held.ino()) => {
+                    && sys::file_id(&m) == Some(held) => {
                     if matches!(stored_at(&self.path), Stored::Future) {
                         return None;
                     }
@@ -1489,7 +1491,11 @@ fn writable(d: &Path) -> bool {
 pub fn survey() -> Survey {
     let Some(d) = dir() else {
         return Survey {
-            dir: Err("no CCTAB_STATE_DIR and no XDG_RUNTIME_DIR"),
+            dir: Err(if sys::HAS_FILE_ID {
+                "no CCTAB_STATE_DIR and no XDG_RUNTIME_DIR"
+            } else {
+                "no file identity on this platform, so a record's lock cannot be proven held"
+            }),
             writable: None,
             records: Vec::new(),
             stale: 0,
@@ -1616,6 +1622,12 @@ mod tests {
     /// other's value. Every test that touches the environment holds this.
     static ENV: Mutex<()> = Mutex::new(());
 
+    // Tests that need the layer ON are `#[cfg(unix)]`: on Windows there is no
+    // file identity, so `dir()` answers `None` whatever the environment says and
+    // the layer is off by design (`the_layer_is_off_without_file_identity` pins
+    // that). The one directory test is Unix-only as well because a read-only
+    // attribute does not stop file creation in a Windows directory.
+
     struct Fixture {
         _guard: std::sync::MutexGuard<'static, ()>,
         dir: PathBuf,
@@ -1654,15 +1666,18 @@ mod tests {
         }
 
         /// The origin line every write stamps under this fixture.
+        #[cfg(unix)]
         fn origin_line(&self) -> String {
             let o = Origin::mine().expect("our own pid is pinned into CLAUDE_PID");
             format!("p {} {}\n", o.pid, o.start)
         }
 
+        #[cfg(unix)]
         fn session(&self, p: &Payload) -> Session {
             Session::open(dir(), p).expect("a state dir and a session id were provided")
         }
 
+        #[cfg(unix)]
         fn record(&self) -> String {
             fs::read_to_string(self.dir.join("s1")).unwrap_or_default()
         }
@@ -1699,6 +1714,7 @@ mod tests {
     }
 
     /// A `Stop` that retires permission and notification waits, not direct MCP waits.
+    #[cfg(unix)]
     fn quiet_stop() -> Payload {
         payload(r#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[]}"#)
     }
@@ -1719,18 +1735,21 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     fn agent_ev(id: &str) -> Payload {
         payload(&format!(
             r#"{{"session_id":"s1","agent_id":"{id}","hook_event_name":"PostToolUse"}}"#
         ))
     }
 
+    #[cfg(unix)]
     fn notify(kind: &str) -> Payload {
         payload(&format!(
             r#"{{"session_id":"s1","hook_event_name":"Notification","notification_type":"{kind}"}}"#
         ))
     }
 
+    #[cfg(unix)]
     fn agent_stop(id: &str) -> Payload {
         payload(&format!(
             r#"{{"session_id":"s1","agent_id":"{id}","hook_event_name":"SubagentStop"}}"#
@@ -1744,6 +1763,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn direct_results_clear_only_their_server_and_request_for_every_action() {
         for action in ["accept", "decline", "cancel"] {
             let f = Fixture::new("direct-actions");
@@ -1765,6 +1785,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn direct_waits_survive_main_activity_and_unidentified_results() {
         let f = Fixture::new("direct-recovery");
         let known = elicitation("server", "A", None);
@@ -1791,6 +1812,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn completion_tombstones_handle_out_of_order_replays_without_refreshing() {
         let f = Fixture::new("direct-replay");
         let result = elicitation("server", "A", Some("accept"));
@@ -1810,6 +1832,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn only_identified_notification_duplicates_coalesce() {
         let f = Fixture::new("direct-notifications");
         let identified = payload(r#"{"session_id":"s1","hook_event_name":"Notification","notification_type":"elicitation_url_dialog","mcp_server_name":"server","elicitation_id":"A"}"#);
@@ -1852,6 +1875,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn the_captured_subagent_sequence_ends_orange_and_then_restores_the_base() {
         let f = Fixture::new("capture");
         let main = main_ev();
@@ -1890,6 +1914,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_background_subagents_tool_call_still_paints_nothing() {
         let f = Fixture::new("bg");
         let agent = agent_ev("aaa");
@@ -1901,6 +1926,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_main_thread_tool_call_does_not_repaint_over_an_agents_dialog() {
         let f = Fixture::new("overlap");
         let agent = agent_ev("aaa");
@@ -1922,6 +1948,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn two_overlapping_dialogs_both_have_to_be_answered() {
         let f = Fixture::new("two");
         let agent = agent_ev("aaa");
@@ -1944,6 +1971,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn stop_does_not_paint_idle_over_an_outstanding_agent_dialog() {
         let f = Fixture::new("stopguard");
         let agent = agent_ev("aaa");
@@ -1959,6 +1987,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn stop_does_clear_a_stale_main_wait() {
         let f = Fixture::new("stopmain");
         let main = main_ev();
@@ -1979,6 +2008,7 @@ mod tests {
     /// Esc at a subagent's dialog fires no hook at all, so without this the tab
     /// stayed orange for the whole 900s TTL - and outside tmux nothing else decays.
     #[test]
+    #[cfg(unix)]
     fn an_empty_background_tasks_at_stop_retires_an_abandoned_agent_wait() {
         let f = Fixture::new("bgempty");
         let agent = agent_ev("aaa");
@@ -1996,6 +2026,7 @@ mod tests {
     /// bounds a stale agent wait to ONE turn even when no `Stop` ever arrives - a
     /// Ctrl+C mid-tool fires nothing at all, measured on capture s5.
     #[test]
+    #[cfg(unix)]
     fn a_user_prompt_retires_every_wait_and_a_tool_call_does_not() {
         let f = Fixture::new("prompt");
         let agent = agent_ev("aaa");
@@ -2024,6 +2055,7 @@ mod tests {
     /// The defect a SHARED epoch caused: unrelated later dialogs refreshed a stale
     /// wait's clock, so it never expired and nothing painted again all session.
     #[test]
+    #[cfg(unix)]
     fn an_unrelated_dialog_does_not_refresh_a_stale_waits_clock() {
         let f = Fixture::new("epochs");
         let agent = agent_ev("aaa");
@@ -2055,6 +2087,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn an_unusable_permission_owner_is_anonymous_not_main() {
         for id in ["-".to_owned(), "?".to_owned(), "a/b".to_owned(), "a".repeat(65)] {
             let f = Fixture::new("invalid_permission_owner");
@@ -2076,6 +2109,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn an_unknown_owner_needs_more_than_unrelated_agent_progress() {
         let f = Fixture::new("unknown");
         let backstop = notify("agent_needs_input");
@@ -2108,6 +2142,7 @@ mod tests {
     /// STATELESS binary painted white. All five waiting kinds behaved that way,
     /// not the two the README named.
     #[test]
+    #[cfg(unix)]
     fn a_quiet_stop_retires_an_unknown_owner_for_every_waiting_kind() {
         for kind in [
             "permission_prompt",
@@ -2136,6 +2171,7 @@ mod tests {
     /// attributable dialog supersedes it, so one dialog is one wait and the agent
     /// that owns it can retire it.
     #[test]
+    #[cfg(unix)]
     fn an_attributable_dialog_supersedes_a_lone_unknown() {
         let f = Fixture::new("supersede");
         let backstop = notify("worker_permission_prompt");
@@ -2153,6 +2189,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_declined_dialog_is_cleared_by_the_agents_subagent_stop() {
         let f = Fixture::new("declined");
         let agent = agent_ev("aaa");
@@ -2169,6 +2206,7 @@ mod tests {
 
     /// A lone unknown wait provides no evidence linking it to a stopping agent.
     #[test]
+    #[cfg(unix)]
     fn a_subagent_stop_preserves_a_lone_unknown() {
         let f = Fixture::new("unknownstop");
         let backstop = notify("worker_permission_prompt");
@@ -2180,6 +2218,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn elicitation_notifications_survive_unrelated_completions_after_reload() {
         for kind in ["elicitation_dialog", "elicitation_url_dialog"] {
             let f = Fixture::new("elicitation-unrelated");
@@ -2206,6 +2245,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn elicitation_and_owned_permission_waits_coexist_in_both_orders() {
         for elicitation_first in [false, true] {
             let f = Fixture::new("elicitation-overlap");
@@ -2226,6 +2266,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn elicitation_and_permission_notifications_remain_independent() {
         for elicitation_first in [false, true] {
             let f = Fixture::new("elicitation-backstops");
@@ -2245,6 +2286,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn elicitation_waits_keep_main_progress_and_expiry_recovery() {
         for expire in [false, true] {
             let f = Fixture::new("elicitation-recovery");
@@ -2263,6 +2305,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn legacy_unknown_waits_are_read_and_protected_from_agents() {
         let f = Fixture::new("legacy-unknown");
         fs::create_dir_all(&f.dir).unwrap();
@@ -2279,6 +2322,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_wait_nothing_ever_cleared_expires() {
         let f = Fixture::new("ttl");
         let agent = agent_ev("aaa");
@@ -2295,6 +2339,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn session_start_resets_and_session_end_removes() {
         let f = Fixture::new("lifecycle");
         let agent = agent_ev("aaa");
@@ -2319,6 +2364,7 @@ mod tests {
     /// The origin is carried by every later write without any of them re-reading
     /// `/proc`, and its absence is not a failure - just the mtime fallback.
     #[test]
+    #[cfg(unix)]
     fn the_origin_is_written_once_and_then_carried() {
         let f = Fixture::new("origin");
         let start = payload(r#"{"session_id":"s1","hook_event_name":"SessionStart"}"#);
@@ -2348,6 +2394,7 @@ mod tests {
     /// on the 24h mtime clock for the life of the session. One such record existed
     /// on this machine, for a session that was running.
     #[test]
+    #[cfg(unix)]
     fn a_write_stamps_an_origin_the_record_is_missing() {
         let f = Fixture::new("restamp");
         fs::create_dir_all(&f.dir).expect("a writable state dir");
@@ -2358,6 +2405,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_mid_turn_compaction_session_start_resets_nothing() {
         let f = Fixture::new("compact");
         let agent = agent_ev("aaa");
@@ -2519,6 +2567,7 @@ mod tests {
     /// never reapable however old it is, and nothing the reaper cannot PROVE is
     /// ours is reapable at all.
     #[test]
+    #[cfg(target_os = "linux")]
     fn the_reaper_reaps_a_dead_session_and_provably_not_a_live_one() {
         let f = Fixture::new("reap");
         fs::create_dir_all(&f.dir).expect("a writable state dir");
@@ -2634,6 +2683,7 @@ mod tests {
 
     /// `doctor`'s report is generated from the same verdicts the reaper acts on.
     #[test]
+    #[cfg(target_os = "linux")]
     fn doctor_reports_where_the_records_are_what_they_hold_and_which_are_stale() {
         let f = Fixture::new("survey");
         fs::create_dir_all(&f.dir).expect("a writable state dir");
@@ -2711,6 +2761,7 @@ mod tests {
     /// readable directory nothing can be written to records no wait at all, so a
     /// subagent's dialog stays orange until the Task returns.
     #[test]
+    #[cfg(unix)]
     fn doctor_reports_a_state_directory_that_cannot_be_written() {
         let f = Fixture::new("nowrite");
         fs::create_dir_all(&f.dir).expect("a writable state dir");
@@ -2736,7 +2787,26 @@ mod tests {
     /// `uninstall` takes the records and nothing else, which is the same line the
     /// reaper draws: a `CCTAB_STATE_DIR` the user pointed at a shared directory must
     /// not be emptied by an uninstaller either.
+    /// Where a lock cannot be proven held, the layer is OFF - not on and failing,
+    /// which is what left an empty record behind and made every later edge decline
+    /// to paint. Off means no directory at all, before anything is created, and a
+    /// survey that says why.
     #[test]
+    fn the_layer_is_off_without_file_identity() {
+        let f = Fixture::new("identity");
+        assert_eq!(dir().is_some(), sys::HAS_FILE_ID);
+        let p = payload(r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#);
+        assert_eq!(Session::open(dir(), &p).is_some(), sys::HAS_FILE_ID);
+        if !sys::HAS_FILE_ID {
+            assert!(!f.dir.exists(), "nothing is created when the layer is off");
+            assert!(purge().is_none());
+            let why = survey().dir.expect_err("disabled");
+            assert!(why.contains("no file identity"), "{}", why);
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn purge_takes_our_records_and_leaves_everything_else() {
         let f = Fixture::new("purge");
         fs::create_dir_all(&f.dir).expect("a writable state dir");

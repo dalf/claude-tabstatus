@@ -42,11 +42,15 @@
 //! there: `fs::copy` onto a running executable is ETXTBSY, where a rename leaves
 //! every running process on its own inode.
 //!
+//! Windows will not rename over a file something is running, so there the binary's
+//! last step is `sys::replace_running`: the running file renamed aside, the new one
+//! renamed in, the old one deleted once nothing runs it. That leaves a window of two
+//! renames with no `bin\tabstatus.exe` at all, and the seam says so where it is done.
+//!
 use crate::json;
-use std::ffi::{OsStr, OsString};
+use crate::sys;
+use std::ffi::OsStr;
 use std::fs;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 /// The proof of ownership. A dotfile so it does not read as plugin content;
@@ -58,7 +62,27 @@ const MARKER_VERSION: i32 = 1;
 /// The binary `hooks/hooks.json` invokes, relative to the plugin root. A real copy
 /// of the binary that installed the tree - not a link back into `bin/` - so the tree
 /// is self-contained and a `git checkout` cannot change what a session executes.
-pub const BIN: &str = "bin/tabstatus";
+///
+/// `bin/tabstatus.exe` on Windows, where `CreateProcess` wants the suffix; the
+/// `.../bin/tabstatus` that hooks.json names still reaches it, because Git Bash
+/// resolves a missing `.exe` the way Windows programs expect.
+pub const BIN: &str =
+    if std::env::consts::EXE_SUFFIX.is_empty() { "bin/tabstatus" } else { "bin/tabstatus.exe" };
+
+/// `<tree>/bin/tabstatus` as a path to open or print. [`BIN`] is the marker's
+/// spelling, always with `/`, and joined whole onto a Windows tree it printed
+/// `...\claude-tabstatus\bin/tabstatus.exe`. Joined a component at a time the
+/// separator is the platform's own; on Unix it is the same bytes as `tree.join(BIN)`.
+pub fn bin_path(tree: &Path) -> PathBuf {
+    BIN.split('/').fold(tree.to_path_buf(), |p, c| p.join(c))
+}
+
+/// A marker-spelled relative path (always `/`) as a report line prints it: with the
+/// platform's own separator, so `bin\tabstatus.exe` on Windows sits beside the
+/// absolute paths around it. The same bytes on Unix.
+pub fn shown(rel: &str) -> String {
+    rel.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
 
 /// Every path this module writes, in the order it writes them. `bin/tabstatus`
 /// FIRST, which is the opposite of what it was and for a reason that only applies
@@ -160,8 +184,9 @@ pub fn default_tree() -> Result<PathBuf, String> {
     if let Some(d) = crate::config::var_nonempty("XDG_DATA_HOME") {
         return Ok(PathBuf::from(d).join("claude-tabstatus"));
     }
-    match crate::config::var_nonempty("HOME") {
-        Some(h) => Ok(PathBuf::from(h).join(".local/share/claude-tabstatus")),
+    // Joined a component at a time, so the separator is the platform's own.
+    match crate::config::home_var() {
+        Some(h) => Ok(PathBuf::from(h).join(".local").join("share").join("claude-tabstatus")),
         None => Err("neither XDG_DATA_HOME nor HOME is set, so there is no default \
                      place for the plugin tree. Give one: tabstatus install --tree <dir>"
             .to_string()),
@@ -181,14 +206,22 @@ pub fn default_tree() -> Result<PathBuf, String> {
 /// directory again. It looks for a `.git` beside a `.claude-plugin/plugin.json`
 /// specifically, not for any `.git` at all: plenty of people keep `$HOME` itself in
 /// git, and the default tree lives three levels under it.
+///
+/// "Under `<config>/skills`" is asked through `sys::is_within`: a component prefix on
+/// Unix, and on Windows where the directory would really land - NTFS takes
+/// `<config>\SKILLS`, a short name and a `\\?\` prefix to the same place, and the
+/// install that walked past this refusal wrote the tree AT the link path, set the env
+/// key, and only then found it could not make the link.
 pub fn refuse_target(tree: &Path, skills: &Path) -> Option<String> {
-    if tree == skills || tree.starts_with(skills) {
+    if sys::is_within(tree, skills) {
         return Some(format!(
-            "{} is under {}, which is where install puts the symlink TO the tree. \
-             A tree there would make install symlink a directory to itself. Pick \
+            "{} is under {}, which is where install puts the {} TO the tree. \
+             A tree there would make install {} a directory to itself. Pick \
              somewhere else, or pass no directory at all for the default.",
             tree.display(),
-            skills.display()
+            skills.display(),
+            sys::DIR_LINK,
+            sys::DIR_LINK
         ));
     }
     if tree.join(".git").exists() {
@@ -267,7 +300,7 @@ pub fn refuse_target(tree: &Path, skills: &Path) -> Option<String> {
                         tree.display(),
                         MARKER,
                         if safe_to_suggest_removing(tree) {
-                            format!(" If it is nothing you need, remove it - `rm -rf {}` - and re-run.", tree.display())
+                            format!(" If it is nothing you need, remove it - `{}` - and re-run.", sys::remove_dir_command(tree))
                         } else {
                             String::new()
                         }
@@ -294,7 +327,7 @@ fn safe_to_suggest_removing(tree: &Path) -> bool {
     if tree.components().filter(|c| matches!(c, Component::Normal(_))).count() < 3 {
         return false;
     }
-    if crate::config::var_nonempty("HOME").map(|h| Path::new(&h) == tree).unwrap_or(false) {
+    if crate::config::home_var().map(|h| Path::new(&h) == tree).unwrap_or(false) {
         return false;
     }
     if tree.file_name() == Some(OsStr::new("claude-tabstatus")) {
@@ -388,7 +421,7 @@ pub fn materialise(tree: &Path, exe: &Path, version: &str, target: &str) -> Resu
             }
             Some(b) => format!("REPLACED, was {} bytes", b.len()),
         };
-        out.push(format!("wrote:    {} ({} bytes, {})", rel, text.len(), what));
+        out.push(format!("wrote:    {} ({} bytes, {})", shown(rel), text.len(), what));
     }
 
     // Prune what an OLDER version generated and this one no longer does, so an
@@ -404,12 +437,12 @@ pub fn materialise(tree: &Path, exe: &Path, version: &str, target: &str) -> Resu
             let p = match in_tree(tree, f, false) {
                 Ok(p) => p,
                 Err(why) => {
-                    out.push(format!("pruned:   {} NOT taken - {}", name, why));
+                    out.push(format!("pruned:   {} NOT taken - {}", shown(&name), why));
                     continue;
                 }
             };
             if p.is_file() && fs::remove_file(&p).is_ok() {
-                out.push(format!("pruned:   {} (generated by an older version)", name));
+                out.push(format!("pruned:   {} (generated by an older version)", shown(&name)));
                 // And the directory it was the last thing in. Without this an older
                 // version's `old/legacy.json` leaves an empty `old/` behind that no
                 // later marker lists, so `remove` never prunes it and `uninstall`
@@ -442,14 +475,14 @@ fn write_binary(tree: &Path, exe: &Path, version: &str) -> Result<Vec<String>, S
     let same_file = fs::canonicalize(&dst).ok() == fs::canonicalize(exe).ok() && dst.exists();
     if same_file {
         return Ok(vec![
-            format!("wrote:    {} (unchanged - it IS the running binary)", BIN),
+            format!("wrote:    {} (unchanged - it IS the running binary)", shown(BIN)),
             format!("verify:   {}", verify(&dst, version)?),
         ]);
     }
     if let (Ok(a), Ok(b)) = (fs::read(exe), fs::read(&dst)) {
         if a == b {
             return Ok(vec![
-                format!("wrote:    {} ({} bytes, unchanged - identical bytes)", BIN, b.len()),
+                format!("wrote:    {} ({} bytes, unchanged - identical bytes)", shown(BIN), b.len()),
                 format!("verify:   {}", verify(&dst, version)?),
             ]);
         }
@@ -459,7 +492,7 @@ fn write_binary(tree: &Path, exe: &Path, version: &str) -> Result<Vec<String>, S
     let _ = fs::remove_file(&tmp);
     let n = fs::copy(exe, &tmp)
         .map_err(|e| format!("cannot copy {} to {}: {}", exe.display(), tmp.display(), e))?;
-    if let Err(e) = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)) {
+    if let Err(e) = sys::set_mode(&tmp, 0o755) {
         let _ = fs::remove_file(&tmp);
         return Err(format!("cannot chmod {}: {}", tmp.display(), e));
     }
@@ -475,21 +508,34 @@ fn write_binary(tree: &Path, exe: &Path, version: &str) -> Result<Vec<String>, S
     // rename(2), not remove-then-copy: the old path resolves to the whole old binary
     // until this instant and to the whole new one afterwards, so no hook event can
     // ever exec a file that is not there. Every process already running the old
-    // inode keeps it, which is also why this is not ETXTBSY.
-    fs::rename(&tmp, &dst).map_err(|e| {
+    // inode keeps it, which is also why this is not ETXTBSY. Windows refuses to
+    // replace a file something is running, so there the seam renames the running one
+    // aside first - see `sys::replace_running` for that sequence and its window.
+    let aside = sys::replace_running(&tmp, &dst).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!("cannot move {} into place at {}: {}", tmp.display(), dst.display(), e)
     })?;
-    Ok(vec![
+    let mut out = vec![
         format!(
             "wrote:    {} ({} bytes, {} from {})",
-            BIN,
+            shown(BIN),
             n,
             if existed { "REPLACED, copied" } else { "copied" },
             exe.display()
         ),
         format!("verify:   {}", said),
-    ])
+    ];
+    // Something this install leaves on the disk, so it is named: the old binary was
+    // running, and could only be renamed out of the way.
+    if let Some(a) = aside {
+        out.push(format!(
+            "aside:    the old {} was running, so it was renamed to {}",
+            shown(BIN),
+            a.display()
+        ));
+        out.push("          a later install or uninstall removes it once nothing runs it".to_string());
+    }
+    Ok(out)
 }
 
 /// Every directory between `p` and `tree` that `p` was the last entry of, deepest
@@ -517,23 +563,33 @@ fn prune_empty_parents(tree: &Path, p: &Path) {
 /// `manage::scratch_pid` recognises, so a killed run's litter is swept.
 pub fn scratch_beside(p: &Path) -> PathBuf {
     let dir = p.parent().unwrap_or(Path::new("."));
-    let name = p.file_name().map(|n| n.as_bytes().to_vec()).unwrap_or_default();
+    let name = p.file_name().map(|n| n.as_encoded_bytes().to_vec()).unwrap_or_default();
     let mut tmp = b".".to_vec();
     tmp.extend_from_slice(&name);
     tmp.extend_from_slice(format!(".cctab-tmp.{}", std::process::id()).as_bytes());
-    dir.join(OsString::from_vec(tmp))
+    dir.join(sys::os_string_from_vec(tmp))
 }
 
 /// A marker path we are willing to unlink: relative, no `..`, no leading `/`. The
 /// marker is ours, but it is still a file on disk that something could have
 /// edited, and prune is the one place here that REMOVES anything.
 ///
+/// Each Normal component must also parse as exactly itself when it stands alone,
+/// because that is how [`in_tree`] uses it: `PathBuf::push` one component at a
+/// time. Windows reads a drive prefix only at the START of a path, so
+/// `hooks/C:evil` splits into two Normal components - and pushing `C:evil` then
+/// REPLACES the buffer with a path on drive C:, outside the tree. On Unix a Normal
+/// component always parses as itself, so this refuses nothing there.
+///
 /// TEXT only, and that is why it is not enough on its own - see [`in_tree`].
 fn safe_relative(p: &[u8]) -> bool {
-    let s = Path::new(OsStr::from_bytes(p));
+    let s = sys::os_str_from_bytes(p);
     !p.is_empty()
         && !p.starts_with(b"/")
-        && s.components().all(|c| matches!(c, Component::Normal(_)))
+        && Path::new(&*s).components().all(|c| match c {
+            Component::Normal(n) => Path::new(n).components().eq([c]),
+            _ => false,
+        })
 }
 
 /// A marker-listed relative path resolved to a place we are CERTAIN is inside
@@ -577,7 +633,7 @@ fn in_tree(tree: &Path, rel: &[u8], create: bool) -> Result<PathBuf, String> {
             tree.display()
         ));
     }
-    let relp = PathBuf::from(OsString::from_vec(rel.to_vec()));
+    let relp = PathBuf::from(sys::os_string_from_vec(rel.to_vec()));
     let last = relp.components().count().saturating_sub(1);
     let mut at = tree.to_path_buf();
     for (i, comp) in relp.components().enumerate() {
@@ -634,15 +690,30 @@ pub fn extra_files(tree: &Path, known: &[Vec<u8>]) -> Vec<String> {
                 stack.push(child);
                 continue;
             }
-            let bytes = child.as_os_str().as_bytes().to_vec();
+            let bytes = slash_joined(&child);
             // The marker is ours whether or not it lists itself.
             if bytes == MARKER.as_bytes() || known.contains(&bytes) {
                 continue;
             }
-            out.push(child.to_string_lossy().into_owned());
+            out.push(String::from_utf8_lossy(&bytes).into_owned());
         }
     }
     out.sort();
+    out
+}
+
+/// A tree-relative path in the marker's spelling: components joined by `/`, which
+/// is what `Path::join` already produces on Unix. On Windows `join` uses `\`, and
+/// comparing that against the marker's `bin/tabstatus.exe` would name every file we
+/// generated as somebody else's.
+fn slash_joined(rel: &Path) -> Vec<u8> {
+    let mut out = Vec::new();
+    for c in rel.components() {
+        if !out.is_empty() {
+            out.push(b'/');
+        }
+        out.extend_from_slice(c.as_os_str().as_encoded_bytes());
+    }
     out
 }
 
@@ -696,11 +767,21 @@ pub struct Removal {
     /// be inside the tree - a symlinked component, or a marker somebody edited.
     /// Named by the report rather than swallowed: they are still on disk.
     pub blocked: Vec<String>,
+    /// Marker-listed files that are inside the tree and still there because removing
+    /// them FAILED, each with the error - on Windows, the binary a hook is running
+    /// right now. While any is left the marker stays too.
+    pub failed: Vec<String>,
     pub dir_gone: bool,
 }
 
 /// Remove a tree we generated, CONSERVATIVELY: only the files the marker lists, then
 /// the marker, then any directory those left empty.
+///
+/// The marker goes only when every file it lists did. A tree that still holds one of
+/// ours but no marker is the shape `refuse_target` refuses forever - somebody else's
+/// non-empty directory - so a single file that could not be removed (a hook running
+/// the binary, on Windows) would turn into an install that needs `rm -rf` to proceed.
+/// Kept, the marker leaves it a tree `install` reuses and a later removal finishes.
 ///
 /// `remove_dir_all` on a path this program derived from a symlink is the one thing an
 /// uninstaller of a personal tool has no business doing, and now that the generated
@@ -719,6 +800,7 @@ pub fn remove(tree: &Path) -> Result<Removal, String> {
     let left = extra_files(tree, &known);
     let mut removed = 0usize;
     let mut blocked: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
     let mut dirs: Vec<PathBuf> = Vec::new();
     for f in &known {
         // The ONE way a path to unlink is built here. A textual check is not enough:
@@ -731,8 +813,11 @@ pub fn remove(tree: &Path) -> Result<Removal, String> {
                 continue;
             }
         };
-        if fs::symlink_metadata(&p).is_ok() && fs::remove_file(&p).is_ok() {
-            removed += 1;
+        if fs::symlink_metadata(&p).is_ok() {
+            match fs::remove_file(&p) {
+                Ok(()) => removed += 1,
+                Err(e) => failed.push(format!("{} ({})", shown(&String::from_utf8_lossy(f)), e)),
+            }
         }
         if let Some(d) = p.parent() {
             if d != tree && d.starts_with(tree) && !dirs.contains(&d.to_path_buf()) {
@@ -740,7 +825,9 @@ pub fn remove(tree: &Path) -> Result<Removal, String> {
             }
         }
     }
-    let _ = fs::remove_file(marker_path(tree));
+    if failed.is_empty() {
+        let _ = fs::remove_file(marker_path(tree));
+    }
     // Deepest first, and `remove_dir` not `remove_dir_all`, so a directory holding
     // anything we did not write survives with its contents.
     dirs.sort_by_key(|d| std::cmp::Reverse(d.components().count()));
@@ -748,7 +835,7 @@ pub fn remove(tree: &Path) -> Result<Removal, String> {
         let _ = fs::remove_dir(d);
     }
     let dir_gone = fs::remove_dir(tree).is_ok();
-    Ok(Removal { removed, left, blocked, dir_gone })
+    Ok(Removal { removed, left, blocked, failed, dir_gone })
 }
 
 #[cfg(test)]
@@ -768,8 +855,10 @@ mod tests {
     /// one copy and one exec with no other thread in it. Serialising the tests is
     /// therefore the honest fix - the alternative is a retry loop in the product for a
     /// race the product does not have.
+    #[cfg(unix)]
     static FORKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[cfg(unix)]
     fn forking() -> std::sync::MutexGuard<'static, ()> {
         FORKING.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -791,7 +880,7 @@ mod tests {
         assert_eq!(m.target, b"x86_64-unknown-linux-musl");
         // Sorted, so the file is stable across runs.
         let files: Vec<String> = m.files.iter().map(|f| String::from_utf8_lossy(f).into()).collect();
-        assert_eq!(files, vec![".claude-plugin/plugin.json", "bin/tabstatus", "hooks/hooks.json"]);
+        assert_eq!(files, vec![".claude-plugin/plugin.json", BIN, "hooks/hooks.json"]);
         // The WRITE order is the opposite of the marker's sorted list, and it is
         // load-bearing: the binary lands first, so the only in-between state a live
         // hook can see is a new binary with old manifests - never an old binary
@@ -831,7 +920,7 @@ mod tests {
         // Under skills, and the link itself.
         for p in [skills.join("claude-tabstatus"), skills.clone(), skills.join("a/b")] {
             let why = refuse_target(&p, &skills).expect("refused");
-            assert!(why.contains("symlink a directory to itself"), "{}", why);
+            assert!(why.contains(&format!("{} a directory to itself", sys::DIR_LINK)), "{}", why);
         }
         // A checkout, even with a marker dropped in it: tracked files are not ours.
         let co = d.join("checkout");
@@ -901,6 +990,7 @@ mod tests {
     /// half-written tree is refused forever by `refuse_target` and only `rm -rf`
     /// recovers it.
     #[test]
+    #[cfg(unix)]
     fn a_tree_a_killed_run_left_behind_is_still_ours_to_finish() {
         let _serial = forking();
         let d = scratch("partial");
@@ -908,7 +998,7 @@ mod tests {
         let exe = d.join("fake-exe");
         fs::create_dir_all(&d).expect("mkdir");
         fs::write(&exe, fake_exe("0.1.0")).expect("write");
-        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).expect("chmod");
+        sys::set_mode(&exe, 0o755).expect("chmod");
         let skills = d.join("cfg/skills");
 
         // The state a SIGKILL between the marker and the last write leaves.
@@ -940,6 +1030,7 @@ mod tests {
     /// What `uninstall` names as left behind. prune never touches these, so
     /// nothing else in the program would ever mention them.
     #[test]
+    #[cfg(unix)]
     fn extra_files_names_what_the_marker_does_not_list() {
         let _serial = forking();
         let d = scratch("extra");
@@ -947,7 +1038,7 @@ mod tests {
         let exe = d.join("fake-exe");
         fs::create_dir_all(&d).expect("mkdir");
         fs::write(&exe, fake_exe("0.1.0")).expect("write");
-        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).expect("chmod");
+        sys::set_mode(&exe, 0o755).expect("chmod");
         materialise(&tree, &exe, "0.1.0", "t").expect("materialised");
         let known: Vec<Vec<u8>> = read_marker(&tree).expect("present").expect("parses").files;
 
@@ -962,7 +1053,7 @@ mod tests {
         // An empty marker list makes everything extra, which is what a tree with an
         // unparseable marker gets - and it still must not name the marker itself.
         let all = extra_files(&tree, &[]);
-        assert!(all.contains(&"bin/tabstatus".to_string()), "{:?}", all);
+        assert!(all.contains(&BIN.to_string()), "{:?}", all);
         assert!(!all.iter().any(|f| f == MARKER), "{:?}", all);
 
         let _ = fs::remove_dir_all(&d);
@@ -973,6 +1064,7 @@ mod tests {
     /// lives. `remove_dir_all` on a path derived from a symlink is exactly what this
     /// does not do.
     #[test]
+    #[cfg(unix)]
     fn remove_takes_only_what_the_marker_lists_and_names_the_rest() {
         let _serial = forking();
         let d = scratch("remove");
@@ -980,7 +1072,7 @@ mod tests {
         let exe = d.join("fake-exe");
         fs::create_dir_all(&d).expect("mkdir");
         fs::write(&exe, fake_exe("0.1.0")).expect("write");
-        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).expect("chmod");
+        sys::set_mode(&exe, 0o755).expect("chmod");
         materialise(&tree, &exe, "0.1.0", "t").expect("materialised");
 
         // A tree holding nothing but what we generated goes completely.
@@ -1015,7 +1107,7 @@ mod tests {
         fs::write(marker_path(&tree), b"not json").expect("write");
         let r = remove(&tree).expect("removed");
         assert_eq!(r.removed, 0);
-        assert!(r.left.contains(&"bin/tabstatus".to_string()), "{:?}", r.left);
+        assert!(r.left.contains(&BIN.to_string()), "{:?}", r.left);
         assert!(tree.join(BIN).is_file());
 
         let _ = fs::remove_dir_all(&d);
@@ -1031,6 +1123,23 @@ mod tests {
         assert!(!safe_relative(b"bin/../../outside"));
     }
 
+    /// Whatever a marker spells, a path `in_tree` hands back is under the tree. On
+    /// Windows the drive-relative spellings are the escape - pushing `C:evil`
+    /// replaces the buffer - and `safe_relative` refuses them; on Unix they are
+    /// ordinary file names inside the tree. The invariant is the same on both.
+    #[test]
+    fn a_marker_path_never_resolves_outside_the_tree() {
+        let d = scratch("escape");
+        let tree = d.join("tree");
+        fs::create_dir_all(tree.join("hooks")).expect("mkdir");
+        for rel in [&b"hooks/C:evil"[..], b"C:evil", b"hooks/C:/Windows/x", b"a/C:\\x", b"hooks/x"] {
+            if let Ok(at) = in_tree(&tree, rel, false) {
+                assert!(at.starts_with(&tree), "{:?} resolved to {}", rel, at.display());
+            }
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
     /// The exec probe, both ways, and the fact that `materialise` will not rename a
     /// copy that fails it into place. This is the check that turns a wrong
     /// architecture, a noexec mount and a lost exec bit into ONE named refusal
@@ -1038,6 +1147,7 @@ mod tests {
     /// what is verified is a 0755 temp copy, a shell script stands in for the binary
     /// and the probe can be driven without a second architecture to hand.
     #[test]
+    #[cfg(unix)]
     fn verify_runs_the_copy_and_refuses_one_that_answers_wrong() {
         let _serial = forking();
         let d = scratch("verify");
@@ -1045,7 +1155,7 @@ mod tests {
 
         let good = d.join("good");
         fs::write(&good, fake_exe("9.9.9")).expect("write");
-        fs::set_permissions(&good, fs::Permissions::from_mode(0o755)).expect("chmod");
+        sys::set_mode(&good, 0o755).expect("chmod");
         let lines = materialise(&d.join("ok"), &good, "9.9.9", "t").expect("materialised");
         assert!(
             lines.iter().any(|l| l == "verify:   tabstatus 9.9.9 (some-triple)"),
@@ -1066,7 +1176,7 @@ mod tests {
         // temp copy is that this tree never gains a bin/tabstatus at all.
         let bad = d.join("bad");
         fs::write(&bad, "#!/bin/sh\nprintf 'not me\\n'\n").expect("write");
-        fs::set_permissions(&bad, fs::Permissions::from_mode(0o755)).expect("chmod");
+        sys::set_mode(&bad, 0o755).expect("chmod");
         let e = materialise(&d.join("no"), &bad, "9.9.9", "t").expect_err("refused");
         assert!(e.contains("not me"), "{}", e);
         assert!(!d.join("no").join(BIN).exists(), "the failed copy must not be renamed into place");
@@ -1090,6 +1200,7 @@ mod tests {
     /// A stand-in for the binary: `materialise` execs `<copy> version` before it
     /// renames the copy into place, so every fixture that plays the binary has to
     /// answer the way the real one does.
+    #[cfg(unix)]
     fn fake_exe(version: &str) -> String {
         format!("#!/bin/sh\nprintf 'tabstatus {} (some-triple)\\n'\n", version)
     }
@@ -1097,6 +1208,7 @@ mod tests {
     /// The whole materialise/refresh cycle, including the two things a stale tree
     /// depends on: an old file is pruned, and a changed file is reported REPLACED.
     #[test]
+    #[cfg(unix)]
     fn materialise_writes_refreshes_prunes_and_reports_what_it_replaced() {
         let _serial = forking();
         let d = scratch("mat");
@@ -1106,14 +1218,14 @@ mod tests {
         let exe = d.join("fake-exe");
         fs::create_dir_all(&d).expect("mkdir");
         fs::write(&exe, fake_exe("0.1.0")).expect("write");
-        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).expect("chmod");
+        sys::set_mode(&exe, 0o755).expect("chmod");
 
         let lines = materialise(&tree, &exe, "0.1.0", "t").expect("materialised");
         assert!(lines.iter().any(|l| l.contains("created")), "{:?}", lines);
         for (rel, text) in crate::embedded::MANIFESTS {
             assert_eq!(fs::read(tree.join(rel)).expect("written"), text.as_bytes());
         }
-        assert_eq!(fs::metadata(tree.join(BIN)).expect("copied").permissions().mode() & 0o777, 0o755);
+        assert_eq!(sys::mode(&fs::metadata(tree.join(BIN)).expect("copied")).map(|m| m & 0o777), Some(0o755));
 
         // A file an "older version" generated, recorded in the marker.
         fs::write(tree.join("hooks/extra.json"), b"{}").expect("write");
@@ -1146,6 +1258,7 @@ mod tests {
     /// whether `<tree>/bin` is a real directory decides whether that string names a
     /// file inside the tree or one in somebody else's.
     #[test]
+    #[cfg(unix)]
     fn a_symlinked_component_is_not_inside_the_tree() {
         let d = scratch("intree");
         let tree = d.join("tree");
@@ -1190,6 +1303,7 @@ mod tests {
     /// outside: the victim's file survives and the marker-listed path is reported as
     /// left behind rather than counted as removed.
     #[test]
+    #[cfg(unix)]
     fn remove_never_reaches_outside_the_tree() {
         let d = scratch("rmout");
         let tree = d.join("tree");
@@ -1214,6 +1328,63 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    /// A generated file that will not go - on Windows, the binary a hook is running,
+    /// played here by a handle that shares nothing - is NAMED, and the marker stays, so
+    /// the tree is still one `install` reuses rather than a stranger's directory it
+    /// refuses. Once the file is free, removal finishes the job.
+    #[test]
+    #[cfg(windows)]
+    fn a_file_that_will_not_go_keeps_the_marker_and_is_named() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = scratch("held");
+        let tree = d.join("tree");
+        let skills = d.join("cfg").join("skills");
+        for rel in generated_paths() {
+            let p = bin_path_like(&tree, rel);
+            fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            fs::write(&p, b"x").expect("write");
+        }
+        fs::write(marker_path(&tree), marker_text("0.1.0", "t", &generated_paths())).expect("write");
+        let held = fs::OpenOptions::new().read(true).share_mode(0).open(bin_path(&tree)).expect("open");
+
+        let r = remove(&tree).expect("removed");
+        assert_eq!(r.removed, 2);
+        assert_eq!(r.failed.len(), 1, "{:?}", r.failed);
+        assert!(r.failed[0].starts_with(&shown(BIN)), "{:?}", r.failed);
+        assert!(!r.dir_gone);
+        assert!(is_generated(&tree), "the marker stays while a file it lists does");
+        assert!(refuse_target(&tree, &skills).is_none(), "so install still reuses it");
+
+        drop(held);
+        let r = remove(&tree).expect("removed");
+        assert!(r.failed.is_empty(), "{:?}", r.failed);
+        assert!(r.dir_gone);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    fn bin_path_like(tree: &Path, rel: &str) -> PathBuf {
+        rel.split('/').fold(tree.to_path_buf(), |p, c| p.join(c))
+    }
+
+    /// Every spelling NTFS takes to `<config>\skills` is refused as under it - the one
+    /// that walked past this check wrote the tree AT the link path.
+    #[test]
+    #[cfg(windows)]
+    fn a_tree_under_skills_is_refused_in_any_spelling() {
+        let d = scratch("skills-case");
+        let skills = d.join("cfg").join("skills");
+        fs::create_dir_all(&skills).expect("mkdir");
+        let upper = PathBuf::from(skills.to_string_lossy().to_uppercase());
+        let mut verbatim = std::ffi::OsString::from(r"\\?\");
+        verbatim.push(skills.join("foo"));
+        for p in [upper.join("claude-tabstatus"), upper.join("foo"), PathBuf::from(&verbatim)] {
+            let why = refuse_target(&p, &skills).expect("refused");
+            assert!(why.contains("a directory to itself"), "{}", why);
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
     /// The `rm -rf` in a refusal is the one line here a hurried operator copies.
     #[test]
     fn rm_rf_is_only_ever_offered_for_something_that_looks_like_ours() {
@@ -1229,6 +1400,7 @@ mod tests {
     /// An emptied directory is invisible to everything downstream - no later marker
     /// lists it, so `remove` never takes it and the tree cannot come down.
     #[test]
+    #[cfg(unix)]
     fn pruning_takes_the_directory_it_emptied() {
         let _serial = forking();
         let d = scratch("prunedir");
@@ -1236,7 +1408,7 @@ mod tests {
         let exe = d.join("fake-exe");
         fs::create_dir_all(&d).expect("mkdir");
         fs::write(&exe, fake_exe("0.1.0")).expect("write");
-        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).expect("chmod");
+        sys::set_mode(&exe, 0o755).expect("chmod");
         materialise(&tree, &exe, "0.1.0", "t").expect("materialised");
 
         fs::create_dir_all(tree.join("old/deeper")).expect("mkdir");
