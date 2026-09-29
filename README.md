@@ -1465,7 +1465,8 @@ active pane, `all` also passes background windows, every inner ESC has to be
 doubled - but turning it on lets any program in any pane write arbitrary bytes to
 your terminal, which is not a decision a tab-title plugin should be taking for
 you. `CCTAB_TERMINAL` also works outside tmux, which is the same fix for a plain
-ssh out of a Konsole tab.
+ssh out of a Konsole tab, and `doctor` names that remedy there too, not only
+inside a multiplexer.
 
 **A reattach is re-armed.** The arming goes to the ptys `list-clients` names, so
 an arming sent while *detached* reaches nobody, and on reattach tmux replays the
@@ -1623,9 +1624,28 @@ invocation, no arming.
   multiplexer case out; the launched-from-Konsole case would still misfire, and
   in xterm OSC 50 sets the font rather than being ignored.
 
+  **`SSH_*` takes out the other case.** A `KONSOLE_*` that crossed a hop
+  describes the terminal it came *from*, so it is not evidence about this tab.
+  Normally it does not cross at all — OpenSSH accepts no environment at either
+  end by default, which is why over ssh you are setting `CCTAB_TERMINAL`
+  already. When it does arrive, from a deliberate `SendEnv`/`AcceptEnv` pair or
+  from a remote rc, nothing here can tell those apart: one describes this hop,
+  the other describes nothing. So it is declined, and `doctor` says which side
+  of the hop the variable is talking about.
+
+  That is deliberately stricter than the convention. iTerm2 forwards
+  `LC_TERMINAL` by default and Ghostty's `+ssh` adds `SendEnv=TERM_PROGRAM`, so
+  pushing an identity variable across is normal practice — but what those
+  variables gate is inert if misread (OSC 133, OSC 7, OSC 1337). Outside tmux
+  this verdict writes OSC 50 straight to the pty, and OSC 50 is xterm's *set
+  font*; Konsole's own header notes the clash. A sequence that does something
+  else when wrong does not get to rest on inherited environment.
+
   `CCTAB_TERMINAL=konsole` is the explicit answer, and `CCTAB_TERMINAL=<anything
   else>` is how a leaked `KONSOLE_*` is turned off. It is also the only way to
-  know, over ssh or inside tmux, that the tab at the far end is Konsole's.
+  know, over a plain ssh, that the tab at the far end is Konsole's — and it
+  outranks the ssh rule, which removes an accidental path to Konsole, never the
+  deliberate one.
 - **`session-start`, `session-end`, and all tmux paints are Linux-only.** They resolve the pty
   through `/proc/$CLAUDE_PID/fd/1`, which macOS and Git Bash do not have, so on
   those platforms Konsole arming does not happen (fine, they are not Konsole)

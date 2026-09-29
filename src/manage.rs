@@ -2387,9 +2387,15 @@ fn report_runtime() {
         ""
     };
     let konsole = Terminal::detect() == Terminal::Konsole;
-    // The REASON matters more than the answer, because there are now three of
-    // them and they disagree: an explicit CCTAB_TERMINAL, inherited KONSOLE_*,
-    // and a multiplexer that makes the inherited kind meaningless.
+    // The SAME predicate `Terminal::detect` suppresses on and the host prefix is
+    // painted from, not a third reading of SSH_CONNECTION and SSH_TTY here: a
+    // report that called the verdict unknowable-over-ssh while the title: line
+    // below painted no host prefix would contradict itself on one page.
+    let ssh = config::over_ssh();
+    // The REASON matters more than the answer, because there are now four of them
+    // and they disagree: an explicit CCTAB_TERMINAL, inherited KONSOLE_*, a
+    // multiplexer that makes the inherited kind meaningless, and an ssh hop that
+    // makes it describe somebody else's terminal.
     let override_ = config::var_nonempty("CCTAB_TERMINAL");
     say(&format!(
         "terminal:  {}",
@@ -2407,27 +2413,65 @@ fn report_runtime() {
                 "inside a multiplexer, so the inherited KONSOLE_* is ignored - set \
                  CCTAB_TERMINAL=konsole if the outer terminal really is Konsole"
                     .to_owned(),
-            (None, false, true, true) => "KONSOLE_* set".to_owned(),
+            // Reachable ONLY over ssh, and provably so rather than by inspection:
+            // with no override, `detect` returns Konsole exactly when there is no
+            // multiplexer, no ssh and a KONSOLE_* - and this arm already has the
+            // first and third, so the hop is the only suppressor left. It was dead
+            // code until ssh became one.
+            (None, false, true, true) =>
+                "not Konsole: KONSOLE_* is set, but it crossed an ssh hop, so it \
+                 describes the terminal it came FROM, not this tab"
+                    .to_owned(),
             (None, false, false, _) =>
                 "not Konsole (no CCTAB_TERMINAL, no KONSOLE_VERSION, no \
                  KONSOLE_DBUS_SESSION)"
                     .to_owned(),
         }
     ));
-    if !mux.is_empty() {
+    // KONSOLE_* is inherited environment, and two topologies leave the verdict
+    // above resting on nothing: inside a multiplexer it describes whichever
+    // terminal started the SERVER, and over ssh it describes the terminal at the
+    // OTHER end of the hop - when it arrives at all, which by default it does
+    // not, since OpenSSH accepts no environment at either end. Either way the
+    // answer there comes from CCTAB_TERMINAL or not at all. LOCALLY and outside a
+    // multiplexer an absent KONSOLE_* IS the evidence, so that case says nothing:
+    // a Konsole hint in every xterm, Alacritty and GNOME Terminal tab is the
+    // noise that teaches people to skim the report.
+    //
+    // Both end at the same remedy, so only the line naming the situation differs.
+    // An explicit CCTAB_TERMINAL has already answered the question - offering it
+    // one line under a verdict that quotes the value back is arguing with what
+    // was typed - and a Konsole that WAS detected needs nothing.
+    let unknowable = !konsole && override_.is_none();
+    let remedy = if !mux.is_empty() {
         say(&format!(
             "           multiplexer: {}, so KONSOLE_* says nothing about the outer \
              terminal",
             mux
         ));
-        if !konsole {
+        unknowable
+    } else if unknowable && ssh {
+        // An ABSENT KONSOLE_* needs this line, because the verdict above can only
+        // list what is missing and that reads like a conclusion. A PRESENT one
+        // already got its explanation in the verdict itself, and saying it twice
+        // reads as two separate problems.
+        if !konsole_vars {
             say(
-                "           If the outer terminal IS Konsole, set \
-                 CCTAB_TERMINAL=konsole: it moves the strip to the end",
+                "           ssh: KONSOLE_* does not survive the hop, so its absence \
+                 here is no evidence",
             );
-            say("           Konsole does not elide, and arms the tab so the title \
-                 shows there at all.");
         }
+        true
+    } else {
+        false
+    };
+    if remedy {
+        say(
+            "           If the outer terminal IS Konsole, set \
+             CCTAB_TERMINAL=konsole: it moves the strip to the end",
+        );
+        say("           Konsole does not elide, and arms the tab so the title \
+             shows there at all.");
     }
     let pos = config::var_nonempty("CCTAB_GLYPH_POS");
     let implied: &str = if pos.is_some() {

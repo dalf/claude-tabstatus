@@ -40,8 +40,20 @@ trap 'cleanup; exit 130' HUP INT TERM
 # Left unpinned, this suite would render differently depending on where it is
 # run - a Konsole tab elides from the left, so the glyph goes last there, and
 # every assertion below would flip. Neutralise the detection here; the
-# glyph-position section sets these explicitly, per case.
-unset KONSOLE_VERSION KONSOLE_DBUS_SESSION TMUX STY CCTAB_GLYPH_POS
+# glyph-position section sets these explicitly, per case. CCTAB_TERMINAL is here
+# because it OUTRANKS the other two: an ambient one flips the glyph end whatever
+# KONSOLE_* a case pins, and now also silences doctor's Konsole remedy, which an
+# override has already answered. Every case that wants one sets it itself.
+#
+# SSH_* is here for the same reason and it is the loudest of them: it decides the
+# HOST PREFIX, so an ambient one prepends `fedora:` to every title in this file.
+# Measured before it was listed, `SSH_CONNECTION=... sh tests/run.sh` failed 233
+# of 762 checks. That much was true before terminal detection ever consulted ssh;
+# what changed is the KIND of damage, because an ambient SSH_* now also suppresses
+# the Konsole verdict the glyph-position cases pin KONSOLE_* to get. Cases that
+# want a hop set SSH_TTY or SSH_CONNECTION themselves.
+unset KONSOLE_VERSION KONSOLE_DBUS_SESSION TMUX STY CCTAB_GLYPH_POS CCTAB_TERMINAL \
+      SSH_CONNECTION SSH_TTY SSH_CLIENT
 # And XDG_DATA_HOME, which is NEW here and the one that now decides where a real
 # plugin tree lands: `install` materialises one, so an install section with only HOME
 # and CLAUDE_CONFIG_DIR redirected would write 680 KB into the RUNNER'S OWN
@@ -2211,6 +2223,88 @@ check 'doctor names the remedy on the multiplexer line' '1' \
     "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
           TMUX=nonsense "$bin" doctor 2>&1 \
        | grep -c 'If the outer terminal IS Konsole, set CCTAB_TERMINAL=konsole')"
+
+# KONSOLE_* is stripped by the hop - no stock ssh config forwards it - so over
+# ssh its absence is not the evidence it is locally, and the remedy is the same
+# one a multiplexer gets. The report used to withhold it everywhere else, which
+# leaves a user over plain ssh with a blank tab and nothing to do about it.
+check 'doctor names the remedy over ssh without a multiplexer' '1' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          SSH_TTY=/dev/pts/9 "$bin" doctor 2>&1 \
+       | grep -c 'If the outer terminal IS Konsole, set CCTAB_TERMINAL=konsole')"
+check 'doctor says why the absence is no evidence there' '1' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          SSH_CONNECTION='10.0.0.1 22 10.0.0.2 22' "$bin" doctor 2>&1 \
+       | grep -c 'does not survive the hop, so its absence here is no evidence')"
+# Locally an absent KONSOLE_* IS the evidence, so nothing is said: in xterm,
+# Alacritty or GNOME Terminal the hint would be noise on every run. SSH_* is
+# emptied here as well as at the top of the file, because THIS case is the one
+# that silently inverts if the neutralising is ever dropped - it would report a
+# hop that is not there and the check would still read 0 for the wrong reason.
+check 'doctor is silent about Konsole in a plain local tab' '0' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          SSH_TTY= SSH_CONNECTION= "$bin" doctor 2>&1 \
+       | grep -c 'CCTAB_TERMINAL=konsole')"
+# An explicit CCTAB_TERMINAL has already answered the question, whatever the
+# value: advising konsole one line under "CCTAB_TERMINAL=wezterm says so
+# explicitly" is the report arguing with what was typed.
+check 'an explicit CCTAB_TERMINAL has already answered, over ssh' '0' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          SSH_TTY=/dev/pts/9 CCTAB_TERMINAL=wezterm "$bin" doctor 2>&1 \
+       | grep -c 'If the outer terminal IS Konsole')"
+check 'and inside a multiplexer too' '0' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          TMUX=nonsense CCTAB_TERMINAL=wezterm "$bin" doctor 2>&1 \
+       | grep -c 'If the outer terminal IS Konsole')"
+# The multiplexer is the nearer obstruction, and it is also what decides where
+# the arming has to be written, so it explains the situation alone: two reasons
+# for one blank tab reads as two problems.
+check 'inside a multiplexer the ssh line gives way' '0' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          TMUX=nonsense SSH_TTY=/dev/pts/9 "$bin" doctor 2>&1 \
+       | grep -c 'does not survive the hop')"
+check 'and the multiplexer line is still the one that prints' '1' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          TMUX=nonsense SSH_TTY=/dev/pts/9 "$bin" doctor 2>&1 \
+       | grep -c 'multiplexer: tmux, so KONSOLE')"
+# A KONSOLE_* that DID cross the hop - a deliberate SendEnv/AcceptEnv pair, or a
+# remote rc - is NOT evidence, and this is the case the rule exists for. Nothing
+# here can tell those two apart: the first describes this hop, the second
+# describes nothing. And outside a multiplexer the verdict is what writes OSC 50
+# straight to the pty, which in xterm is SET FONT - so the one topology still
+# deciding on inheritance would also be the one where being wrong lands. The
+# remedy prints instead, and CCTAB_TERMINAL is how anyone who meant it says so.
+check 'a KONSOLE_* that crossed the hop is not evidence' '0' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          SSH_TTY=/dev/pts/9 KONSOLE_VERSION=260801 "$bin" doctor 2>&1 \
+       | grep -c '^terminal: *Konsole')"
+check 'and doctor says which side of the hop it describes' '1' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          SSH_TTY=/dev/pts/9 KONSOLE_VERSION=260801 "$bin" doctor 2>&1 \
+       | grep -c 'crossed an ssh hop, so it describes the terminal it came FROM')"
+# ...and the remedy still reaches that case, which is the whole point of the rule:
+# declining without naming the one line that fixes it is what #17 was about.
+check 'a forwarded KONSOLE_* still gets the remedy' '1' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          SSH_TTY=/dev/pts/9 KONSOLE_VERSION=260801 "$bin" doctor 2>&1 \
+       | grep -c 'If the outer terminal IS Konsole, set CCTAB_TERMINAL=konsole')"
+# The absent-KONSOLE_* line must NOT appear when one is plainly set - the verdict
+# already explained it, and saying it twice reads as two separate problems.
+check 'the absence line gives way when KONSOLE_* is present' '0' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          SSH_TTY=/dev/pts/9 KONSOLE_VERSION=260801 "$bin" doctor 2>&1 \
+       | grep -c 'does not survive the hop')"
+# An explicit CCTAB_TERMINAL still outranks the ssh rule in BOTH directions: the
+# rule removes an accidental path to Konsole, never the deliberate one.
+check 'CCTAB_TERMINAL=konsole still wins over the ssh rule' '1' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          SSH_TTY=/dev/pts/9 CCTAB_TERMINAL=konsole "$bin" doctor 2>&1 \
+       | grep -c '^terminal: *Konsole, from CCTAB_TERMINAL=konsole')"
+# And the local case is untouched: no hop, so KONSOLE_* is still the evidence.
+check 'a local KONSOLE_* is still evidence' '1' \
+    "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          KONSOLE_VERSION=260801 "$bin" doctor 2>&1 \
+       | grep -c '^terminal: *Konsole (KONSOLE_\* in the environment')"
 
 # --- the state layer: wait ownership --------------------------------------
 # Everything above this point is the STATELESS program, because the suite unsets
