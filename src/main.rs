@@ -114,7 +114,7 @@ fn paint(edge: Edge) -> io::Result<()> {
         return Ok(());
     };
 
-    let cfg = Config::from_env();
+    let mut cfg = Config::from_env();
     let composed = render::compose(paint, &cfg);
 
     // Dry run prints the TAB TITLE whatever else is true, so it stays the way to
@@ -134,10 +134,18 @@ fn paint(edge: Edge) -> io::Result<()> {
     };
     match paint {
         Paint::SessionStart => {
+            // Inside a LOCAL tmux the inherited KONSOLE_* says nothing, but the
+            // process that owns the attached client's pty does. Asking costs one
+            // round trip on an edge that already makes four, and nothing at all
+            // on the edges that paint. Safe after compose(): `composed.place` is the
+            // location alone, and the title compose() also built is thrown away
+            // inside tmux in favour of the carrier above. Outside tmux this is a
+            // no-op, so detection can only ever change what happens INSIDE tmux.
+            let ev = tmux::adopt_konsole(&mut cfg);
             // Before the first title lands, for the same reason the Konsole
             // arming precedes it: a tab painted before it can show the paint.
-            tmux::session_start(&cfg);
-            tmux::arm_konsole(&cfg);
+            tmux::session_start(&cfg, &ev);
+            tmux::arm_konsole(&cfg, &ev);
             emit::session_start(&payload, &cfg)
         }
         Paint::SessionEnd => {

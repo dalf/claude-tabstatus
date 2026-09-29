@@ -393,7 +393,7 @@ fn ttl_of(raw: Option<&OsStr>, default: u32) -> u32 {
 /// and then never again - so a cell whitens and never disappears. Turning the
 /// status line on anyway would run a user's `#(...)` in `status-right` on our
 /// schedule, which is not ours to decide. doctor reports it instead.
-pub fn session_start(cfg: &Config) {
+pub fn session_start(cfg: &Config, ev: &Evidence) {
     let Some(t) = &cfg.tmux else { return };
     let fmt = title_format(cfg.glyph_pos);
     let sts = set_titles_string(cfg.glyph_pos);
@@ -420,11 +420,25 @@ pub fn session_start(cfg: &Config) {
     // which a tmux older than 3.0 has no syntax for, and measured, a command that
     // fails at the END of a `;`-chained batch leaves every command before it
     // applied. So an old tmux loses the re-arm and keeps the whole decay.
-    match (cfg.terminal, exe_path()) {
+    match (cfg.terminal, ev, exe_path()) {
         // A path with a single quote in it has no representation inside ARM_HOOK's
         // sh quoting, and a path that is not UTF-8 cannot go into a format at all.
         // Both drop the re-arm and keep everything else.
-        (Terminal::Konsole, Some(exe)) => {
+        //
+        // The ARITY is the policy. A verdict that came from EVIDENCE installs the
+        // hook that re-proves, because the hook outlives the SessionStart that
+        // set it: detect Konsole locally, detach, reattach from an xterm, and the
+        // unconditional form would push OSC 50 into a terminal where it SETS THE
+        // FONT. A verdict the user ASSERTED installs the unconditional form,
+        // because over ssh the client's ancestry ends in sshd and re-proving
+        // there would destroy the Konsole -> ssh -> tmux topology this exists for.
+        (Terminal::Konsole, Evidence::Konsole(_), Some(exe)) => {
+            set(&mut c, OPT_EXE, &exe);
+            c.arg(";").arg("set-hook");
+            t.target(&mut c);
+            c.arg(HOOK).arg(ARM_HOOK_PROBE);
+        }
+        (Terminal::Konsole, _, Some(exe)) => {
             set(&mut c, OPT_EXE, &exe);
             c.arg(";").arg("set-hook");
             t.target(&mut c);
@@ -435,7 +449,13 @@ pub fn session_start(cfg: &Config) {
         // arming in force while the strip moved back to the end Konsole elides is
         // the one combination that is worse than either. doctor's `arm: WARN` then
         // names /clear as the way back.
+        //
+        // Un-arm FIRST, because the hook about to go is the only record that an
+        // earlier SessionStart armed at all - see [`HOOK`]. The one round trip
+        // it costs is paid on this arm alone, so a Konsole start never pays it,
+        // and the walk behind it only runs when a hook of ours was really there.
         _ => {
+            un_arm(t);
             c.arg(";").arg("set-hook").arg("-u");
             t.target(&mut c);
             c.arg(HOOK);
@@ -522,6 +542,27 @@ fn set(c: &mut Command, name: &str, value: &str) {
 /// fires only for a client attaching to that session, so a Konsole tab whose tmux
 /// session holds no claude is never armed - and an arming with no matching
 /// un-arming is this project's named defect.
+///
+/// THE ASYMMETRY between the two hook shapes below: evidence may only ADD
+/// Konsole, never subtract it. Only `CCTAB_TERMINAL` subtracts, and it already
+/// does.
+///
+/// THE HOOK IS ALSO THE RECORD. It is per session, it says whether we armed and
+/// in which mode, and it is the only thing a DETECTED session leaves behind for
+/// a later SessionEnd, whose own environment says nothing. So it is never
+/// removed without the un-arming happening first - [`un_arm`] before a declining
+/// SessionStart takes it off, the same before `uninstall` does - and
+/// [`arm_konsole`] reads it back before it arms, rather than assuming the
+/// `set-hook` at the end of SessionStart's batch landed.
+///
+/// WHY NOT a matching `client-detached[1971]` that un-arms the leaver, which is
+/// the obvious way to stop a tab being left armed after a detach that never
+/// returns: measured, in `client-detached` context `#{client_tty}` names a
+/// DIFFERENT, still-attached client, so that hook would un-arm the wrong tab;
+/// when the LAST client leaves, the client formats render empty; and
+/// `#{hook_client}` names the leaver only by client NAME, by which time it is
+/// gone from `list-clients` and cannot be re-proved. Do not re-discover this by
+/// shipping it.
 const HOOK: &str = "client-attached[1971]";
 
 /// The hook's command, a CONSTANT: `run-shell` this binary's own re-arm verb, with
@@ -551,6 +592,264 @@ const HOOK: &str = "client-attached[1971]";
 /// mangled.
 const ARM_HOOK: &str = "run-shell -b \"'#{@cctab_exe}' tmux-arm '#{client_tty}'\"";
 
+/// The hook EVIDENCE installs. It carries the attaching client's pid so the arm
+/// RE-PROVES before it writes: detect Konsole locally, detach, reattach from an
+/// xterm, and this hook still fires - without the pid it would push OSC 50 into
+/// xterm, where that sequence SETS THE FONT rather than being ignored.
+///
+/// Measured on a private server with a real pty client: tmux expands
+/// `#{client_pid}` in `client-attached` context to the ATTACHING client, in the
+/// same expansion that already fills `#{client_tty}`, and `show-hooks` prints
+/// both formats literally - tmux stores the string and expands it at fire time.
+const ARM_HOOK_PROBE: &str =
+    "run-shell -b \"'#{@cctab_exe}' tmux-arm '#{client_tty}' '#{client_pid}'\"";
+
+/// What the clients attached to OUR session prove about the terminal that is
+/// actually drawing the tab.
+///
+/// Inside tmux the inherited `KONSOLE_*` describes the terminal the SERVER was
+/// born under - measured, the server is reparented to systemd, so after a detach
+/// and an ssh from elsewhere it lies. The tmux CLIENT is not daemonised: it is a
+/// direct child of the shell the terminal spawned, so its ancestry is evidence
+/// about NOW rather than inheritance from then. That is why ssh, nested tmux and
+/// reattach-from-elsewhere all decline STRUCTURALLY here, with no special case.
+///
+/// WHAT IT PROVES IS EXACTLY "konsole OWNS the pty the client speaks through",
+/// which is as close to "konsole is drawing the tab" as /proc can get. The walk
+/// climbs the ppid chain only while `tty_nr` stays the client's own, and the
+/// FIRST ancestor whose `tty_nr` differs is the process holding the master side
+/// of that pty - the one that will read the OSC 50. An xterm launched from a
+/// Konsole shell therefore DECLINES: the xterm owns the pty, so the walk stops
+/// there and never reaches the konsole behind it. Nothing is written to a
+/// terminal that reads OSC 50 as SET FONT.
+///
+/// It can still be wrong in the SAFE direction - a transparent pty relay such as
+/// `script` or `su --pty` below konsole owns the pty and is not named konsole,
+/// so it declines - and `CCTAB_TERMINAL` is the switch in both directions.
+pub enum Evidence {
+    /// Never asked: outside tmux, or `CCTAB_TERMINAL` already answered.
+    NotAsked,
+    /// Asked and refused. No client attached, a client whose pty is owned by
+    /// something that is not konsole, a tmux too old to name `#{client_pid}`,
+    /// or no answer at all. Every one of those is a decline, never an error.
+    Declined,
+    /// Every attached client speaks through a pty konsole owns, carrying the
+    /// ptys they were named by, so nothing is ever written to a client that did
+    /// not prove it.
+    Konsole(Vec<OsString>),
+}
+
+/// How many processes of an ancestry are inspected before the walk gives up.
+///
+/// The cap alone bounds a cycle: Linux ppid chains are acyclic by construction,
+/// so the only way to revisit a pid is a reparent DURING the walk, and a fixed
+/// count bounds that absolutely with no visited set to carry. The measured chain
+/// here is three - `tmux: client` -> `bash` -> `konsole` - and the slack is for a
+/// login shell, `su` and direnv.
+const WALK_DEPTH: usize = 16;
+
+/// Refine `cfg` from what the attached clients prove, and say what was proved.
+///
+/// ONE tmux round trip, on an edge that already makes four, and nothing at all
+/// on the paint path: inside tmux the glyph POSITION is baked into server
+/// options by this same SessionStart, and later paints only write a carrier.
+///
+/// THE VERDICT RULE IS "ALL, AND AT LEAST ONE". `set-titles-string` is a SESSION
+/// option and tmux has no per-client title format, so the layout is one value for
+/// every client; a mixed session therefore declines as a whole. A false positive
+/// costs an OSC 50 into a terminal that reads it as SET FONT, a false negative
+/// costs one environment variable - which is why the walk below is the
+/// conservative one - and doctor's `client:` line names which client refused.
+pub fn adopt_konsole(cfg: &mut Config) -> Evidence {
+    let Some(t) = &cfg.tmux else { return Evidence::NotAsked };
+    // CCTAB_TERMINAL outranks evidence in BOTH directions, and asking anyway
+    // would exec tmux to compute an answer that is already thrown away.
+    if config::var_nonempty("CCTAB_TERMINAL").is_some() {
+        return Evidence::NotAsked;
+    }
+    let mut c = Command::new("tmux");
+    c.arg("list-clients");
+    t.target(&mut c);
+    // The pid comes FIRST and the tty is the remainder, so a pty path holding a
+    // space cannot shift the field the walk is built from.
+    c.arg("-F").arg("#{client_pid} #{client_tty}");
+    let Ok(out) = capture(c) else { return Evidence::Declined };
+    let mut ttys = Vec::new();
+    for line in out.lines().filter(|l| !l.is_empty()) {
+        let Some((pid, tty)) = line.split_once(' ') else { return Evidence::Declined };
+        if !under_konsole(pid.as_bytes()) {
+            return Evidence::Declined;
+        }
+        ttys.push(OsString::from(tty));
+    }
+    if ttys.is_empty() {
+        return Evidence::Declined;
+    }
+    cfg.adopt_terminal(Terminal::Konsole);
+    Evidence::Konsole(ttys)
+}
+
+/// Is the owner of `pid`'s controlling pty a process named exactly `konsole`?
+///
+/// `raw` is tmux's own output rather than user input, but a path built from
+/// unvalidated text is a traversal waiting to happen and [`digits`] costs
+/// nothing. It also does the declining for an old tmux: an unknown format
+/// expands to the EMPTY string - measured on 3.7c - so a tmux that has never
+/// heard of `#{client_pid}` fails here and needs no version test anywhere.
+fn under_konsole(raw: &[u8]) -> bool {
+    konsole_ancestor(raw).is_some()
+}
+
+/// The same question, answered with the konsole's own pid, which is what lets
+/// doctor's `client:` line be checked by hand against `ps`.
+fn konsole_ancestor(raw: &[u8]) -> Option<u32> {
+    if !digits(raw) {
+        return None;
+    }
+    let pid: u32 = String::from_utf8_lossy(raw).parse().ok()?;
+    konsole_in_chain(pid, proc_parent)
+}
+
+/// The walk, over a LOOKUP rather than over /proc directly, so the depth cap and
+/// the stop conditions are testable without a process tree to arrange. It names
+/// the konsole it found, which is what lets doctor print a pid a reader can check
+/// against `ps`.
+///
+/// THE RULE IS OWNERSHIP OF THE PTY, and `tty_nr` - field 7 of
+/// `/proc/<pid>/stat` - is what decides it. Every process a terminal emulator
+/// spawns inside a pty carries that pty as its controlling terminal; the
+/// emulator itself holds the MASTER side, so its own `tty_nr` is something else
+/// (0 when it was launched from a desktop menu, the launching pty when it was
+/// launched from a shell). So: climb while `tty_nr` equals the CLIENT's, and the
+/// first ancestor whose `tty_nr` DIFFERS is the process that owns the client's
+/// pty. Claim Konsole iff that process is `konsole`; claim nothing on any other
+/// exit. Measured here - `tmux: client` 34824 -> `bash` 34824 -> `konsole` 0 -
+/// and on the shape this rule exists to kill, `konsole -> bash -> xterm -> bash
+/// -> client`, where the xterm owns the pty and the walk stops on it.
+///
+/// "DIFFERS", never "is zero": a konsole started from a terminal HAS a
+/// controlling terminal, and skipping zeros would walk straight past a konsole
+/// started from a menu. Both were measured; both must stop the walk.
+///
+/// THE ZERO GUARD is on the CLIENT, not on its ancestors. `tty_nr == 0` means
+/// "no controlling terminal", which is an absence rather than an identity, so if
+/// the client itself has none then every tty-less ancestor compares equal and the
+/// walk would answer by accident. Measured: `setsid tmux attach` under konsole
+/// yields a working client whose own `tty_nr` is 0 while tmux still reports
+/// `client_tty=/dev/pts/16`. That case declines, explicitly, before a hop.
+///
+/// STOPPING AT THE FIRST TERMINAL EMULATOR by NAME was the obvious alternative
+/// and it is the one that needs a list of emulators to guess at; this needs
+/// none, because /proc answers "who owns this pty" directly and the only name
+/// asked about afterwards is `konsole` itself. An earlier pass rejected the
+/// list-based idea for the right reason and then kept matching ANY ancestor at
+/// ANY depth, which re-admitted exactly the false positive `$TMUX` used to
+/// suppress. There is deliberately NO fallback to that older match on any error
+/// path: the fallback IS the bug.
+///
+/// WHAT IT COSTS is false NEGATIVES, never a new false positive - the rule can
+/// only turn a claim into a decline. A transparent pty relay below konsole
+/// (`script`, `su --pty`, `socat`, `expect`) owns the pty and is not named
+/// konsole, so it declines although a claim would have worked; nothing in /proc
+/// distinguishes such a relay from an xterm that swallows the sequence, so no
+/// rule can be right about both. `CCTAB_TERMINAL` is the escape hatch for all of
+/// them.
+///
+/// EXACT match on `konsole`: no prefix, no case folding. `TASK_COMM_LEN`
+/// truncates `comm` at 15 bytes and `konsole` is 7, so truncation cannot bite
+/// here - a longer terminal name one day would need a different signal, not a
+/// wider match. Yakuake and the other Konsole KPart hosts own the pty under
+/// their own name and decline; `CCTAB_TERMINAL` is what they have.
+///
+/// `comm` alone decides, and that is a deliberate refusal to corroborate with
+/// `/proc/<pid>/exe`: measured here, exe is unreadable even same-uid for some
+/// processes, resolves through packaging symlinks, and carries a real
+/// `" (deleted)"` suffix after a package upgrade - three silent false NEGATIVES
+/// in exchange for no security at all, since `prctl(PR_SET_NAME)` defeats comm in
+/// two lines. The honest security argument is different: this only ever inspects
+/// the ancestry of a tmux client the user themselves attached, and every process
+/// in that chain already holds the user's tty and can write OSC 50 to it
+/// directly, so no privilege boundary is crossed. No process's `environ` is ever
+/// read - that inherited leak is what this exists to stop trusting.
+fn konsole_in_chain<F>(start: u32, lookup: F) -> Option<u32>
+where
+    F: Fn(u32) -> Option<(String, u32, u32)>,
+{
+    // The client's own controlling terminal is the whole basis of comparison, so
+    // it is read first and an absent one ends this here.
+    let base = lookup(start)?.2;
+    if base == 0 {
+        return None;
+    }
+    let mut pid = start;
+    for _ in 0..WALK_DEPTH {
+        // A missing or unreadable /proc entry is NORMAL - the process exited, or
+        // there is no /proc at all, as on macOS, where the pty resolution through
+        // /proc/$CLAUDE_PID/fd/1 is already Linux-only. Never an error, never
+        // logged.
+        let (comm, ppid, tty) = lookup(pid)?;
+        if tty != base {
+            // The pty's owner, and the only process whose name is ever asked
+            // about. A konsole ABOVE this one is somebody else's terminal.
+            return (comm == "konsole").then_some(pid);
+        }
+        if ppid <= 1 {
+            return None;
+        }
+        pid = ppid;
+    }
+    // The cap ran out with the whole chain on one pty: no owner was identified,
+    // so there is nothing to claim.
+    None
+}
+
+/// One hop: `(comm, ppid, tty_nr)` for a live pid, or `None` for anything else.
+///
+/// Checking that the START pid's own comm is `tmux: client` was considered and
+/// REJECTED: it would make detection depend on an undocumented tmux-internal
+/// string and fail silently on a build that spells it differently. The pid can
+/// in principle be reused between the listing and this read, but the client is
+/// attached by construction and the window is microseconds, so the realistic
+/// outcome of losing that race is an unreadable entry and a decline.
+fn proc_parent(pid: u32) -> Option<(String, u32, u32)> {
+    parse_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// Fields 2, 4 and 7 of a `/proc/<pid>/stat` line: the command name, the parent,
+/// and the controlling terminal that decides who owns the client's pty.
+///
+/// The idiom is `state.rs`'s, deliberately reused rather than written a second
+/// time: `comm` starts after the FIRST `(` and ends at the LAST `") "`, and the
+/// line is NEVER split on whitespace. The first hop here proves it is not
+/// hypothetical - measured on this machine, a tmux client's comm is literally
+/// `tmux: client`, with a space and a colon inside the parentheses, and a naive
+/// split reads `client)` as the process state. `rsplit_once(") ")` is provably
+/// right and not merely usually right: every field after `comm` is a single
+/// character or a number, so none of them can contain `") "`.
+///
+/// `tty_nr` is the kernel's `dev_t` for the controlling terminal, or 0 for none.
+/// It is COMPARED and never decoded: this asks only whether two processes share
+/// one terminal, so splitting it back into major and minor would be code with no
+/// caller.
+fn parse_stat(raw: &str) -> Option<(String, u32, u32)> {
+    let (_, rest) = raw.split_once('(')?;
+    let (comm, tail) = rest.rsplit_once(") ")?;
+    // The tail begins at field 3, the state, so the words are
+    // [0]=state [1]=ppid [2]=pgrp [3]=session [4]=tty_nr.
+    let mut w = tail.split(' ');
+    let ppid = w.nth(1)?;
+    let tty = w.nth(2)?;
+    // Both are turned into numbers the walk trusts, and `ppid` additionally into
+    // a /proc PATH, so both get the same digits-only gate: a short, truncated or
+    // non-numeric line declines rather than yielding half an answer. `tty_nr` is
+    // signed in the kernel but never negative in practice; a `-1` here fails
+    // `digits` and declines, which is the safe direction.
+    if !digits(ppid.as_bytes()) || !digits(tty.as_bytes()) {
+        return None;
+    }
+    Some((comm.to_owned(), ppid.parse().ok()?, tty.parse().ok()?))
+}
+
 /// This binary, for the hook to run, or `None` when it cannot be carried.
 fn exe_path() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
@@ -561,13 +860,28 @@ fn exe_path() -> Option<String> {
     Some(exe.to_owned())
 }
 
-/// `tabstatus tmux-arm <tty>` - arm ONE terminal, named by tmux.
+/// `tabstatus tmux-arm <tty> [<client pid>]` - arm ONE terminal, named by tmux.
 ///
 /// It takes the pty as an argument instead of asking tmux, so the hook costs one
 /// fork and no socket round trip, and so the verb needs no `$TMUX` of its own.
 /// [`emit::tty_write`] is the guard: /dev/pts or /dev/tty, a character device,
 /// writable, and silent about any of that failing.
-pub fn arm_tty(path: &OsStr) {
+///
+/// WITH A PID the arm RE-PROVES before it writes, because the hook outlives the
+/// SessionStart that installed it: detect Konsole locally, detach, reattach from
+/// an xterm, and this fires with the xterm client's pid. A pid that is absent,
+/// empty or not digits declines - an empty one is how a tmux too old for
+/// `#{client_pid}` renders the argument, and it must NOT fall through to the
+/// unconditional form. WITHOUT a pid the arm is unconditional, which is what
+/// `CCTAB_TERMINAL=konsole` asserted and what the ssh topology needs, where the
+/// ancestry ends in sshd and always will.
+///
+/// `run-shell` inherits the tmux SERVER's environment, so this process cannot
+/// read `CCTAB_TERMINAL` for itself: the ARITY is what carries the policy.
+pub fn arm_tty(path: &OsStr, pid: Option<&OsStr>) {
+    if pid.is_some_and(|p| !under_konsole(p.as_bytes())) {
+        return;
+    }
     emit::tty_write(Path::new(path), emit::KONSOLE_ARM);
 }
 
@@ -590,14 +904,61 @@ fn drop_hook(t: &Tmux) {
 /// attached client's pty, and writing there needs no grant, works from a
 /// background window, and needs no DCS wrapper.
 ///
-/// Opt-in via `CCTAB_TERMINAL=konsole`, because in the topology this is for -
-/// Konsole, ssh, tmux - `KONSOLE_*` does not survive the ssh and there is
-/// nothing to detect.
-pub fn arm_konsole(cfg: &Config) {
+/// Asserted via `CCTAB_TERMINAL=konsole`, which is the only signal in the
+/// topology this was built for - Konsole, ssh, tmux - because `KONSOLE_*` does
+/// not survive the ssh; or PROVED locally by [`adopt_konsole`], in which case the
+/// rule is that no byte goes to a client that did not prove it for itself. The
+/// probe already named those ptys, so the proved path costs no second listing.
+pub fn arm_konsole(cfg: &Config, ev: &Evidence) {
+    let Some(t) = &cfg.tmux else { return };
     if cfg.terminal != Terminal::Konsole {
         return;
     }
-    to_clients(cfg, emit::KONSOLE_ARM);
+    match ev {
+        Evidence::Konsole(ttys) => {
+            // NOTHING IS ARMED THAT CANNOT BE UN-ARMED. A detected session
+            // leaves nothing in its own environment, so the hook [`session_start`]
+            // has just installed is the only record its SessionEnd can read -
+            // and it is the one command in that batch a tmux older than 3.0
+            // cannot run and a path holding a quote cannot carry. Read it back
+            // instead of assuming it landed: the alternative is a tab wearing
+            // `LocalTabTitleFormat=%w` for the life of the window, which is this
+            // project's named defect and exactly what an ASSERTED session is
+            // spared by having `CCTAB_TERMINAL` still in its environment.
+            if hook_value(t).as_deref() != Some(ARM_HOOK_PROBE) {
+                return;
+            }
+            for tty in ttys {
+                emit::tty_write(Path::new(tty), emit::KONSOLE_ARM);
+            }
+        }
+        _ => to_clients(t, emit::KONSOLE_ARM, false),
+    }
+}
+
+/// The value of our own hook index, or `None` when the server did not answer.
+///
+/// One expression, so [`ask`]'s newline rule is satisfied for free: a foreign
+/// hook holding a newline of its own can only truncate ITSELF, and a truncated
+/// value matches neither constant and is therefore left alone.
+fn hook_value(t: &Tmux) -> Option<String> {
+    ask(t, &[&format!("#{{{HOOK}}}")]).ok()?.into_iter().next()
+}
+
+/// Put a previous arming back, before the record of it is removed.
+///
+/// `set-hook -u` - in a declining [`session_start`] and in [`uninstall`] - is the
+/// moment a tab armed by an earlier SessionStart loses the only thing that knew
+/// about it, and the tab then keeps Konsole's `%w` for the life of the window.
+/// The hook about to go is what says whether we armed and in which mode, so it
+/// is asked before it goes. Not ours, or nothing there: nothing was armed by us,
+/// and nothing is written.
+fn un_arm(t: &Tmux) {
+    match hook_value(t).as_deref() {
+        Some(h) if h == ARM_HOOK => to_clients(t, emit::KONSOLE_RESTORE, false),
+        Some(h) if h == ARM_HOOK_PROBE => to_clients(t, emit::KONSOLE_RESTORE, true),
+        _ => {}
+    }
 }
 
 /// Put the tab formats back, but only when no OTHER claude is left in this
@@ -606,19 +967,51 @@ pub fn arm_konsole(cfg: &Config) {
 /// Our own pane is excluded from the count rather than relied on to have been
 /// cleared already: session end's empty title travels through the pty and tmux's
 /// parser, and racing that would silently skip the restore.
+///
+/// THE MODE IS LEARNED FROM THE SERVER, NOT FROM OUR OWN ENVIRONMENT. SessionEnd
+/// builds a fresh `Config::from_env()`, and in the DETECTED topology that Config
+/// says Unknown - so asking `cfg.terminal` here would arm tabs at SessionStart,
+/// never restore them, and leave `client-attached[1971]` installed forever: this
+/// project's named defect, "an arming with no matching un-arming", reintroduced
+/// by the change meant to make arming safer. Re-probing here is not the fix
+/// either, because the Konsole client may have detached by now and the probe
+/// would decline exactly when the restore is needed. The right question is "did
+/// WE arm this server", and the server holds the answer.
+///
+/// It rides in the `display-message` this already makes, LAST, obeying [`ask`]'s
+/// rule that a user's hook value can hold a newline of its own. It also fixes the
+/// older shape of the same leak, where `CCTAB_TERMINAL` changed between start and
+/// end: a SessionEnd whose own environment says nothing now restores inside a
+/// server an ASSERTED session armed, where before it returned early.
+///
+/// The server is the authority only where it HAS an answer. An empty hook is not
+/// one, and the arm below says what is done about it.
 pub fn session_end(cfg: &Config) {
     let Some(t) = &cfg.tmux else { return };
-    if cfg.terminal != Terminal::Konsole {
+    let others = others_expr(t);
+    let Ok(f) = ask(t, &[&others, &format!("#{{{HOOK}}}")]) else { return };
+    let prove = match f.get(1).map(String::as_str) {
+        Some(h) if h == ARM_HOOK => false,
+        Some(h) if h == ARM_HOOK_PROBE => true,
+        // NOTHING OF OURS INSTALLED IS NOT THE SAME AS "WE ARMED NOTHING".
+        // [`arm_konsole`] never depended on the hook in the asserted mode, and
+        // three ordinary things leave that mode armed with no hook: a tmux too
+        // old for an indexed `set-hook`, a binary path the hook cannot carry,
+        // and a hook removed since - by `uninstall` or by a later SessionStart.
+        // Our own environment is the only thing left to ask, and asking it is
+        // exactly what shipped before the server was asked at all. The DETECTED
+        // mode has nothing to fall back on, which is why the two removals
+        // un-arm on their way out and why `arm_konsole` refuses to arm at all
+        // unless the hook is provably there to be read here.
+        Some("") | None if cfg.terminal == Terminal::Konsole => false,
+        // A `client-attached[1971]` that is not ours: not ours to fire for, and
+        // not ours to drop.
+        _ => return,
+    };
+    if f.first().is_some_and(|s| s.contains('1')) {
         return;
     }
-    let mut c = Command::new("tmux");
-    c.arg("display-message").arg("-p");
-    t.target(&mut c);
-    c.arg(others_expr(t));
-    if capture(c).is_ok_and(|s| s.contains('1')) {
-        return;
-    }
-    to_clients(cfg, emit::KONSOLE_RESTORE);
+    to_clients(t, emit::KONSOLE_RESTORE, prove);
     // The last claude in this session is going: nothing is left for a reattach to
     // re-arm, so the hook goes with it.
     drop_hook(t);
@@ -638,15 +1031,28 @@ fn others_expr(t: &Tmux) -> String {
 }
 
 /// Write `bytes` to the pty of every client attached to OUR session.
-fn to_clients(cfg: &Config, bytes: &[u8]) {
-    let Some(t) = &cfg.tmux else { return };
+///
+/// `prove` is the same rule the arming hook follows, applied to the OTHER two
+/// OSC 50 writes: in DETECTED mode no byte goes to a client that did not prove
+/// itself, and `KONSOLE_RESTORE` is an OSC 50 too. Proving costs no extra round
+/// trip - only a wider format on the listing this already makes.
+fn to_clients(t: &Tmux, bytes: &[u8], prove: bool) {
     let mut c = Command::new("tmux");
     c.arg("list-clients");
     t.target(&mut c);
-    c.arg("-F").arg("#{client_tty}");
+    c.arg("-F").arg(if prove { "#{client_pid} #{client_tty}" } else { "#{client_tty}" });
     let Ok(out) = capture(c) else { return };
     for line in out.lines().filter(|l| !l.is_empty()) {
-        emit::tty_write(Path::new(line), bytes);
+        let tty = if prove {
+            let Some((pid, tty)) = line.split_once(' ') else { continue };
+            if !under_konsole(pid.as_bytes()) {
+                continue;
+            }
+            tty
+        } else {
+            line
+        };
+        emit::tty_write(Path::new(tty), bytes);
     }
 }
 
@@ -887,6 +1293,12 @@ pub fn uninstall() -> Vec<String> {
     // Ours, and not in the batch below: `client-attached[N]` is an array option an
     // old tmux cannot parse, and an error inside a `;`-chained batch stops the
     // commands after it - which would be the restore.
+    //
+    // The Konsole tab comes back with everything else. Removing the hook is what
+    // takes the record of an arming away, and an uninstall that put the title
+    // formats back while leaving a tab on `LocalTabTitleFormat=%w` would be
+    // restoring the half that is easy to see.
+    un_arm(&t);
     drop_hook(&t);
 
     // Ours come off whatever happens: they are our own namespace, and an orphaned
@@ -1058,7 +1470,7 @@ fn split_first_line(s: &str) -> (&str, &str) {
 // --- doctor ------------------------------------------------------------------
 
 /// Inspect server title settings, clients, and this pane's window decorators.
-pub fn report(cfg: &Config) -> Vec<String> {
+pub fn report(cfg: &Config, ev: &Evidence) -> Vec<String> {
     let mut out = Vec::new();
     if config::flag("CCTAB_NO_TMUX") {
         out.push("tmux:      off   CCTAB_NO_TMUX is set, so nothing tmux-specific runs".to_owned());
@@ -1199,7 +1611,12 @@ pub fn report(cfg: &Config) -> Vec<String> {
         ));
         out.push(
             "                   CCTAB_TERMINAL and CCTAB_GLYPH_POS are server-wide \
-             and the LAST SessionStart wins. Set them the same for every claude here."
+             and the LAST SessionStart wins - and with neither set, so is whichever \
+             clients proved Konsole then."
+                .to_owned(),
+        );
+        out.push(
+            "                   Set them the same for every claude here."
                 .to_owned(),
         );
     }
@@ -1209,7 +1626,13 @@ pub fn report(cfg: &Config) -> Vec<String> {
             match get(8) {
                 h if h == ARM_HOOK =>
                     "OK   client-attached re-arms this tab's Konsole format on every \
-                     reattach",
+                     reattach (CCTAB_TERMINAL asserted Konsole)",
+                // Without this arm doctor would call the hook this very binary
+                // just installed "not ours" and prescribe /clear for a healthy
+                // server.
+                h if h == ARM_HOOK_PROBE =>
+                    "OK   client-attached re-checks who owns the attaching client's pty, \
+                     then re-arms",
                 "" => "WARN no client-attached hook, so a detach/reattach lands in an \
                        un-armed tab. Remedy: /clear, which re-runs SessionStart",
                 _ => "WARN client-attached[1971] is not ours, so a reattach may land \
@@ -1220,8 +1643,14 @@ pub fn report(cfg: &Config) -> Vec<String> {
     let mut c = Command::new("tmux");
     c.arg("list-clients");
     t.target(&mut c);
+    // The pid LEADS the line so the per-client verdict below can be built from
+    // it, and so a reader can check the verdict by hand against ps. This is the
+    // line that diagnoses every declined case: over ssh, after a reattach from
+    // elsewhere, and a mixed session where one stray client refused for all of
+    // them. The cost accepted is an unrelated pid landing in a report people
+    // paste into issues - a pid on the user's own tty ancestry, not a secret.
     c.arg("-F")
-        .arg("#{client_tty} #{client_termname} #{?#{m:*title*,#{client_termfeatures}},HASTITLE,NOTITLE}");
+        .arg("#{client_pid} #{client_tty} #{client_termname} #{?#{m:*title*,#{client_termfeatures}},HASTITLE,NOTITLE}");
     match capture(c).as_deref().map(str::trim) {
         Ok("") | Err(_) => out.push(
             "           client: none attached, so nothing is being painted right now"
@@ -1229,7 +1658,11 @@ pub fn report(cfg: &Config) -> Vec<String> {
         ),
         Ok(s) => {
             for line in s.lines() {
-                out.push(format!("           client: {line}"));
+                let verdict = match line.split_once(' ').and_then(|(p, _)| konsole_ancestor(p.as_bytes())) {
+                    Some(pid) => format!(" konsole (pid {pid})"),
+                    None => " no konsole owns its pty".to_owned(),
+                };
+                out.push(format!("           client: {line}{verdict}"));
                 if line.ends_with("NOTITLE") {
                     out.push(
                         "                   tmux is not granting that terminal the \
@@ -1246,13 +1679,30 @@ pub fn report(cfg: &Config) -> Vec<String> {
             }
         }
     }
+    // Four states, because the reasons differ and only the reason is actionable.
+    // The asserted-NOT arm exists for the same principle the ssh remedy follows:
+    // offering CCTAB_TERMINAL=konsole one line under a verdict that quotes the
+    // user's own value back is the report arguing with what was typed.
     out.push(format!(
         "           konsole: {}",
-        if cfg.terminal == Terminal::Konsole {
-            "on   CCTAB_TERMINAL=konsole - OSC 50 goes to each attached client's pty"
-        } else {
-            "off  set CCTAB_TERMINAL=konsole when the outer terminal is Konsole \
-             (KONSOLE_* does not survive ssh)"
+        match (cfg.terminal, ev) {
+            (Terminal::Konsole, Evidence::Konsole(_)) =>
+                "on   every attached client's pty is owned by konsole - OSC 50 goes \
+                 only to a client that proves it",
+            (Terminal::Konsole, _) =>
+                "on   CCTAB_TERMINAL=konsole - OSC 50 goes to each attached client's pty",
+            // NOT "no client is owned by konsole": the rule is ALL, and at
+            // least one, so a session where one client proved it and a stray one
+            // did not declines with a `client:` line above saying konsole. A
+            // summary that contradicts the lines it summarises is worse than no
+            // summary, and the mixed session is the case this report exists to
+            // diagnose. The same sentence covers the zero-client session, where
+            // the `client:` line says none is attached.
+            (_, Evidence::Declined) =>
+                "off  not every attached client's pty is owned by konsole - the \
+                 client: lines say which. Over ssh none ever can: set \
+                 CCTAB_TERMINAL=konsole when the outer terminal is Konsole",
+            _ => "off  CCTAB_TERMINAL says this is not Konsole",
         }
     ));
     out.push(format!(
@@ -1452,6 +1902,318 @@ mod tests {
         assert!(OURS.contains(&OPT_EXE));
         assert!(OURS.contains(&OPT_WINDOW_STRIP));
         assert_eq!(OURS.len(), 15);
+    }
+
+    /// The probing hook is the whole of the F4 answer, so it has to keep every
+    /// invariant the asserted one has, and add the pid.
+    #[test]
+    fn the_probing_hook_carries_the_client_pid_and_nothing_else_new() {
+        assert!(ARM_HOOK_PROBE.contains("'#{@cctab_exe}'"), "{ARM_HOOK_PROBE}");
+        assert!(ARM_HOOK_PROBE.contains("tmux-arm"));
+        assert!(ARM_HOOK_PROBE.contains("'#{client_tty}'"));
+        assert!(ARM_HOOK_PROBE.contains("'#{client_pid}'"));
+        assert!(!ARM_HOOK_PROBE.contains('$'));
+        assert!(!ARM_HOOK_PROBE.contains('\\'));
+        // The two are compared BYTE for byte - by session_end to learn the mode
+        // and by doctor to name it - so they must never collide.
+        assert_ne!(ARM_HOOK_PROBE, ARM_HOOK);
+        // No server option is added by any of this: OURS is still the whole set
+        // uninstall has to remove.
+        assert_eq!(OURS.len(), 15);
+    }
+
+    /// THE /proc TRAP, against fixture STRINGS and never a live pid. The first
+    /// line is the REAL first hop on this machine: a whitespace split reads
+    /// `client)` as the process state and then `3285450` as something else
+    /// entirely - or worse, silently returns the wrong number.
+    ///
+    /// Field 7, `tty_nr`, is asserted EXPLICITLY on the two real lines captured
+    /// here, because the only thing separating it from field 6 is an `nth`.
+    #[test]
+    fn the_stat_line_is_parsed_from_the_last_paren_and_never_by_splitting() {
+        let p = |s: &str| parse_stat(s);
+        // state ppid    pgrp    sid     tty_nr
+        let hop = "1379066 (tmux: client) S 3285450 1379066 1379066 34824 -1 4194304";
+        assert_eq!(p(hop), Some(("tmux: client".to_owned(), 3_285_450, 34824)));
+        // The real konsole on this machine: no controlling terminal of its own.
+        let k = "5892 (konsole) S 3402 5892 5892 0 -1 4194304";
+        assert_eq!(p(k), Some(("konsole".to_owned(), 3402, 0)));
+        // A comm holding a close paren, a space, or both - and field 7 read past
+        // it, which is what proves `rsplit_once(") ")` still anchors the tail.
+        assert_eq!(p("42 (a) b) S 7 1 1 34825 -1"), Some(("a) b".to_owned(), 7, 34825)));
+        assert_eq!(p("971172 (x) y) z) S 971171 971171 971167 0 -1"),
+            Some(("x) y) z".to_owned(), 971_171, 0)));
+        assert_eq!(p("42 (x)) S 7 1 1 3"), Some(("x)".to_owned(), 7, 3)));
+        assert_eq!(p("42 (a (b) S 7 1 1 3"), Some(("a (b".to_owned(), 7, 3)));
+        assert_eq!(p("42 () S 7 1 1 3"), Some((String::new(), 7, 3)));
+        // The case state.rs already records from this machine.
+        assert_eq!(p("9 (npm exec chrome) S 9 1 1 0"), Some(("npm exec chrome".to_owned(), 9, 0)));
+        // TASK_COMM_LEN truncates comm at 15 bytes, which `konsole` cannot reach.
+        assert_eq!(p("9 (abcdefghijklmno) S 3 1 1 0"), Some(("abcdefghijklmno".to_owned(), 3, 0)));
+        // Every one of these is None and NEVER a wrong ppid or a wrong tty_nr.
+        for bad in [
+            "9 no parens here at all",
+            "9 (comm) S",
+            "9 (comm) ",
+            "9 (comm) S x 1",
+            "9 (comm) S -1 1",
+            // Field 7 missing entirely: the tail has only four words.
+            "9 (comm) S 7 1 1",
+            "9 (comm) S 7 1",
+            // Field 7 present but not a number, and truncated mid-field.
+            "9 (comm) S 7 1 1 x",
+            "9 (comm) S 7 1 1 -1",
+            "9 (comm) S 7 1 1 34a24",
+            "9 (comm) S 7 1 1 ",
+            "",
+        ] {
+            assert_eq!(p(bad), None, "{bad:?}");
+        }
+    }
+
+    /// The walk, over the chains that were MEASURED for issue #18. Each fixture
+    /// is the client first and its ancestors after it, `(comm, tty_nr)`, with the
+    /// ppid chain implied: pid n is the nth entry and parents pid n + 1.
+    ///
+    /// The rule under test is "claim iff the process that OWNS the client's pty
+    /// is named konsole", so what separates the claims from the declines here is
+    /// never the presence of a konsole - several declining chains contain one.
+    #[test]
+    fn the_walk_stops_at_the_owner_of_the_client_pty() {
+        // `chain(&[..])` is the injected tree; no test here touches /proc.
+        fn chain(rows: &'static [(&'static str, u32)]) -> impl Fn(u32) -> Option<(String, u32, u32)> {
+            move |pid: u32| {
+                let i = usize::try_from(pid).ok()?.checked_sub(1)?;
+                let (comm, tty) = *rows.get(i)?;
+                Some((comm.to_owned(), pid + 1, tty))
+            }
+        }
+        let walk = |rows| konsole_in_chain(1, chain(rows));
+
+        // MUST CLAIM -----------------------------------------------------
+        // The live chain on this machine: client -> bash -> konsole(no ctty).
+        assert_eq!(walk(&[("tmux: client", 34824), ("bash", 34824), ("konsole", 0)]), Some(3));
+        // konsole launched from a desktop menu, with the client right under it.
+        assert_eq!(walk(&[("tmux: client", 34832), ("konsole", 0)]), Some(2));
+        // konsole launched from a TERMINAL, so it HAS a ctty. The test is
+        // "differs", not "is zero", and this is the case that proves it.
+        assert_eq!(
+            walk(&[("tmux: client", 34833), ("konsole", 34832), ("xterm", 0)]),
+            Some(2)
+        );
+        // Nested login shells on the one pty.
+        assert_eq!(
+            walk(&[
+                ("tmux: client", 34834),
+                ("bash", 34834),
+                ("bash", 34834),
+                ("bash", 34834),
+                ("bash", 34834),
+                ("konsole", 0),
+            ]),
+            Some(6)
+        );
+
+        // MUST DECLINE ---------------------------------------------------
+        // THE FALSE POSITIVE THIS RULE EXISTS FOR: an xterm launched from a
+        // Konsole shell. A konsole ABOVE the pty owner is not a Konsole.
+        assert_eq!(walk(&[("tmux: client", 34833), ("xterm", 34832), ("konsole", 0)]), None);
+        // The same shape with a transparent relay: a known, accepted false
+        // negative, and indistinguishable from the xterm above inside /proc.
+        assert_eq!(walk(&[("tmux: client", 34835), ("socat", 34834), ("konsole", 0)]), None);
+        // A Konsole KPart host: the pty is owned under its own name.
+        assert_eq!(walk(&[("tmux: client", 34835), ("dolphin", 34834), ("konsole", 0)]), None);
+        // ssh-shaped: the pty owner is a daemon, and konsole is unreachable.
+        assert_eq!(walk(&[("tmux: client", 34834), ("sshd", 0)]), None);
+        // tmux in tmux: the outer server owns the inner client's pty.
+        assert_eq!(walk(&[("tmux: client", 34833), ("tmux: server", 0)]), None);
+        // A TTY-LESS INTERMEDIATE still stops the walk, even with a konsole
+        // directly behind it - 0 is a difference like any other.
+        assert_eq!(walk(&[("tmux: client", 34836), ("xterm", 0), ("konsole", 0)]), None);
+
+        // THE CLIENT-SIDE ZERO GUARD -------------------------------------
+        // `setsid tmux attach` under konsole: a working client with no ctty of
+        // its own. Every tty-less ancestor would compare equal, so the walk
+        // carries no information and must decline before a single hop.
+        assert_eq!(walk(&[("tmux: client", 0), ("bash", 34832), ("konsole", 0)]), None);
+        // And no chain whose client tty_nr is 0 can EVER return Some, not even
+        // one whose very first ancestor is a konsole.
+        assert_eq!(walk(&[("tmux: client", 0), ("konsole", 34832)]), None);
+        assert_eq!(walk(&[("konsole", 0), ("konsole", 0)]), None);
+        assert_eq!(konsole_in_chain(1, |_| Some(("konsole".to_owned(), 1, 0))), None);
+
+        // THE STOP CONDITIONS, unchanged ---------------------------------
+        // WHERE THE CAP FALLS, pinned by a chain that can actually cross it.
+        // `pid n` is the nth process inspected, all on one pty except the
+        // owner, so an owner at hop `owner` is reachable exactly when the cap
+        // allows that many hops. The numbers are LITERAL on purpose: written as
+        // `WALK_DEPTH` they would follow the constant and pin nothing, and the
+        // pair is what makes editing `WALK_DEPTH` - or widening the loop to
+        // `0..=WALK_DEPTH` - a test failure rather than a silent behaviour
+        // change.
+        let capped = |owner: u32| {
+            konsole_in_chain(1, move |p| {
+                let owns = p == owner;
+                Some((
+                    if owns { "konsole" } else { "bash" }.to_owned(),
+                    p + 1,
+                    if owns { 0 } else { 34824 },
+                ))
+            })
+        };
+        // The 16th process inspected is the last one the cap reaches.
+        assert_eq!(capped(16), Some(16));
+        // The 17th is one hop too far, and a konsole there is never seen.
+        assert_eq!(capped(17), None);
+        // TERMINATION, which is a different question: a chain that NEVER leaves
+        // the one pty has no owner to find, so the cap alone is what ends it -
+        // and that is all this fixture can show, since a same-pty `konsole` is
+        // unclaimable at any depth.
+        assert_eq!(konsole_in_chain(1, |p| Some((
+            if p > 18 { "konsole" } else { "bash" }.to_owned(),
+            p + 1,
+            7
+        ))), None);
+        // A self-parent and a two-cycle TERMINATE, on the cap alone.
+        assert_eq!(konsole_in_chain(5, |p| Some(("bash".to_owned(), p, 7))), None);
+        assert_eq!(
+            konsole_in_chain(5, |p| Some(("bash".to_owned(), if p == 5 { 6 } else { 5 }, 7))),
+            None
+        );
+        // init and the kernel's own parent end it.
+        assert_eq!(konsole_in_chain(9, |_| Some(("bash".to_owned(), 1, 7))), None);
+        assert_eq!(konsole_in_chain(9, |_| Some(("bash".to_owned(), 0, 7))), None);
+        // A /proc entry that went away mid-walk is a decline, not a panic - both
+        // on the very first read, which is where `base` comes from, and later.
+        assert_eq!(konsole_in_chain(1, |_| None), None);
+        assert_eq!(walk(&[("tmux: client", 7), ("bash", 7)]), None);
+        // An unreadable field 7 is an unreadable entry: proc_parent returns None
+        // and the walk declines, exactly as for a missing /proc file.
+        assert_eq!(
+            konsole_in_chain(1, |p| parse_stat(&if p == 1 {
+                "1 (tmux: client) S 2 1 1 34824 -1".to_owned()
+            } else {
+                "2 (konsole) S 1 1 1 x -1".to_owned()
+            })),
+            None
+        );
+
+        // EXACT match on the OWNER: no prefix, no folding, no KPart host.
+        for no in ["konsoleX", "Konsole", "KONSOLE", "yakuake", "xterm", "konsol", " konsole"] {
+            assert_eq!(walk2(no), None, "{no}");
+        }
+        assert_eq!(walk2("konsole"), Some(2), "the same fixture claims for the exact name");
+    }
+
+    /// THE REGRESSION GUARD for issue #18, phrased so the intent survives a
+    /// refactor: A KONSOLE ABOVE THE PTY OWNER IS NOT A KONSOLE.
+    ///
+    /// `konsole -> bash -> xterm -> bash -> client` is the chain the shipped
+    /// any-ancestor-at-any-depth match claimed, and claiming it sent OSC 50 into
+    /// an xterm, where that sequence SETS THE FONT. Every hop below the konsole
+    /// is on the client's own pty; the xterm holds its master. There is no
+    /// fallback to the old match on any error path, so this stays None.
+    #[test]
+    fn a_konsole_above_the_pty_owner_is_not_a_konsole() {
+        let pty = 34833;
+        let chain: [(&str, u32); 5] = [
+            ("tmux: client", pty),
+            ("bash", pty),
+            ("xterm", 34832),
+            ("bash", 34832),
+            ("konsole", 0),
+        ];
+        let lookup = move |pid: u32| {
+            let (comm, tty) = *chain.get(usize::try_from(pid).ok()?.checked_sub(1)?)?;
+            Some((comm.to_owned(), pid + 1, tty))
+        };
+        assert_eq!(konsole_in_chain(1, lookup), None);
+        // Same chain with the xterm replaced by the konsole itself: the fixture
+        // is otherwise identical, so the decline above is about OWNERSHIP and
+        // not about the chain being too long or malformed.
+        let chain2: [(&str, u32); 5] = [
+            ("tmux: client", pty),
+            ("bash", pty),
+            ("konsole", 34832),
+            ("bash", 34832),
+            ("konsole", 0),
+        ];
+        let lookup2 = move |pid: u32| {
+            let (comm, tty) = *chain2.get(usize::try_from(pid).ok()?.checked_sub(1)?)?;
+            Some((comm.to_owned(), pid + 1, tty))
+        };
+        assert_eq!(konsole_in_chain(1, lookup2), Some(3));
+    }
+
+    /// The client-side zero guard, in isolation: `tty_nr == 0` is an ABSENCE of
+    /// a controlling terminal, not an identity, so a client that has none can
+    /// never prove anything - not at hop one, not at any depth, whatever its
+    /// ancestors are named. Measured live: `setsid tmux attach` under konsole
+    /// produces exactly such a client.
+    #[test]
+    fn a_client_with_no_controlling_terminal_declines_before_a_single_hop() {
+        // If a hop were walked at all this would panic, so the guard is proved
+        // by the walk NEVER asking for a second pid.
+        let seen = std::cell::Cell::new(0u32);
+        let r = konsole_in_chain(4242, |pid| {
+            seen.set(seen.get() + 1);
+            assert_eq!(pid, 4242, "no ancestor may be read once the client has no ctty");
+            Some(("konsole".to_owned(), 7, 0))
+        });
+        assert_eq!(r, None);
+        assert_eq!(seen.get(), 1, "the client's own stat, and nothing else");
+        // And nothing behind a tty-less client is reachable either.
+        for behind in ["konsole", "bash", "xterm"] {
+            let behind = behind.to_owned();
+            assert_eq!(
+                konsole_in_chain(1, |p| Some(if p == 1 {
+                    ("tmux: client".to_owned(), 2, 0)
+                } else {
+                    (behind.clone(), 3, 34832)
+                })),
+                None,
+                "{behind}"
+            );
+        }
+    }
+
+    /// The owner fixture the exact-match loop above runs: client on a pty, one
+    /// ancestor owning it under `comm`.
+    fn walk2(comm: &str) -> Option<u32> {
+        let comm = comm.to_owned();
+        konsole_in_chain(1, move |p| {
+            Some(if p == 1 {
+                ("tmux: client".to_owned(), 2, 34824)
+            } else {
+                (comm.clone(), 3, 0)
+            })
+        })
+    }
+
+    /// A pid is turned into a PATH, so it is validated before one is built. Every
+    /// value here declines with no /proc access attempted - `""` in particular,
+    /// which is how a tmux too old for `#{client_pid}` renders the argument.
+    #[test]
+    fn a_client_pid_that_is_not_digits_never_reaches_proc() {
+        for bad in ["", "#{client_pid}", "12a", "-1", " 5", "5 ", "../../etc", "4294967296", "0x1"] {
+            assert!(!under_konsole(bad.as_bytes()), "{bad:?}");
+        }
+    }
+
+    /// The ARITY is the policy, and the empty pid is the sharp edge: it must
+    /// DECLINE rather than fall through to the unconditional form.
+    #[test]
+    fn the_arm_re_proves_only_when_it_was_given_a_pid() {
+        // A directory is not a pty, so `emit::tty_write` refuses every one of
+        // these; what is asserted is the DECISION in front of it.
+        let path = OsStr::new("/");
+        arm_tty(path, None);
+        arm_tty(path, Some(OsStr::new("")));
+        arm_tty(path, Some(OsStr::new("not a pid")));
+        // Pid 1 is init, whose comm is never `konsole` on any machine this runs
+        // on, so the proving form declines it. The unconditional form does not
+        // consult the ancestry at all.
+        assert!(!under_konsole(b"1"));
     }
 
     #[test]

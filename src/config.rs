@@ -265,6 +265,25 @@ impl Config {
         }
     }
 
+    /// Re-decide the terminal from evidence a COLD edge gathered, and re-derive
+    /// everything hanging off it.
+    ///
+    /// `glyph_pos` is the whole reason this is a method rather than a field
+    /// assignment at the call site: setting `terminal` alone arms the tab and
+    /// leaves the strip at the prefix end Konsole elides away, which is half the
+    /// reported bug still present and invisible to any test that only looks at
+    /// the arming. The derivation is duplicated deliberately and sits beside the
+    /// one in `from_env`, where a change to either is hard to make without
+    /// seeing the other - adjacency makes a drift visible, not impossible.
+    ///
+    /// `Terminal::detect` and `from_env` stay pure environment reads - this file
+    /// promises "the environment, read once and turned into types" and a probe
+    /// behind either of them would exec tmux on every tool call.
+    pub fn adopt_terminal(&mut self, terminal: Terminal) {
+        self.terminal = terminal;
+        self.glyph_pos = GlyphPos::parse(var_nonempty("CCTAB_GLYPH_POS").as_deref(), terminal);
+    }
+
     /// The compiled-in defaults and an empty environment, so the unit tests in
     /// this crate do not depend on the process they run in.
     #[cfg(test)]
@@ -413,6 +432,28 @@ mod tests {
         let p = |t| GlyphPos::parse(None, t);
         assert!(p(Terminal::Konsole) == GlyphPos::Suffix);
         assert!(p(Terminal::Unknown) == GlyphPos::Prefix);
+    }
+
+    /// THE COUPLED FIELD. A refinement that set `terminal` alone would arm the
+    /// tab and leave the strip on the end Konsole elides - half the reported bug,
+    /// looking fixed, and passing every terminal-flavoured test there is.
+    #[test]
+    fn adopting_a_terminal_re_derives_the_glyph_position_with_it() {
+        // CCTAB_GLYPH_POS is unset in this process, which is what lets the
+        // terminal decide; the suite pins nothing per test here.
+        assert!(var_nonempty("CCTAB_GLYPH_POS").is_none(), "the test process sets no layout");
+        let mut cfg = Config::for_test();
+        assert!(cfg.glyph_pos == GlyphPos::Prefix);
+        cfg.adopt_terminal(Terminal::Konsole);
+        assert!(cfg.terminal == Terminal::Konsole);
+        assert!(cfg.glyph_pos == GlyphPos::Suffix, "the strip has to move off the elided end");
+        // And back: only CCTAB_TERMINAL ever subtracts Konsole, but the method
+        // itself must not be one-way, or a caller could only ever add.
+        cfg.adopt_terminal(Terminal::Unknown);
+        assert!(cfg.glyph_pos == GlyphPos::Prefix);
+        // An explicit CCTAB_GLYPH_POS still outranks a DETECTED verdict, exactly
+        // as it already does under an asserted CCTAB_TERMINAL=konsole.
+        assert!(GlyphPos::parse(Some(OsStr::new("prefix")), Terminal::Konsole) == GlyphPos::Prefix);
     }
 
     #[test]
