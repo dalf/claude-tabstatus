@@ -55,8 +55,9 @@ unset XDG_DATA_HOME
 # carries a `session_id` depend on what an earlier assertion left behind. The
 # state section near the end sets CCTAB_STATE_DIR per case, under $tmp; every
 # other assertion in this file is therefore the STATELESS answer, which is what
-# makes it the byte-for-byte guard it was before the record existed.
-unset XDG_RUNTIME_DIR CCTAB_STATE_DIR
+# makes it the byte-for-byte guard it was before the record existed. LOCALAPPDATA
+# is the same variable for a native Windows binary.
+unset XDG_RUNTIME_DIR CCTAB_STATE_DIR LOCALAPPDATA
 
 pass=0
 fail=0

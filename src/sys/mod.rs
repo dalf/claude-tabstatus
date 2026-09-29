@@ -27,6 +27,17 @@
 //! many spellings - any letter case, an 8.3 short name, a `\\?\` prefix - and every
 //! refusal, "already correct" and "orphan" decision install makes compares paths, so
 //! they have to agree on what "the same directory" means.
+//!
+//! And THE RECORD LOCK, which is the state layer's whole concurrency story and the
+//! same algorithm on both: lock the record's file with [`lock_exclusive`], prove the
+//! path still names the locked file ([`file_id_of`] against [`file_id_at`]), and
+//! write by [`replace_file`] over the file while still holding it. On Unix that is
+//! `flock`, `fstat`/`lstat` and `rename(2)`, exactly as before this seam existed. On
+//! Windows the lock is `LockFileEx`, which is MANDATORY - it refuses every other
+//! handle's read of the bytes it covers - so it covers one byte far past any record
+//! and no reader ever meets it; identity is `FILE_ID_INFO` from a handle; and the
+//! replace is a POSIX-semantics rename, the only kind that replaces a file its writer
+//! holds open. [`replaces_open_files`] says where that kind exists.
 
 #[cfg(unix)]
 mod unix;
@@ -39,17 +50,20 @@ mod windows;
 use windows as imp;
 
 pub use imp::{
-    create_private_dir, file_id, home_fallback, is_executable, is_line_end, is_within,
-    kernel_hostname_file, link_dir, mode, normalize, os_str_from_bytes, os_string_from_vec,
-    probe_dir_link, process_alive, process_start_time, remove_dir_command, remove_dir_link,
-    replace_dir_link, replace_running, same_path, session_tty, set_mode, sweep_replaced,
-    with_mode, write_tty, DIR_LINK, HAS_FILE_ID, HAS_MODES, HAS_SESSION_TTY, HAS_UNLINK_RUNNING,
+    create_private_dir, file_id, file_id_at, file_id_of, home_fallback, is_executable,
+    is_line_end, is_within, kernel_hostname_file, link_dir, lock_exclusive, mode, normalize,
+    os_str_from_bytes, os_string_from_vec, probe_dir_link, process_alive, process_start_time,
+    remove_dir_command, remove_dir_link, replace_dir_link, replace_file, replace_running,
+    replaces_open_files, reserved_name, same_path, same_process, session_tty, set_mode,
+    sweep_replaced, with_mode, write_tty, DIR_LINK, HAS_MODES, HAS_RECORD_LOCK, HAS_SESSION_TTY,
+    HAS_UNLINK_RUNNING, NO_STATE_DIR, ORIGIN_KEY, RUNTIME_DIR_VAR,
 };
 
-/// What identifies a file independently of its name: device and inode on Unix.
-/// [`file_id`] answers `None` where there is no such identity to offer, which
-/// callers read as "cannot prove same file".
-pub type FileId = (u64, u64);
+/// What identifies a file independently of its name: device and inode on Unix, the
+/// volume serial and the 128-bit file id on Windows (ReFS uses all 128 bits). The
+/// functions answer `None` where there is no such identity to offer, which callers
+/// read as "cannot prove same file".
+pub type FileId = (u64, u128);
 
 #[cfg(test)]
 mod tests {
@@ -68,10 +82,133 @@ mod tests {
     /// function.
     #[test]
     fn the_capability_constants_match_the_functions() {
-        let m = std::fs::metadata(std::env::current_exe().expect("exe")).expect("meta");
-        assert_eq!(HAS_FILE_ID, file_id(&m).is_some());
+        let exe = std::env::current_exe().expect("exe");
+        let m = std::fs::metadata(&exe).expect("meta");
+        let lm = std::fs::symlink_metadata(&exe).expect("lstat");
+        let f = std::fs::File::open(&exe).expect("open");
+        // A handle and the path it was opened by agree on what file that is.
+        let proven = file_id_of(&f).is_some() && file_id_at(&exe, &lm) == file_id_of(&f);
+        assert_eq!(HAS_RECORD_LOCK, proven);
         assert_eq!(HAS_MODES, mode(&m).is_some());
         assert_eq!(HAS_MODES, is_executable(&m).is_some());
+    }
+
+    /// The record lock excludes another locker - a second handle, in this very
+    /// process - and refuses NO reader. The second half is the one Windows has to be
+    /// made to keep: `LockFileEx` refuses every read of the bytes it covers.
+    #[test]
+    fn the_record_lock_excludes_another_locker_and_no_reader() {
+        let d = scratch("lock");
+        let rec = d.join("rec");
+        std::fs::write(&rec, b"cts5\nb w\n").expect("write");
+        let open = || {
+            std::fs::OpenOptions::new().read(true).write(true).open(&rec).expect("open")
+        };
+        let held = open();
+        lock_exclusive(&held).expect("locked");
+        assert_eq!(std::fs::read(&rec).expect("a reader is not refused"), b"cts5\nb w\n");
+        let second = open();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            lock_exclusive(&second).expect("locked in turn");
+            tx.send(()).expect("send");
+        });
+        let wait = std::time::Duration::from_millis(300);
+        assert!(rx.recv_timeout(wait).is_err(), "a second locker waits for the first");
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(10)).expect("and gets it once released");
+        waiter.join().expect("join");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The write the state layer makes: a new file replaces the record while its
+    /// writer still holds the old one open and locked. The name then names the new
+    /// file, the held handle still reads the old one, and their identities differ -
+    /// which is how a hook queued on the old file learns it must lock again.
+    ///
+    /// Also where the record's path is longer than Windows' MAX_PATH (260): every
+    /// other operation std makes reaches such a path, so the replace must too, or
+    /// the layer is on and silently records nothing.
+    #[test]
+    fn a_replace_lands_while_the_old_file_is_held_open_and_locked() {
+        let d = scratch("replace-held");
+        let mut deep = d.join("deep");
+        while deep.as_os_str().len() < 300 {
+            deep.push("abcdefghijklmnopqrstuvwxyz0123456789");
+        }
+        std::fs::create_dir_all(&deep).expect("mkdir deep");
+        for dir in [&d, &deep] {
+            assert!(replaces_open_files(dir), "the platform temp directory can");
+            let (rec, tmp) = (dir.join("rec"), dir.join("rec.1.tmp"));
+            std::fs::write(&rec, b"old").expect("write");
+            let held = std::fs::OpenOptions::new().read(true).write(true).open(&rec).expect("open");
+            lock_exclusive(&held).expect("locked");
+            std::fs::write(&tmp, b"new").expect("write");
+            replace_file(&tmp, &rec).expect("replaced while held");
+            assert_eq!(std::fs::read(&rec).expect("read"), b"new");
+            let mut old = Vec::new();
+            std::io::Read::read_to_end(&mut &held, &mut old).expect("read held");
+            assert_eq!(old, b"old", "the held handle keeps the file it opened");
+            let lm = std::fs::symlink_metadata(&rec).expect("lstat");
+            assert_ne!(file_id_of(&held), file_id_at(&rec, &lm), "the name moved on");
+        }
+        assert_eq!(names(&d), vec!["deep", "rec"]);
+        assert_eq!(names(&deep), vec!["rec"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Not a test: a process for the liveness test below, alive until its stdin closes.
+    #[test]
+    #[ignore = "a child process for another test"]
+    fn live_until_stdin_closes() {
+        if std::env::var_os("CCTAB_TEST_HOLD").is_some() {
+            let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
+        }
+    }
+
+    /// The reaper's one question: is the process that recorded (pid, start) still
+    /// that process? Yes for this one; no for a wrong start (a reused pid), for a
+    /// child that has exited - also while its handle is still held, which on Windows
+    /// keeps the pid reserved - and for a pid nothing has.
+    #[test]
+    #[cfg(any(target_os = "linux", windows))]
+    fn a_process_is_the_same_process_only_while_it_runs() {
+        let me = std::process::id();
+        let start = process_start_time(me).expect("our own start time");
+        assert_eq!(process_start_time(me), Some(start), "immutable");
+        assert_eq!(same_process(me, start), Some(true));
+        assert_eq!(same_process(me, start + 1), Some(false));
+        assert_eq!(process_alive(me), Some(true));
+        let mut child = std::process::Command::new(std::env::current_exe().expect("exe"))
+            .args(["--exact", "sys::tests::live_until_stdin_closes", "--ignored"])
+            .env("CCTAB_TEST_HOLD", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let born = process_start_time(pid).expect("a running child has a start time");
+        assert_eq!(same_process(pid, born), Some(true));
+        drop(child.stdin.take());
+        child.wait().expect("wait");
+        assert_eq!(same_process(pid, born), Some(false), "exited, handle still held");
+        assert_eq!(process_start_time(pid), None);
+        drop(child);
+        assert_eq!(same_process(pid, born), Some(false), "exited, handle released");
+        assert_eq!(same_process(u32::MAX, 1), Some(false), "no such pid");
+    }
+
+    /// A word of the session-id grammar that Windows opens as a DEVICE in any
+    /// directory; nothing is reserved on Unix.
+    #[test]
+    fn only_dos_device_names_are_reserved() {
+        for n in ["NUL", "nul", "Con", "PRN", "aux", "COM1", "lpt9", "COM0"] {
+            assert_eq!(reserved_name(n), cfg!(windows), "{n}");
+        }
+        for n in ["NULL", "COM", "COM10", "LPT", "s1", "aec0f2b1-4d31-4e11-9a41-2c7d55e1a900"] {
+            assert!(!reserved_name(n), "{n}");
+        }
     }
 
     #[test]

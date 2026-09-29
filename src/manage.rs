@@ -891,9 +891,10 @@ fn refuse_unresolved(c: &Ctx) -> Option<String> {
 ///
 /// `dir_writable`'s probe and `write_atomic`'s temp file are named with the pid that
 /// created them, so nothing collides with a stale one - and nothing used to clean
-/// one up either. Both are per-run scratch, so a name whose pid is no longer in
-/// /proc is litter by definition. A LIVE pid is left alone: a concurrent install's
-/// temp file is the one thing here that must not be removed under it.
+/// one up either. Both are per-run scratch, so a name whose pid no longer runs (no
+/// /proc entry; on Windows, no such process or one that has exited) is litter by
+/// definition. A LIVE pid is left alone: a concurrent install's temp file is the one
+/// thing here that must not be removed under it.
 fn sweep_litter(dir: &Path) {
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -905,8 +906,8 @@ fn sweep_litter(dir: &Path) {
         let Some(pid) = scratch_pid(name) else { continue };
         // A digit string that is not a pid's canonical spelling (too large, or a
         // leading zero) names no process, exactly as it names no /proc entry. Unknown
-        // liveness (Windows) counts as alive: keeping litter is harmless, removing a
-        // concurrent install's temp file is not.
+        // liveness (a process this user may not ask about) counts as alive: keeping
+        // litter is harmless, removing a concurrent install's temp file is not.
         let alive = pid
             .parse::<u32>()
             .ok()
@@ -2142,8 +2143,9 @@ fn remove_state(c: &Ctx) -> Result<(), String> {
 /// Removing a still-LIVE session's record is harmless, because a session with no
 /// record degrades to the stateless answer, which is exactly what it painted before
 /// this plugin existed; and by this point the plugin is unlinked, so no hook of any
-/// session will run again to write another. Without this the files sat in
-/// `$XDG_RUNTIME_DIR` until logout, unmentioned by a report that ends "Done." and
+/// session will run again to write another. Without this the files sat in the
+/// state directory - until logout, or on Windows for good - unmentioned by a report
+/// that ends "Done." and
 /// "The repo itself was not touched" - which reads as a complete account of what is
 /// left behind.
 fn remove_records() {

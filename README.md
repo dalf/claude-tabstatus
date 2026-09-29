@@ -355,12 +355,15 @@ fires no `SessionEnd`, so the record has three independent bounds and no daemon:
   its own carrier clock.
 - A **`SessionStart` in any session reaps the others**, by asking whether the
   process that wrote each record is still running. Every write stamps the record
-  with `$CLAUDE_PID` *and that pid's start time* - field 22 of `/proc/<pid>/stat` -
+  with `$CLAUDE_PID` *and that pid's start time* - field 22 of `/proc/<pid>/stat`;
+  on Windows the process's creation FILETIME, written as `q <pid> <FILETIME>` -
   and the reaper unlinks a record only when that pair no longer names a running
   process. (`SessionStart` is where it usually happens; doing it on any write is
   what covers a session whose `SessionStart` ran before this plugin was installed,
   which would otherwise be left on the one-day mtime rule for its whole life.)
-- The directory is under `$XDG_RUNTIME_DIR`, which the OS empties at logout.
+- The directory is under `$XDG_RUNTIME_DIR`, which the OS empties at logout. On
+  Windows it is `%LOCALAPPDATA%\claude-tabstatus`, which nothing empties; after a
+  reboot no origin is alive, so the next `SessionStart` reaps every record.
 
 The reaper **provably cannot delete a live session's record that carries an
 origin**, and the pair is why.
@@ -374,7 +377,11 @@ start time is also what makes pid recycling harmless - a recycled pid reads as
 *gone*, not as alive, because the start time under it differs. The error the rule
 *can* make is the harmless one: keeping a dead session's record if a new process
 were handed the same pid inside the same 10ms tick, which needs 4194304 intervening
-spawns (`pid_max`, measured, at `CLK_TCK` 100).
+spawns (`pid_max`, measured, at `CLK_TCK` 100). On Windows the same proof holds:
+`$CLAUDE_PID` is the live `claude.exe` (measured), its creation time never changes,
+and a pid is not reissued while any handle to its process is open, so the error
+needs a reused pid inside the same 100ns creation stamp. A process the reaper may
+not ask about counts as alive there too.
 
 The parse has one trap worth naming, because the obvious `awk '{print $22}'` falls
 into it: field 2 of `/proc/<pid>/stat` is the executable name in parentheses, and it
@@ -438,6 +445,37 @@ obtained, the hook makes no unlocked state change. `std::fs::File::lock` ships i
 std (1.89), so this costs no dependency; it
 is the reason `rust-version` moved from 1.74 to 1.89.
 
+**On Windows it is the same algorithm with three different primitives**, all in
+`src/sys/windows.rs`. The lock is `LockFileEx` on *one byte* at offset 2^62, far past
+any record, because that lock is mandatory: over the record's bytes it would refuse
+every other handle's read - the reaper's, `doctor`'s, and the hook's own read by path,
+which would then write a fresh record over the real one. The identity check compares
+the volume serial and 128-bit file id (`FILE_ID_INFO`), read from handles. And the
+replace is a POSIX-semantics rename (`FileRenameInfoEx`), the only kind that replaces
+a file its writer still holds open. A volume without it (FAT, exFAT, the 9P share
+WSL exports, some SMB servers) cannot keep a record, so the layer is off there and
+`doctor` says why.
+
+One thing can still refuse that replace on Windows, and never on Linux: another
+program holding the record open *without* delete sharing - Python's `open()`, a
+.NET `File.OpenRead`, `Get-Content -Wait`, some editors and backup tools. The hook
+retries for half a second under its lock; past that the write is lost, like any
+failed write (best effort), and the hook still paints the edge's answer. When the
+lost write was a subagent's clear, the tab shows the truth but the record keeps the
+wait, so main-thread edges paint nothing until that agent's next tool call or its
+`SubagentStop` clears it (measured), or a prompt, a quiet `Stop` or the TTL does.
+Leave the directory's files alone while sessions run. And because NTFS compares
+names without case, two session ids differing only in case would share one record;
+Claude Code's ids are lowercase UUIDs.
+
+Measured with the in-crate barrier harness (`cargo test race_400 -- --ignored
+--nocapture`: each hook a separate process, all released together once ready),
+400 rounds of the clear race, 400 of the wait race and 50 eight-way rounds lose
+**0, 0 and 0** with the lock on Windows and on Linux, and without it 400, 400 and 50
+on Windows and 399, 400 and 50 on Linux.
+That harness lines the hooks up far more tightly than the one behind the 76 of 400
+above, so the two sets of numbers are not comparable.
+
 ```text
 cts5                                           the tag: version 5 of the wire
 b i                                            base = w | a | i
@@ -445,6 +483,10 @@ g 1790380620                                  last main Stop reporting backgroun
 p 3709427 84460384                             the session's (pid, start time)
 w aec99e1f4bda1972b:1790380630 -:1790380631    one wait per word: owner, then epoch
 ```
+
+On Windows the origin line is `q <pid> <creation FILETIME>` instead of `p`, and each
+platform reads the other's key as an unknown field - no origin, the mtime rule -
+never as a pid of its own.
 
 `-` is the main loop, `?` an unknown permission/input notification, `?p` an anonymous
 permission request with an unusable supplied owner, and `?!` an anonymous
@@ -619,7 +661,10 @@ file cannot be deleted while it runs - run it from another copy, or pass
 could not remove and keeps the tree's marker, so a later `install` still reuses the
 tree. Paths are compared the way NTFS compares them - any letter case, an 8.3 short
 name or a `\\?\` prefix is the same directory - and a removal hint is a PowerShell
-`Remove-Item -Recurse -Force -LiteralPath '...'` rather than `rm -rf`.
+`Remove-Item -Recurse -Force -LiteralPath '...'` rather than `rm -rf`. [Wait
+ownership](#wait-ownership) and the purple background indicator work there as on
+Linux, with the per-session record under `%LOCALAPPDATA%\claude-tabstatus` and the
+same lock guarantees; `doctor` shows the record and each session's liveness.
 
 ### The plugin directory is build output
 
@@ -1113,7 +1158,9 @@ Four things, and nothing else:
 Plus one thing that is not configuration: the running plugin keeps a small
 per-session record under `$XDG_RUNTIME_DIR/claude-tabstatus` (see
 [wait ownership](#wait-ownership)). `uninstall` removes that directory too, and says
-so; it is on a tmpfs the OS empties at logout in any case.
+so; it is on a tmpfs the OS empties at logout in any case. On Windows the records
+are under `%LOCALAPPDATA%\claude-tabstatus`, which nothing empties, so `uninstall`
+is what removes them there.
 
 The first one is not optional. Claude Code repaints its own terminal title
 roughly every 960ms, straight over ours, and a plugin cannot set environment
@@ -1804,7 +1851,7 @@ Everything the runtime half reads, in one place:
 | `CCTAB_TTL_GONE` | `3600` | seconds before a cell leaves the tmux strip; `0` = never |
 | `CCTAB_NO_TMUX` | unset | set to anything: no record, no `tmux` invocation, no arming |
 | `CCTAB_DRY_RUN` | unset | `1` prints the computed tab title and emits nothing |
-| `CCTAB_STATE_DIR` | `$XDG_RUNTIME_DIR/claude-tabstatus` | where the per-session wait record lives. Unset **and** no `XDG_RUNTIME_DIR` means no record at all, and every edge falls back to the stateless answer. **Use a dedicated directory:** `session-start` reaps in it. It deletes only files it can prove are its own records ([wait ownership](#wait-ownership)), but it is still the wrong place to keep anything else |
+| `CCTAB_STATE_DIR` | `$XDG_RUNTIME_DIR/claude-tabstatus`; on Windows `%LOCALAPPDATA%\claude-tabstatus` | where the per-session wait record lives. Unset **and** no `XDG_RUNTIME_DIR` (`LOCALAPPDATA`) means no record at all, and every edge falls back to the stateless answer. **Use a dedicated directory:** `session-start` reaps in it. It deletes only files it can prove are its own records ([wait ownership](#wait-ownership)), but it is still the wrong place to keep anything else. On Windows give a drive-absolute path (`C:\...`): Git Bash rewrites a `\\server\share` value into a drive-rooted one. Do not share one directory between WSL and Windows - each reads the other's origin as absent |
 | `CCTAB_NOW` | unset | test only: pins the epoch the tmux record and the state record carry |
 
 `XDG_DATA_HOME` is read by `install` alone, for where the [generated plugin
@@ -1820,7 +1867,8 @@ directory - deliberately with no `$HOME` fallback, because that would put a reco
 inside the golden corpus's fixture `HOME` and make every case carrying a
 `session_id` order-dependent. That it reaches a *hook* subprocess at all is
 measured, not assumed: a temporary probe build logged what a real `PostToolUse`
-hook sees, and it was `xdg=Some("/run/user/1000")`. `TMUX`, `TMUX_PANE`, `STY`,
+hook sees, and it was `xdg=Some("/run/user/1000")`. On Windows `LOCALAPPDATA` takes
+its place, with the same absence of any fallback. `TMUX`, `TMUX_PANE`, `STY`,
 `KONSOLE_VERSION`,
 `KONSOLE_DBUS_SESSION`, `SSH_CONNECTION`, `SSH_TTY`, `HOME`, `PWD`, `HOSTNAME`
 and `GIT_DIR` are read as they are.
@@ -1878,7 +1926,9 @@ parser dependencies (`serde`, `serde_core`, `serde_json`, `memchr`) use
 `opt-level = 3` for speed. `rust-version` is **1.89** - raised from 1.74
 for `std::fs::File::lock`, which is what makes the state layer's read-modify-write
 atomic without a crate. The alternative was a bounded compare-and-retry loop: more
-code, and only probably correct.
+code, and only probably correct. That is the Unix lock; Windows locks one byte with
+`LockFileEx` directly, because std's lock there covers the whole file and refuses
+readers.
 
 A digest is written **per triple built**, `bin/sources.<triple>.sha256`, plus an
 unsuffixed copy for the host because `bin/tabstatus` is the host binary. A single
@@ -1945,6 +1995,16 @@ cargo test --locked
 python3 tests/test_payload.py   # subprocess parsing and state-preservation regressions
 ```
 
+The unit tests include a real race: `concurrent_hooks_of_one_session_lose_no_update`
+runs hooks of one session as separate processes, released together, and must lose
+no update, on Linux and Windows alike. Its control, which switches the lock off in
+the test build only, shows that the same race does lose updates without it:
+
+```sh
+cargo test race_control -- --ignored --nocapture   # stops at the first lost update
+cargo test race_400 -- --ignored --nocapture       # 400 rounds, with and without the lock
+```
+
 The state section pins `CLAUDE_PID` per case rather than inheriting it, and that is
 a gate property rather than tidiness: the layer reads that variable to stamp a
 record's origin, so run from inside a Claude Code session - which is how this project
@@ -1963,8 +2023,8 @@ newest of the four and the one that would otherwise reach a real
 happens to be unset on the machine this was written on, so the bug would not have
 shown locally. It is unset once at the top of the file and pinned per case as well.
 `CCTAB_STATE_DIR` is the one that is not derived from any of the others:
-`state::purge` resolves the record directory from `XDG_RUNTIME_DIR` /
-`CCTAB_STATE_DIR` **alone**, so an `uninstall` with only the first three redirected
+`state::purge` resolves the record directory from `XDG_RUNTIME_DIR` (`LOCALAPPDATA`
+on Windows) / `CCTAB_STATE_DIR` **alone**, so an `uninstall` with only the first three redirected
 deletes the *real* wait records of whoever is running it. Harmless and
 self-healing - a session with no record degrades to the stateless answer and the
 next edge writes another - but any script or session exercising `uninstall` should

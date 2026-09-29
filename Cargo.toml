@@ -5,7 +5,9 @@ edition = "2021"
 # Raised from 1.74 for `std::fs::File::lock`, stable since 1.89, which is what
 # makes the state layer's read-modify-write atomic without a dependency. The
 # alternative was a bounded compare-and-retry loop, which is more code and only
-# probably correct; a lock that ships in std is neither. Toolchain here: 1.98.1.
+# probably correct; a lock that ships in std is neither. That is the Unix lock;
+# Windows locks one byte directly (see src/sys/windows.rs), because std's lock
+# there covers the whole file and refuses readers. Toolchain here: 1.98.1.
 rust-version = "1.89"
 description = "Puts the Claude Code session state into the terminal tab title."
 license = "GPL-3.0-or-later"
@@ -21,9 +23,12 @@ serde_json = "1"
 # std can make only a symlink, which Windows refuses without Developer Mode or
 # elevation. Storage_FileSystem for the rest of that link's mechanics and for path
 # identity: a no-replace rename, the drive type, and a directory's stored spelling
-# of a name. Declarations only; no Unix build sees this crate.
+# of a name - and for the state record: a file's identity from a handle, a
+# one-byte lock, a POSIX-semantics replace, and the volume's rename capability.
+# System_Threading for a process's creation time, which is a record origin's start
+# time there. Declarations only; no Unix build sees this crate.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading"] }
 
 [[bin]]
 name = "tabstatus"
