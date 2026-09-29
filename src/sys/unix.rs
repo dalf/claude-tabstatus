@@ -29,17 +29,12 @@ pub const HAS_RECORD_LOCK: bool = true;
 /// [`mode`] always answers, and [`set_mode`] applies what it is given.
 pub const HAS_MODES: bool = true;
 
-/// [`session_tty`] can resolve a pty - through `/proc`, so on Linux.
-#[cfg(not(target_os = "macos"))]
+/// [`session_tty`] can resolve a pty on every Unix here. Linux reads the symlink
+/// `/proc/<pid>/fd/1`; macOS asks `proc_pidfdinfo` for the same fd's vnode path.
+/// Only that lookup differs - see [`fd1_path`] - and the guard downstream of it is
+/// one body. The constant and the function have to agree, because `doctor` reads the
+/// constant to say whether `session-start` and `session-end` have a route at all.
 pub const HAS_SESSION_TTY: bool = true;
-
-/// [`session_tty`] never resolves here: fd 1 of another process is not a path
-/// macOS will hand over through anything `libc` declares - see there. The constant
-/// and the function have to agree, because `doctor` reads the constant to say
-/// whether `session-start` and `session-end` have a route at all, and a `true`
-/// would promise a pty nothing can open.
-#[cfg(target_os = "macos")]
-pub const HAS_SESSION_TTY: bool = false;
 
 /// [`set_session_title`] has no console to title: a Unix terminal takes its title
 /// as bytes on the pty, through [`session_tty`].
@@ -516,16 +511,16 @@ fn same_as_recorded(
 ///
 /// THE HEADLESS GUARD: unless fd 1 of that pid resolves to a writable character
 /// device under /dev/pts or /dev/tty, do nothing rather than retitle an unrelated
-/// terminal - which covers a redirected `claude -p` and every platform with no
-/// /proc. `None` is therefore both "no tab to paint" and "fd 1 would not resolve",
-/// deliberately the same answer: painting on a guess is the one outcome that
-/// retitles somebody else's terminal.
-#[cfg(not(target_os = "macos"))]
+/// terminal - which covers a redirected `claude -p` and every platform where fd 1
+/// cannot be resolved at all. `None` is therefore both "no tab to paint" and "fd 1
+/// would not resolve", deliberately the same answer: painting on a guess is the one
+/// outcome that retitles somebody else's terminal.
+///
+/// ONE body for every Unix. Only [`fd1_path`] is `cfg`-selected, because only the
+/// lookup differs; the three checks below are the contract and they are the same
+/// three whichever kernel answered.
 pub fn session_tty(claude_pid: &OsStr) -> Option<File> {
-    let mut link = OsString::from("/proc/");
-    link.push(claude_pid);
-    link.push("/fd/1");
-    let target = fs::read_link(Path::new(&link)).ok()?;
+    let target = fd1_path(claude_pid)?;
     if !is_tty_path(&target) || !is_char_device(&target.metadata().ok()?.file_type()) {
         return None;
     }
@@ -534,30 +529,221 @@ pub fn session_tty(claude_pid: &OsStr) -> Option<File> {
     OpenOptions::new().write(true).open(&target).ok()
 }
 
-/// DELIBERATELY UNANSWERED on macOS, and the honest `None` the guard above already
-/// defines: "fd 1 would not resolve", which paints nothing rather than guessing at
-/// a terminal.
+/// What fd 1 of `claude_pid` names, where a `/proc` says so: the symlink
+/// `/proc/<pid>/fd/1`, read as a path. The pid is pasted in as the bytes it arrived
+/// as and never parsed - a name that is not a live pid's fd is a `read_link` error,
+/// which is the same `None` a rejected parse would have produced. This is also the
+/// line `tests/oracle/tabstatus.sh` implements as `readlink "/proc/$CLAUDE_PID/fd/1"`,
+/// and the 312-case replay compares the two, so it stays a paste.
 ///
-/// What it would take: `proc_pidfdinfo(pid, 1, PROC_PIDFDVNODEPATHINFO, ...)` into
-/// a `vnode_fdinfowithpath`, whose `vip_path` is the path fd 1 names. `libc` 0.2.189
-/// declares `proc_pidfdinfo` and `proc_fdinfo` but NEITHER `PROC_PIDFDVNODEPATHINFO`
-/// nor `struct vnode_fdinfowithpath` - measured, not assumed - so both would have to
-/// be hand-written `#[repr(C)]`, and no machine in this project can link a macOS
-/// binary to check a layout that a wrong guess turns into memory corruption on
-/// somebody's Mac. It is not guessed here.
+/// Measured while writing the macOS side, and left alone deliberately: because the
+/// bytes are pasted, a `$CLAUDE_PID` of `../../dev` makes `/proc/../../dev/fd/1`,
+/// and `/dev/fd` IS a symlink to `/proc/self/fd` - so that one name resolves, to
+/// THIS hook's own fd 1. It buys nothing: the guard downstream still demands a
+/// writable pty, so the worst it reaches is the terminal the hook is already
+/// running in, and `$CLAUDE_PID` comes from the process that spawned the hook.
+/// macOS cannot reach even that, for the unrelated reason that a system call takes
+/// a number and `parse_pid` is what produces one - which is a `cfg` away from here,
+/// so this sentence names it rather than linking it.
+#[cfg(not(target_os = "macos"))]
+fn fd1_path(claude_pid: &OsStr) -> Option<PathBuf> {
+    let mut link = OsString::from("/proc/");
+    link.push(claude_pid);
+    link.push("/fd/1");
+    fs::read_link(Path::new(&link)).ok()
+}
+
+/// The same question where there is no `/proc`: `proc_pidfdinfo` with the
+/// `PROC_PIDFDVNODEPATHINFO` flavour, whose `vip_path` is the path fd 1's vnode
+/// hangs at. [`fd1_path_from_vnode`] turns the answer into a path, and everything
+/// after that is the shared guard above.
 ///
-/// `proc_bsdinfo.e_tdev`, which IS declared, is the CONTROLLING TERMINAL and not
-/// this: a redirected `claude -p > file` keeps its controlling terminal, so taking
-/// that route would paint a terminal that is not this session's output - exactly the
-/// substitution the headless guard exists to refuse.
+/// THE HEADLESS GUARD SURVIVES, which is the whole reason this route is usable:
+/// the kernel serves this flavour only for a vnode, so a PIPE OR SOCKET on fd 1 is
+/// `EBADF` and never a path, and an fd 1 redirected to a file yields that FILE's
+/// path, which [`is_tty_path`] rejects. Nothing here has to recognise a headless
+/// session; it falls out of what the call will and will not answer.
 ///
-/// The consequence is bounded, because it is only these two edges: the hot
-/// working/waiting/idle paint travels the hook protocol's `terminalSequence` and
-/// needs no pty at all. `session-start`'s arming and `session-end`'s clearing are
-/// what is missing, and [`HAS_SESSION_TTY`] is `false` so that `doctor` says so.
+/// `e_tdev` from `proc_bsdinfo` - which [`process_start_time`] already reads, and
+/// which needs no new declaration at all - is deliberately NOT used: it is the
+/// CONTROLLING terminal, which a redirected `claude -p > file` still has, so it
+/// would name a terminal that is not this session's output. That is exactly the
+/// substitution the guard exists to refuse.
 #[cfg(target_os = "macos")]
-pub fn session_tty(_claude_pid: &OsStr) -> Option<File> {
-    None
+fn fd1_path(claude_pid: &OsStr) -> Option<PathBuf> {
+    let pid = pid_to_ask_about(parse_pid(claude_pid)?)?;
+    let want = std::mem::size_of::<VnodeFdInfoWithPath>();
+    let size = i32::try_from(want).ok()?;
+    // SAFETY: every field of this struct, transitively, is an integer or an array
+    // of integers, so all-zero is a valid value of it. Nothing is read out of it
+    // except `pvip.vip_path`, and only after the byte count says the kernel filled
+    // the whole of it.
+    let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+    // SAFETY: the pointer and `size` describe that same live buffer exactly, so the
+    // call writes at most `size` bytes inside it; it keeps no pointer to it, and
+    // `info` outlives the call. The kernel refuses a `size` below the flavour's own
+    // before it copies anything - see the declarations below - so the one way to
+    // get this wrong is an error return.
+    let nb = unsafe {
+        libc::proc_pidfdinfo(
+            pid,
+            1,
+            PROC_PIDFDVNODEPATHINFO,
+            std::ptr::from_mut(&mut info).cast(),
+            size,
+        )
+    };
+    // `vip_path` is `[[c_char; 32]; 32]` because libc spells a 1024-byte array that
+    // way; flatten it into the bytes a path is made of. `as u8` is the identity on
+    // whichever sign the platform gives `c_char` and copies no other byte.
+    let raw: Vec<u8> = info.pvip.vip_path.iter().flatten().map(|&c| c as u8).collect();
+    fd1_path_from_vnode(nb, want, &raw)
+}
+
+/// The kernel's answer read as a path, as a pure function of the byte count it
+/// returned and the bytes it wrote - so the macOS body above is a call and a `?`,
+/// and every DECISION in it is one a Linux `cargo test` runs.
+///
+/// `nb` is a byte count, not a status: `nb <= 0` is the error return, and it does
+/// not convert. `ENOENT` there means the vnode was REVOKED - an fd whose terminal
+/// went away - and it is the same `None` as any other failure, because both mean
+/// there is no tab to paint. A count that is not exactly `want` is a hard error and
+/// not a short read to tolerate: the fields this reads would be holding the zeros
+/// the buffer was created with, and a zero-length path is not a refusal this can
+/// tell apart from a real one. The taxonomy is lsof's technique - `nb <= 0`, the
+/// revoked vnode, a short count as an error - and none of its code.
+///
+/// It is also what makes a wrong `PROC_PIDFDVNODEPATHINFO` harmless: another
+/// flavour fills its own smaller struct and returns ITS size, which is not `want`.
+///
+/// Then the NUL. `vip_path` is a C string in a fixed array, so the path ends at the
+/// first zero byte and the rest is whatever was there. lsof forces a terminator
+/// into the last byte before calling `strlen`; a Rust slice cannot be walked off
+/// the end in the first place, so what is left is the policy, and the policy here
+/// is stricter: an array with NO zero in it is refused rather than truncated to its
+/// last byte. `MAXPATHLEN` counts the terminator, so a real path always has one,
+/// and a truncated path names a DIFFERENT file - which is the one thing the guard
+/// downstream cannot catch, since /dev/pts/12 truncated to /dev/pts/1 is also a
+/// writable character device, belonging to somebody else's terminal.
+///
+/// An empty path is `None` for the same reason it is not a path.
+///
+/// The bytes become an `OsString` unaltered: a path is bytes on Unix, and a
+/// filesystem that holds a name which is not UTF-8 still holds a name.
+#[cfg(any(target_os = "macos", test))]
+fn fd1_path_from_vnode(nb: i32, want: usize, raw: &[u8]) -> Option<PathBuf> {
+    if usize::try_from(nb) != Ok(want) {
+        return None;
+    }
+    let end = raw.iter().position(|b| *b == 0)?;
+    let name = raw.get(..end)?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(os_string_from_vec(name.to_vec())))
+}
+
+/// The flavour that answers with a vnode's path. `libc` 0.2.189 declares neither
+/// this nor the struct below - measured against the crate source, not assumed - so
+/// both are written out here; see the declarations for what makes that sound.
+#[cfg(target_os = "macos")]
+const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+
+/// `struct proc_fileinfo`, and below it `struct vnode_fdinfowithpath`: the two
+/// halves of what `proc_pidfdinfo`'s `PROC_PIDFDVNODEPATHINFO` copies out.
+///
+/// WHAT THIS CONFORMS TO. The interface is `xnu`'s `bsd/sys/proc_info.h` - the field
+/// order every caller of that flavour must match to interoperate at all. Nothing is
+/// copied from it: no text, no comments, no transcription. Apple's source is APSL
+/// 2.0 and this program is GPL-3.0-or-later, so an ABI is the only thing that may
+/// cross, and an ABI is an interface rather than an expression of one.
+///
+/// WHAT MAKES IT SOUND WITHOUT A MAC. No machine in this project can link a macOS
+/// binary, so a hand-written layout is normally a guess, and the last word on this
+/// function said so. It is not a guess here because the layout is ASSERTED rather
+/// than assumed: the `const _` block below fails the macOS `cargo check` - which
+/// this project does run, for both Apple ABIs - unless every size and offset is the
+/// one measured against the header. The nested types are libc's OWN
+/// (`vinfo_stat`, `vnode_info`, `vnode_info_path`), and libc checks those against
+/// Apple's real SDK on its own CI; what is added here is five scalars and two
+/// fields, all of which the asserts pin.
+///
+/// AND A WRONG SIZE WOULD NOT BE CORRUPTION ANYWAY. The kernel compares the
+/// `buffersize` it was handed against this flavour's own size and returns `ENOMEM`
+/// before it copies a byte, then copies out exactly that many. The direction is
+/// kernel to user into a buffer we sized ourselves, so a mistake is an error
+/// return that [`fd1_path_from_vnode`] reads as `None` - never a write past the end
+/// of anything.
+///
+/// WHO MAY ASK. The gate is the same-user check, not an entitlement: this asks
+/// about `$CLAUDE_PID`, which is this user's own `claude`, and it works under SIP
+/// with no privilege of any kind.
+///
+/// The fields are named for the ABI and read through `pvip` alone; the rest are
+/// here to occupy the bytes the kernel writes, which is what the asserts check.
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+#[repr(C)]
+struct ProcFileInfo {
+    fi_openflags: u32,
+    fi_status: u32,
+    fi_offset: libc::off_t,
+    fi_type: i32,
+    fi_guardflags: u32,
+}
+
+#[cfg(target_os = "macos")]
+#[allow(dead_code)]
+#[repr(C)]
+struct VnodeFdInfoWithPath {
+    pfi: ProcFileInfo,
+    pvip: libc::vnode_info_path,
+}
+
+// The layout, checked by the compiler that will build for the Mac. These numbers
+// are the header's, and a build that disagrees with any one of them does not
+// produce a binary - which is the whole of what stands in for running this
+// anywhere. They are not vacuous: one spurious `u32` added to `ProcFileInfo` here
+// failed four of them.
+//
+// `vip_path`'s offset is asserted too, because the path is read by flattening that
+// array: it must begin where the header puts it and run to the end of the struct,
+// which is 1176 - 152 = 1024 bytes, `MAXPATHLEN`.
+//
+// What a size cannot catch is two same-width fields swapped, and `proc_fileinfo`
+// ends in three of them. That is survivable here and only here: this reads NOTHING
+// out of `proc_fileinfo`. What it reads is `pvip`, whose offset is asserted, and
+// inside it `vip_path`, whose offset is asserted, in a struct that is libc's own
+// and is checked against Apple's real SDK on libc's CI.
+// One item each, and not one block: a const block stops at its first failure, and
+// what an operator on a Mac wants from a broken build is every number that moved.
+#[cfg(target_os = "macos")]
+const _: () = assert!(size_of::<ProcFileInfo>() == 24);
+#[cfg(target_os = "macos")]
+const _: () = assert!(size_of::<libc::vinfo_stat>() == 136);
+#[cfg(target_os = "macos")]
+const _: () = assert!(size_of::<libc::vnode_info>() == 152);
+#[cfg(target_os = "macos")]
+const _: () = assert!(size_of::<libc::vnode_info_path>() == 1176);
+#[cfg(target_os = "macos")]
+const _: () = assert!(size_of::<VnodeFdInfoWithPath>() == 1200);
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::offset_of!(VnodeFdInfoWithPath, pvip) == 24);
+#[cfg(target_os = "macos")]
+const _: () = assert!(std::mem::offset_of!(libc::vnode_info_path, vip_path) == 152);
+
+/// `$CLAUDE_PID` as a pid: 1-10 ASCII digits and nothing else. The `/proc` body
+/// needs no such thing - a bad name is a failed `read_link` - but a system call
+/// takes a number, and this is the same rule the Windows backend's `parse_pid`
+/// applies to the same variable. [`pid_to_ask_about`] then rules out the values
+/// that are not a `pid_t` at all.
+#[cfg(any(target_os = "macos", test))]
+fn parse_pid(raw: &OsStr) -> Option<u32> {
+    let b = raw.as_bytes();
+    if b.is_empty() || b.len() > 10 || !b.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    std::str::from_utf8(b).ok()?.parse().ok()
 }
 
 /// The console route to the session's title, which Unix does not have: `Ok(false)`,
@@ -715,5 +901,102 @@ mod tests {
     #[test]
     fn the_refusal_names_the_state_directory_variable() {
         assert!(NO_STATE_DIR.ends_with(RUNTIME_DIR_VAR), "{NO_STATE_DIR}");
+    }
+
+    /// The macOS fd-1 lookup's whole decision, run where this project can run
+    /// anything. `proc_pidfdinfo` answers with a BYTE COUNT and a C string inside a
+    /// fixed array, so every way either can be wrong is staged here - including the
+    /// two the kernel is not supposed to produce, because "not supposed to" is not
+    /// a guarantee the caller gets to rely on.
+    #[test]
+    fn an_fd_path_needs_the_whole_struct_and_ends_at_the_first_nul() {
+        const WANT: usize = 1200;
+        // `vip_path` as the kernel leaves it: the path, a terminator, and then
+        // whatever the array held - here, deliberately, another path.
+        let arr = |s: &[u8]| {
+            let mut v = s.to_vec();
+            v.resize(1024, 0);
+            v.splice(600..612, *b"/dev/ttys999");
+            v
+        };
+        let read = |nb: i32, s: &[u8]| fd1_path_from_vnode(nb, WANT, &arr(s));
+        assert_eq!(read(1200, b"/dev/ttys004"), Some(PathBuf::from("/dev/ttys004")));
+        // A byte count, not a status: below zero it is the error return, and it is
+        // the same `None` as a revoked vnode's `ENOENT` - both mean no tab.
+        assert_eq!(read(-1, b"/dev/ttys004"), None, "an error is not a length");
+        assert_eq!(read(0, b"/dev/ttys004"), None, "nothing was filled");
+        // A short count would leave the path holding the zeros the buffer was made
+        // with, which is an empty path this cannot tell from a real refusal. And a
+        // longer one is a struct that is not the one asked for - which is also what
+        // a wrong flavour constant would return.
+        assert_eq!(read(1199, b"/dev/ttys004"), None, "a short fill");
+        assert_eq!(read(1201, b"/dev/ttys004"), None, "not the struct we asked for");
+        // No terminator anywhere: refused, never truncated. /dev/ttys004 cut to
+        // /dev/ttys00 is another writable character device, so nothing downstream
+        // would catch it.
+        assert_eq!(fd1_path_from_vnode(1200, WANT, &[b'/'; 1024]), None, "unterminated");
+        assert_eq!(fd1_path_from_vnode(1200, WANT, &[0u8; 1024]), None, "empty");
+        assert_eq!(fd1_path_from_vnode(1200, WANT, &[]), None, "no path at all");
+        // A path is bytes here, and a name that is not UTF-8 is still a name: the
+        // bytes come back as they went in, undecoded.
+        let odd = read(1200, b"/dev/tty\xff\xfe");
+        assert_eq!(odd.as_deref().map(|p| p.as_os_str().as_bytes()), Some(&b"/dev/tty\xff\xfe"[..]));
+        // What the shared guard does with the answers: the pty passes the prefix
+        // test, the redirected `claude -p > out.txt` does not - which is the whole
+        // reason this flavour is safe to ask for. A pipe or socket on fd 1 never
+        // reaches here at all; the kernel answers EBADF for a non-vnode.
+        assert!(is_tty_path(&read(1200, b"/dev/ttys004").expect("a pty path")));
+        assert!(is_tty_path(&read(1200, b"/dev/tty").expect("a tty path")));
+        assert!(!is_tty_path(&read(1200, b"/Users/me/out.txt").expect("a file path")));
+        assert!(!is_tty_path(&read(1200, b"/dev/null").expect("a device path")));
+    }
+
+    /// `$CLAUDE_PID` as a number, which only the macOS body needs - `/proc` takes
+    /// the bytes and lets `read_link` refuse them. Ten digits is `u32`'s width; the
+    /// values that are not a `pid_t` are [`pid_to_ask_about`]'s business, and 0 is
+    /// rejected there, so this accepts it and the caller does not.
+    #[test]
+    fn a_claude_pid_is_decimal_digits_and_nothing_else() {
+        assert_eq!(parse_pid(OsStr::new("4242")), Some(4242));
+        assert_eq!(parse_pid(OsStr::new("0")), Some(0), "pid_to_ask_about refuses it");
+        assert_eq!(parse_pid(OsStr::new("")), None);
+        assert_eq!(parse_pid(OsStr::new(" 42")), None);
+        assert_eq!(parse_pid(OsStr::new("42\n")), None);
+        assert_eq!(parse_pid(OsStr::new("-42")), None);
+        assert_eq!(parse_pid(OsStr::new("4294967295")), Some(u32::MAX));
+        assert_eq!(parse_pid(OsStr::new("4294967296")), None, "past a u32");
+        assert_eq!(parse_pid(OsStr::new("00000000004")), None, "eleven digits");
+        // Not a path, not a number, and never pasted into a system call.
+        assert_eq!(parse_pid(OsStr::new("../../etc/passwd")), None);
+        assert_eq!(parse_pid(os_str_from_bytes(b"4\xff2").as_ref()), None);
+        // And what the two of them together let through is exactly a pid.
+        let ask = |s: &str| parse_pid(OsStr::new(s)).and_then(pid_to_ask_about);
+        assert_eq!(ask("4242"), Some(4242));
+        assert_eq!(ask("0"), None);
+        assert_eq!(ask("4294967295"), None);
+    }
+
+    /// The headless guard over a REAL fd 1, on the Unix that can stage one: this
+    /// process's own. Under `cargo test` fd 1 is a captured pipe, which `/proc`
+    /// spells `pipe:[...]` - not a path at all, and the same shape a redirected
+    /// `claude -p > out.txt` produces. Whatever it is, the guard paints only a pty.
+    ///
+    /// The other half - fd 1 IS a pty and the guard opens it - is what every tmux
+    /// case in `tests/run.sh` exercises against real terminals, which is where it
+    /// belongs; a unit test cannot count on having one.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn the_guard_refuses_a_real_fd_1_that_is_not_a_terminal() {
+        let me = OsString::from(std::process::id().to_string());
+        let target = fd1_path(&me).expect("/proc names this process's own fd 1");
+        if !is_tty_path(&target) {
+            assert!(session_tty(&me).is_none(), "fd 1 is {}", target.display());
+        }
+        // And a name that is not a pid resolves to nothing without ever being
+        // parsed - `read_link` refuses it, which is the whole of the Linux route's
+        // validation and is what the oracle does too.
+        assert_eq!(fd1_path(OsStr::new("not-a-pid")), None);
+        assert_eq!(fd1_path(OsStr::new("")), None);
+        assert_eq!(fd1_path(OsStr::new("0")), None, "a pid nothing has");
     }
 }

@@ -33,11 +33,23 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add x86_64-unknown-linux-musl
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Run Rust unit tests
         run: |
           cargo test --locked --target x86_64-unknown-linux-musl
           cargo test --locked --target x86_64-unknown-linux-gnu
+
+      # No runner here builds for a Mac, and src/sys/unix.rs declares two structs
+      # of macOS's own ABI to resolve a session's pty. Their layout is asserted at
+      # compile time - `const _: () = assert!(size_of::<...>() == ...)` - so this
+      # type-check IS the check, and it is the only thing standing between a
+      # hand-written layout and a guess. `check` does not link, so no Apple SDK is
+      # needed; both ABIs, because they are two different ones.
+      - name: Check the macOS ABI declarations on both Apple targets
+        run: |
+          cargo check --locked --target aarch64-apple-darwin
+          cargo check --locked --target x86_64-apple-darwin
 
       - name: Build release binaries and source manifests
         run: sh scripts/build.sh --all
