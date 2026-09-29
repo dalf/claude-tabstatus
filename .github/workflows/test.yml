@@ -12,7 +12,11 @@ permissions:
 
 jobs:
   test:
-    name: Build and test Linux binaries
+    # The name says the Apple targets too. This runner builds no Mac binary and
+    # never will - `cargo check` does not link - but it is where the macOS ABI
+    # asserts are evaluated, and a job whose name hides that is a job nobody looks
+    # in when one of them fails.
+    name: Build and test Linux binaries, and check both Apple ABIs
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:

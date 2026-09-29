@@ -38,14 +38,20 @@ serde_json = "1"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Wdk_System_Threading", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Threading"] }
 
-# macOS only: the two answers `/proc` gives on Linux and this platform has no
+# macOS only: the three answers `/proc` gives on Linux and this platform has no
 # `/proc` for. `proc_pidinfo(PROC_PIDTBSDINFO)` with `struct proc_bsdinfo` for a
-# process's start time, and `kill(pid, 0)` with ESRCH/EPERM for its liveness. Both
-# are libc's OWN declarations, so no struct layout is hand-written here - which
-# matters because nothing in this project can link a macOS binary to check one.
-# libc has no required dependency of its own, and the crate sits behind this target
-# exactly as windows-sys sits behind cfg(windows): no Linux or Windows build sees
-# it. What libc does NOT declare is why session_tty stays None there - src/sys/unix.rs.
+# process's start time; `kill(pid, 0)` with ESRCH/EPERM for its liveness; and
+# `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` for the path fd 1 names, which is the
+# session's own tab. libc has no required dependency of its own, and the crate sits
+# behind this target exactly as windows-sys sits behind cfg(windows): no Linux or
+# Windows build sees it.
+#
+# Two of the three use libc's OWN declarations and hand-write no layout. The third
+# needs `struct proc_fileinfo`, `struct vnode_fdinfowithpath` and the flavour
+# constant, which libc does not declare, so src/sys/unix.rs writes them - and,
+# because nothing in this project can link a macOS binary to check a layout, it
+# ASSERTS every size and offset it depends on at compile time. CI type-checks both
+# Apple ABIs, so those asserts run somewhere other than a developer's machine.
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 

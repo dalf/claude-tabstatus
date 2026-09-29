@@ -34,6 +34,17 @@ pub const HAS_MODES: bool = true;
 /// Only that lookup differs - see [`fd1_path`] - and the guard downstream of it is
 /// one body. The constant and the function have to agree, because `doctor` reads the
 /// constant to say whether `session-start` and `session-end` have a route at all.
+///
+/// THREE CALLERS, NOT ONE, which is worth saying where the constant is written
+/// because flipping it on macOS moved two of them without touching their files.
+/// `manage.rs`'s `doctor` prints the `session terminal` row from it;
+/// `mux::Channel::Direct::carries_raw` reads it to decide whether the session's own
+/// tab is a BYTE route, and `mux::route` therefore now sends Konsole's OSC 50
+/// arming down that channel on macOS as it already did on Linux. That is the
+/// intended meaning - the two facts are one fact, "the session's own tab is a pty
+/// we can write to" - and it is inert unless [`crate::surface::Surface::Konsole`]
+/// was detected anyway. It is still a behaviour change in a file this declaration
+/// does not name, so it is named here.
 pub const HAS_SESSION_TTY: bool = true;
 
 /// [`set_session_title`] has no console to title: a Unix terminal takes its title
@@ -526,6 +537,19 @@ pub fn session_tty(claude_pid: &OsStr) -> Option<File> {
     }
     // Asking whether it is writable and opening it are the same question; ask it
     // once.
+    //
+    // NO `O_NOCTTY`, and that is a decision rather than an omission, because this
+    // opens somebody else's terminal by name and the flag is the obvious hardening.
+    // What it would guard against is acquiring a controlling terminal by accident,
+    // which takes a session leader that has none; the hook is a child of `claude`
+    // and inherits its ctty, so it is never one, and an attempt to reproduce the
+    // acquisition on Linux from a `setsid` process left `tty_nr` at 0. What it
+    // would COST is the part that decides it: `libc` is a
+    // `cfg(target_os = "macos")` dependency here, so spelling `O_NOCTTY` on Linux
+    // means either widening that dependency to every Unix - which
+    // `docs/backend-scouting.md` §5's gate governs and this is not the commit for -
+    // or hand-writing a per-architecture octal constant, which is the exact kind of
+    // guess the macOS declarations below go to such lengths not to make.
     OpenOptions::new().write(true).open(&target).ok()
 }
 
@@ -605,9 +629,16 @@ fn fd1_path(claude_pid: &OsStr) -> Option<PathBuf> {
 /// and every DECISION in it is one a Linux `cargo test` runs.
 ///
 /// `nb` is a byte count, not a status: `nb <= 0` is the error return, and it does
-/// not convert. `ENOENT` there means the vnode was REVOKED - an fd whose terminal
-/// went away - and it is the same `None` as any other failure, because both mean
-/// there is no tab to paint. A count that is not exactly `want` is a hard error and
+/// not convert. BOTH halves of that matter, because `libproc`'s userland wrapper
+/// and the system call under it do not agree on how a failure looks - one reports
+/// it as -1 and the other can surface 0 - and this project cannot run either to
+/// settle which arrives. It does not have to: requiring EXACTLY `want` refuses
+/// every value that is not a full struct, by construction, so the distinction has
+/// no way to matter here and no claim about it is relied on. `ENOENT` means the
+/// vnode was REVOKED - an fd whose terminal went away - and it is the same `None`
+/// as any other failure, because both mean there is no tab to paint.
+///
+/// A count that is not exactly `want` is a hard error and
 /// not a short read to tolerate: the fields this reads would be holding the zeros
 /// the buffer was created with, and a zero-length path is not a refusal this can
 /// tell apart from a real one. The taxonomy is lsof's technique - `nb <= 0`, the
@@ -703,18 +734,35 @@ struct VnodeFdInfoWithPath {
 // The layout, checked by the compiler that will build for the Mac. These numbers
 // are the header's, and a build that disagrees with any one of them does not
 // produce a binary - which is the whole of what stands in for running this
-// anywhere. They are not vacuous: one spurious `u32` added to `ProcFileInfo` here
-// failed four of them.
+// anywhere. They are not vacuous: adding one spurious `u32` to `ProcFileInfo` here
+// fails THREE of them - `ProcFileInfo`'s size, `VnodeFdInfoWithPath`'s size and
+// `pvip`'s offset - identically on both Apple targets. Three failed asserts, and
+// four lines beginning `error`, because cargo appends its own summary line. The
+// number that means something is the three, and this comment said four until the
+// control was re-run and counted.
 //
 // `vip_path`'s offset is asserted too, because the path is read by flattening that
 // array: it must begin where the header puts it and run to the end of the struct,
 // which is 1176 - 152 = 1024 bytes, `MAXPATHLEN`.
 //
-// What a size cannot catch is two same-width fields swapped, and `proc_fileinfo`
-// ends in three of them. That is survivable here and only here: this reads NOTHING
-// out of `proc_fileinfo`. What it reads is `pvip`, whose offset is asserted, and
-// inside it `vip_path`, whose offset is asserted, in a struct that is libc's own
-// and is checked against Apple's real SDK on libc's CI.
+// WHAT THESE CANNOT CATCH, exactly rather than roughly, because a limit described
+// loosely is worse than one described plainly. `ProcFileInfo` is four 32-bit fields
+// and one `off_t`, and `off_t`'s 8-byte alignment pins it to offset 8 - so ANY
+// permutation of `fi_openflags`, `fi_status`, `fi_type` and `fi_guardflags` leaves
+// every size and offset here unchanged and every assert green. Measured rather than
+// argued: `fi_type` and `fi_guardflags` transposed produced zero diagnostics on
+// both Apple targets. That is survivable here and only here, because this reads
+// NOTHING out of `proc_fileinfo` - a swapped pair inside it has no consequence at
+// all. What it reads is `pvip`, whose offset is asserted, and inside it `vip_path`,
+// whose offset is asserted, in a struct that is libc's own and is checked against
+// Apple's real SDK on libc's CI.
+//
+// One struct up, that hazard is not hypothetical: `darwin-libproc-sys` 0.2.0
+// declares `vnode_info` as `vi_stat, vi_type, vi_fsid, vi_pad` where the header has
+// `vi_stat, vi_type, vi_pad, vi_fsid`. Same 152 bytes, different offset for
+// `vi_fsid` - invisible to a size assert. It is one reason libc's declaration is
+// the one used here and no `libproc` wrapper crate is.
+//
 // One item each, and not one block: a const block stops at its first failure, and
 // what an operator on a Mac wants from a broken build is every number that moved.
 #[cfg(target_os = "macos")]
@@ -732,15 +780,34 @@ const _: () = assert!(std::mem::offset_of!(VnodeFdInfoWithPath, pvip) == 24);
 #[cfg(target_os = "macos")]
 const _: () = assert!(std::mem::offset_of!(libc::vnode_info_path, vip_path) == 152);
 
-/// `$CLAUDE_PID` as a pid: 1-10 ASCII digits and nothing else. The `/proc` body
-/// needs no such thing - a bad name is a failed `read_link` - but a system call
-/// takes a number, and this is the same rule the Windows backend's `parse_pid`
-/// applies to the same variable. [`pid_to_ask_about`] then rules out the values
-/// that are not a `pid_t` at all.
+/// `$CLAUDE_PID` as a pid: 1-10 ASCII digits, canonical, and nothing else. The
+/// `/proc` body needs no such thing - a bad name is a failed `read_link` - but a
+/// system call takes a number, so this is where the bytes stop being bytes.
+/// [`pid_to_ask_about`] then rules out the values that are not a `pid_t` at all.
+///
+/// NOT the same function as the Windows backend's `parse_pid`, and this comment
+/// used to claim it was. Three digit rules are shared - non-empty, at most ten, all
+/// ASCII digits - and two things differ. Windows ends in `.filter(|&p| p != 0)`;
+/// here 0 is passed on and [`pid_to_ask_about`] is what refuses it, which the test
+/// below pins for the pair rather than for either half. And leading zeros are
+/// refused here, which Windows accepts.
+///
+/// THE LEADING ZERO IS NOT FUSSINESS, it is the one place these two Unixes could
+/// have disagreed about the same string. Linux never parses at all: `/proc/007`
+/// does not exist, because `/proc` spells its pids canonically, so `007` is a
+/// failed `read_link` and no tab. Accepting it here would have made `007` resolve
+/// pid 7's fd 1 on macOS and nothing on Linux - a split in a function whose whole
+/// design is that only the system call differs. Unreachable from a real
+/// `$CLAUDE_PID`, which Claude Code writes canonically; refused anyway, because
+/// "unreachable" is a claim about today's caller and this is a claim about the
+/// function.
 #[cfg(any(target_os = "macos", test))]
 fn parse_pid(raw: &OsStr) -> Option<u32> {
     let b = raw.as_bytes();
     if b.is_empty() || b.len() > 10 || !b.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if b.len() > 1 && b.first() == Some(&b'0') {
         return None;
     }
     std::str::from_utf8(b).ok()?.parse().ok()
@@ -921,8 +988,12 @@ mod tests {
         };
         let read = |nb: i32, s: &[u8]| fd1_path_from_vnode(nb, WANT, &arr(s));
         assert_eq!(read(1200, b"/dev/ttys004"), Some(PathBuf::from("/dev/ttys004")));
-        // A byte count, not a status: below zero it is the error return, and it is
-        // the same `None` as a revoked vnode's `ENOENT` - both mean no tab.
+        // A byte count, not a status. BOTH spellings of failure are staged, and on
+        // purpose: `libproc`'s wrapper and the call under it do not agree on whether
+        // a failure arrives as -1 or as 0, and nothing here can run either to find
+        // out. Requiring exactly `want` makes the question moot, and these two lines
+        // are what says so. Either way it is the same `None` as a revoked vnode's
+        // `ENOENT`, because all three mean no tab.
         assert_eq!(read(-1, b"/dev/ttys004"), None, "an error is not a length");
         assert_eq!(read(0, b"/dev/ttys004"), None, "nothing was filled");
         // A short count would leave the path holding the zeros the buffer was made
@@ -966,6 +1037,13 @@ mod tests {
         assert_eq!(parse_pid(OsStr::new("4294967295")), Some(u32::MAX));
         assert_eq!(parse_pid(OsStr::new("4294967296")), None, "past a u32");
         assert_eq!(parse_pid(OsStr::new("00000000004")), None, "eleven digits");
+        // A LEADING ZERO IS NOT A PID HERE, and the reason is the other kernel:
+        // `/proc/007` does not exist, so Linux answers `None` for these and macOS
+        // would otherwise have resolved pid 7's fd 1. The two Unixes give one
+        // answer for one string, which is the whole premise of this file.
+        assert_eq!(parse_pid(OsStr::new("007")), None, "Linux has no /proc/007");
+        assert_eq!(parse_pid(OsStr::new("0042")), None);
+        assert_eq!(parse_pid(OsStr::new("00")), None, "not even zero twice");
         // Not a path, not a number, and never pasted into a system call.
         assert_eq!(parse_pid(OsStr::new("../../etc/passwd")), None);
         assert_eq!(parse_pid(os_str_from_bytes(b"4\xff2").as_ref()), None);
@@ -974,6 +1052,20 @@ mod tests {
         assert_eq!(ask("4242"), Some(4242));
         assert_eq!(ask("0"), None);
         assert_eq!(ask("4294967295"), None);
+    }
+
+    /// The leading-zero rule is only worth anything if Linux really does refuse
+    /// what it is imitating, so ask Linux rather than assert what it would say.
+    /// `/proc/<pid>` is canonical decimal: this process's own pid resolves and the
+    /// same number with a zero in front does not, which is exactly the pair
+    /// [`parse_pid`] now answers the same way on both kernels.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn proc_spells_a_pid_canonically_which_is_why_a_leading_zero_is_refused() {
+        let me = std::process::id();
+        assert!(fd1_path(&OsString::from(me.to_string())).is_some(), "own fd 1");
+        assert_eq!(fd1_path(&OsString::from(format!("0{me}"))), None, "/proc/0{me}");
+        assert_eq!(parse_pid(OsStr::new(&format!("0{me}"))), None, "and so does this");
     }
 
     /// The headless guard over a REAL fd 1, on the Unix that can stage one: this
