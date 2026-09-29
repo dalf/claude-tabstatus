@@ -1,0 +1,10 @@
+# Link the MSVC C runtime statically into the Windows binary, so the released
+# tabstatus-x86_64-pc-windows-msvc.exe runs on a machine without the Visual C++
+# Redistributable (no vcruntime140.dll, no api-ms-win-crt-*.dll imports). It is
+# here rather than in CI so a local `cargo build` or `sh scripts/build.sh` makes
+# the same binary the release ships. Only this target is configured; the Linux
+# targets are untouched (musl is static by default, gnu stays dynamic). A
+# RUSTFLAGS environment variable REPLACES this list, as cargo documents; the
+# Test workflow checks the built .exe's imports so that cannot ship unnoticed.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

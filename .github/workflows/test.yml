@@ -73,3 +73,95 @@ jobs:
             bin/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
+
+  windows:
+    name: Build and test Windows binary
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        # Git Bash: scripts/build.sh is POSIX sh, and it is also the shell Claude
+        # Code runs hooks through on Windows.
+        shell: bash
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
+          rustup default stable
+
+      # The in-crate tests include the Windows-only ones: ConPTY, the record lock
+      # and the install junction. .cargo/config.toml links the CRT statically for
+      # this target, so they exercise the same flags as the release binary.
+      - name: Run Rust unit tests
+        run: cargo test --locked --all-targets
+
+      - name: Build release binary and source manifests
+        run: sh scripts/build.sh --all
+
+      # .cargo/config.toml asks for +crt-static; a RUSTFLAGS variable would
+      # silently replace it. Read the import table so a binary that needs the
+      # Visual C++ Redistributable can never be uploaded as tested.
+      - name: Check the binary does not need the VC++ runtime
+        run: |
+          python - bin/tabstatus-x86_64-pc-windows-msvc.exe <<'EOF'
+          import struct, sys
+          b = open(sys.argv[1], "rb").read()
+          pe = struct.unpack_from("<I", b, 0x3C)[0]
+          assert b[pe:pe + 4] == b"PE\0\0", "not a PE image"
+          nsec, optsize = struct.unpack_from("<H", b, pe + 6)[0], struct.unpack_from("<H", b, pe + 20)[0]
+          opt = pe + 24
+          assert struct.unpack_from("<H", b, opt)[0] == 0x20B, "not PE32+"
+          secs = [struct.unpack_from("<IIII", b, opt + optsize + 40 * i + 8) for i in range(nsec)]
+          def off(rva):
+              return next(p + rva - va for vs, va, rs, p in secs if va <= rva < va + max(vs, rs))
+          def cstr(rva):
+              o = off(rva)
+              return b[o:b.index(b"\0", o)].decode().lower()
+          dlls = []
+          for index, size, name_at in ((1, 20, 12), (13, 32, 4)):  # imports, delay-load imports
+              rva = struct.unpack_from("<I", b, opt + 112 + 8 * index)[0]
+              while rva:
+                  d = off(rva)
+                  if not any(b[d:d + size]):
+                      break
+                  dlls.append(cstr(struct.unpack_from("<I", b, d + name_at)[0]))
+                  rva += size
+          print("imports:", " ".join(dlls))
+          bad = [d for d in dlls if d.startswith(("vcruntime", "msvcp", "ucrtbase", "api-ms-win-crt-"))]
+          sys.exit("needs the VC++ runtime: " + " ".join(bad) if bad else 0)
+          EOF
+
+      # The suites that run on native Windows Python. test_state_guarantees and
+      # test_tmux_status need fcntl and tmux, and tests/run.sh and the corpus
+      # replay assume a Unix userland; they run in the Linux job only.
+      - name: Run integration tests
+        run: |
+          binary="$GITHUB_WORKSPACE/bin/tabstatus-x86_64-pc-windows-msvc.exe"
+          CCTAB_TEST_BIN="$binary" python tests/test_payload.py
+          CCTAB_TEST_BIN="$binary" python tests/test_state_contract.py
+          CCTAB_TEST_BIN="$binary" python tests/test_background.py
+          CCTAB_TEST_BIN="$binary" python tests/test_elicitation.py
+
+      # --text so the line reads "<hash>  name" like the Linux ones in the merged
+      # release SHA256SUMS; Git Bash defaults to "<hash> *name". The digest is the
+      # same (MSYS does no newline translation), and release.yml re-checks it on
+      # Linux, which always reads bytes as they are.
+      - name: Generate binary checksum
+        working-directory: bin
+        run: sha256sum --text tabstatus-x86_64-pc-windows-msvc.exe > SHA256SUMS
+
+      - name: Upload tested binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-binaries
+          path: |
+            bin/tabstatus-x86_64-pc-windows-msvc.exe
+            bin/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14

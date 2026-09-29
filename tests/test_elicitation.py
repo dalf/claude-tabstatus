@@ -287,13 +287,27 @@ class ElicitationTests(unittest.TestCase):
             self.send(edge, session="future", mcp_server_name="mcp", elicitation_id="a", action="accept")
             self.assertEqual(self.record("future"), future)
         (self.state / "directory").mkdir()
+        self.start(session="directory")
+        self.finish(session="directory")
+        self.assertTrue((self.state / "directory").is_dir())
+
+    def test_symlink_record_path_is_not_overwritten(self):
+        # Split out of the case above only because Windows may refuse to make the
+        # symlink at all: CreateSymbolicLinkW needs Developer Mode or elevation
+        # (WinError 1314, ERROR_PRIVILEGE_NOT_HELD). That one refusal, on Windows
+        # only, is a skip; anywhere else a failed symlink_to stays an error.
+        self.state.mkdir()
         sentinel = self.root / "sentinel"
         sentinel.write_text("keep")
-        (self.state / "symlink").symlink_to(sentinel)
-        for session in ("directory", "symlink"):
-            self.start(session=session)
-            self.finish(session=session)
-        self.assertTrue((self.state / "directory").is_dir())
+        try:
+            (self.state / "symlink").symlink_to(sentinel)
+        except OSError as e:
+            if os.name == "nt" and getattr(e, "winerror", None) == 1314:
+                self.skipTest("this Windows account may not create symlinks "
+                              "(no Developer Mode or elevation)")
+            raise
+        self.start(session="symlink")
+        self.finish(session="symlink")
         self.assertTrue((self.state / "symlink").is_symlink())
         self.assertEqual(sentinel.read_text(), "keep")
 
