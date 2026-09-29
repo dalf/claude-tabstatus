@@ -49,6 +49,7 @@ mod render;
 mod settings;
 mod state;
 mod support;
+mod surface;
 mod sys;
 mod text;
 mod tmux;

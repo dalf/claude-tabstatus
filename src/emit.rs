@@ -18,7 +18,8 @@
 //!     an OSC 0; the Konsole arming has no console form and is not sent. Both are
 //!     behind a headless guard, and elsewhere (macOS) nothing is painted.
 
-use crate::config::{Config, Terminal};
+use crate::config::Config;
+use crate::surface::{compose, Surface};
 use crate::sys;
 use std::fmt::Write as _;
 use std::io::{self, Write};
@@ -88,22 +89,11 @@ fn escape_into(out: &mut String, s: &str) {
     }
 }
 
-/// Konsole's per-tab title format, set to "the title the shell sent" and back to
-/// Konsole's COMPILED-IN defaults. Named here rather than spelled at each use,
-/// because inside tmux the same two byte strings go to a tmux CLIENT's pty
-/// instead of to this pane - and an arming with no matching restore is this
-/// project's named defect.
-///
-/// SEAM: TabColor=#RRGGBB rides in this same property list - and whoever adds it
-/// must add TabColor=#000000 to the restore, or the colour outlives the session.
-pub const KONSOLE_ARM: &[u8] = b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07";
-pub const KONSOLE_RESTORE: &[u8] =
-    b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07";
-
 /// Arm this tab and paint it, in one write.
 pub fn session_start(title: &str, cfg: &Config) -> io::Result<()> {
+    let caps = cfg.surface.caps();
     let mut out: Vec<u8> = Vec::with_capacity(title.len() + 96);
-    if cfg.terminal == Terminal::Konsole && cfg.tmux.is_none() {
+    if cfg.surface == Surface::Konsole && cfg.tmux.is_none() {
         // %w makes the OSC 0 payload the entire tab text. Under Konsole's stock
         // formats an OSC 0 title is invisible in the tab, which is why Claude's
         // own title never shows up there. Konsole applies profile properties per
@@ -114,28 +104,29 @@ pub fn session_start(title: &str, cfg: &Config) -> io::Result<()> {
         // Inside tmux this pane is not the tab, so the sequence would be
         // swallowed; `tmux::arm_konsole` writes it to the attached client's pty
         // instead, which is why the Konsole test above also asks for no tmux.
-        out.extend_from_slice(KONSOLE_ARM);
+        let _ = compose::push_arm(&mut out, caps);
     }
     // The arming has to precede the title, or the tab is painted before it can
     // show what was painted.
-    out.extend_from_slice(b"\x1b]0;");
-    out.extend_from_slice(title.as_bytes());
-    out.push(0x07);
+    let _ = compose::push_title(&mut out, caps, title);
     write_session(cfg, &out, title)
 }
 
 /// Restore the tab and blank its title, in one write.
 pub fn session_end(cfg: &Config) -> io::Result<()> {
+    let caps = cfg.surface.caps();
     let mut out: Vec<u8> = Vec::with_capacity(96);
-    if cfg.terminal == Terminal::Konsole && cfg.tmux.is_none() {
+    if cfg.surface == Surface::Konsole && cfg.tmux.is_none() {
         // We own restore: with the built-in terminal title disabled - which the
         // installer does, otherwise it repaints over ours every 960ms - Claude
-        // Code no longer clears the title on exit either. The two formats below
-        // are Konsole's COMPILED-IN defaults, not whatever a customized profile
-        // had, because that is all we can know.
-        out.extend_from_slice(KONSOLE_RESTORE);
+        // Code no longer clears the title on exit either. The two formats in the
+        // capability row are Konsole's COMPILED-IN defaults, not whatever a
+        // customized profile had, because that is all we can know.
+        let _ = compose::push_restore(&mut out, caps);
     }
-    out.extend_from_slice(b"\x1b]0;\x07");
+    // An EMPTY title is the unpaint, so it is composed as a title rather than
+    // spelled as its own literal.
+    let _ = compose::push_title(&mut out, caps, "");
     write_session(cfg, &out, "")
 }
 

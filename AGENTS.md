@@ -24,6 +24,7 @@ carries the management verbs (`install`, `uninstall`, `doctor`, `version`,
 | `src/render.rs` | `compose`: length cap, ssh prefix, JSON-safety pass, glyph placement, in that order |
 | `src/emit.rs` | delivery: `terminalSequence` JSON, raw OSC to a pane pty, or a console title |
 | `src/support.rs` | one vocabulary for absence: `Support<T>` says available, unsupported, disabled by a knob of ours, unverifiable or failed, each with the reason a user can act on |
+| `src/surface/` | the leaf terminal, chosen at runtime and dispatched statically: `probe.rs` the detection table and the `CCTAB_TERMINAL` override, `rows.rs` the fourteen capability rows as `const` data with their provenance, `compose.rs` the bytes a row spells |
 | `src/tmux.rs` | the tmux integration: the record, `set-titles-string`, window-status formats, restore |
 | `src/manage.rs` | all management verbs: `install`, `uninstall`, `doctor`, `version`, `tmux-format`, `tmux-arm`, `print-embedded`, `help` |
 | `src/tree.rs` | the generated plugin tree that `install` materialises and Claude Code loads |
@@ -421,6 +422,7 @@ tag each time.
 | [docs/state-contract.md](docs/state-contract.md) | contributors | the normative state record and transition rules |
 | [docs/indicator-semantics.md](docs/indicator-semantics.md) | contributors, curious users | what each colour means and the precedence between them |
 | [docs/history.md](docs/history.md) | anyone | slices 1-7 and the shell-to-Rust port, with its comparison table |
+| [docs/research/terminal-capability-matrix.md](docs/research/terminal-capability-matrix.md) | contributors | the cross-terminal capability matrix every row in `src/surface/rows.rs` cites, each claim marked verified or inferred |
 | [COMPARISON.md](COMPARISON.md) | anyone | how this project relates to similar ones |
 | [tests/corpus/USAGE.txt](tests/corpus/USAGE.txt) | contributors | the golden corpus tools |
 

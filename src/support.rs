@@ -72,9 +72,6 @@ use std::fmt;
 
 /// Every capability query in this crate answers with this, and `doctor` prints
 /// exactly these five words.
-// The capability rows and the report that print these land in later commits of
-// this series; nothing in the tree constructs one yet.
-#[allow(dead_code)]
 pub enum Support<T = ()> {
     /// The capability is here, and this is what it produced.
     Available(T),
@@ -85,34 +82,40 @@ pub enum Support<T = ()> {
     /// It could, and a knob of OURS turned it off. The string NAMES THAT KNOB, so
     /// that a user who reads it can grep the README for it: `"CCTAB_NO_TMUX"`,
     /// `"CCTAB_DRY_RUN"`. Never "disabled by configuration", which names nothing.
+    // A const capability row may not say it - `surface::tests` asserts exactly
+    // that - so the only thing that can construct one is [`Support::gate`], whose
+    // consumer is doctor's report in a later commit of this series.
+    #[allow(dead_code)]
     Disabled(&'static str),
     /// The terminal may or may not honour it and NOTHING WE CAN READ SAYS WHICH.
     /// The string names the FOREIGN setting the user must go and check:
     /// `"compatibility.allowOSC777"`, `"profiles.suppressApplicationTitle"`.
     ///
-    /// No row in this build says it yet - the Windows Terminal capability rows that
-    /// force it belong to the surface axis - and it lands here rather than with them
-    /// because the vocabulary is the thing being fixed, and a fifth word added later
-    /// is a fifth word every existing caller has to be re-read for.
+    /// The Windows Terminal rows of the surface axis are what force it, and it
+    /// landed here before them because the vocabulary is the thing being fixed,
+    /// and a fifth word added later is a fifth word every existing caller has to
+    /// be re-read for.
     Unverifiable(&'static str),
     /// It was attempted and the OS said no.
+    // Only an ATTEMPT produces one, so it arrives through [`Support::of_io`] at
+    // the boundary that lifts `sys::session_tty` and `sys::set_session_title`
+    // into this vocabulary - doctor's report, a later commit of this series.
+    #[allow(dead_code)]
     Failed(std::io::Error),
 }
 
 /// A capability that yields nothing but its own presence.
-// Consumed by the const capability rows of the surface axis, a later commit.
-#[allow(dead_code)]
 pub type Presence = Support<()>;
 
 /// `Available(())`, spelled once so a const table row is one word wide.
-// Consumed by the const capability rows of the surface axis, a later commit.
-#[allow(dead_code)]
 pub const YES: Presence = Support::Available(());
 
-// Every method below is reached only from this file's tests until the capability
-// rows, the composer and the report land in later commits of this series.
-#[allow(dead_code)]
+// `should_emit`, `label` and `reason` are live - the composer gates on the first
+// and `Display` prints the other two. The six below are the REPORTING boundary's
+// half of this file, and doctor is a later commit of this series; each carries the
+// lint suppression on its own line so that promoting one is a one-line edit.
 impl<T> Support<T> {
+    #[allow(dead_code)]
     pub fn ok(self) -> Option<T> {
         match self {
             Support::Available(v) => Some(v),
@@ -120,6 +123,7 @@ impl<T> Support<T> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_available(&self) -> bool {
         matches!(self, Support::Available(_))
     }
@@ -134,6 +138,7 @@ impl<T> Support<T> {
         matches!(self, Support::Available(_) | Support::Unverifiable(_))
     }
 
+    #[allow(dead_code)]
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Support<U> {
         match self {
             Support::Available(v) => Support::Available(f(v)),
@@ -147,6 +152,7 @@ impl<T> Support<T> {
     /// Change the payload type while KEEPING the reason, so that a layer boundary
     /// can never silently invent one. `Ok` is the value; `Err` is this same
     /// absence wearing the outer layer's type parameter.
+    #[allow(dead_code)]
     pub fn carry<U>(self) -> Result<T, Support<U>> {
         match self {
             Support::Available(v) => Ok(v),
@@ -165,6 +171,7 @@ impl<T> Support<T> {
     /// means no knob applies. doctor's `hostname` row is what will read it: the
     /// platform answers, and `CCTAB_HOST` is what decides whether that answer is
     /// the one painted.
+    #[allow(dead_code)]
     pub fn gate(self, off: Option<&'static str>) -> Support<T> {
         match (self, off) {
             (Support::Available(_), Some(knob)) => Support::Disabled(knob),
@@ -172,6 +179,7 @@ impl<T> Support<T> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn of_io(r: std::io::Result<T>) -> Support<T> {
         match r {
             Ok(v) => Support::Available(v),

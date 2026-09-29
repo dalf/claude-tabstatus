@@ -46,9 +46,9 @@
 //! Only windows that start Claude receive local format decorators. Window names,
 //! automatic renaming, global window formats and the outer aggregate stay intact.
 
-use crate::config::{self, Config, GlyphPos, Terminal};
+use crate::config::{self, Config, GlyphPos};
 use crate::edge::{Glyph, Paint};
-use crate::emit;
+use crate::surface::Surface;
 use crate::sys;
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -420,11 +420,11 @@ pub fn session_start(cfg: &Config) {
     // which a tmux older than 3.0 has no syntax for, and measured, a command that
     // fails at the END of a `;`-chained batch leaves every command before it
     // applied. So an old tmux loses the re-arm and keeps the whole decay.
-    match (cfg.terminal, exe_path()) {
+    match (cfg.surface, exe_path()) {
         // A path with a single quote in it has no representation inside ARM_HOOK's
         // sh quoting, and a path that is not UTF-8 cannot go into a format at all.
         // Both drop the re-arm and keep everything else.
-        (Terminal::Konsole, Some(exe)) => {
+        (Surface::Konsole, Some(exe)) => {
             set(&mut c, OPT_EXE, &exe);
             c.arg(";").arg("set-hook");
             t.target(&mut c);
@@ -568,7 +568,12 @@ fn exe_path() -> Option<String> {
 /// [`sys::write_tty`] is the guard: /dev/pts or /dev/tty, a character device,
 /// writable, and silent about any of that failing.
 pub fn arm_tty(path: &OsStr) {
-    sys::write_tty(Path::new(path), emit::KONSOLE_ARM);
+    // The verb exists only for Konsole, so it reads Konsole's row directly rather
+    // than resolving a surface it has no environment for: the hook fires in a tmux
+    // server's own environment, where nothing names the leaf.
+    if let Some(a) = &Surface::Konsole.caps().arming {
+        sys::write_tty(Path::new(path), a.pair().0);
+    }
 }
 
 /// Take the re-arm hook back off.
@@ -594,10 +599,12 @@ fn drop_hook(t: &Tmux) {
 /// Konsole, ssh, tmux - `KONSOLE_*` does not survive the ssh and there is
 /// nothing to detect.
 pub fn arm_konsole(cfg: &Config) {
-    if cfg.terminal != Terminal::Konsole {
+    if cfg.surface != Surface::Konsole {
         return;
     }
-    to_clients(cfg, emit::KONSOLE_ARM);
+    if let Some(a) = &cfg.surface.caps().arming {
+        to_clients(cfg, a.pair().0);
+    }
 }
 
 /// Put the tab formats back, but only when no OTHER claude is left in this
@@ -608,7 +615,7 @@ pub fn arm_konsole(cfg: &Config) {
 /// parser, and racing that would silently skip the restore.
 pub fn session_end(cfg: &Config) {
     let Some(t) = &cfg.tmux else { return };
-    if cfg.terminal != Terminal::Konsole {
+    if cfg.surface != Surface::Konsole {
         return;
     }
     let mut c = Command::new("tmux");
@@ -618,7 +625,9 @@ pub fn session_end(cfg: &Config) {
     if capture(c).is_ok_and(|s| s.contains('1')) {
         return;
     }
-    to_clients(cfg, emit::KONSOLE_RESTORE);
+    if let Some(a) = &cfg.surface.caps().arming {
+        to_clients(cfg, a.pair().1);
+    }
     // The last claude in this session is going: nothing is left for a reattach to
     // re-arm, so the hook goes with it.
     drop_hook(t);
@@ -1203,7 +1212,7 @@ pub fn report(cfg: &Config) -> Vec<String> {
                 .to_owned(),
         );
     }
-    if cfg.terminal == Terminal::Konsole {
+    if cfg.surface == Surface::Konsole {
         out.push(format!(
             "           arm: {}",
             match get(8) {
@@ -1248,7 +1257,7 @@ pub fn report(cfg: &Config) -> Vec<String> {
     }
     out.push(format!(
         "           konsole: {}",
-        if cfg.terminal == Terminal::Konsole {
+        if cfg.surface == Surface::Konsole {
             "on   CCTAB_TERMINAL=konsole - OSC 50 goes to each attached client's pty"
         } else {
             "off  set CCTAB_TERMINAL=konsole when the outer terminal is Konsole \

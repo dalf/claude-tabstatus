@@ -50,8 +50,9 @@
 use crate::embedded::{self, Verdict};
 use crate::settings::{self, Outcome};
 use crate::tree;
-use crate::config::{self, Config, Terminal};
+use crate::config::{self, Config};
 use crate::edge::{Glyph, Paint};
+use crate::surface::Surface;
 use crate::{json, render, state, sys, tmux};
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -2885,7 +2886,7 @@ fn report_runtime() {
     } else {
         ""
     };
-    let konsole = Terminal::detect() == Terminal::Konsole;
+    let konsole = crate::surface::detect() == Surface::Konsole;
     // The REASON matters more than the answer, because there are now three of
     // them and they disagree: an explicit CCTAB_TERMINAL, inherited KONSOLE_*,
     // and a multiplexer that makes the inherited kind meaningless.
