@@ -254,7 +254,11 @@ and explicit uninstall are also separate from the ordinary update guards.
 This is an existing lifecycle limitation, not an ownership-retirement rule.
 
 The wire writer emits `cts5`, preserving both anonymous permission provenance
-(`?p`) and known background (`g <epoch>`). Readers also accept `cts1`–`cts4`,
+(`?p`) and known background (`g <epoch>`). The optional `s <surface>` line records
+what the session ARMED, and is written only by a session that armed something, so a
+record for a session that armed nothing is byte for byte what it was before the line
+existed; a surface name this build has no row for reads as absent rather than as a
+different terminal. Readers also accept `cts1`–`cts4`,
 without interpreting their reserved `g` fields. Guarded older readers refuse
 ordinary updates of newer records rather than silently dropping activity.
 Recognized older records migrate on a changed write; missing historical owner

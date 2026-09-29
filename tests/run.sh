@@ -2562,6 +2562,48 @@ check 'state: SessionStart reaps a record nothing has touched for a day' 'gone' 
 check 'state: SessionStart does not reap a live record' 'present' \
     "$([ -e "$_sd/$_sid" ] && printf present || printf gone)"
 
+# RUNG 2 OF THE ARMED RECORD. What a backend arms is recorded where the END hook
+# reads it back, and the state record is the rung for a session with no multiplexer
+# to hold one. It is written ONLY by a session that actually armed something, which
+# is what keeps every record above - and every corpus case, which has no state
+# directory at all - byte for byte what it was.
+#
+# These run OUTSIDE dry run, because the dry-run short circuit returns before
+# anything is routed and therefore before anything is armed. CLAUDE_PID stays empty,
+# so no pty is touched and no origin line is stamped.
+_sd2=$tmp/state-armed
+sarm() {
+    (cd -- "$tmp/repos/plain" && printf '%s\n' "$(pl SessionStart ',"source":"startup"')" \
+        | env HOME=$tmp CCTAB_STATE_DIR=$_sd2 CCTAB_NOW=1000000 CLAUDE_PID= "$@" \
+          "$bin" session-start >/dev/null 2>&1)
+}
+srec() { tr '\n' '|' <"$_sd2/$_sid" 2>/dev/null; }
+rm -rf "$_sd2"
+sarm CCTAB_TERMINAL=konsole
+check 'state: a session that armed records the surface it armed' 'cts5|b i|s konsole|' "$(srec)"
+# With no `$CLAUDE_PID` there is no origin to stamp, so the record SessionStart
+# would write is the one a session with no record is already assumed to have, and
+# `write_if_changed` creates no file at all. That is the pre-existing behaviour, and
+# these two assert that only a session which ARMED changes it.
+rm -rf "$_sd2"
+sarm CCTAB_TERMINAL=wezterm
+check 'state: and a session that armed nothing still writes no record at all' 'gone' \
+    "$([ -e "$_sd2/$_sid" ] && printf present || printf gone)"
+rm -rf "$_sd2"
+sarm
+check 'state: as does one with no terminal to name at all' 'gone' \
+    "$([ -e "$_sd2/$_sid" ] && printf present || printf gone)"
+# The line survives every later write, because every write starts from the record it
+# read - so the end hook, hours later, still finds it.
+rm -rf "$_sd2"
+sarm CCTAB_TERMINAL=konsole
+(cd -- "$tmp/repos/plain" && printf '%s\n' "$(stop_busy)" \
+    | env HOME=$tmp CCTAB_DRY_RUN=1 CCTAB_STATE_DIR=$_sd2 CCTAB_NOW=1000009 CLAUDE_PID= \
+      "$bin" idle >/dev/null 2>&1)
+check 'state: and later edges carry it through untouched' 'cts5|b i|g 1000009|s konsole|' \
+    "$(srec)"
+rm -rf "$_sd2"
+
 # WHAT THE REAPER MAY NOT TOUCH. CCTAB_STATE_DIR is a documented user knob, so the
 # directory is not always one we created - and `reapable` used to fall back to
 # mtime for anything it could not parse, which deleted a 30-day-old private key out
@@ -3251,6 +3293,116 @@ else
     check 'screen gets nothing, deliberately' \
         '{"terminalSequence":"\u001b]0;🔵 ~/plain\u0007","suppressOutput":true}' \
         "$(cd -- "$tmp/plain" && HOME=$tmp STY=1234.pts-0.host "$bin" working </dev/null)"
+
+    # --- the armed record ---------------------------------------------------
+    # THE DEFECT, driven end to end on a real server. `session_end` used to decide
+    # whether to restore the tab by re-deriving the arming condition FROM ITS OWN
+    # environment, while `session_start` had derived it from the start hook's, an
+    # unbounded time earlier. Change CCTAB_TERMINAL in between and the two answers
+    # differ - and the direction that hurts leaves Konsole's `LocalTabTitleFormat=%w`
+    # in force for the life of the tab, with nothing left that will ever put it back.
+    #
+    # WHAT IS ASSERTED HERE is the DECISION and the record behind it: @cctab_armed,
+    # and the client-attached hook, which `tmux::disarm` takes off in the same branch
+    # and under the same condition as the restore write. The restore BYTES need a
+    # real attached client on a pty this suite cannot allocate; they are asserted in
+    # tests/test_tmux_status.py, over a pty, against an attached client.
+    tsession_end() {
+        _d=$1
+        shift
+        (cd -- "$_d" && env -u CLAUDE_PID HOME=$tmp TMUX="$tsock,1,0" TMUX_PANE=%0 "$@" \
+            "$bin" session-end </dev/null >/dev/null 2>&1)
+    }
+    tarmed() { tm display-message -p -t %0 '#{@cctab_armed}'; }
+    thook() { tm display-message -p -t %0 '#{client-attached[1971]}'; }
+    # A clean slate: no other claude pane in this session may carry a record, or
+    # every session-end below takes the "somebody else is still painting" branch.
+    for _p in t:w0.0 t:w1.0 t:w1.1 t:shell.0; do tput_title "$_p" '' >/dev/null 2>&1; done
+
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check 'session-start records the surface it armed' 'konsole' "$(tarmed)"
+    check 'and a session-start that arms nothing records that instead' '-' \
+        "$(tsession_start "$tmp/code/one" CCTAB_TERMINAL=wezterm; tarmed)"
+    # THE CASE THIS COMMIT EXISTS FOR. Armed as Konsole; CCTAB_TERMINAL is something
+    # else by the time the session ends. Before the record, the end hook re-derived
+    # "not Konsole", wrote nothing, took no hook off, and left the tab armed forever.
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check 'the re-arm hook is installed by the konsole start' '1' \
+        "$(thook | grep -c 'tmux-arm')"
+    tsession_end "$tmp/code/one" CCTAB_TERMINAL=wezterm
+    check 'a CCTAB_TERMINAL changed mid-session still restores the tab' '' "$(thook)"
+    check 'and the record goes with the arm it described' '' "$(tarmed)"
+    # The other half of the same defect: a store that says NOTHING was armed is not
+    # talked out of it by an environment that now claims Konsole.
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=wezterm
+    tsession_end "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check 'and a session that armed nothing is not restored by a late CCTAB_TERMINAL' '-' \
+        "$(tarmed)"
+
+    # TWO LIVE SESSIONS, one tab. The arming is per TAB and inside tmux one tab holds
+    # every window, so the claude that leaves first must neither restore the tab nor
+    # delete the record the other one still needs.
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    tput_title t:w1.0 "~/code/two ct1 w $(tm display-message -p '%s')"
+    tsession_end "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check 'one session ending leaves the other one armed' 'konsole' "$(tarmed)"
+    check 'and leaves the re-arm hook in place for it' '1' "$(thook | grep -c 'tmux-arm')"
+    # And the last one out does turn the lights off - with the terminal changed under
+    # it, so this is the record answering and not the environment.
+    tput_title t:w1.0 ''
+    tsession_end "$tmp/code/one" CCTAB_TERMINAL=vte
+    check 'the last session ending does restore the tab' '' "$(thook)"
+    check 'and clears the record with it' '' "$(tarmed)"
+
+    # DEGRADING. Whatever goes wrong with the record, the answer is rung 3 - the old
+    # predicate, which is the behaviour every one of the 312 corpus cases runs on -
+    # and never a panic, never a missing restore. Exit 0 is asserted with it, because
+    # a hook that exits non-zero blocks a tool call.
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    tm set -t %0 -- @cctab_armed konsole-from-the-future
+    check 'a record naming a surface this build has no row for is ignored' '0' \
+        "$(cd -- "$tmp/code/one" && env -u CLAUDE_PID HOME=$tmp TMUX="$tsock,1,0" TMUX_PANE=%0 \
+              CCTAB_TERMINAL=konsole "$bin" session-end </dev/null >/dev/null 2>&1; printf %s $?)"
+    check 'and the end hook falls back to this environment, which says konsole' '' "$(thook)"
+    # A session that crashed between arming and recording - or one armed by a build
+    # that predates the record - leaves the option unset, which must read as "no
+    # record" and not as "nothing was armed".
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    tm set -ut %0 -- @cctab_armed
+    tsession_end "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check 'an absent record degrades to the old predicate, which still restores' '' \
+        "$(thook)"
+
+    # doctor prints WHICH RUNG answered, because "this tab will be restored" means
+    # two very different things depending on whether anything remembers.
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check 'doctor names the surface the multiplexer recorded' '1' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 CCTAB_TERMINAL=konsole "$bin" doctor 2>&1 \
+           | grep -c 'restore: konsole, recorded by the multiplexer')"
+    check 'and says so even when this session is not the one that armed' '1' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 CCTAB_TERMINAL=wezterm "$bin" doctor 2>&1 \
+           | grep -c 'restore: konsole, recorded by the multiplexer')"
+    check 'with no record at all, doctor calls the answer an assumption' '1' \
+        "$(tm set -ut %0 -- @cctab_armed
+           cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 CCTAB_TERMINAL=konsole "$bin" doctor 2>&1 \
+           | grep -c 'restore: konsole, ASSUMED from this hook')"
+    # The record line is printed for every session inside tmux, not only in Konsole
+    # mode: "armed, and nothing here can say by whom" is the shape of the defect.
+    check 'and prints the line outside konsole mode too, saying nothing is armed' '1' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" doctor 2>&1 \
+           | grep -c 'restore: nothing armed, ')"
+    # uninstall owns the session-scoped record too: the server-wide sweep cannot
+    # reach it, so a forgotten unset would outlive the uninstall that reported
+    # success.
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check 'uninstall takes the armed record off with the hook' '' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" uninstall --force >/dev/null 2>&1
+           tarmed)"
 
     tmux_gone
     printf 'tmux section: private server %s, killed.\n' "$tsock"

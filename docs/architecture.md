@@ -394,6 +394,7 @@ b i                                            base = w | a | i
 g 1790380620                                   last main Stop reporting background
 p 3709427 84460384                             the session's (pid, start time)
 w aec99e1f4bda1972b:1790380630 -:1790380631    one wait per word: owner, then epoch
+s konsole                                      the surface this session ARMED
 ```
 
 On Windows the origin line is `q <pid> <creation FILETIME>` instead of `p`, and
@@ -427,6 +428,16 @@ no individual task list or count is stored. What sets, clears and preserves it i
 the [contract](state-contract.md#transitions-and-retirement), and why child
 completion alone does not prove a workflow ended is in the
 [indicator policy](indicator-semantics.md#background-lifecycle-and-reconciliation).
+
+The optional `s` line is written **only** by a session that actually armed its
+terminal - today, Konsole - and it is what `SessionEnd` restores from when there is
+no tmux server to hold the same fact. A surface name this build has no row for
+reads as **absent**, never as a different terminal, so the end hook falls back to
+its own environment rather than writing bytes at random. Its silence therefore
+means "nothing is recorded" and not "nothing was armed": a session that armed
+nothing writes exactly the record it always wrote, which is what keeps every record
+already on disk, and the 312-case golden corpus, byte for byte unchanged. The
+normative rule is in [time and persistence](state-contract.md#time-and-persistence).
 
 The `n` key is reserved, last in the file so free-form text would arrive whole, for
 a cached session title; it is not implemented (see the roadmap in
@@ -1341,6 +1352,7 @@ set -s @cctab_title                      the generated strip-and-label format
 set -s @cctab_string                     the set-titles-string we installed
 set -s @cctab_window_strip               the generated strip for one window
 set -s @cctab_window_color               one status color for a themed window cap
+set -t <our session> @cctab_armed        the surface this session armed, or `-`
 set -g set-titles on
 set -g set-titles-string '#{s|^ ||:#{T:@cctab_title}}'
 set -w -t <window> window-status-format          a strip plus the saved normal format
@@ -1355,6 +1367,17 @@ set -s @cctab_exe                        this binary, for the hook to run
 set-hook -t <our session> 'client-attached[1971]' \
     'run-shell -b "'\''#{@cctab_exe}'\''  tmux-arm '\''#{client_tty}'\''"'
 ```
+
+`@cctab_armed` is the odd one out, and deliberately: it is a **session** option
+rather than a server one. Every other option feeds `set-titles-string`, which is
+server-wide and genuinely is "the last `SessionStart` wins". An arming is not - it
+goes to the ptys of the clients attached to *one* session, so two tmux sessions on
+one server are two different outer tabs, and a server-wide record would let either
+one's `SessionEnd` erase the other's. It holds the surface's name, or `-` when that
+`SessionStart` armed nothing, and `SessionEnd` reads it back instead of guessing
+from its own environment - so a `CCTAB_TERMINAL` that changes mid-session no longer
+loses the restore. A value naming no surface this build knows reads as **absent**,
+never as a different terminal. `tabstatus uninstall` removes it with the hook.
 
 `@cctab_window_color` returns the highest-priority visible state across all Claude
 panes in the window (orange > blue > purple > white), sharing the strip's carrier

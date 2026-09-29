@@ -42,6 +42,7 @@
 
 pub mod tmux;
 
+use crate::armed::Armed;
 use crate::config;
 use crate::edge::Paint;
 use crate::support::{Presence, Support, YES};
@@ -299,13 +300,43 @@ impl Channel {
     }
 }
 
+/// The leaf's appearance bytes: WHOSE they are, and where they go.
+///
+/// The surface travels WITH the channel because the two are one decision and they
+/// are made from different evidence: the channel is a fact about the stack HERE
+/// AND NOW, while the surface is what was ARMED, which only a record can say (see
+/// [`crate::armed`]). Splitting them let `session_end` take the channel from the
+/// route and the bytes from `cfg.stack.leaf` - a restore composed half from a
+/// record and half from the end hook's environment, which is the defect wearing a
+/// disguise.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Appearance {
+    pub channel: Channel,
+    /// The surface whose [`crate::surface::Arming`] these bytes come from.
+    pub surface: Surface,
+}
+
 /// Who writes what, for ONE paint.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Route {
     pub title: Channel,
     /// The leaf's appearance bytes - Konsole's tab-title formats today - or `None`
     /// when this paint has none to send, or nowhere to send them.
-    pub appearance: Option<Channel>,
+    pub appearance: Option<Appearance>,
+}
+
+impl Route {
+    /// The surface whose appearance bytes ride `channel` on this paint, or `None`.
+    ///
+    /// Every caller that used to ask `route.appearance == Some(Channel::X)` and
+    /// then reach for `cfg.stack.leaf.caps().arming` asks this instead, so the
+    /// channel test and the choice of bytes cannot come from two different
+    /// answers.
+    pub fn arms(&self, channel: Channel) -> Option<Surface> {
+        self.appearance
+            .filter(|a| a.channel == channel)
+            .map(|a| a.surface)
+    }
 }
 
 /// THE ONE PLACE that decides who writes what.
@@ -318,10 +349,13 @@ pub struct Route {
 /// match is the shape in which "outside tmux, and again inside it" cannot be
 /// written by accident.
 ///
-/// The leaf is asked for `arming`, never for its NAME: an appearance byte string
-/// is what makes this paint have a channel at all, and a surface that grows one
-/// later needs no edit here.
-pub fn route(stack: &Stack, paint: Paint) -> Route {
+/// The SURFACE is an argument and not `stack.leaf`, and that is this commit: what
+/// is armed at SessionStart is the leaf the environment named, and what is
+/// restored at SessionEnd is whatever [`crate::armed`] read back out of a store.
+/// Re-deriving the second from the environment is the defect; taking both from one
+/// argument is the repair. The surface is asked for `arming` and never for its
+/// NAME, so a surface that grows an arming later needs no edit here.
+pub fn route(stack: &Stack, paint: Paint, armed: Armed) -> Route {
     let title = match (paint, stack.renders_title()) {
         // session start and end write the tab themselves whatever is above them:
         // `terminalSequence` cannot carry either - SessionStart is too early for
@@ -331,7 +365,11 @@ pub fn route(stack: &Stack, paint: Paint) -> Route {
         (Paint::Line(_) | Paint::LineWithBackground(_), true) => Channel::Direct,
         (Paint::Line(_) | Paint::LineWithBackground(_), false) => Channel::Protocol,
     };
-    let appearance = match (paint, stack.leaf.caps().arming.is_some(), stack.has_clients()) {
+    // WHOSE bytes is the record's answer, never the leaf's: at SessionStart the
+    // two are the same thing, and at SessionEnd they are the whole bug.
+    let surface = armed.surface();
+    let arms = surface.is_some_and(|s| s.caps().arming.is_some());
+    let channel = match (paint, arms, stack.has_clients()) {
         // A painting edge arms nothing: the arming is what makes the tab able to
         // SHOW a title, and it is paired with the restore across the session.
         (Paint::Line(_) | Paint::LineWithBackground(_), _, _) => None,
@@ -345,6 +383,9 @@ pub fn route(stack: &Stack, paint: Paint) -> Route {
     // channel that cannot carry raw bytes carries no arming, so the answer is
     // `None` and every backend below reads the same `None`.
     .filter(|c| c.carries_raw());
+    let appearance = channel
+        .zip(surface)
+        .map(|(channel, surface)| Appearance { channel, surface });
     Route { title, appearance }
 }
 
@@ -352,6 +393,12 @@ pub fn route(stack: &Stack, paint: Paint) -> Route {
 mod tests {
     use super::*;
     use crate::edge::Glyph;
+
+    /// Rung 3, which is what every caller below is asserting about unless it says
+    /// otherwise: the leaf this hook's environment named, labelled an assumption.
+    fn as_leaf(st: &Stack) -> Armed {
+        Armed::assumed(st.leaf)
+    }
 
     fn stack(mux: Option<Mux>, leaf: Surface) -> Stack {
         Stack {
@@ -394,28 +441,30 @@ mod tests {
     #[test]
     fn the_arming_channel_is_the_two_old_predicates_in_one_place() {
         // Outside a multiplexer the arming rides the session's own tab, which is a
-        // byte route only where that tab is a pty.
-        let own_tab = if sys::HAS_SESSION_TTY {
-            Some(Channel::Direct)
-        } else {
-            None
-        };
+        // byte route only where that tab is a pty. It is the SURFACE that is
+        // asserted now, because who owns the bytes and where they go are one
+        // answer.
+        let own_tab = sys::HAS_SESSION_TTY.then_some(Surface::Konsole);
         for paint in [Paint::SessionStart, Paint::SessionEnd] {
             // No multiplexer: the session's own pty, as `emit.rs` did.
-            let r = route(&stack(None, Surface::Konsole), paint);
-            assert!(r.appearance == own_tab);
+            let st = stack(None, Surface::Konsole);
+            let r = route(&st, paint, as_leaf(&st));
+            assert!(r.arms(Channel::Direct) == own_tab);
             // screen is not a renderer and names no client, so the leaf's own pty
             // is still the outer terminal. `mux.is_some()` would have sent these
             // bytes to a client registry that does not exist.
-            let r = route(&stack(Some(Mux::Screen), Surface::Konsole), paint);
-            assert!(r.appearance == own_tab);
+            let st = stack(Some(Mux::Screen), Surface::Konsole);
+            let r = route(&st, paint, as_leaf(&st));
+            assert!(r.arms(Channel::Direct) == own_tab);
             // tmux: the attached clients' ptys, as `arm_konsole` did.
-            let r = route(&tmux_stack(Surface::Konsole), paint);
-            assert!(r.appearance == Some(Channel::Clients));
+            let st = tmux_stack(Surface::Konsole);
+            let r = route(&st, paint, as_leaf(&st));
+            assert!(r.arms(Channel::Clients) == Some(Surface::Konsole));
             // A leaf with no appearance bytes arms nowhere, on any stack.
             for s in [Surface::Unknown, Surface::WezTerm, Surface::WindowsTerminal] {
-                assert!(route(&stack(None, s), paint).appearance.is_none());
-                assert!(route(&tmux_stack(s), paint).appearance.is_none());
+                for st in [stack(None, s), tmux_stack(s)] {
+                    assert!(route(&st, paint, as_leaf(&st)).appearance.is_none());
+                }
             }
         }
     }
@@ -433,7 +482,8 @@ mod tests {
         // And the routing says so rather than the caller: with no byte route to
         // the session's own tab there is no arming to send, on the one stack that
         // would otherwise have asked for one.
-        let r = route(&stack(None, Surface::Konsole), Paint::SessionStart);
+        let st = stack(None, Surface::Konsole);
+        let r = route(&st, Paint::SessionStart, as_leaf(&st));
         assert_eq!(r.appearance.is_some(), sys::HAS_SESSION_TTY);
     }
 
@@ -448,7 +498,7 @@ mod tests {
                 stack(Some(Mux::Screen), Surface::Konsole),
                 tmux_stack(Surface::Konsole),
             ] {
-                assert!(route(&st, paint).appearance.is_none());
+                assert!(route(&st, paint, as_leaf(&st)).appearance.is_none());
             }
         }
     }
@@ -471,8 +521,8 @@ mod tests {
                         (_, true) => Channel::Direct,
                         (_, false) => Channel::Protocol,
                     };
-                    assert!(route(&st, paint).title == want);
-                    assert!(route(&st, paint).title != Channel::Clients);
+                    assert!(route(&st, paint, as_leaf(&st)).title == want);
+                    assert!(route(&st, paint, as_leaf(&st)).title != Channel::Clients);
                 }
             }
         }
@@ -486,7 +536,7 @@ mod tests {
         for leaf in [Surface::Unknown, Surface::Konsole] {
             for paint in PAINTS {
                 for st in [stack(None, leaf), stack(Some(Mux::Screen), leaf)] {
-                    assert!(route(&st, paint).appearance != Some(Channel::Clients));
+                    assert!(route(&st, paint, as_leaf(&st)).arms(Channel::Clients).is_none());
                 }
                 assert!(tmux_stack(leaf).tmux().is_some());
             }

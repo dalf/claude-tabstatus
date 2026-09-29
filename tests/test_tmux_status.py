@@ -5,6 +5,7 @@ CCTAB_TEST_BIN=/path/to/tabstatus python3 tests/test_tmux_status.py
 CCTAB_TEST_TMUX=/path/to/tmux selects another tmux build for every invocation.
 Every test owns a unique socket, isolated HOME and disposable shell panes.
 """
+import contextlib
 import fcntl
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -157,6 +158,61 @@ class TmuxStatusTests(unittest.TestCase):
                 return
             time.sleep(0.025)
         self.assertEqual(actual, expected)
+
+    @contextlib.contextmanager
+    def attached_client(self, session="alpha"):
+        """A real tmux client on a pty THIS process owns both ends of.
+
+        The appearance bytes go to the ptys `list-clients` names, never through
+        tmux's allow-passthrough, so there is no other way to see them: the client
+        writes its redraw into the slave and the plugin writes its OSC 50 into the
+        same slave, and both come back out of the master interleaved. Reading has
+        to keep going the whole time, because a full pty buffer blocks the tmux
+        client.
+        """
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
+        client = subprocess.Popen(self.base + ["attach-session", "-t", session],
+                                  env=self.env, stdin=slave, stdout=slave, stderr=slave,
+                                  start_new_session=True)
+        os.close(slave)
+
+        class Client:
+            captured = b""
+
+            def read(self, budget=0.1):
+                if select.select([master], [], [], budget)[0]:
+                    try:
+                        self.captured += os.read(master, 65536)
+                    except OSError:
+                        pass
+
+            def saw(self, wanted, timeout=5):
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    if wanted in self.captured:
+                        return True
+                    self.read()
+                return wanted in self.captured
+
+        watcher = Client()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if self.tm("list-clients", "-t", self.pane, "-F", "#{client_tty}"):
+                    break
+                watcher.read(0.05)
+            self.assertTrue(self.tm("list-clients", "-t", self.pane, "-F", "#{client_tty}"),
+                            "no client attached, so no appearance byte has anywhere to go")
+            yield watcher
+        finally:
+            client.terminate()
+            try:
+                client.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                client.kill()
+                client.wait(timeout=3)
+            os.close(master)
 
     def publish(self, pane, edge="working", age=0):
         # Invoke the real hook with the disposable pane shell as Claude's tty
@@ -357,6 +413,55 @@ class TmuxStatusTests(unittest.TestCase):
                 client.kill()
                 client.wait(timeout=3)
             os.close(master)
+
+    def test_the_armed_record_drives_the_restore_when_the_terminal_changes(self):
+        """THE DEFECT, byte for byte, on a real client pty.
+
+        `session_end` used to decide whether to restore the outer tab by
+        re-deriving the arming condition from ITS OWN environment, an unbounded
+        time after `session_start` derived it from the start hook's. Change
+        CCTAB_TERMINAL in between - or land in a shell whose rc sets it
+        differently - and the end hook wrote nothing at all, leaving Konsole's
+        `LocalTabTitleFormat=%w` in force with nothing left that would ever put it
+        back. What is armed is now RECORDED in `@cctab_armed`, and the restore is
+        driven by the record.
+
+        This is the only place in the suite where the arming BYTES are observed:
+        they go to the ptys `list-clients` names, so seeing them needs a real
+        client attached to a real pty. tests/run.sh asserts the decision and the
+        record; this asserts what actually reaches the terminal.
+        """
+        arm = b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07"
+        restore = b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07"
+        with self.attached_client() as client:
+            self.hook("session-start", self.pane, {"CCTAB_TERMINAL": "konsole"})
+            self.assertTrue(client.saw(arm), "the arming never reached the client's pty")
+            self.assertEqual(self.tm("display-message", "-p", "-t", self.pane,
+                                     "#{@cctab_armed}"), "konsole")
+            # The terminal this hook can see is now WezTerm, which arms nothing.
+            # Before the record that was the whole input to the decision.
+            self.hook("session-end", self.pane, {"CCTAB_TERMINAL": "wezterm"})
+            self.assertTrue(client.saw(restore), "the restore was lost with CCTAB_TERMINAL")
+            self.assertEqual(self.tm("display-message", "-p", "-t", self.pane,
+                                     "#{@cctab_armed}"), "")
+
+    def test_a_session_that_armed_nothing_is_not_restored_by_a_late_terminal(self):
+        """The other half of the same defect, and the reason `-` is a value.
+
+        A store that says nothing was armed must not be talked out of it by an
+        environment that names Konsole only at the end. Writing the restore here
+        would be an un-arming with no arming - a tab handed the compiled-in
+        Konsole defaults it may never have had.
+        """
+        restore = b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07"
+        with self.attached_client() as client:
+            self.hook("session-start", self.pane, {"CCTAB_TERMINAL": "wezterm"})
+            self.assertEqual(self.tm("display-message", "-p", "-t", self.pane,
+                                     "#{@cctab_armed}"), "-")
+            self.hook("session-end", self.pane, {"CCTAB_TERMINAL": "konsole"})
+            # Give the client the same budget the positive case gets, so this is a
+            # real absence and not a race the timeout hid.
+            self.assertFalse(client.saw(restore, timeout=2))
 
     def test_current_state_semantics_agree_with_plain_terminal(self):
         # Exercise all four states and ownership precedence through ordinary

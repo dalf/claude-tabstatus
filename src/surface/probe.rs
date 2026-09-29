@@ -202,14 +202,23 @@ pub fn from_override(raw: Option<&OsStr>) -> Option<Surface> {
     // allocates: a `CCTAB_TERMINAL` which is not UTF-8 has to MISS every row
     // rather than be repaired into a near match, and the fold has to stay
     // ASCII-only so that no locale can decide whether `KONSOLE` names Konsole.
-    let v = raw?.as_encoded_bytes();
-    Some(
-        Surface::ALL
-            .iter()
-            .copied()
-            .find(|s| v.eq_ignore_ascii_case(s.caps().name.as_bytes()))
-            .unwrap_or(Surface::Unknown),
-    )
+    Some(by_name(raw?.as_encoded_bytes()).unwrap_or(Surface::Unknown))
+}
+
+/// The surface this NAME spells, or `None` when no row answers to it.
+///
+/// The STRICT half of [`from_override`], which turns a miss into
+/// [`Surface::Unknown`] because a `CCTAB_TERMINAL` that named nothing still has to
+/// stop the detection ladder. A STORE has the opposite obligation: a value written
+/// by a future version - or by a user's stray `set -s @cctab_armed` - must read as
+/// ABSENT and let the next rung answer, never as a different surface. That is the
+/// same rule the platform stamp follows, and it is what keeps `@cctab_armed` and
+/// the record's `s` line safe to extend.
+pub fn by_name(name: &[u8]) -> Option<Surface> {
+    Surface::ALL
+        .iter()
+        .copied()
+        .find(|s| name.eq_ignore_ascii_case(s.caps().name.as_bytes()))
 }
 
 #[cfg(test)]

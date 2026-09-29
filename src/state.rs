@@ -120,6 +120,8 @@
 use crate::clock;
 use crate::edge::{Edge, Glyph, Notification, Paint, Resolved};
 use crate::payload::{Payload, MAX_ELICITATION_ID_BYTES};
+use crate::support::Support;
+use crate::surface::{self, Surface};
 use crate::sys;
 use std::ffi::OsStr;
 use std::fs;
@@ -410,6 +412,7 @@ fn id_str(raw: &[u8]) -> Option<String> {
 ///   g 1790380620                            last positive main Stop snapshot
 ///   p 3709427 84460384                         the session's (pid, start time)
 ///   w aec99e1f4bda1972b:1790380630 -:1790380631
+///   s konsole                                  the surface this session ARMED
 /// ```
 ///
 /// Each `w` word is one wait: its owner, a colon, and the epoch at which THAT wait
@@ -425,6 +428,15 @@ fn id_str(raw: &[u8]) -> Option<String> {
 /// expires. An absent `p` line means the reaper falls back to mtime for this file.
 /// On Windows the origin line is `q <pid> <creation FILETIME>` instead
 /// ([`sys::ORIGIN_KEY`]), and each platform reads the other's as no origin.
+///
+/// The optional `s` line is rung 2 of [`crate::armed`], and it is written ONLY by
+/// a session that actually armed something - which is what keeps every record
+/// written before this commit readable, keeps every record written by a session
+/// that armed nothing byte-for-byte what it was, and keeps the 312-case corpus,
+/// which has no state directory at all, untouched. The price is that this rung can
+/// say "konsole armed" and cannot say "nothing armed"; its silence falls through
+/// to the assumption, exactly as a missing file does. An older reader skips the
+/// key like any other unknown one, so the tag does not move.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Record {
     base: Glyph,
@@ -440,6 +452,14 @@ struct Record {
     /// Recently completed exact identities, oldest first. Suppresses replayed
     /// starts and preserves result-before-start ordering within the wait TTL.
     completed: Vec<Wait>,
+    /// The CANONICAL name of the surface this session armed, or `None`.
+    ///
+    /// The name and not a `Surface`, for two reasons that point the same way: the
+    /// name is the wire form, and validating it at PARSE time is what makes "an
+    /// unrecognised value reads as absent" a property of the record rather than of
+    /// every reader; and `Surface` is deliberately not `Debug`, while this struct
+    /// is, for its own tests.
+    armed: Option<&'static str>,
 }
 
 impl Record {
@@ -452,6 +472,7 @@ impl Record {
             origin: None,
             waits: Vec::new(),
             completed: Vec::new(),
+            armed: None,
         }
     }
 
@@ -510,6 +531,10 @@ impl Record {
                 "e" => r.completed = rest.split(' ').filter_map(Wait::parse)
                     .filter(|w| matches!(w.who, Owner::Elicitation(_)))
                     .take(MAX_WAITS).collect(),
+                // ABSENT, never DIFFERENT: a surface name from a later version -
+                // or from a hand-edited record - must not choose escape bytes, so
+                // it reads as no record at all and the next rung answers.
+                "s" => r.armed = surface::by_name(rest.as_bytes()).map(|s| s.caps().name),
                 // Unknown fields remain forward-extensible.
                 _ => {}
             }
@@ -567,6 +592,13 @@ impl Record {
                 out.push(' ');
                 out.push_str(&w.render());
             }
+            out.push('\n');
+        }
+        // LAST, so that every record a session which armed nothing writes is byte
+        // for byte the record it wrote before this line existed.
+        if let Some(name) = self.armed {
+            out.push_str("s ");
+            out.push_str(name);
             out.push('\n');
         }
         out
@@ -971,6 +1003,53 @@ impl Session {
 
     fn remove(&self) {
         let _ = fs::remove_file(&self.path);
+    }
+
+    /// RUNG 2, read back: what this session armed, according to its own record.
+    ///
+    /// It takes NO LOCK and it is called before [`Session::resolve`], because the
+    /// `SessionEnd` branch of that function DELETES this file - and unlocked is the
+    /// same discipline the reaper and doctor already read on, since
+    /// `write_if_changed` renames over the path and a reader therefore sees the old
+    /// record or the new one and never a torn one.
+    ///
+    /// The absences are all `Unsupported`, and they have to be: an `Available`
+    /// stops the ladder in [`crate::armed`], and a record that predates this line -
+    /// or a session whose SessionStart armed nothing - has said nothing about
+    /// arming at all. Only rung 1 can state a negative.
+    pub fn armed(&self) -> Support<Option<Surface>> {
+        let Stored::Ours(r) = stored_at(&self.path) else {
+            return Support::Unsupported("this session has no record of its own");
+        };
+        match r.armed.and_then(|n| surface::by_name(n.as_bytes())) {
+            Some(s) => Support::Available(Some(s)),
+            None => Support::Unsupported("the record says nothing about what was armed"),
+        }
+    }
+
+    /// RUNG 2, written: remember the surface whose appearance bytes just went out.
+    ///
+    /// AFTER the arming and not before, which is the whole reason this is a second
+    /// write rather than a field of the record `SessionStart` already writes.
+    /// Record-then-arm as one transaction would have to run before the routing
+    /// exists, and a routing computed before the record would be the record
+    /// describing an intention rather than an act - so a crash in between leaves no
+    /// record, and `session_end` degrades to the assumption, which is exactly what
+    /// it did before this line existed.
+    ///
+    /// A failed lock or a failed write is silence for the same reason: the rung
+    /// below is the old behaviour, so losing this costs nothing that was ever had.
+    ///
+    /// It is CREATION-CAPABLE, unlike the painting edges: `SessionStart` writes no
+    /// file at all when the record it would write is the one a session with no
+    /// record is already assumed to have - which is every session whose
+    /// `$CLAUDE_PID` names nothing - and this is a fact about the session that no
+    /// default can stand in for.
+    pub fn note_armed(&self, surface: Surface) {
+        let Some(_lock) = self.lock(true) else { return };
+        let (was, mut now) = self.load();
+        now.armed = Some(surface.caps().name);
+        self.write_if_changed(&was, &mut now);
     }
 
     /// Delete the records of sessions that are gone. Runs on `SessionStart` only -
@@ -2502,6 +2581,50 @@ mod tests {
         assert_eq!(f.record(), "");
     }
 
+    /// RUNG 2, end to end: what a session armed survives to the end hook, and a
+    /// session that armed nothing writes a record byte for byte what it always
+    /// wrote.
+    ///
+    /// The second half is the one that had to be true before this line could
+    /// exist: every state record on disk, and every assertion about one in
+    /// `tests/run.sh` and the six Python suites, is a record of a session that
+    /// armed nothing.
+    #[test]
+    fn what_a_session_armed_is_written_only_when_it_armed_and_read_back_at_the_end() {
+        let f = Fixture::new("armed");
+        let start =
+            payload(r#"{"session_id":"s1","hook_event_name":"SessionStart","source":"startup"}"#);
+        let plain = f.session(&start);
+        plain.resolve(Edge::SessionStart, &start);
+        let untouched = format!("cts5\nb i\n{}", f.origin_line());
+        assert_eq!(f.record(), untouched);
+        // A session that armed nothing never calls `note_armed`, so this is the
+        // whole of the claim: the file is what it was.
+        assert!(matches!(plain.armed(), Support::Unsupported(_)));
+        plain.note_armed(Surface::Konsole);
+        assert_eq!(f.record(), format!("{untouched}s konsole\n"));
+        assert!(matches!(plain.armed(), Support::Available(Some(Surface::Konsole))));
+        // And an ordinary painting edge carries it through untouched, because
+        // every write starts from the record it read.
+        let stop = payload(r#"{"session_id":"s1","hook_event_name":"Stop"}"#);
+        f.session(&stop).resolve(Edge::Idle, &stop);
+        assert!(f.record().ends_with("s konsole\n"));
+        assert!(matches!(f.session(&stop).armed(), Support::Available(Some(Surface::Konsole))));
+        // A name this build has no row for reads as ABSENT and lets the next rung
+        // answer - never as a different surface whose bytes would then be written.
+        fs::write(f.dir.join("s1"), "cts5\nb i\ns konsole-ng\n").expect("a writable state dir");
+        assert!(matches!(f.session(&stop).armed(), Support::Unsupported(_)));
+        // A record that is not ours at all is the same answer, by a different road.
+        fs::write(f.dir.join("s1"), "not-a-record\n").expect("a writable state dir");
+        assert!(matches!(f.session(&stop).armed(), Support::Unsupported(_)));
+        // SessionEnd deletes the file, which is why `paint` reads this BEFORE it
+        // resolves: afterwards there is nothing left to read.
+        let end = payload(r#"{"session_id":"s1","hook_event_name":"SessionEnd"}"#);
+        f.session(&end).resolve(Edge::SessionEnd, &end);
+        assert_eq!(f.record(), "");
+        assert!(matches!(f.session(&end).armed(), Support::Unsupported(_)));
+    }
+
     /// The origin is carried by every later write without any of them re-reading
     /// `/proc`, and its absence is not a failure - just the mtime fallback.
     #[test]
@@ -2833,6 +2956,7 @@ mod tests {
                     Wait { who: Owner::Unknown, raised: 1_000_000 },
                 ],
                 completed: Vec::new(),
+                armed: None,
             },
             // The edges of the numbers, because all of them go through `itoa` and
             // `digits` rather than the formatter and `parse`.
@@ -2842,6 +2966,7 @@ mod tests {
                 origin: Some(Origin { pid: u32::MAX, start: u64::MAX }),
                 waits: vec![Wait { who: Owner::Main, raised: u64::MAX }],
                 completed: Vec::new(),
+                armed: None,
             },
         ];
         for r in cases {
@@ -2855,6 +2980,7 @@ mod tests {
                 origin: Some(Origin { pid: 42, start: 7 }),
                 waits: vec![Wait { who: Owner::Agent("ab-c_D".to_owned()), raised: 99 }],
                 completed: Vec::new(),
+                armed: None,
             }
             .render(),
             format!("cts5\nb w\n{} 42 7\nw ab-c_D:99\n", sys::ORIGIN_KEY)
@@ -3026,6 +3152,7 @@ mod tests {
                     raised: 999_990,
                 }],
                 completed: Vec::new(),
+                armed: None,
             }
             .render(),
         )

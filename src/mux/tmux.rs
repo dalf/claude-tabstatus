@@ -46,11 +46,13 @@
 //! Only windows that start Claude receive local format decorators. Window names,
 //! automatic renaming, global window formats and the outer aggregate stay intact.
 
+use crate::armed::Armed;
 use crate::clock::{self, DEFAULT_TTL_GONE, DEFAULT_TTL_WAITING, DEFAULT_TTL_WORKING, NEVER};
 use crate::config::{self, Config, GlyphPos};
 use crate::edge::{Glyph, Paint};
 use crate::mux::{Channel, Route};
-use crate::surface::Surface;
+use crate::support::Support;
+use crate::surface::{self, Surface};
 use crate::sys;
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -113,6 +115,31 @@ const WINDOW_FORMATS: [WindowFormat; 2] = [
 /// option's value is substituted LITERALLY, which is what spares the hook every
 /// layer of quoting; see [`ARM_HOOK`].
 const OPT_EXE: &str = "@cctab_exe";
+
+/// THE ARMED RECORD - rung 1 of [`crate::armed`]. The surface SessionStart armed
+/// the outer tab for, written where the END hook can read it back instead of
+/// re-deriving it from its own environment.
+///
+/// It is the only option in this file set at SESSION scope rather than server
+/// scope, and that is deliberate: every other option feeds `set-titles-string`,
+/// which is server-wide and genuinely is "the last SessionStart wins". An arming
+/// is not. It goes to the ptys of the clients attached to ONE session, so two tmux
+/// sessions on one server are two different outer tabs, and a server-wide record
+/// would let either one's SessionEnd delete the other's. Measured on tmux 3.7c: a
+/// session value shadows a server value, and unsetting it falls back to the server
+/// one - which is why the unset below leaves the empty string that reads as "no
+/// record" rather than as "nothing was armed".
+const OPT_ARMED: &str = "@cctab_armed";
+
+/// What [`OPT_ARMED`] holds when SessionStart armed NOTHING.
+///
+/// A sentinel rather than an empty value, because the two are different answers
+/// and the empty one has to keep meaning "no record here". Without it, every tmux
+/// server that predates this commit - and every session whose SessionStart hook
+/// never ran - would read as "nothing was armed" and silently lose its restore.
+/// No surface is named `-`, so [`crate::surface::by_name`] answers `None` for it
+/// the same way it answers `None` for a name from the future.
+const ARMED_NONE: &str = "-";
 
 /// Is this pane carrying one of our records? ASCII and anchored at the end.
 ///
@@ -360,6 +387,13 @@ pub fn session_start(cfg: &Config, route: Route) {
     ));
     c.arg(";").arg("set").arg("-g").arg("set-titles").arg("on");
     c.arg(";").arg("set").arg("-g").arg("set-titles-string").arg(sts);
+    // THE ARMED RECORD, written in the SAME batch as the arming it describes, so
+    // that a tmux that accepted the options accepted the record too. It is written
+    // on every SessionStart, including the ones that arm nothing - that is what
+    // makes `-` a statement rather than a silence, and it is the only reason
+    // SessionEnd can decline to restore a tab nobody armed.
+    let armed = route.arms(Channel::Clients);
+    set_session(&mut c, t, OPT_ARMED, armed.map_or(ARMED_NONE, |s| s.caps().name));
     // LAST in the batch, deliberately: `client-attached[N]` is an array option,
     // which a tmux older than 3.0 has no syntax for, and measured, a command that
     // fails at the END of a `;`-chained batch leaves every command before it
@@ -367,11 +401,11 @@ pub fn session_start(cfg: &Config, route: Route) {
     // The hook exists to re-arm what `route` armed, so it is gated on the SAME
     // answer and never on the leaf's name a second time: a re-arm installed for a
     // leaf whose arming did not go out is an arming with no matching un-arming.
-    match (route.appearance, exe_path()) {
+    match (armed, exe_path()) {
         // A path with a single quote in it has no representation inside ARM_HOOK's
         // sh quoting, and a path that is not UTF-8 cannot go into a format at all.
         // Both drop the re-arm and keep everything else.
-        (Some(Channel::Clients), Some(exe)) => {
+        (Some(_), Some(exe)) => {
             set(&mut c, OPT_EXE, &exe);
             c.arg(";").arg("set-hook");
             t.target(&mut c);
@@ -458,6 +492,18 @@ fn set(c: &mut Command, name: &str, value: &str) {
     c.arg("set").arg("-s").arg("--").arg(name).arg(value);
 }
 
+/// `; set -t <our pane> -- <name> <value>`: a SESSION option, for the one option
+/// whose scope is a session and not the server. See [`OPT_ARMED`] for why that is
+/// not a detail, and [`set`] for why the `--` is load-bearing.
+fn set_session(c: &mut Command, t: &Tmux, name: &str, value: &str) {
+    if c.get_args().next().is_some() {
+        c.arg(";");
+    }
+    c.arg("set");
+    t.target(c);
+    c.arg("--").arg(name).arg(value);
+}
+
 /// The array index our `client-attached` hook occupies.
 ///
 /// An INDEX and not a bare `set-hook -g client-attached`: measured on 3.7c, a
@@ -523,13 +569,68 @@ pub fn arm_tty(path: &OsStr) {
     }
 }
 
-/// Take the re-arm hook back off.
-fn drop_hook(t: &Tmux) {
+/// Take the re-arm hook back off, and the armed record with it.
+///
+/// ONE function, because the two have exactly one lifetime between them: the hook
+/// exists to re-arm on reattach what SessionStart armed, and the record exists to
+/// say what that was. Dropping one without the other leaves either a hook that
+/// re-arms a tab nothing will restore, or a record claiming an arm the reattach
+/// will no longer renew - both spellings of the same defect.
+///
+/// The record is UNSET rather than set to [`ARMED_NONE`]: the session option
+/// falls back to the server's, which we never write, so the answer becomes the
+/// empty string - "no record here" - and the next rung gets to speak. Saying
+/// "nothing was armed" would be a claim about a session that no longer exists.
+fn disarm(t: &Tmux) {
     let mut c = Command::new("tmux");
     c.arg("set-hook").arg("-u");
     t.target(&mut c);
     c.arg(HOOK);
+    c.arg(";").arg("set").arg("-u");
+    t.target(&mut c);
+    c.arg("--").arg(OPT_ARMED);
     run(c);
+}
+
+/// RUNG 1: the surface this tmux session recorded as armed, read back out of the
+/// multiplexer's own key-value store.
+///
+/// An `Available` answer STOPS the ladder, so every way of not knowing has to be
+/// one of the other words - a tmux that is not on PATH, a socket that went away
+/// between the two hooks, a server whose SessionStart predates this record, or a
+/// value naming a surface this build has no row for. Any of those falls through to
+/// the state record and then to the assumption; only the server's own `-` is
+/// allowed to say "nothing was armed", and only because SessionStart writes it.
+///
+/// ONE round trip, on SessionEnd and on doctor, both of which already exec tmux.
+/// Nothing on the paint path reaches this.
+pub fn armed(t: &Tmux) -> Support<Option<Surface>> {
+    match ask(t, &[&format!("#{{{OPT_ARMED}}}")]) {
+        Ok(f) => armed_value(f.first().map_or("", String::as_str)),
+        Err(Fail::NoBinary) => Support::Unsupported("tmux(1) is not on PATH"),
+        Err(Fail::NoAnswer) => {
+            Support::Unsupported("the tmux server did not answer, so it remembers nothing")
+        }
+    }
+}
+
+/// What one [`OPT_ARMED`] value means. Split out of [`armed`] because doctor
+/// already has the value - it reads the option in the same one round trip it makes
+/// for everything else - and a report that re-derived the verdict from a second
+/// query is a report that can disagree with the paint path.
+fn armed_value(v: &str) -> Support<Option<Surface>> {
+    if v.is_empty() {
+        return Support::Unsupported("this tmux session holds no record of what was armed");
+    }
+    if v == ARMED_NONE {
+        return Support::Available(None);
+    }
+    // ABSENT, never DIFFERENT: a name from a later version, or one a user set by
+    // hand, must not choose escape bytes.
+    match surface::by_name(v.as_bytes()) {
+        Some(leaf) => Support::Available(Some(leaf)),
+        None => Support::Unsupported("the record names a surface this build has no row for"),
+    }
 }
 
 /// Arm the outer terminal's tab, from inside tmux.
@@ -552,11 +653,9 @@ fn drop_hook(t: &Tmux) {
 /// carried the complementary half. Two halves in two files is how a pane gets
 /// armed twice.
 pub fn arm_konsole(cfg: &Config, route: Route) {
-    if route.appearance != Some(Channel::Clients) {
-        return;
-    }
+    let Some(surface) = route.arms(Channel::Clients) else { return };
     let Some(t) = cfg.stack.tmux() else { return };
-    if let Some(a) = &cfg.stack.leaf.caps().arming {
+    if let Some(a) = &surface.caps().arming {
         to_clients(t, a.pair().0);
     }
 }
@@ -568,23 +667,28 @@ pub fn arm_konsole(cfg: &Config, route: Route) {
 /// cleared already: session end's empty title travels through the pty and tmux's
 /// parser, and racing that would silently skip the restore.
 pub fn session_end(cfg: &Config, route: Route) {
-    if route.appearance != Some(Channel::Clients) {
-        return;
-    }
+    // WHOSE bytes came out of the record, not out of this hook's environment; see
+    // [`crate::armed`]. All this function still decides is whether anyone else is
+    // using them.
+    let Some(surface) = route.arms(Channel::Clients) else { return };
     let Some(t) = cfg.stack.tmux() else { return };
     let mut c = Command::new("tmux");
     c.arg("display-message").arg("-p");
     t.target(&mut c);
     c.arg(others_expr(t));
+    // Another claude is still painting into this tab, so the arming is still in
+    // force for it. Leaving the RECORD alone here is the same decision as leaving
+    // the tab armed: the session that does turn the lights out has to still be
+    // able to read what to put back.
     if capture(c).is_ok_and(|s| s.contains('1')) {
         return;
     }
-    if let Some(a) = &cfg.stack.leaf.caps().arming {
+    if let Some(a) = &surface.caps().arming {
         to_clients(t, a.pair().1);
     }
     // The last claude in this session is going: nothing is left for a reattach to
-    // re-arm, so the hook goes with it.
-    drop_hook(t);
+    // re-arm, and nothing is left armed for a record to describe.
+    disarm(t);
 }
 
 /// `1` once per pane of this session that carries a record and is not ours.
@@ -853,8 +957,9 @@ pub fn uninstall() -> Vec<String> {
     }
     // Ours, and not in the batch below: `client-attached[N]` is an array option an
     // old tmux cannot parse, and an error inside a `;`-chained batch stops the
-    // commands after it - which would be the restore.
-    drop_hook(&t);
+    // commands after it - which would be the restore. It takes the armed record
+    // with it - a SESSION option, which the server-scope sweep below cannot reach.
+    disarm(&t);
 
     // Ours come off whatever happens: they are our own namespace, and an orphaned
     // @cctab_title is exactly what would make a later doctor lie. Keep the saved
@@ -971,7 +1076,13 @@ pub fn uninstall() -> Vec<String> {
 }
 
 /// Every option SessionStart writes, so that uninstall cannot forget one.
-const OURS: [&str; 15] = [
+///
+/// The sweep that reads this list unsets at SERVER scope. [`OPT_ARMED`] is written
+/// at SESSION scope and is removed by [`disarm`], which uninstall calls first; it
+/// is listed here anyway, because the list is also the answer to "what is in our
+/// namespace", and because a `@cctab_armed` someone set at server scope by hand
+/// would otherwise outlive an uninstall.
+const OURS: [&str; 16] = [
     OPT_GW,
     OPT_GA,
     OPT_GI,
@@ -985,6 +1096,7 @@ const OURS: [&str; 15] = [
     OPT_PREV_STRING,
     OPT_PREV_TITLES,
     OPT_EXE,
+    OPT_ARMED,
     OPT_WINDOW_STRIP,
     OPT_WINDOW_COLOR,
 ];
@@ -1064,6 +1176,7 @@ pub fn report(cfg: &Config) -> Vec<String> {
             &ours,
             &format!("#{{{OPT_SAVED}}}"),
             &format!("#{{{OPT_STRING}}}"),
+            &format!("#{{{OPT_ARMED}}}"),
             &format!("#{{{HOOK}}}"),
         ],
     ) {
@@ -1170,10 +1283,32 @@ pub fn report(cfg: &Config) -> Vec<String> {
                 .to_owned(),
         );
     }
+    // THE ARMED RECORD - rung 1, and which rung would answer if it were empty.
+    // Printed for every session inside tmux and not only in Konsole mode, because
+    // "this tab is armed and nothing here can say by whom" is the shape of the
+    // defect, and a line that only spoke when the environment already agreed could
+    // never show it.
+    //
+    // Labelled `restore:` and not `record:`, because doctor already prints a
+    // column-zero `record:` for the state directory and two labels reading the
+    // same in one report is a reader's problem, not a naming preference. It also
+    // names the ACT a user is looking for when a tab is stuck.
+    let record = Armed::resolve(
+        armed_value(get(8)),
+        Support::Unsupported("doctor has no session id, so it cannot read a state record"),
+        cfg.stack.leaf,
+    );
+    out.push(format!(
+        "           restore: {}",
+        match record.surface().filter(|s| s.caps().arming.is_some()) {
+            Some(s) => format!("{}, {}", s.caps().name, record.source().why()),
+            None => format!("nothing armed, {}", record.source().why()),
+        }
+    ));
     if cfg.stack.leaf == Surface::Konsole {
         out.push(format!(
             "           arm: {}",
-            match get(8) {
+            match get(9) {
                 h if h == ARM_HOOK =>
                     "OK   client-attached re-arms this tab's Konsole format on every \
                      reattach",
@@ -1405,7 +1540,40 @@ mod tests {
         // and @cctab_exe is the one this slice added.
         assert!(OURS.contains(&OPT_EXE));
         assert!(OURS.contains(&OPT_WINDOW_STRIP));
-        assert_eq!(OURS.len(), 15);
+        assert!(OURS.contains(&OPT_ARMED));
+        assert_eq!(OURS.len(), 16);
+    }
+
+    /// The armed record's grammar, which is the whole of rung 1's reliability.
+    ///
+    /// Three answers and not two: "nothing was armed" is a STATEMENT, and the
+    /// empty string has to keep meaning "no record here", or every tmux server
+    /// that predates this option - and every session whose SessionStart hook never
+    /// ran - would read as a session that armed nothing and silently lose its
+    /// restore.
+    #[test]
+    fn the_armed_record_reads_an_unknown_value_as_absent_and_never_as_a_surface() {
+        let seen = |v: &str| matches!(armed_value(v), Support::Available(Some(s)) if s == Surface::Konsole);
+        assert!(seen("konsole"));
+        // The option is written from `caps().name`, so it arrives canonical; the
+        // reader is case-insensitive anyway, because `CCTAB_TERMINAL` taught this
+        // crate what a byte compare costs.
+        assert!(seen("KONSOLE"));
+        assert!(matches!(armed_value(ARMED_NONE), Support::Available(None)));
+        // Everything else has to fall THROUGH to the next rung rather than choose
+        // bytes: a name from a later version, a name from no version at all, a
+        // hand-edited value, and the empty string a server that never wrote one
+        // gives back.
+        for miss in ["", "konsol", "konsolex", "kitty-next", "-x", "1", " konsole"] {
+            assert!(!matches!(armed_value(miss), Support::Available(Some(_))), "{miss}");
+        }
+        // And a name this build DOES know but which arms nothing is still read
+        // back faithfully - the routing, not the reader, is what declines to send
+        // bytes for it.
+        assert!(matches!(armed_value("wezterm"), Support::Available(Some(s)) if s == Surface::WezTerm));
+        assert!(Surface::WezTerm.caps().arming.is_none());
+        // No surface may ever be named `-`, or the sentinel would become a row.
+        assert!(surface::by_name(ARMED_NONE.as_bytes()).is_none());
     }
 
     #[test]

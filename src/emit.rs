@@ -101,7 +101,7 @@ fn escape_into(out: &mut String, s: &str) {
 pub fn session_start(title: &str, cfg: &Config, route: Route) -> io::Result<()> {
     let caps = cfg.stack.leaf.caps();
     let mut out: Vec<u8> = Vec::with_capacity(title.len() + 96);
-    if route.appearance == Some(Channel::Direct) {
+    if let Some(surface) = route.arms(Channel::Direct) {
         // %w makes the OSC 0 payload the entire tab text. Under Konsole's stock
         // formats an OSC 0 title is invisible in the tab, which is why Claude's
         // own title never shows up there. Konsole applies profile properties per
@@ -113,7 +113,7 @@ pub fn session_start(title: &str, cfg: &Config, route: Route) -> io::Result<()> 
         // swallowed; `tmux::arm_konsole` writes it to the attached client's pty
         // instead, which is why `route` answers `Channel::Clients` there and this
         // block is skipped.
-        let _ = compose::push_arm(&mut out, caps);
+        let _ = compose::push_arm(&mut out, surface.caps());
     }
     // The arming has to precede the title, or the tab is painted before it can
     // show what was painted.
@@ -125,13 +125,18 @@ pub fn session_start(title: &str, cfg: &Config, route: Route) -> io::Result<()> 
 pub fn session_end(cfg: &Config, route: Route) -> io::Result<()> {
     let caps = cfg.stack.leaf.caps();
     let mut out: Vec<u8> = Vec::with_capacity(96);
-    if route.appearance == Some(Channel::Direct) {
+    if let Some(surface) = route.arms(Channel::Direct) {
         // We own restore: with the built-in terminal title disabled - which the
         // installer does, otherwise it repaints over ours every 960ms - Claude
         // Code no longer clears the title on exit either. The two formats in the
         // capability row are Konsole's COMPILED-IN defaults, not whatever a
         // customized profile had, because that is all we can know.
-        let _ = compose::push_restore(&mut out, caps);
+        //
+        // WHOSE row is [`crate::armed`]'s answer and not `cfg.stack.leaf`'s: this
+        // hook runs an unbounded time after the one that armed, and a
+        // `CCTAB_TERMINAL` changed in between used to turn this whole block off
+        // and leave the tab governed by `%w` forever.
+        let _ = compose::push_restore(&mut out, surface.caps());
     }
     // An EMPTY title is the unpaint, so it is composed as a title rather than
     // spelled as its own literal.
