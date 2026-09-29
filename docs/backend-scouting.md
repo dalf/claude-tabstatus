@@ -34,7 +34,7 @@ the prose, not the line number.
 > markers below, because evidence that is quietly rewritten to agree with what
 > happened is no longer evidence. Its base is `9bfd987`; this branch's base is
 > `a1e4153`, the head of
-> [#28](https://github.com/dalf/claude-tabstatus/pull/28)'s Windows port. Three
+> [#28](https://github.com/dalf/claude-tabstatus/pull/28)'s Windows port. Five
 > things it says are no longer true of the tree, and each is marked where it
 > appears:
 >
@@ -47,6 +47,16 @@ the prose, not the line number.
 >   and `tests/run.sh`. The credit for that fix is #28's.
 > * **Two of the Open questions were answered by shipping.** Numbers 1 and 6 are
 >   marked below with what #28 did about them.
+> * **macOS has a backend now, and "no backend on macOS" is the reading to drop.**
+>   `libc` is a `cfg(target_os = "macos")` dependency of this tree with zero
+>   transitive dependencies, `sys::session_tty` resolves fd 1 there, and
+>   `sys::HAS_SESSION_TTY` is `true`, so session-start and session-end paint. §1's
+>   "silently deliver nothing", §5's `libc` row and §6's macOS session-terminal row
+>   are each marked. **Nothing in it has ever been run on a Mac**, which is why the
+>   marks say what is asserted at compile time and what is not.
+> * **Open question 4 is answered too**, by a scouting pass this file did not
+>   originally contain: §4 gained a subsection on what `replaces_id` is worth
+>   without the reply, and the question below points at it.
 >
 > Everything else here — the hook-protocol ceiling, the capability matrix, the
 > dependency verdicts, the prior art, the §9 reasoning — was re-read against this
@@ -115,6 +125,34 @@ process identity so the reaper falls back to a 24-hour file age; `manage::sweep_
 reads a missing `/proc/<pid>` as a dead process and can delete a live concurrent
 installer's temporary file. A green type-check is not evidence of support, and the
 build script is right to refuse to list a target it has not run.
+
+> **ALL THREE OF THESE READS ARE ANSWERED NOW, not just documented.** Re-checked by
+> grep in this tree rather than recalled: **every `"/proc` string in `src/` sits
+> inside a `cfg(not(target_os = "macos"))` item**, each with a macOS answer beside
+> it.
+>
+> * `session_tty` no longer returns `None`: it resolves fd 1 through
+>   `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` and `sys::HAS_SESSION_TTY` is `true`,
+>   so **session-start arms the tab and session-end clears it**. The tmux pane
+>   writes were never affected in the first place — `sys::write_tty` takes a path
+>   tmux names, not fd 1.
+> * `state::start_time` goes through `sys::process_start_time`, which on macOS is
+>   `proc_pidinfo(PROC_PIDTBSDINFO)` with `pbi_start_tvsec`/`_tvusec`, under its own
+>   `sys::ORIGIN_KEY` of `r` so no other platform's number is ever compared to it.
+> * `manage::sweep_litter` never reads `/proc` directly; it calls
+>   `sys::process_alive`, which on macOS is `kill(pid, 0)` with the ESRCH/EPERM
+>   mapping, and unknown liveness counts as alive so a concurrent installer's temp
+>   file is not removed.
+>
+> The `XDG_RUNTIME_DIR` clause is answered too: `sys::RUNTIME_DIR_VAR` is `TMPDIR`
+> on macOS.
+>
+> **What does NOT change is the sentence that closes this paragraph.** A green
+> type-check is still not evidence of support, and nothing in the macOS route has
+> ever been RUN. What is new is that the one hand-written layout is no longer a
+> type-check's silence but a compile-time assertion that fails the build — see Open
+> question 2 — which narrows what "compiles and is silently wrong" can mean here
+> without eliminating it.
 
 **The test suite is more Linux-welded than the Rust is.** `tests/run.sh` is 625
 POSIX-sh assertions using symlinks, octal mode bits and tmux; three Python modules
@@ -237,6 +275,12 @@ Cost and reach of each candidate. Delivery column: **hook** = fits the
 `terminalSequence` allowlist; **pty** = needs the direct pty write (Linux-only
 today); **oob** = out of band entirely.
 
+> **"Linux-only today" is stale for the pty column.** The direct pty write is every
+> Unix now: `sys::session_tty` resolves fd 1 on macOS as well, so a **pty** row
+> reaches macOS too. It is still not Windows, where the session's tab is a console
+> and `sys::HAS_SESSION_TTY` is `false`; a **pty** row there means
+> `sys::set_session_title`, which carries a title and not arbitrary bytes.
+
 | channel | delivery | reach | cost | ev |
 |---|---|---|---|---|
 | **OSC 9;4 taskbar progress** | **hook** | Windows Terminal, ConEmu, kitty, Ghostty, WezTerm | free — one line of stdout | V |
@@ -280,6 +324,49 @@ or persist the id from a rare, deliberately slow path; or accept no replacement 
 coalesce purely on our own side by not sending. This is a real open question, not a
 detail.
 
+### What `replaces_id` is worth without the reply
+
+> **THIS SUBSECTION IS NEWER THAN THE REST OF THE FILE.** The paragraph above is the
+> snapshot's text and is left standing; this answers its last sentence. Open
+> question 4 is closed by it.
+
+The spec sentence above turned out to describe **no single behaviour**. A separate
+scouting pass read each daemon's own source and found four different ones. That pass
+is the provenance of this table; **it was not re-run in this tree, and no
+notification daemon was exercised here** — the only D-Bus code this repository has
+ever executed is `docs/research/dbus_notify.rs`, which measured the timings above.
+
+| daemon | what it does with a client-chosen non-zero `replaces_id` | consequence for fire-and-forget |
+|---|---|---|
+| **dunst** | honours it | replacement works |
+| **KDE Plasma** (`plasma-workspace`) | honours it | replacement works |
+| **xfce4-notifyd** | honours it | replacement works |
+| **mako** | **zeroes it** | no replacement; each call is a new notification |
+| **swaync** | honours it **only if it is ≤ its own counter** | a *low* id would replace **an unrelated application's** notification |
+| **GNOME Shell** | **discards it and allocates a fresh id** | the client never learns the real id, so every call stacks another banner |
+
+Two of those are the design constraints, and they point opposite ways. swaync makes
+a **low** id actively dangerous — it is the one row where guessing wrong touches
+somebody else's notification rather than our own. GNOME Shell makes *any* id
+useless, so it cannot be fixed on the wire at all.
+
+**The workaround, which is what the backend should do:**
+
+* a **large, stable, non-zero id derived from the session id** — large so it is
+  above swaync's counter and cannot collide with another application's, stable so
+  repeated calls in one session agree, non-zero so the three honouring daemons and
+  swaync use it;
+* plus the hints **`x-dunst-stack-tag`** and **`x-canonical-private-synchronous`**
+  carrying that same key, which give dunst and the GNOME/Canonical lineage a
+  second, id-independent way to coalesce;
+* plus, for **GNOME Shell**, the only thing that works client-side: **send at most
+  one notification per waiting episode**, and let the absence of a second send be
+  the coalescing.
+
+Five of six daemons covered, no reply read, and the 14.8 ms wait stays unpaid. What
+is *not* claimed: none of this was observed running, here or anywhere in this
+repository.
+
 ## 5. Dependencies: the gate, and the verdicts
 
 The project had six crates when this was written (`serde`, `serde_core`, `serde_json`, `itoa`,
@@ -296,7 +383,7 @@ right only when **all four** hold:
 | crate | transitive | verdict | reason |
 |---|---|---|---|
 | `windows-sys` 0.61 | 1 | **depend**, `cfg(windows)` only — **and #28 since did exactly this**, target-gated with seven features plus a dev-dependency, so this row is settled rather than proposed | raw declarations plus link directives; hand-rolling `raw-dylib` externs is the same code without the maintenance |
-| `libc` 0.2 | 0 | **depend**, `cfg(target_os="macos")` only | zero transitive deps; but confirm it declares `proc_pidinfo`/`proc_pidfdinfo` and the `proc_info.h` structs, or they are hand-declared anyway |
+| `libc` 0.2 | 0 | **depend**, `cfg(target_os="macos")` only — **and this tree since did exactly that**, so the row is settled rather than proposed | zero transitive deps; the caveat came true both ways — it **does** declare `proc_pidinfo`, `proc_pidfdinfo`, `vinfo_stat`, `vnode_info` and `vnode_info_path`, and it does **not** declare `proc_fileinfo`, `vnode_fdinfowithpath` or `PROC_PIDFDVNODEPATHINFO`, which are hand-declared with asserted layouts. See the note under this table |
 | D-Bus (`zbus` 5.19) | **49 required** | **reject** | async runtime, MSRV 1.87, 49 crates for one method call that measured 255 µs hand-rolled |
 | `notify-rust` 4.18 | 31 | **reject** | wraps zbus on Linux; same cost, less control |
 | `dbus` 0.9 | 4 | **reject** | needs system `libdbus`; a link-time dependency on a hook binary that must run on a box we do not control |
@@ -309,6 +396,17 @@ right only when **all four** hold:
 | `is-terminal`, `supports-color`, `sysinfo`, `cfg-if` | 4 / 1 / 1 / 0 | **reject** | each replaces a handful of lines this crate already has |
 | `windows` 0.62 (full WinRT) | 8, 9.1 MB | **reject** | the COM/WinRT projection for what is a handful of Win32 calls |
 
+> **`libc` IS NOW A DEPENDENCY OF THIS TREE**, and the "macOS has no backend"
+> reading of this table is stale. `Cargo.toml` carries
+> `[target.'cfg(target_os = "macos")'.dependencies] libc = "0.2"`, zero transitive
+> dependencies, and no Linux or Windows build resolves it — the same shape
+> `windows-sys` has behind `cfg(windows)`. It supplies three answers `/proc` gives
+> on Linux: `proc_pidinfo(PROC_PIDTBSDINFO)` for a start time, `kill(pid, 0)` for
+> liveness, and `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` for the session's own tab.
+> Licence `MIT OR Apache-2.0`, one-way compatible into GPL-3.0-or-later; the
+> provenance record is in [research/attribution.md](research/attribution.md), which
+> also says why no `libproc` wrapper crate was taken.
+
 **Net effect: two target-gated crates, both first-party platform bindings, neither
 on any hot path, and no change to the default Linux build's dependency tree.**
 Notifications are hand-rolled (Linux) or a subprocess (macOS `osascript`, Windows
@@ -320,7 +418,7 @@ What each backend must supply, and with what. Linux is the reference column.
 
 | primitive | Linux (today) | macOS | Windows |
 |---|---|---|---|
-| session terminal | readlink `/proc/$CLAUDE_PID/fd/1` + `/dev/pts/`\|`/dev/tty` prefix + char-device | `proc_pidfdinfo(pid, 1, PROC_PIDFDVNODEPATHINFO)` → `vnode_fdinfowithpath.vip_path` (**I**, needs a Mac) | `AttachConsole(pid)` + `CONOUT$` — **process-global, needs a paired release** (**I**) |
+| session terminal | readlink `/proc/$CLAUDE_PID/fd/1` + `/dev/pts/`\|`/dev/tty` prefix + char-device | `proc_pidfdinfo(pid, 1, PROC_PIDFDVNODEPATHINFO)` → `vnode_fdinfowithpath.vip_path` — **SHIPPED**, sharing the prefix/char-device/writable guard with Linux; layout asserted at compile time, permission gate `CHECK_SAME_USER` (both **V**); never run on a Mac (**I**) | `AttachConsole(pid)` + `CONOUT$` — **process-global, needs a paired release** — **SHIPPED by #28** |
 | process identity | `/proc/<pid>/stat` field 22, clock ticks since boot | `proc_pidinfo(PROC_PIDTBSDINFO)` → `pbi_start_tvsec`/`_tvusec`, **seconds since epoch** | `GetProcessTimes` → **100 ns FILETIME** |
 | liveness | `/proc/<pid>` exists | `kill(pid,0)`: `ESRCH` dead, `EPERM` **alive** | `OpenProcess`: must not read access-denied as dead |
 | state dir | `$XDG_RUNTIME_DIR` — per-user, 0700, tmpfs, **cleared at logout** | `$TMPDIR` (per-user under `/var/folders/<hash>/T`) | `%LOCALAPPDATA%` — **persistent**, unlike the other two |
@@ -437,13 +535,49 @@ Needing hardware, or the owner:
    native Windows on that basis. The seam does not assume a session pid is knowable:
    `Ok(false)` is the refused guard, and `doctor`'s `session terminal` row prints
    which of the four answers applied.
-2. **Does `proc_pidfdinfo` on another process's fd 1 succeed for an ordinary user
-   on current macOS?** The whole macOS delivery path depends on it.
+2. ~~**Does `proc_pidfdinfo` on another process's fd 1 succeed for an ordinary user
+   on current macOS?**~~
+   **ANSWERED AS FAR AS A TYPE-CHECK AND A KERNEL SOURCE CAN ANSWER IT — and the
+   remaining part is stated plainly, because it is the part that matters.**
+   `src/sys/unix.rs` now calls
+   `proc_pidfdinfo(pid, 1, PROC_PIDFDVNODEPATHINFO, …)` and reads `vip_path`. Three
+   separate questions were inside this one, and two of them are settled:
+   * **Permission.** XNU's `bsd/kern/proc_info.c` gates `proc_pidfdinfo` with
+     `proc_security_policy(p, PROC_INFO_CALL_PIDFDINFO, flavor, CHECK_SAME_USER)` —
+     read here, not taken on trust. Same uid, therefore no entitlement and nothing
+     SIP withholds. `$CLAUDE_PID` is this user's own `claude`. **V**, against the
+     source.
+   * **Layout.** The two structs libc does not declare are hand-written and their
+     sizes and offsets are `const _: () = assert!(…)` items that fail the build:
+     seven of them, evaluated by `cargo check` for **both** Apple ABIs, in CI as
+     well as locally. Negative controls confirm they bite — a spurious `u32` fails
+     three, an `off_t` written as `i32` fails one. A wrong size is not corruption
+     either: the kernel returns `ENOMEM` for a `buffersize` below the flavour's own
+     before copying a byte. **V**, at compile time.
+   * **What is left, and it is the whole of what is left: NOTHING HERE HAS EVER RUN
+     ON A MAC.** No machine in this project can link a macOS binary, only
+     type-check one. That the call returns a path at runtime, that a macOS pty is
+     spelled `/dev/ttysNNN` and so passes the existing `/dev/tty` prefix, and that
+     `proc_pidfdinfo` links at all are unobserved. **I.** A green `cargo check` is
+     not evidence of support, and this row does not claim otherwise.
+
+   The headless guard is the part that makes the unproven part survivable: the same
+   file shows XNU serving this flavour only behind
+   `fp_get_ftype(p, fd, DTYPE_VNODE, EBADF, &fp)`, so a pipe or socket on fd 1 is
+   `EBADF` and never a path, and a redirected fd 1 yields a *file* path that
+   `is_tty_path` rejects. A mistake in the unproven step is an error return, not a
+   wrong terminal.
 3. **Does `AttachConsole` work from a detached hook child, and what is the correct
    release discipline?** It is process-global, which is why the terminal writer must
    be an opaque type with a `Drop` rather than an `Option<File>`.
-4. **Does a self-chosen non-zero `replaces_id` work** without reading the reply
-   (§4)? This decides whether D-Bus coalescing is affordable at all.
+4. ~~**Does a self-chosen non-zero `replaces_id` work** without reading the reply
+   (§4)?~~
+   **ANSWERED, AND THE ANSWER IS A SPLIT — five daemons of six can be covered
+   without reading a reply, and the sixth has to be handled by not sending.** The
+   verdict, the daemon-by-daemon breakdown and the hint-based workaround are
+   recorded in §4 under *What `replaces_id` is worth without the reply*. It does
+   **not** decide D-Bus coalescing against us: fire-and-forget coalescing is
+   affordable, at the cost of one hint pair and one client-side rule.
 5. **Does `WT_SESSION` really cross into WSL via `WSLENV`**, and does Windows
    Terminal clear it for non-WT children? Marked **I** throughout.
 6. ~~**Does `std::fs::File::lock` behave equivalently on Windows?**~~

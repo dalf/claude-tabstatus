@@ -433,6 +433,7 @@ tag each time.
 | [docs/research/terminal-capability-matrix.md](docs/research/terminal-capability-matrix.md) | contributors | the cross-terminal capability matrix every row in `src/surface/rows.rs` cites, each claim marked verified or inferred |
 | [docs/research/portability-census.md](docs/research/portability-census.md) | contributors | the measured portability census, kept as history with a re-measured header |
 | [docs/research/dbus_notify.rs](docs/research/dbus_notify.rs) | contributors | a dependency-free, hand-rolled D-Bus `Notify` call: the measurement behind the D-Bus decision |
+| [docs/research/attribution.md](docs/research/attribution.md) | contributors | provenance and licences of what the macOS session-terminal route took from `libc`, XNU and lsof, and what was deliberately not taken |
 | [COMPARISON.md](COMPARISON.md) | anyone | how this project relates to similar ones |
 | [tests/corpus/USAGE.txt](tests/corpus/USAGE.txt) | contributors | the golden corpus tools |
 

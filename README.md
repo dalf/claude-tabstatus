@@ -39,7 +39,7 @@ work cannot be remembered between hooks. The full policy is in
 |---|---|---|
 | Linux x86_64 | supported; the musl build is static and recommended - it runs on any x86_64 Linux whatever its glibc | `tabstatus-x86_64-unknown-linux-musl` (or `-linux-gnu`) |
 | Windows x86_64, native | supported; needs Git Bash, which Claude Code itself requires on Windows and runs hooks through | `tabstatus-x86_64-pc-windows-msvc.exe` |
-| macOS | **not supported yet** - see [issue #1](https://github.com/dalf/claude-tabstatus/issues/1) | none |
+| macOS | **untested**: the code path is there - the same pty route as Linux, with the pty found through `proc_pidfdinfo` instead of `/proc` - but it has never been run on a Mac, and there is no build target or release asset; see [issue #1](https://github.com/dalf/claude-tabstatus/issues/1) | none |
 | aarch64 / ARM | no build; an x86_64 binary fails with *Exec format error*. Check `uname -m` on a remote VM first | none |
 
 | Terminal | What you get |
@@ -47,7 +47,7 @@ work cannot be remembered between hooks. The full policy is in
 | Windows Terminal, and any terminal that honours a plain OSC 0 title | works with no configuration |
 | Konsole | works; the tab is switched to show the title automatically ([Konsole](#konsole)) |
 | Konsole, then ssh to a Linux host | set one variable on the remote side ([Konsole over ssh](#konsole-over-ssh)) |
-| tmux (Linux only) | one indicator per Claude pane, decaying over time ([tmux](#tmux)) |
+| tmux (Linux; untested on macOS) | one indicator per Claude pane, decaying over time ([tmux](#tmux)) |
 | GNU screen | no indicator; tmux running inside screen works |
 
 Direct MCP elicitation tracking relies on two hook events found in the Claude
@@ -490,7 +490,7 @@ host prefix; `CCTAB_ELLIPSIS` and `CCTAB_HOST` change the marker and the prefix.
 | `CCTAB_TTL_GONE` | `3600` | seconds before a cell leaves the tmux strip; `0` = never |
 | `CCTAB_NO_TMUX` | unset | set to anything: no tmux integration at all |
 | `CCTAB_DRY_RUN` | unset | `1` prints the computed tab title and emits nothing |
-| `CCTAB_STATE_DIR` | `$XDG_RUNTIME_DIR/claude-tabstatus`; on Windows `%LOCALAPPDATA%\claude-tabstatus` | where the per-session records live. Unset with no `XDG_RUNTIME_DIR` (`LOCALAPPDATA`) means background and wait tracking are off. **Use a dedicated, empty directory**: stale records are cleaned up there, and `doctor` lists anything it leaves alone. On Windows give a drive-absolute path (`C:\...`) on NTFS - Git Bash rewrites a `\\server\share` value into a drive-rooted one - and do not share it with WSL: each reads the other's records as having no origin |
+| `CCTAB_STATE_DIR` | `$XDG_RUNTIME_DIR/claude-tabstatus`; on macOS `$TMPDIR/claude-tabstatus`; on Windows `%LOCALAPPDATA%\claude-tabstatus` | where the per-session records live. Unset with no `XDG_RUNTIME_DIR` (`TMPDIR` on macOS, `LOCALAPPDATA` on Windows) means background and wait tracking are off. **Use a dedicated, empty directory**: stale records are cleaned up there, and `doctor` lists anything it leaves alone. On Windows give a drive-absolute path (`C:\...`) on NTFS - Git Bash rewrites a `\\server\share` value into a drive-rooted one - and do not share it with WSL: each reads the other's records as having no origin |
 
 `XDG_DATA_HOME` is read only by `install`, to choose where the plugin tree goes.
 

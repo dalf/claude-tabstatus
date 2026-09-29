@@ -76,7 +76,7 @@ There are four moving parts:
 
 The title itself reaches the terminal in one of three ways: as the hook's JSON
 `terminalSequence` (the ordinary case), written straight to Claude Code's pty
-(`session-start` and `session-end` on Linux, which the hook protocol cannot carry,
+(`session-start` and `session-end` on Unix, which the hook protocol cannot carry,
 and every paint inside tmux), or as a console title on native Windows.
 
 ## Hook registration
@@ -598,7 +598,15 @@ case would share one record; Claude Code's ids are lowercase UUIDs.
 ## Windows console-title painting
 
 `session-start` and `session-end`, which the hook protocol cannot carry, reach the
-tab on Linux by writing to Claude Code's pty through `/proc/$CLAUDE_PID/fd/1`. On
+tab on Unix by writing to Claude Code's pty. Linux resolves the pty by reading the
+symlink `/proc/$CLAUDE_PID/fd/1`; macOS has no `/proc` and asks the kernel for the
+same file descriptor's path with `proc_pidfdinfo`. Everything after that - the
+`/dev/pts/` or `/dev/tty` prefix, the character-device test, the writable test -
+is one shared body, so the two Unixes accept and refuse exactly the same
+terminals. Konsole arming and the direct writes to tmux's panes go the same way,
+through the same guard, on both. **The macOS route has never been run on a Mac**:
+no machine in this project can link a macOS binary, only type-check one, and the
+struct layout it depends on is asserted at compile time rather than tested. On
 Windows they reach it as a **console title** instead: the hook leaves its own
 hidden console, attaches to Claude Code's (`$CLAUDE_PID`), calls
 `SetConsoleTitleW` - the idle title, or an empty one at the end - and detaches; the
@@ -1329,8 +1337,9 @@ format to `%w`, and on `SessionEnd` sets both formats back to Konsole's defaults
 in memory, and never inherits them into new tabs or writes them to disk. OSC 50
 means "set font" in xterm, so it is sent only when Konsole is detected
 (`KONSOLE_VERSION` or `KONSOLE_DBUS_SESSION`, outside tmux and screen) or
-`CCTAB_TERMINAL=konsole` says so. Konsole arming is Linux-only: Windows has no
-console form of it. The user-facing rules, including the ssh case, are in the README.
+`CCTAB_TERMINAL=konsole` says so. Konsole arming is Unix-only, and on macOS
+untested: Windows has no console form of it. The user-facing rules, including the
+ssh case, are in the README.
 
 Konsole's elide direction is not configurable: it is
 `QTabBar::setElideMode(Qt::ElideLeft)` at one hardcoded call site, with no config key
@@ -1353,8 +1362,9 @@ tmux, while known background stays visible.
 
 ### Delivery
 
-All tmux paints write raw OSC directly to the pane's verified terminal through
-`/proc/$CLAUDE_PID/fd/1`, so tmux integration is Linux-only. Claude Code 2.1.274
+All tmux paints write raw OSC directly to the pane's verified terminal - Claude
+Code's pty, through `/proc/$CLAUDE_PID/fd/1` on Linux and `proc_pidfdinfo` on
+macOS - so tmux integration is Unix-only, and on macOS untested. Claude Code 2.1.274
 wraps hook `terminalSequence` OSCs in tmux passthrough, which bypasses `pane_title`;
 using that JSON delivery path would leave the startup idle record unchanged. A
 missing or redirected terminal is a silent no-op. The non-tmux JSON delivery path is

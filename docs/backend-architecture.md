@@ -347,6 +347,14 @@ Linux build's dependency tree.** Notifications are hand-rolled on Linux — one
 — or a subprocess elsewhere. zbus was rejected at 49 required transitive crates and
 an async runtime, for one method call.
 
+> **BOTH ARE TAKEN NOW, and this is no longer a projection.** `Cargo.toml` carries
+> `windows-sys` behind `cfg(windows)` and `libc = "0.2"` behind
+> `cfg(target_os = "macos")`. `libc` has zero transitive dependencies; a Linux build
+> resolves neither crate, so the sentence about the default Linux build's dependency
+> tree is now a measured fact rather than a design intention. Licences, and why no
+> `libproc` wrapper crate was taken in place of `libc`, are recorded in
+> [research/attribution.md](research/attribution.md).
+
 ## Migration
 
 ### What has landed, on this branch
@@ -423,6 +431,25 @@ says "or on a Unix with no `/proc`", `session_tty` resolves through `/proc` — 
 degradation is written down rather than silent, but it is a degradation.
 [#1](https://github.com/dalf/claude-tabstatus/issues/1) is the port.
 
+> **OVERTAKEN IN ITS FACTS, NOT IN ITS WARNING.** macOS has a backend: `libc` is a
+> `cfg(target_os = "macos")` dependency with zero transitive dependencies, and the
+> five reads are answered rather than degraded. Re-checked by grep in this tree:
+> **every `"/proc` string in `src/` is inside a `cfg(not(target_os = "macos"))`
+> item**, each with a macOS answer next to it — `proc_pidinfo(PROC_PIDTBSDINFO)`
+> for a start time, `kill(pid, 0)` for liveness, `TMPDIR` for the state directory,
+> `None` for the host-name file so `$HOSTNAME` is reached one failed `open`
+> earlier, and `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` for the session's own tab.
+> `sys::HAS_SESSION_TTY` is `true` there, so **session-start arms the tab and
+> session-end clears it**, through the same prefix/char-device/writable guard Linux
+> uses. Only the lookups are `cfg`-selected; every decision downstream of them is a
+> pure function the Linux `cargo test` runs.
+>
+> The warning stands, and it is the only thing here that was ever load-bearing:
+> **nothing in it has ever been RUN on a Mac.** No machine in this project can link
+> a macOS binary, only type-check one, and no CI runner is a Mac. "It compiles" is
+> still not "it works". [#1](https://github.com/dalf/claude-tabstatus/issues/1)
+> remains open; what closed is the type-checks-and-means-nothing reading of it.
+
 ### What `doctor` prints
 
 The axes were the whole refactor and nothing printed them. `doctor` now resolves ONE
@@ -493,7 +520,7 @@ existing `tests/run.sh` assertion changed; the 35 added are purely additive.
 
 | # | why it is not here |
 |---|---|
-| macOS | #28 ported Windows, not macOS. [#1](https://github.com/dalf/claude-tabstatus/issues/1). |
+| macOS | #28 ported Windows, not macOS. [#1](https://github.com/dalf/claude-tabstatus/issues/1). **Largely here since, at the `sys` layer**: `libc` is a `cfg(target_os = "macos")` dependency with zero transitive deps, and every `/proc` read in `src/` is now inside `cfg(not(target_os = "macos"))` with a macOS answer beside it — start time (`proc_pidinfo`), liveness (`kill(pid, 0)`), state directory (`TMPDIR`), host name (no file, straight to `$HOSTNAME`), origin key (`r`), and the session terminal (`proc_pidfdinfo`), so `sys::HAS_SESSION_TTY` is `true` and session-start and session-end paint. What remains is not a `/proc` read: **nothing has ever been run on a Mac** (no machine here can link a macOS binary, and no CI runner is a Mac), the 312-case corpus is a Linux specification, `scripts/build.sh` still refuses to list a target it has not run, and the macOS terminal rows in §3 of the scouting file are written from vendor source rather than from a running terminal. |
 | the tier-3 restore rule | a **behaviour change**, so it needs its own commit with newly recorded corpus cases, and an owner's decision this branch did not have |
 | an attention channel | this branch builds the seam [#14](https://github.com/dalf/claude-tabstatus/issues/14) needs and stops there. The recommended first channel and its policy table are in [backend-scouting.md §4](backend-scouting.md) |
 | the Windows state layer's file identity | #28 landed it (`8c878bb`); nothing here touches it |
@@ -577,6 +604,17 @@ user instead.
    `windows-2025` runner that builds and runs the suite. For **macOS** the weakness
    stands unchanged and unaddressed: nothing in CI runs there, `unix.rs` takes the
    `/proc` path, and every Linux test stays green while the reads mean nothing.
+
+   > **HALF OF THIS IS NOW WRONG AND THE OTHER HALF IS SHARPER.** `unix.rs` does
+   > not take the `/proc` path on macOS any more — every `/proc` read in `src/` is
+   > `cfg(not(target_os = "macos"))` with a macOS call beside it. But **nothing in
+   > CI runs on a Mac** is exactly as true as it was, and that is the whole of the
+   > weakness: the macOS bodies are each a call and a `?`, every *decision* around
+   > them is a pure function a Linux test exercises, and the one hand-written
+   > layout is asserted at compile time on both Apple ABIs in CI. What no assert
+   > and no Linux test can reach is whether the calls behave as their kernel's
+   > source says — and that is now the only thing standing, which is a smaller
+   > claim than "the reads mean nothing" and a claim that cannot be closed here.
 5. **Generic code with zero instantiations is type-checked but never
    monomorphised.** A bound only codegen would reject is not caught on Linux. The
    safety net is the fake staying a *complete* impl; if it drifts, the net thins
@@ -586,6 +624,27 @@ user instead.
    `#[repr(C)]` layout is accepted silently on Linux and fails at runtime on the
    target. Taking no dependency is what makes an offline migration landable; this is
    its price.
+
+   > **THE LAYOUT HALF OF THIS IS FALSE, and was falsified deliberately.**
+   > `src/sys/unix.rs`'s two hand-written macOS structs carry seven
+   > `const _: () = assert!(…)` items pinning `size_of` and `offset_of`, and
+   > `cargo check --target aarch64-apple-darwin` / `x86_64-apple-darwin` — run in
+   > CI, not only locally — evaluates every one of them. A wrong `#[repr(C)]` is
+   > therefore **not** accepted silently: it fails the build for the target it
+   > would have broken. Negative controls re-run against this tree: a spurious
+   > `u32` fails three of the seven, an `off_t` written as `i32` fails one.
+   >
+   > **Two parts survive, and they are what a future backend should copy the
+   > caution from.** First, a *signature* still is not checked, because nothing
+   > here links: whether `proc_pidfdinfo` resolves at all is unobserved. Second, a
+   > size assert cannot see two same-width fields transposed — measured, not
+   > argued: `fi_type` and `fi_guardflags` swapped compiles clean on both Apple
+   > targets with all seven asserts green. That is survivable in this one case only
+   > because nothing is read out of that struct. It is not survivable in general:
+   > `darwin-libproc-sys` 0.2.0 declares `vnode_info` with `vi_fsid` and `vi_pad`
+   > in the other order from the header — same size, different offset — which is
+   > precisely the error class the asserts are blind to, and one reason libc's own
+   > declarations carry everything nested here.
 7. ~~**`RawPath`'s soundness rests on a std *doc* guarantee**~~ — **superseded by
    [#28](https://github.com/dalf/claude-tabstatus/pull/28) and not ported.** There is
    no `RawPath` in this tree. Bytes come out of an `OsStr` through

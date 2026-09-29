@@ -9,12 +9,24 @@ Toolchain: rustc 1.98.1, rust-version = "1.89" (Cargo.toml)
 > and `--all-targets`; `aarch64-apple-darwin` the same. Windows is no longer a
 > type-check that fails - it is a port that is built and tested on a `windows-2025`
 > runner in CI. The root-cause groups below are kept because they are still the
-> honest shape of what a port of this kind has to move, and because the "macOS
-> compiles but is WRONG at runtime" section is **still true in substance**: macOS is
-> unported, it takes `src/sys/unix.rs`, and every `/proc` read still means nothing
-> there - `sys::process_alive` documents that it answers `Some(false)` on a Unix
-> without `/proc`. What has moved is WHERE: the `file:line` citations below are
-> `9bfd987`'s, and the reads they name now live in `src/sys/unix.rs`.
+> honest shape of what a port of this kind has to move.
+>
+> **The "macOS compiles but is WRONG at runtime" section is NO LONGER true in
+> substance**, and this paragraph used to say it was. Re-checked by grep in the
+> current tree: every `"/proc` string in `src/` sits inside a
+> `cfg(not(target_os = "macos"))` item, each with a macOS call beside it -
+> `proc_pidinfo(PROC_PIDTBSDINFO)` for a start time; `kill(pid, 0)` for liveness,
+> where `sys::liveness_from_kill` maps ESRCH to dead and EPERM to **alive**, which
+> is exactly the wrong `Some(false)` this paragraph named; `TMPDIR` for the state
+> directory; and `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` for the session's own
+> tab, so `sys::HAS_SESSION_TTY` is `true` and session-start and session-end paint.
+>
+> What IS still true is the whole of what is left: **nothing has ever been RUN on a
+> Mac.** No machine in this project can link a macOS binary and no CI runner is a
+> Mac, so a green `cargo check` is still not evidence of support.
+>
+> What has moved is also WHERE: the `file:line` citations below are `9bfd987`'s, and
+> the reads they name now live in `src/sys/unix.rs`.
 
 ## Raw commands / outputs
 - check-windows.txt            cargo check --locked --offline --target x86_64-pc-windows-gnu
