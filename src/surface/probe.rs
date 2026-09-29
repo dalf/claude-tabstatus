@@ -147,15 +147,20 @@ const PROBES: &[Probe] = if cfg!(target_os = "macos") {
 /// the test's fixture is a match on a literal - there is no indirect call on the
 /// paint path.
 fn detect_in<F: Fn(&str) -> bool>(probes: &[Probe], flag: F, in_mux: bool) -> Surface {
-    for p in probes {
-        if in_mux && !p.survives_mux {
-            continue;
-        }
-        if flag(p.var) {
-            return p.surface;
-        }
-    }
-    Surface::Unknown
+    matching(probes, flag, in_mux).map_or(Surface::Unknown, |p| p.surface)
+}
+
+/// The candidate that answered, or `None`. Spelled once because doctor prints the
+/// VARIABLE and the paint path takes the SURFACE, and two loops with the same veto
+/// in them is a report that can name evidence a detector ignored.
+fn matching<'a, F: Fn(&str) -> bool>(
+    probes: &'a [Probe],
+    flag: F,
+    in_mux: bool,
+) -> Option<&'a Probe> {
+    probes
+        .iter()
+        .find(|p| (p.survives_mux || !in_mux) && flag(p.var))
 }
 
 /// Which surface is drawing the tab, to the extent it can be known: step 3 of
@@ -175,6 +180,22 @@ pub fn resolve_leaf(hint: Option<Surface>, in_mux: bool) -> Surface {
         return s;
     }
     detect_in(PROBES, config::flag, in_mux)
+}
+
+/// Which variable of THIS build's candidate list is the evidence behind the leaf -
+/// the third rung of [`resolve_leaf`], asked again for a REPORT.
+///
+/// "What did each candidate look for, and what did it see" is the pair of questions
+/// the probe table was made DATA to be able to answer, and a detector written as
+/// code could be asked neither. `None` is the answer over ssh, and the answer
+/// inside a multiplexer that swallowed a `KONSOLE_*` - which doctor says in words,
+/// because the two absences have different remedies.
+///
+/// It re-reads the environment rather than making `resolve_leaf` return its own
+/// provenance: the paint path would then carry a report's field, and both callers
+/// read the same process environment, which cannot change underneath them.
+pub fn evidence(in_mux: bool) -> Option<&'static str> {
+    matching(PROBES, config::flag, in_mux).map(|p| p.var)
 }
 
 /// What `CCTAB_TERMINAL` says, or `None` when it says nothing.
@@ -312,6 +333,25 @@ mod tests {
         // server, so it is the one probe a multiplexer does not silence.
         let w = |set: &[&str], in_mux| detect_in(WINDOWS_PROBES, env(set), in_mux);
         assert!(w(&["WT_SESSION"], true) == Surface::WindowsTerminal);
+    }
+
+    /// doctor's evidence and the detector's verdict come out of ONE walk, so a
+    /// report cannot name a variable the detector vetoed - which is the exact
+    /// shape of #18's defect, one layer up.
+    #[test]
+    fn the_evidence_a_report_names_is_the_probe_the_detector_took() {
+        for set in [
+            vec![],
+            vec!["KONSOLE_VERSION"],
+            vec!["KONSOLE_DBUS_SESSION"],
+            vec!["KONSOLE_VERSION", "KONSOLE_DBUS_SESSION"],
+        ] {
+            for in_mux in [false, true] {
+                let named = matching(LINUX_PROBES, env(&set), in_mux).map(|p| p.var);
+                let leaf = detect_in(LINUX_PROBES, env(&set), in_mux);
+                assert_eq!(named.is_some(), leaf != Surface::Unknown, "{set:?} {in_mux}");
+            }
+        }
     }
 
     /// The order in the list is the precedence, and the first match wins - which

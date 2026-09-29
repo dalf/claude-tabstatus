@@ -40,6 +40,7 @@ project with similar ones.
   - [Native Windows](#native-windows)
   - [Migrating from a checkout symlink](#migrating-from-a-checkout-symlink)
   - [A deleted tree behind a live link](#a-deleted-tree-behind-a-live-link)
+- [The three axes](#the-three-axes)
 - [Konsole arming](#konsole-arming)
 - [tmux integration](#tmux-integration)
 - [TTL rationale](#ttl-rationale)
@@ -1264,6 +1265,52 @@ tree:      /home/me/.local/share/claude-tabstatus (from the plugin symlink)
 `install` heals it *in place*: the link already names where the tree belongs, so the
 tree is rewritten there and the link is not touched. An `install --tree <somewhere>`
 you chose once is not silently abandoned for the default path.
+
+## The three axes
+
+Three things decide what a paint looks like and where it goes, and they are
+independent: the **platform** this binary was built for, the **surface** - the leaf
+terminal drawing the tab - and the **multiplexer**, if any, between them.
+`tabstatus doctor` prints all three as one fixed-column capability table, so a
+report from Linux and a report from Windows can be diffed against each other:
+
+```text
+platform    linux                        a record carries its session's origin as `p <pid> <start>`
+  session terminal      ok    CLAUDE_PID=4242 - session-start and session-end write it directly
+  record lock           ok    a record is written under an exclusive lock proven to hold that same file
+  state dir             n/a   no CCTAB_STATE_DIR and no XDG_RUNTIME_DIR
+surface     konsole                      Konsole, measured on a running terminal
+  evidence              ok    $KONSOLE_VERSION
+  elide                 left  the tab label is cut from the left, so a glyph goes last
+  title (OSC 0)         ok    icon name and window title together
+  arm / restore         ok    ESC]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w BEL
+                              back to ESC]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H BEL
+multiplexer tmux
+  outer title           ok    it re-renders its own format on a timer, which is what lets a glyph decay
+```
+
+The verdict column has exactly five words - `ok`, `n/a`, `off`, `?`, `fail` - and
+each one means something different. `n/a` is "this cannot, ever"; `off` names a knob
+of **ours** you can turn back on; `?` is "the terminal may or may not honour it and
+nothing we can read says which", which is what Windows Terminal's
+`compatibility.allowOSC777` and `profiles.suppressApplicationTitle` force; and `fail`
+is an attempt the OS refused. Escape bytes are **named, never written** - doctor is
+read in the terminal whose tab is misbehaving.
+
+Each surface line says how far its row should be trusted, because six of the fourteen
+have never had a byte delivered to them by this program. They exist because
+`CCTAB_TERMINAL` can name them over ssh, and their table can be read without them:
+
+```sh
+tabstatus doctor --surface windows-terminal
+```
+
+That spelling needs no terminal, no session and no config directory - every input is
+compiled-in data - and prints the surface axis alone, in the same columns, so it
+diffs cleanly against the block inside the full report. The names are the fourteen
+`CCTAB_TERMINAL` accepts: `unknown`, `konsole`, `vte`, `kitty`, `alacritty`,
+`wezterm`, `foot`, `ghostty`, `xterm`, `iterm2`, `apple-terminal`,
+`windows-terminal`, `conhost`, `vscode`.
 
 ## Konsole arming
 

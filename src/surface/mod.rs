@@ -34,7 +34,7 @@ pub mod compose;
 mod probe;
 mod rows;
 
-pub use probe::{by_name, resolve_leaf};
+pub use probe::{by_name, evidence, resolve_leaf};
 
 use crate::support::{Presence, Support};
 
@@ -153,6 +153,20 @@ pub enum CapSource {
     Inferred,
 }
 
+impl CapSource {
+    /// How far a reader should trust the row, in one phrase, on the surface line of
+    /// doctor's capability table. Six of the fourteen rows have never had a byte
+    /// delivered to them, and a table that prints `ok` without saying whether that
+    /// was MEASURED invites a reader to trust all fourteen equally.
+    pub fn why(self) -> &'static str {
+        match self {
+            CapSource::Measured => "measured on a running terminal",
+            CapSource::VendorSource => "read from vendor source, never run",
+            CapSource::Inferred => "inferred, never read and never run",
+        }
+    }
+}
+
 /// An OSC's terminator, because it is part of the grammar and not a detail.
 ///
 /// VTE takes `OSC 9;4` only with ST and drops a BEL-terminated one ON PURPOSE
@@ -165,14 +179,22 @@ pub enum Terminator {
     St,
 }
 
+impl Terminator {
+    /// NAMED, never written: a report that echoed a real BEL would beep the
+    /// terminal it is being read in, and one that echoed a real ESC would be
+    /// parsed by it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Terminator::Bel => "BEL",
+            Terminator::St => "ST",
+        }
+    }
+}
+
 /// Can this surface be given a title, and how.
 ///
-/// Only `osc0` has a consumer today - `compose::push_title` - and the other three
-/// are report rows: doctor prints the whole table, and doctor's capability table
-/// has not landed in this tree yet. Until it does, the table walk in this file's
-/// tests is what reads them, so the lint is silenced for the struct rather than
-/// for each row of it.
-#[allow(dead_code)]
+/// Only `osc0` has a consumer on the paint path - `compose::push_title` - and the
+/// other three are report rows: doctor prints the whole table.
 pub struct TitleCaps {
     /// `OSC 0` - icon name AND window title. The one sequence with no `N` in any
     /// row of the matrix, which is why even an unidentified surface is still sent
@@ -203,17 +225,29 @@ pub enum TabColor {
     Osc1337(Terminator),
 }
 
+impl TabColor {
+    /// Which OSC, and how it is terminated - the two things doctor prints and the
+    /// two things a reader compares across surfaces. The terminator travels with
+    /// the grammar for the reason [`Terminator`] gives, so a report cannot show one
+    /// without the other.
+    pub fn grammar(self) -> (&'static str, Terminator) {
+        match self {
+            TabColor::Osc34(t) => ("OSC 34", t),
+            TabColor::Osc1337(t) => ("OSC 1337 SetColors", t),
+        }
+    }
+}
+
 /// Named by EFFECT, never by OSC number. `OSC 9` is TWO unrelated protocols -
 /// iTerm2's text notification and ConEmu's taskbar progress - and Konsole routes
 /// it to the progress handler and produces no notification at all, so a field
 /// called `osc9` could not mean anything.
 ///
-/// Nothing in this build emits attention: #14 is the commit that does, and doctor
-/// is the commit that prints these. The grammars land here first because a row
-/// added later is a row every existing caller has to be re-read for, and because
-/// naming `Terminator` per grammar is the fact that stops a BEL-terminated
-/// `OSC 9;4` being written to VTE, which drops it on purpose.
-#[allow(dead_code)]
+/// Nothing in this build emits attention: #14 is the commit that does. doctor
+/// prints them. The grammars land here first because a row added later is a row
+/// every existing caller has to be re-read for, and because naming `Terminator`
+/// per grammar is the fact that stops a BEL-terminated `OSC 9;4` being written to
+/// VTE, which drops it on purpose.
 pub struct AttentionCaps {
     /// Whether a BEL produces an attention signal a user will actually notice.
     /// Almost everywhere this is `Unverifiable` and the reason names the foreign
@@ -244,12 +278,34 @@ pub enum NotifySyntax {
     Osc99(Terminator),
 }
 
+impl NotifySyntax {
+    /// See [`TabColor::grammar`]. The three do not overlap, so which one a surface
+    /// speaks is the whole answer, and doctor prints it rather than a bool.
+    pub fn grammar(self) -> (&'static str, Terminator) {
+        match self {
+            NotifySyntax::Osc9(t) => ("OSC 9", t),
+            NotifySyntax::Osc777(t) => ("OSC 777 notify", t),
+            NotifySyntax::Osc99(t) => ("OSC 99", t),
+        }
+    }
+}
+
 /// `ESC ] 9 ; 4 ; <state> ; <percent>` - ConEmu's taskbar progress grammar, the
 /// one attention channel that is on Claude Code's `terminalSequence` allowlist,
 /// portable to all three operating systems and free of any pty write.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ProgressSyntax {
     Osc94(Terminator),
+}
+
+impl ProgressSyntax {
+    /// See [`TabColor::grammar`]. The terminator is the load-bearing half here:
+    /// VTE returns early on a BEL-terminated `OSC 9;4` on purpose.
+    pub fn grammar(self) -> (&'static str, Terminator) {
+        match self {
+            ProgressSyntax::Osc94(t) => ("OSC 9;4", t),
+        }
+    }
 }
 
 /// The appearance bytes a surface needs before a title will show at all, PAIRED
@@ -286,29 +342,23 @@ pub struct SurfaceCaps {
     /// doctor prints. Never reused once shipped.
     pub name: &'static str,
     /// The vendor's own spelling, for a report a human reads. doctor is its only
-    /// consumer and doctor's capability table has not landed here yet; it lives in
-    /// the row because the row is also where the answer about a terminal this
-    /// machine cannot run lives.
-    #[allow(dead_code)]
+    /// consumer; it lives in the row because the row is also where the answer about
+    /// a terminal this machine cannot run lives.
     pub human: &'static str,
     pub elide: Elide,
     pub title: TitleCaps,
-    /// Read by doctor's capability table and by #11, neither of which is this
-    /// commit. It is here because tab colour rides in Konsole's arming property
-    /// list, and a colour armed without a restore outlives the session.
-    #[allow(dead_code)]
+    /// Read by doctor's capability table, and by #11 when it lands. It is here
+    /// because tab colour rides in Konsole's arming property list, and a colour
+    /// armed without a restore outlives the session.
     pub tab_color: Support<TabColor>,
-    /// Read by doctor's capability table and by #14, neither of which is this
-    /// commit.
-    #[allow(dead_code)]
+    /// Read by doctor's capability table, and by #14 when it lands.
     pub attention: AttentionCaps,
     /// `Some` iff this surface needs arming AND the paired restore is known.
     pub arming: Option<Arming>,
-    /// Printed by doctor, which has not landed here yet. Asserted below, because
-    /// six of these rows describe a terminal nobody has ever delivered a byte to
-    /// and a row that cannot say so invites a reader to trust all fourteen
-    /// equally.
-    #[allow(dead_code)]
+    /// Printed by doctor, on the surface line, through [`CapSource::why`].
+    /// Asserted below, because six of these rows describe a terminal nobody has
+    /// ever delivered a byte to and a row that cannot say so invites a reader to
+    /// trust all fourteen equally.
     pub source: CapSource,
 }
 

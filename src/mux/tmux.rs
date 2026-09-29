@@ -1148,7 +1148,10 @@ pub fn report(cfg: &Config) -> Vec<String> {
         return out;
     };
     let shown = String::from_utf8_lossy(raw.as_encoded_bytes()).into_owned();
-    let Some(t) = Tmux::detect() else {
+    // The handle from the stack doctor resolved, not a second `Tmux::detect()`: the
+    // two cannot disagree today, and the one that is reached through `Config` is the
+    // one the paint path used.
+    let Some(t) = cfg.stack.tmux() else {
         out.push(format!(
             "tmux:      WARN $TMUX={shown} is not <socket>,<pid>,<session>, so it is \
              treated as NOT tmux"

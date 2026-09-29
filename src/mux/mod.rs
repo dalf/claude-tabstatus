@@ -57,6 +57,17 @@ pub enum MuxKind {
     Screen,
 }
 
+impl MuxKind {
+    /// The row, reached from the KIND rather than from a live handle. doctor needs
+    /// this because the multiplexer the environment CLAIMS is not always one we can
+    /// drive - a stale `$TMUX` names tmux and holds nothing - and a report that
+    /// could only name a driveable one would have nothing to say about the case
+    /// that is actually broken.
+    pub fn caps(self) -> &'static MuxCaps {
+        caps_of(self)
+    }
+}
+
 /// The multiplexer this process is running inside, when there is one.
 ///
 /// `Screen` carries no handle because there is nothing to hold: screen has no
@@ -71,12 +82,19 @@ pub enum Mux {
 
 /// What a multiplexer can do FOR us, as one `const` per kind.
 ///
-/// Only the two powers this commit's routing reads are here. The timer, the
-/// key-value store and the attach event are equally real and equally load-bearing
-/// - they are what `set-titles-string`, `@cctab_*` and `client-attached` already
-/// use - but a row whose reader does not exist yet is a row no test can be wrong
-/// about, so each arrives with the commit that reads it.
+/// Only the two powers this commit's routing reads are here. The timer and the
+/// attach event are equally real and equally load-bearing - they are what
+/// `set-titles-string` and `client-attached` already use - but a row whose reader
+/// does not exist yet is a row no test can be wrong about, so each arrives with the
+/// commit that reads it. The key-value store already HAS a reader - it is rung 1 of
+/// [`crate::armed`] - and is still not a row here, because the routing does not
+/// branch on it: `tmux::armed` reaches the handle the same way `to_clients` does,
+/// through a channel [`route`] already produced.
 pub struct MuxCaps {
+    /// Stable lowercase ASCII, the way [`crate::surface::SurfaceCaps::name`] is:
+    /// what doctor prints, and what the `multiplexer:` line of the report has
+    /// always spelled.
+    pub name: &'static str,
     /// Does this layer draw the OUTER tab itself? tmux: yes, from a format on its
     /// own timer, which is why our OSC 0 inside a pane becomes a RECORD instead
     /// of a title. screen: no.
@@ -94,14 +112,32 @@ pub struct MuxCaps {
 }
 
 const TMUX: MuxCaps = MuxCaps {
+    name: "tmux",
     renders_title: true,
     client_registry: YES,
 };
 
 const SCREEN: MuxCaps = MuxCaps {
+    name: "screen",
     renders_title: false,
     client_registry: Support::Unsupported("screen names no client's pty in a format"),
 };
+
+impl MuxCaps {
+    /// Invariant I1's bool in the report's vocabulary, so that the REASON lives
+    /// with the row rather than in doctor. `renders_title` stays a plain bool
+    /// because [`route`] matches on it; this is the same fact with the sentence
+    /// `$STY` needs attached to it.
+    pub fn title_renderer(&self) -> Presence {
+        if self.renders_title {
+            YES
+        } else {
+            Support::Unsupported(
+                "it draws no outer tab of its own, so $STY only suppresses the leaf's evidence",
+            )
+        }
+    }
+}
 
 const fn caps_of(kind: MuxKind) -> &'static MuxCaps {
     match kind {
@@ -123,12 +159,25 @@ pub struct MuxEnv {
     /// The multiplexer this process can drive, or why it cannot. `Disabled`
     /// names our own kill switch, which is what lets doctor print it.
     pub mux: Support<Option<Mux>>,
-    /// Was a multiplexer's environment present AT ALL - `$TMUX` or `$STY`, set and
-    /// non-empty, whatever it holds and whatever we were told to do about it?
-    /// This one bool IS the `!flag("TMUX") && !flag("STY")` conjunction that used
-    /// to sit inside the Konsole detector, and it is the only thing the leaf axis
-    /// is told about multiplexers.
-    pub swallows_leaf_evidence: bool,
+    /// Which multiplexer the environment CLAIMS - `$TMUX` or `$STY`, set and
+    /// non-empty, whatever it holds and whatever we were told to do about it. Its
+    /// `is_some()` IS the `!flag("TMUX") && !flag("STY")` conjunction that used to
+    /// sit inside the Konsole detector, and that bool is the only thing the leaf
+    /// axis is told about multiplexers.
+    ///
+    /// It is the KIND rather than the bool because doctor has to be able to name
+    /// the layer that swallowed the evidence, and because the two answers differ:
+    /// a `$TMUX` that is not `<socket>,<pid>,<session>` claims tmux and leaves
+    /// `mux` empty.
+    pub claimed: Option<MuxKind>,
+}
+
+impl MuxEnv {
+    /// Did a multiplexer swallow the leaf's environment evidence? The one question
+    /// [`crate::surface::resolve_leaf`] is allowed to ask about multiplexers.
+    fn swallows_leaf_evidence(&self) -> bool {
+        self.claimed.is_some()
+    }
 }
 
 impl Mux {
@@ -149,11 +198,19 @@ impl Mux {
     /// the other: `CCTAB_NO_TMUX` backs the tmux slice out of the way, and it was
     /// never a claim that the environment's `KONSOLE_*` became trustworthy again.
     pub fn probe() -> MuxEnv {
-        let swallows_leaf_evidence = config::flag("TMUX") || config::flag("STY");
+        // tmux first here as well as below, so that the layer NAMED is the layer
+        // that would be driven when both variables are set.
+        let claimed = if config::flag("TMUX") {
+            Some(MuxKind::Tmux)
+        } else if config::flag("STY") {
+            Some(MuxKind::Screen)
+        } else {
+            None
+        };
         if config::flag("CCTAB_NO_TMUX") {
             return MuxEnv {
                 mux: Support::Disabled("CCTAB_NO_TMUX"),
-                swallows_leaf_evidence,
+                claimed,
             };
         }
         // tmux wins over `$STY` when both are set: the corpus case
@@ -167,7 +224,7 @@ impl Mux {
         };
         MuxEnv {
             mux: Support::Available(mux),
-            swallows_leaf_evidence,
+            claimed,
         }
     }
 }
@@ -210,6 +267,19 @@ impl MuxOracle for NoOracle {
 /// allocated.
 pub struct Stack {
     pub mux: Option<Mux>,
+    /// Which multiplexer the ENVIRONMENT claimed, which is not the same fact as
+    /// `mux` and is the one doctor's `multiplexer:` line has always printed: a
+    /// `$TMUX` that is not `<socket>,<pid>,<session>` claims tmux and leaves
+    /// nothing to drive, and `CCTAB_NO_TMUX` backs us out of a multiplexer that is
+    /// plainly there. Carried from the ONE resolution rather than re-read by
+    /// doctor from `$TMUX` and `$STY`, because a report that re-derives what
+    /// painted is a report that can disagree with it.
+    pub claimed: Option<MuxKind>,
+    /// OUR knob, when a knob is why `mux` is empty. Named so that doctor can print
+    /// `off: CCTAB_NO_TMUX` where it would otherwise print an absence with no
+    /// cause - the distinction [`Support::Disabled`] exists for, kept instead of
+    /// being flattened away by `ok().flatten()`.
+    pub disabled_by: Option<&'static str>,
     pub leaf: Surface,
     /// Derived from `leaf` LAST, in [`resolve`], so a leaf verdict that arrives
     /// from the multiplexer cannot leave the layout computed against a different
@@ -254,9 +324,15 @@ impl Stack {
 pub fn resolve<O: MuxOracle>(ask: &mut O) -> Stack {
     let env = Mux::probe();
     let hint = ask.leaf_hint().ok();
-    let leaf = surface::resolve_leaf(hint, env.swallows_leaf_evidence);
+    let leaf = surface::resolve_leaf(hint, env.swallows_leaf_evidence());
+    let disabled_by = match &env.mux {
+        Support::Disabled(knob) => Some(*knob),
+        _ => None,
+    };
     Stack {
         mux: env.mux.ok().flatten(),
+        claimed: env.claimed,
+        disabled_by,
         leaf,
         elide: leaf.caps().elide,
     }
@@ -402,7 +478,9 @@ mod tests {
 
     fn stack(mux: Option<Mux>, leaf: Surface) -> Stack {
         Stack {
+            claimed: mux.as_ref().map(Mux::kind),
             mux,
+            disabled_by: None,
             leaf,
             elide: leaf.caps().elide,
         }
@@ -419,10 +497,41 @@ mod tests {
         Paint::LineWithBackground(Glyph::Working),
     ];
 
+    /// The two facts doctor needs that `Option<Mux>` cannot hold: which layer the
+    /// environment named, and whether one of OUR knobs is why there is nothing to
+    /// drive. Asserted against a constructed `MuxEnv` rather than against the
+    /// process environment, which several modules' tests read at the same time.
+    #[test]
+    fn the_environments_claim_survives_a_multiplexer_we_cannot_drive() {
+        // A stale `$TMUX`: tmux is claimed, nothing is driveable, and no knob of
+        // ours is to blame - the three answers doctor prints differently.
+        let stale = MuxEnv {
+            mux: Support::Available(None),
+            claimed: Some(MuxKind::Tmux),
+        };
+        assert!(stale.swallows_leaf_evidence());
+        assert!(stale.mux.ok().flatten().is_none());
+        let off = MuxEnv {
+            mux: Support::Disabled("CCTAB_NO_TMUX"),
+            claimed: Some(MuxKind::Tmux),
+        };
+        assert!(off.swallows_leaf_evidence());
+        assert_eq!(off.mux.reason().as_deref(), Some("CCTAB_NO_TMUX"));
+        let plain = MuxEnv { mux: Support::Available(None), claimed: None };
+        assert!(!plain.swallows_leaf_evidence());
+    }
+
     /// I1, as a property of the rows rather than of the routing: screen is in the
     /// axis so that `$STY` can suppress leaf evidence, and for nothing else.
     #[test]
     fn only_tmux_renders_the_outer_title() {
+        // The same bool in the report's vocabulary, with the reason attached where
+        // the row is rather than in doctor.
+        assert_eq!(caps_of(MuxKind::Tmux).title_renderer().label(), "ok");
+        assert_eq!(caps_of(MuxKind::Screen).title_renderer().label(), "n/a");
+        assert!(caps_of(MuxKind::Screen).title_renderer().reason().is_some());
+        assert_eq!(MuxKind::Tmux.caps().name, "tmux");
+        assert_eq!(MuxKind::Screen.caps().name, "screen");
         assert!(caps_of(MuxKind::Tmux).renders_title);
         assert!(!caps_of(MuxKind::Screen).renders_title);
         assert!(caps_of(MuxKind::Tmux).client_registry.is_available());

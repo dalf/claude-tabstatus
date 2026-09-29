@@ -52,9 +52,10 @@ use crate::settings::{self, Outcome};
 use crate::tree;
 use crate::config::{self, Config};
 use crate::edge::{Glyph, Paint};
-use crate::surface::Surface;
-use crate::mux::{self, tmux};
-use crate::{json, render, state, sys};
+use crate::surface::{self, Elide, Surface, Terminator};
+use crate::support::{Presence, Support, YES};
+use crate::mux::{tmux, MuxKind, Stack};
+use crate::{json, location, render, state, sys};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
@@ -70,8 +71,11 @@ enum Flag {
     Force,
     RestoreBackup,
     KeepTree,
-    /// `--tree <dir>`, the only option here that takes a value.
+    /// `--tree <dir>`, install's only option that takes a value.
     Tree,
+    /// `--surface <name>`, doctor's only option, and the other one here that takes
+    /// a value.
+    Surface,
 }
 
 impl Flag {
@@ -81,6 +85,7 @@ impl Flag {
             b"--restore-backup" => Some(Flag::RestoreBackup),
             b"--keep-tree" => Some(Flag::KeepTree),
             b"--tree" => Some(Flag::Tree),
+            b"--surface" => Some(Flag::Surface),
             _ => None,
         }
     }
@@ -102,7 +107,13 @@ pub enum Subcommand {
         restore_backup: bool,
         keep_tree: bool,
     },
-    Doctor,
+    /// `doctor [--surface <name>]` - what is installed and what would paint, or,
+    /// with a surface named, the capability table of a terminal THIS MACHINE CANNOT
+    /// RUN. The table is `&'static` data all the way down, which is how the Windows
+    /// column gets read before any Windows box exists.
+    Doctor {
+        surface: Option<OsString>,
+    },
     /// The word `standalone` used to be a second install verb, for a machine with no
     /// checkout. `install` now does exactly what it did, everywhere, so the word is
     /// kept only long enough to say so: a name that used to work and now errors
@@ -153,9 +164,9 @@ impl Subcommand {
         Some(match first?.as_encoded_bytes() {
             b"install" => install_options(rest),
             b"uninstall" => uninstall_options(rest),
-            // These three take no options and IGNORE any argument given, which is
-            // what they have always done: `doctor --force` runs doctor.
-            b"doctor" => Subcommand::Doctor,
+            b"doctor" => doctor_options(rest),
+            // These two take no options and IGNORE any argument given, which is
+            // what they have always done.
             b"standalone" => Subcommand::StandaloneGone,
             b"print-embedded" => Subcommand::PrintEmbedded(rest.first().cloned()),
             b"tmux-format" => Subcommand::TmuxFormat,
@@ -185,7 +196,8 @@ impl Subcommand {
                 restore_backup,
                 keep_tree,
             } => with_ctx(|c| uninstall(c, force, restore_backup, keep_tree)),
-            Subcommand::Doctor => with_ctx(doctor),
+            Subcommand::Doctor { surface: None } => with_ctx(doctor),
+            Subcommand::Doctor { surface: Some(name) } => surface_table(&name),
             Subcommand::StandaloneGone => {
                 fail("`standalone` is now just `install`.");
                 fail("install always writes the plugin tree from the copies compiled into");
@@ -288,6 +300,31 @@ fn install_options(rest: &[OsString]) -> Subcommand {
     Subcommand::Install { tree, force }
 }
 
+/// `doctor [--surface <name>]`.
+///
+/// Every other argument is still passed over rather than refused - a report is the
+/// one command that must run on the configuration that is broken, and `doctor
+/// --force` has always been a report - so this looks for the single option doctor
+/// takes and ignores the rest.
+fn doctor_options(rest: &[OsString]) -> Subcommand {
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        if !matches!(Flag::parse(arg), Some(Flag::Surface)) {
+            continue;
+        }
+        return match it.next() {
+            Some(n) if !n.is_empty() && !n.as_encoded_bytes().starts_with(b"-") => {
+                Subcommand::Doctor { surface: Some(n.clone()) }
+            }
+            _ => Subcommand::BadUsage(format!(
+                "--surface needs the terminal to print the table for, one of: {}",
+                surface_names()
+            )),
+        };
+    }
+    Subcommand::Doctor { surface: None }
+}
+
 fn uninstall_options(rest: &[OsString]) -> Subcommand {
     let mut force = false;
     let mut restore_backup = false;
@@ -297,8 +334,10 @@ fn uninstall_options(rest: &[OsString]) -> Subcommand {
             Some(Flag::Force) => force = true,
             Some(Flag::RestoreBackup) => restore_backup = true,
             Some(Flag::KeepTree) => keep_tree = true,
-            // `--tree` is a real flag, but only install takes it.
-            Some(Flag::Tree) | None => return Subcommand::BadOption(arg.clone()),
+            // `--tree` and `--surface` are real flags, and neither is uninstall's.
+            Some(Flag::Tree) | Some(Flag::Surface) | None => {
+                return Subcommand::BadOption(arg.clone())
+            }
         }
     }
     Subcommand::Uninstall {
@@ -360,7 +399,10 @@ fn usage() {
         "                               be kept (Windows, on a WSL share)\n",
         "      --restore-backup         roll settings.json back to the pre-install copy\n",
         "      --keep-tree              leave the generated plugin tree on disk\n",
-        "  tabstatus doctor             report what is installed and what would paint\n",
+        "  tabstatus doctor             report what is installed and what would paint,\n",
+        "                               including the capability table of the three axes\n",
+        "      --surface <name>         print that table for a terminal this machine is\n",
+        "                               not running, and nothing else\n",
         "  tabstatus tmux-format        print the two outer-tab tmux format strings\n",
         "  tabstatus tmux-arm <tty>     re-arm one Konsole tab; tmux's client-attached\n",
         "                               hook runs this, so a reattach is armed again\n",
@@ -2497,6 +2539,13 @@ fn remove_records() {
 /// Read-only by construction: the one command whose job is to explain a broken
 /// config has to be able to run on the config that is broken.
 fn doctor(c: &Ctx) -> Result<(), String> {
+    // ONE resolution, for the whole report. This built `Config::from_env()` three
+    // separate times, and each one re-ran the whole of `mux::resolve` - survivable
+    // while detection was two getenvs, and not survivable now: `MuxOracle::leaf_hint`
+    // MAY EXEC, so three constructions are three forks whose answers can disagree,
+    // which is precisely the doctor-versus-reality mismatch this report exists to
+    // remove. Every `report_*` below takes the stack that was resolved here.
+    let cfg = Config::from_env();
     say(&format!("tabstatus {} ({})", env!("CARGO_PKG_VERSION"), target_triple()));
     report_tree(c);
     say(&format!("config:    {}", c.config.display()));
@@ -2507,9 +2556,10 @@ fn doctor(c: &Ctx) -> Result<(), String> {
     report_env_key(c)?;
     report_state(c);
     report_record();
-    report_runtime();
-    report_tmux();
-    report_title();
+    report_runtime(&cfg);
+    report_stack(&cfg);
+    report_tmux(&cfg);
+    report_title(&cfg);
     Ok(())
 }
 
@@ -2876,18 +2926,22 @@ fn report_record() {
     }
 }
 
-/// What the runtime half would decide from this environment: which terminal, which
-/// glyph position, and whether there is a pty to write to.
-fn report_runtime() {
+/// What the runtime half would decide from this environment: which terminal, why,
+/// and which glyph position that implies.
+///
+/// The `pty:` line this used to end with is now the platform axis's `session
+/// terminal` row, where the fact belongs: `$CLAUDE_PID` is how a PLATFORM reaches
+/// the session's own terminal, and it was the one line here that was not about the
+/// leaf. Its four sentences are unchanged.
+fn report_runtime(cfg: &Config) {
     let konsole_vars = config::flag("KONSOLE_VERSION") || config::flag("KONSOLE_DBUS_SESSION");
-    let mux = if config::flag("TMUX") {
-        "tmux"
-    } else if config::flag("STY") {
-        "screen"
-    } else {
-        ""
-    };
-    let konsole = mux::resolve(&mut mux::NoOracle).leaf == Surface::Konsole;
+    // The layer the ENVIRONMENT claimed, carried out of the one resolution rather
+    // than re-read from `$TMUX` and `$STY` here. It is deliberately not
+    // `stack.mux.is_some()`: a `$TMUX` that is not `<socket>,<pid>,<session>` leaves
+    // nothing to drive and still swallowed the leaf's evidence, and this line has
+    // always named the layer that did the swallowing.
+    let mux = cfg.stack.claimed.map_or("", |k| k.caps().name);
+    let konsole = cfg.stack.leaf == Surface::Konsole;
     // The REASON matters more than the answer, because there are now three of
     // them and they disagree: an explicit CCTAB_TERMINAL, inherited KONSOLE_*,
     // and a multiplexer that makes the inherited kind meaningless.
@@ -2946,32 +3000,434 @@ fn report_runtime() {
         },
         implied
     ));
-    match config::var_nonempty("CLAUDE_PID") {
+}
+
+// --- doctor: the three axes -------------------------------------------------
+
+/// The capability table's columns, FIXED so that a report from Linux and one from a
+/// Windows build diff cleanly. That matters more here than anywhere else in the
+/// report: fourteen surface rows exist, six of them have never had a byte delivered
+/// to them, and the only way to compare a column that was measured with one that was
+/// read out of vendor source is to have them land in the same place.
+const AXIS_W: usize = 12;
+const VALUE_W: usize = 29;
+const NAME_W: usize = 22;
+/// `ok` / `n/a` / `off` / `?` / `fail` and one space - [`Support::label`] is the only
+/// place those five words are spelled, so this is the only place their width is.
+const LABEL_W: usize = 6;
+/// Where a capability's own text starts, and therefore where a second line of it is
+/// indented to.
+const DETAIL_COL: usize = 2 + NAME_W + LABEL_W;
+
+/// One axis: which of the three, what it resolved to, and one phrase about the whole
+/// of it.
+fn axis(which: &str, value: &str, note: &str) {
+    say(format!("{which:<AXIS_W$}{value:<VALUE_W$}{note}").trim_end());
+}
+
+/// One capability, in two columns: the verdict word and the one thing a reader can
+/// act on.
+fn row(name: &str, label: &str, detail: &str) {
+    say(format!("  {name:<NAME_W$}{label:<LABEL_W$}{detail}").trim_end());
+}
+
+/// A capability whose verdict IS a [`Support`], which is all of them but two.
+///
+/// `Support::label` and `Support::reason` are the whole formatter - doctor cannot
+/// invent a sixth word, and cannot print an absence without the reason the row
+/// carries - and `detail` is what to show when the answer is `ok` and there is
+/// therefore no reason to print: the grammar, the path, the pid.
+fn cap<T>(name: &str, s: &Support<T>, detail: &str) {
+    row(name, s.label(), s.reason().as_deref().unwrap_or(detail));
+}
+
+/// A second line of one capability's text, under the first.
+fn more(detail: &str) {
+    say(format!("{:DETAIL_COL$}{detail}", "").trim_end());
+}
+
+/// Which OSC and how it is terminated, which is one fact: VTE drops a BEL-terminated
+/// `OSC 9;4` on purpose, so a report naming the sequence without its terminator
+/// would say that VTE and kitty agree.
+fn grammar((osc, t): (&str, Terminator)) -> String {
+    format!("{osc} {}", t.name())
+}
+
+/// An escape sequence as a REPORT can print it: the bytes themselves, with ESC and
+/// BEL named rather than written.
+///
+/// doctor is read in the terminal whose tab is misbehaving. A report that echoed the
+/// real control bytes would arm that terminal while describing the arming.
+fn visible(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for &b in bytes {
+        match b {
+            0x1b => out.push_str("ESC"),
+            0x07 => out.push_str(" BEL"),
+            0x20..=0x7e => out.push(char::from(b)),
+            other => out.push_str(&format!("\\x{other:02x}")),
+        }
+    }
+    out
+}
+
+/// Every name `--surface` accepts, which is every variant's - including the ones
+/// this build could never detect, because over ssh an override is the only way a
+/// leaf is knowable at all.
+fn surface_names() -> String {
+    Surface::ALL
+        .iter()
+        .map(|s| s.caps().name)
+        .collect::<Vec<&str>>()
+        .join(", ")
+}
+
+/// The three axes and what each one can do, from the stack resolved ONCE at the top
+/// of the report.
+///
+/// This is the user-visible payoff of the whole backend refactor: the axes existed
+/// and nobody could see them. Every verdict here is the same value the paint path
+/// reads - a `&'static` capability row, or a `HAS_*` / `Option` a platform function
+/// answered with - so the table cannot claim a capability the program does not act
+/// on.
+fn report_stack(cfg: &Config) {
+    report_platform(cfg);
+    report_leaf(cfg.stack.leaf, Some(&leaf_evidence(cfg)));
+    report_mux(&cfg.stack);
+}
+
+/// Can this build NAME the leaf, and what named it? The `Support` shape is not a
+/// dressing-up: "nothing named it" is a capability this session does not have, and
+/// the two ways of not having it - an override nobody set, and evidence a
+/// multiplexer swallowed - have different remedies.
+fn leaf_evidence(cfg: &Config) -> Support<String> {
+    let in_mux = cfg.stack.claimed.is_some();
+    match (
+        config::var_nonempty("CCTAB_TERMINAL"),
+        surface::evidence(in_mux),
+    ) {
+        (Some(v), _) => Support::Available(format!(
+            "CCTAB_TERMINAL={}",
+            String::from_utf8_lossy(v.as_encoded_bytes())
+        )),
+        (None, Some(var)) => Support::Available(format!("${var}")),
+        // Rung 2 of the ladder: nothing in the environment named it and it is named
+        // anyway, so the multiplexer did. Unreachable while doctor asks `NoOracle` -
+        // and it is here rather than in #18's commit because a report that answered
+        // "nothing named it" beside a named leaf would be the same staleness that
+        // issue is about.
+        (None, None) if cfg.stack.leaf != Surface::Unknown => {
+            Support::Available("the multiplexer".to_owned())
+        }
+        (None, None) if in_mux => {
+            Support::Unsupported("a multiplexer swallowed the environment's evidence")
+        }
+        (None, None) => Support::Unsupported("nothing in the environment named it"),
+    }
+}
+
+/// The platform axis: what this build's operating system supplies.
+///
+/// THE MAPPING LIVES HERE AND NOWHERE ELSE. `crate::sys` answers in `Option`, `bool`
+/// and `HAS_*`, which is the right shape for a caller that has to branch, and those
+/// answers are lifted into [`Support`] at this boundary - the only place a REPORT is
+/// produced. No signature in `sys` changes to serve a report, and no row below can
+/// claim a capability whose constant the paint path does not read.
+///
+/// The session's own terminal is reported from `$CLAUDE_PID` and deliberately NOT by
+/// opening it: on Windows the console route attaches a console, and releasing one
+/// invalidates this process's stdout handles - so a report that proved the
+/// capability by taking it would truncate itself, on exactly the platform it exists
+/// to explain.
+fn report_platform(cfg: &Config) {
+    axis(
+        "platform",
+        std::env::consts::OS,
+        &format!(
+            "a record carries its session's origin as `{} <pid> <start>`",
+            sys::ORIGIN_KEY
+        ),
+    );
+    // The four sentences the `pty:` line used to print, unchanged, now as one row's
+    // verdict plus its reason. Which of them applies is decided by the two platform
+    // constants and by the stack resolved at the top of the report - never by a
+    // second `Tmux::detect()`, which is the drift this commit removes.
+    let pid = cfg
+        .claude_pid
+        .as_deref()
+        .map(|p| String::from_utf8_lossy(p.as_encoded_bytes()).into_owned());
+    let session: Presence = match (&pid, sys::HAS_SESSION_CONSOLE, cfg.stack.tmux().is_some()) {
+        (None, _, _) => Support::Unsupported(
+            "CLAUDE_PID is not set, so this is not a hook subprocess (session-start \
+             and session-end would do nothing)",
+        ),
         // The same test `emit::write_session` makes: inside tmux the title is tmux's
         // carrier, so no console is titled.
-        Some(p) if sys::HAS_SESSION_CONSOLE && tmux::Tmux::detect().is_some() => say(&format!(
-            "pty:       CLAUDE_PID={} - no pty here, and inside tmux no console title is \
-             set either, so session-start and session-end paint nothing directly",
-            String::from_utf8_lossy(p.as_encoded_bytes())
-        )),
-        Some(p) if sys::HAS_SESSION_CONSOLE => say(&format!(
-            "pty:       CLAUDE_PID={} - no pty here: session-start and session-end set the \
-             title of its console instead, when it is a 64-bit process, an ancestor of \
-             the hook, and its stdout is that console",
-            String::from_utf8_lossy(p.as_encoded_bytes())
-        )),
-        Some(p) if !sys::HAS_SESSION_TTY => say(&format!(
-            "pty:       CLAUDE_PID={} - but this platform has no pty to resolve from it, so \
+        (Some(_), true, true) => Support::Unsupported(
+            "no pty here, and inside tmux no console title is set either, so \
              session-start and session-end paint nothing directly",
-            String::from_utf8_lossy(p.as_encoded_bytes())
-        )),
-        Some(p) => say(&format!(
-            "pty:       CLAUDE_PID={} - session-start and session-end write it directly",
-            String::from_utf8_lossy(p.as_encoded_bytes())
-        )),
-        None => say("pty:       CLAUDE_PID is not set, so this is not a hook subprocess \
-                  (session-start and session-end would do nothing)"),
+        ),
+        (Some(_), true, false) => YES,
+        (Some(_), false, _) if !sys::HAS_SESSION_TTY => Support::Unsupported(
+            "this platform has no pty to resolve from it, so session-start and \
+             session-end paint nothing directly",
+        ),
+        (Some(_), false, _) => YES,
+    };
+    cap(
+        "session terminal",
+        &session,
+        &match (&pid, sys::HAS_SESSION_CONSOLE) {
+            (Some(p), true) => format!(
+                "CLAUDE_PID={p} - session-start and session-end set the title of its \
+                 console, when it is a 64-bit process, an ancestor of the hook, and \
+                 its stdout is that console"
+            ),
+            (Some(p), false) => {
+                format!("CLAUDE_PID={p} - session-start and session-end write it directly")
+            }
+            (None, _) => String::new(),
+        },
+    );
+    if let Some(p) = &pid {
+        if !session.is_available() {
+            more(&format!("CLAUDE_PID={p}"));
+        }
     }
+    // OUR OWN pid, because what is under test here is the platform primitive and not
+    // some other process: the session's pid may be gone, and on native Windows it
+    // may never have been exported at all.
+    let me = std::process::id();
+    let stamp: Support<u64> = match sys::process_start_time(me) {
+        Some(t) => Support::Available(t),
+        None => Support::Unsupported(
+            "this platform will not say when a pid started, so the reaper falls back \
+             to the record's mtime",
+        ),
+    };
+    cap(
+        "process stamp",
+        &stamp,
+        &match &stamp {
+            Support::Available(t) => format!("{t}, this process (pid {me})"),
+            _ => String::new(),
+        },
+    );
+    let lock: Presence = if sys::HAS_RECORD_LOCK {
+        YES
+    } else {
+        Support::Unsupported("no record lock here that can be proven held, so the \
+                              whole state layer stays off")
+    };
+    cap(
+        "record lock",
+        &lock,
+        "a record is written under an exclusive lock proven to hold that same file",
+    );
+    let dir: Support<PathBuf> = match state::dir() {
+        Some(d) => Support::Available(d),
+        None if sys::HAS_RECORD_LOCK => Support::Unsupported(sys::NO_STATE_DIR),
+        None => Support::Unsupported("there is no record lock to protect one"),
+    };
+    cap(
+        "state dir",
+        &dir,
+        &match &dir {
+            Support::Available(d) => format!("{} (CCTAB_STATE_DIR, else ${})", d.display(), sys::RUNTIME_DIR_VAR),
+            _ => String::new(),
+        },
+    );
+    let modes: Presence = if sys::HAS_MODES {
+        YES
+    } else {
+        Support::Unsupported(
+            "no POSIX mode bits here, so the directory's own inherited ACL is what \
+             keeps a record private",
+        )
+    };
+    cap("file modes", &modes, "the record directory is created 0700");
+    let unlink: Presence = if sys::HAS_UNLINK_RUNNING {
+        YES
+    } else {
+        Support::Unsupported(
+            "a running program's own file cannot be replaced in one rename here, so \
+             install renames it aside first",
+        )
+    };
+    cap(
+        "replace while running",
+        &unlink,
+        "one rename, atomic, over the very binary the hooks exec",
+    );
+    row(
+        "plugin link",
+        "ok",
+        &format!("a {} points Claude Code's config at the generated tree", sys::DIR_LINK),
+    );
+    // `Support::gate` layers OUR knob over the platform's answer, which is what stops
+    // this row claiming to be the name that gets painted when `CCTAB_HOST` is what
+    // does.
+    let named = location::hostname(cfg);
+    let host: Support<String> = match named {
+        Some(h) => Support::Available(h),
+        None => Support::Unsupported("nothing here names this machine"),
+    }
+    .gate(cfg.host_override.as_ref().map(|_| "CCTAB_HOST"));
+    cap(
+        "hostname",
+        &host,
+        match &host {
+            Support::Available(h) => h,
+            _ => "",
+        },
+    );
+}
+
+/// The surface axis: the leaf terminal's whole capability row.
+///
+/// `evidence` is `None` for `doctor --surface <name>`, where there is no session to
+/// have evidence about - the point of that spelling is to read a table for a machine
+/// this is not. Everything else about the block is the same in both, so the two
+/// diff cleanly.
+fn report_leaf(s: Surface, evidence: Option<&Support<String>>) {
+    let c = s.caps();
+    axis("surface", c.name, &format!("{}, {}", c.human, c.source.why()));
+    if let Some(e) = evidence {
+        cap(
+            "evidence",
+            e,
+            match e {
+                Support::Available(what) => what,
+                _ => "",
+            },
+        );
+    }
+    // Not a `Support`: which end of a label a terminal throws away is not a
+    // capability it has or lacks. The layout DECISION is `glyph:` above, which
+    // `CCTAB_GLYPH_POS` can win; this is the measurement under it.
+    let (word, cut) = match c.elide {
+        Elide::Left => ("left", "the tab label is cut from the left, so a glyph goes last"),
+        Elide::Right => ("right", "the tab label is cut from the right, so a glyph goes first"),
+        Elide::Unknown => ("?", "no truncation behaviour has ever been observed here"),
+    };
+    row("elide", word, cut);
+    cap("title (OSC 0)", &c.title.osc0, "icon name and window title together");
+    cap("title (OSC 1)", &c.title.osc1, "");
+    cap("title (OSC 2)", &c.title.osc2, "");
+    cap("title stack (CSI 22t)", &c.title.stack_22t, "");
+    let colour = match &c.tab_color {
+        Support::Available(g) => grammar(g.grammar()),
+        _ => String::new(),
+    };
+    cap("tab colour", &c.tab_color, &colour);
+    let a = &c.attention;
+    cap("bell", &a.bell, "");
+    let notify = match &a.notify {
+        Support::Available(g) => grammar(g.grammar()),
+        _ => String::new(),
+    };
+    cap("notification", &a.notify, &notify);
+    let progress = match &a.progress {
+        Support::Available(g) => grammar(g.grammar()),
+        _ => String::new(),
+    };
+    cap("taskbar progress", &a.progress, &progress);
+    cap("acknowledge", &a.acknowledge, "");
+    // `Option<Arming>` has nowhere to carry a reason, so the two absences are spelled
+    // here. They are not the same absence: twelve surfaces need no arming, and
+    // `Unknown` is REFUSED one, because appearance bytes are never written to a
+    // terminal that cannot be named.
+    let armed: Presence = match (&c.arming, s) {
+        (Some(_), _) => YES,
+        (None, Surface::Unknown) => {
+            Support::Unsupported("a terminal that cannot be named is sent no appearance bytes")
+        }
+        (None, _) => Support::Unsupported("a title shows here with nothing armed first"),
+    };
+    // The pair, always together: `Arming::pair` is the only way to read either one
+    // out, because an arm whose restore drifted from it is this project's named
+    // recurring defect and a report is where a drift would be seen.
+    match &c.arming {
+        Some(arm) => {
+            let (on, off) = arm.pair();
+            cap("arm / restore", &armed, &visible(on));
+            more(&format!("back to {}", visible(off)));
+            more("which is the terminal's COMPILED-IN default, not your profile");
+        }
+        None => cap("arm / restore", &armed, ""),
+    }
+}
+
+/// The multiplexer axis: which one the environment claimed, whether it is one we can
+/// drive, and what it does for us.
+fn report_mux(st: &Stack) {
+    // The three absences a single `Option<Mux>` flattened into one: our knob turned
+    // it off, the environment named one we cannot drive, and there is none. Only the
+    // first has a remedy, and it is the name of the knob.
+    let driving: Presence = match (&st.mux, st.disabled_by, st.claimed) {
+        (Some(_), _, _) => YES,
+        (None, Some(knob), _) => Support::Disabled(knob),
+        (None, None, Some(MuxKind::Tmux)) => Support::Unsupported(
+            "$TMUX is not <socket>,<pid>,<session>, so there is nothing to drive",
+        ),
+        (None, None, Some(_)) => {
+            Support::Unsupported("the environment names one and nothing here can drive it")
+        }
+        (None, None, None) => Support::Unsupported("neither $TMUX nor $STY is set"),
+    };
+    axis(
+        "multiplexer",
+        st.claimed.map_or("none", |k| k.caps().name),
+        &if driving.is_available() {
+            String::new()
+        } else {
+            driving.to_string()
+        },
+    );
+    // The rows describe what we could ASK of it, so they are printed for a
+    // multiplexer that is actually there and for no other.
+    let Some(m) = &st.mux else { return };
+    let caps = m.caps();
+    cap(
+        "outer title",
+        &caps.title_renderer(),
+        "it re-renders its own format on a timer, which is what lets a glyph decay",
+    );
+    cap(
+        "client registry",
+        &caps.client_registry,
+        "it names each attached client's pty, where the leaf's appearance bytes go",
+    );
+}
+
+/// `doctor --surface <name>`: one surface's capability table, for a terminal this
+/// machine cannot run.
+///
+/// Every input is `&'static` data, so this needs no terminal, no config directory and
+/// no session - which is how a human reads the Windows column before any Windows box
+/// exists. It prints the surface axis ALONE: the other two describe this machine, and
+/// this spelling is about another one.
+fn surface_table(name: &OsStr) -> i32 {
+    let want = name.as_encoded_bytes();
+    let Some(s) = surface::by_name(want) else {
+        fail(&format!(
+            "no surface is named {}. One of: {}",
+            String::from_utf8_lossy(want),
+            surface_names()
+        ));
+        return 1;
+    };
+    version();
+    report_leaf(s, None);
+    // At the AXIS's own column, not a capability's: indented to `more`'s depth it
+    // would read as a third line of the arming row above it.
+    say(&format!(
+        "{:AXIS_W$}CCTAB_TERMINAL={} is what names this surface to a session that \
+         cannot detect it",
+        "",
+        s.caps().name
+    ));
+    0
 }
 
 /// Inside tmux or not, the socket, the pane, whether the decay's clock is running,
@@ -2981,16 +3437,16 @@ fn report_runtime() {
 /// Two tmux invocations, both read-only, both on a cold path. Nothing here is a
 /// copy of what the runtime half decides: [`tmux::report`] is in the module that
 /// decides it.
-fn report_tmux() {
-    for line in tmux::report(&Config::from_env()) {
+fn report_tmux(cfg: &Config) {
+    for line in tmux::report(cfg) {
         say(&line);
     }
 }
 
 /// The runtime half's own pipeline, CALLED rather than copied, so this line cannot
 /// drift from what actually paints.
-fn report_title() {
-    let title = render::compose(Paint::Line(Glyph::Idle), &Config::from_env()).title;
+fn report_title(cfg: &Config) {
+    let title = render::compose(Paint::Line(Glyph::Idle), cfg).title;
     let mut line = b"title:     ".to_vec();
     line.extend_from_slice(title.as_bytes());
     line.push(b'\n');
@@ -3028,7 +3484,7 @@ mod tests {
         // an idle tab.
         assert!(matches!(parse(&["standalone"]), Subcommand::StandaloneGone));
         assert!(matches!(parse(&["standalone", "/tmp/x"]), Subcommand::StandaloneGone));
-        assert!(matches!(parse(&["doctor"]), Subcommand::Doctor));
+        assert!(matches!(parse(&["doctor"]), Subcommand::Doctor { surface: None }));
         for w in ["version", "--version", "-V"] {
             assert!(matches!(parse(&[w]), Subcommand::Version), "{}", w);
         }
@@ -3128,10 +3584,57 @@ mod tests {
 
     #[test]
     fn the_three_read_only_verbs_ignore_their_arguments() {
-        // Reproduced, not improved: `doctor --force` has always run doctor.
-        assert!(matches!(parse(&["doctor", "--force", "--bogus"]), Subcommand::Doctor));
+        // Reproduced, not improved: `doctor --force` has always run doctor, and the
+        // one option doctor now takes must not turn the others into refusals.
+        assert!(matches!(
+            parse(&["doctor", "--force", "--bogus"]),
+            Subcommand::Doctor { surface: None }
+        ));
         assert!(matches!(parse(&["version", "--bogus"]), Subcommand::Version));
         assert!(matches!(parse(&["help", "--bogus"]), Subcommand::Help));
+    }
+
+    /// `--surface` takes a value, is found among arguments doctor ignores, and names
+    /// the fourteen when it is given nothing usable - a report must not fall through
+    /// to the paint path and paint an idle tab, which is what a `None` from `parse`
+    /// would have done.
+    #[test]
+    fn the_surface_table_is_asked_for_by_name_or_refused_by_name() {
+        for words in [
+            vec!["doctor", "--surface", "konsole"],
+            vec!["doctor", "--force", "--surface", "konsole"],
+        ] {
+            match parse(&words) {
+                Subcommand::Doctor { surface: Some(n) } => assert_eq!(n, OsString::from("konsole")),
+                _ => panic!("{words:?} should name a surface"),
+            }
+        }
+        for words in [
+            vec!["doctor", "--surface"],
+            vec!["doctor", "--surface", ""],
+            vec!["doctor", "--surface", "--force"],
+        ] {
+            match parse(&words) {
+                Subcommand::BadUsage(why) => {
+                    assert!(why.contains("windows-terminal"), "{why}");
+                    assert!(why.contains("konsole"), "{why}");
+                }
+                _ => panic!("{words:?} should be a BadUsage naming the fourteen"),
+            }
+        }
+    }
+
+    /// Every one of the fourteen names reaches its own row, because that list is what
+    /// the refusal above prints and what a reader over ssh has to choose from.
+    #[test]
+    fn every_surface_name_the_refusal_prints_is_a_surface() {
+        let printed = surface_names();
+        for s in Surface::ALL {
+            let name = s.caps().name;
+            assert!(printed.contains(name), "{name} is not offered");
+            let found = surface::by_name(name.to_uppercase().as_bytes());
+            assert!(matches!(found, Some(f) if f == *s), "{name}");
+        }
     }
 
     /// The verbs must be as disjoint from the edge names as the old ones.

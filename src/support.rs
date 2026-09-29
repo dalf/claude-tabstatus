@@ -83,9 +83,8 @@ pub enum Support<T = ()> {
     /// that a user who reads it can grep the README for it: `"CCTAB_NO_TMUX"`,
     /// `"CCTAB_DRY_RUN"`. Never "disabled by configuration", which names nothing.
     // A const capability row may not say it - `surface::tests` asserts exactly
-    // that - so the only thing that can construct one is [`Support::gate`], whose
-    // consumer is doctor's report in a later commit of this series.
-    #[allow(dead_code)]
+    // that - so the only things that construct one are `Mux::probe`, `NoOracle`
+    // and [`Support::gate`]. doctor prints all three.
     Disabled(&'static str),
     /// The terminal may or may not honour it and NOTHING WE CAN READ SAYS WHICH.
     /// The string names the FOREIGN setting the user must go and check:
@@ -97,9 +96,14 @@ pub enum Support<T = ()> {
     /// be re-read for.
     Unverifiable(&'static str),
     /// It was attempted and the OS said no.
-    // Only an ATTEMPT produces one, so it arrives through [`Support::of_io`] at
-    // the boundary that lifts `sys::session_tty` and `sys::set_session_title`
-    // into this vocabulary - doctor's report, a later commit of this series.
+    // CONSUMER: doctor's `cap`, through `label` and `reason` - the formatter is
+    // total over the five words and prints this one with the error's own text.
+    // Nothing CONSTRUCTS one yet, which is what the lint is about: doctor reports
+    // capabilities it deliberately does not take, because opening the session's
+    // terminal on Windows would release the console its own stdout is on. The
+    // producer is [`Support::of_io`], and #14's backends are the first that will
+    // attempt delivery; the tests below construct one so the label and the reason
+    // stay pinned meanwhile.
     #[allow(dead_code)]
     Failed(std::io::Error),
 }
@@ -110,12 +114,13 @@ pub type Presence = Support<()>;
 /// `Available(())`, spelled once so a const table row is one word wide.
 pub const YES: Presence = Support::Available(());
 
-// `should_emit`, `label` and `reason` are live - the composer gates on the first
-// and `Display` prints the other two. The six below are the REPORTING boundary's
-// half of this file, and doctor is a later commit of this series; each carries the
-// lint suppression on its own line so that promoting one is a one-line edit.
+// Live: `ok` and `is_available` in `mux`, `gate` and `is_available` in doctor's
+// platform and multiplexer axes, `should_emit` in the composer, and `label` /
+// `reason` / `Display` in doctor's formatter. The three that are not are the
+// TYPE-CHANGING half - they exist for a layer boundary that has to move a value or
+// a failure across, and #14's backends are the first that will - so each carries
+// the lint suppression on its own line, with its consumer named.
 impl<T> Support<T> {
-    #[allow(dead_code)]
     pub fn ok(self) -> Option<T> {
         match self {
             Support::Available(v) => Some(v),
@@ -123,7 +128,6 @@ impl<T> Support<T> {
         }
     }
 
-    #[allow(dead_code)]
     pub fn is_available(&self) -> bool {
         matches!(self, Support::Available(_))
     }
@@ -138,6 +142,9 @@ impl<T> Support<T> {
         matches!(self, Support::Available(_) | Support::Unverifiable(_))
     }
 
+    // CONSUMER: #14's backends, which take a `Support<T>` out of a probe and hand
+    // on a value of their own. Kept because `carry` below is written in terms of
+    // the same total match and the two are read together.
     #[allow(dead_code)]
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Support<U> {
         match self {
@@ -152,6 +159,8 @@ impl<T> Support<T> {
     /// Change the payload type while KEEPING the reason, so that a layer boundary
     /// can never silently invent one. `Ok` is the value; `Err` is this same
     /// absence wearing the outer layer's type parameter.
+    // CONSUMER: #14's backends, at the seam between a probe's answer and a
+    // delivery's. Nothing in this build crosses that boundary yet.
     #[allow(dead_code)]
     pub fn carry<U>(self) -> Result<T, Support<U>> {
         match self {
@@ -168,10 +177,9 @@ impl<T> Support<T> {
 
     /// Layer OUR knob over a fact the platform or a const row already stated, so
     /// that the row can say `Available` without knowing the knob exists. `None`
-    /// means no knob applies. doctor's `hostname` row is what will read it: the
+    /// means no knob applies. doctor's `hostname` row is what reads it: the
     /// platform answers, and `CCTAB_HOST` is what decides whether that answer is
     /// the one painted.
-    #[allow(dead_code)]
     pub fn gate(self, off: Option<&'static str>) -> Support<T> {
         match (self, off) {
             (Support::Available(_), Some(knob)) => Support::Disabled(knob),
@@ -179,6 +187,9 @@ impl<T> Support<T> {
         }
     }
 
+    // CONSUMER: whatever first ATTEMPTS a capability it then reports. doctor does
+    // not: see `Support::Failed` above for why it reports the session's terminal
+    // without opening it.
     #[allow(dead_code)]
     pub fn of_io(r: std::io::Result<T>) -> Support<T> {
         match r {

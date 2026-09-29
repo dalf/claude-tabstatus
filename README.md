@@ -505,6 +505,18 @@ directory, the terminal it detected and why, the glyph position, and the tmux
 checks above. `CCTAB_DRY_RUN=1 tabstatus working` prints the title it would
 paint, without painting it.
 
+`doctor` also prints a capability table for the platform, the terminal drawing
+the tab (the *surface*) and the multiplexer. Its verdict column has five words:
+`ok`, `n/a` ("this cannot, ever"), `off` (a knob of ours you can turn back on),
+`?` (the terminal may or may not honour it and nothing we can read says which)
+or `fail` (an attempt the OS refused), with escape bytes named, never written.
+`tabstatus doctor --surface <name>` prints one terminal's table with no terminal,
+session or config directory, for any of the fourteen names `CCTAB_TERMINAL`
+accepts: `unknown`, `konsole`, `vte`, `kitty`, `alacritty`, `wezterm`, `foot`,
+`ghostty`, `xterm`, `iterm2`, `apple-terminal`, `windows-terminal`, `conhost`,
+`vscode`. Why the table looks as it does is in
+[docs/architecture.md](docs/architecture.md#the-three-axes).
+
 | symptom | cause and fix |
 |---|---|
 | tab stays blank in a new session | the plugin tree was deleted but the link and settings key remain; `doctor` says `FAIL the plugin directory is not there`. Run `install` |

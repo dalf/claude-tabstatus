@@ -207,6 +207,8 @@ impl Config {
             dry_run: false,
             stack: Stack {
                 mux: None,
+                claimed: None,
+                disabled_by: None,
                 leaf: Surface::Unknown,
                 elide: Elide::Unknown,
             },

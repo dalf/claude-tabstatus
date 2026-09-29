@@ -2217,6 +2217,177 @@ check 'doctor names the remedy on the multiplexer line' '1' \
           TMUX=nonsense "$bin" doctor 2>&1 \
        | grep -c 'If the outer terminal IS Konsole, set CCTAB_TERMINAL=konsole')"
 
+# --- doctor: the three axes ------------------------------------------------
+# The user-visible payoff of the backend split: until this section the platform,
+# the surface and the multiplexer each existed as an axis and NOTHING PRINTED THEM.
+# Every verdict below is `Support`'s own word - ok / n/a / off / ? / fail, spelled
+# in exactly one place in the crate - and the columns are FIXED, because the whole
+# point of a table whose six vendor-source rows have never had a byte delivered to
+# them is that a report from here and a report from a Windows build can be diffed
+# against each other.
+_axes() { # _axes <env assignments...> -- doctor, from the plain directory
+    ( cd -- "$tmp/plaindir" && env HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          SSH_TTY= SSH_CONNECTION= "$@" "$bin" doctor </dev/null 2>&1 )
+}
+_axdoc=$(_axes CLAUDE_PID=4242)
+# The platform line names the RECORD KEY, because that one letter is the whole of
+# what a Unix record and a Windows record disagree about, and a report read on one
+# platform about a state directory shared with the other has to be able to say so.
+check 'doctor: the platform axis names the key a record carries its origin under' '1' \
+    "$(printf '%s\n' "$_axdoc" \
+       | grep -c '^platform    linux                        a record carries its session.s origin as `p <pid> <start>`$')"
+# The one row that is not there to be `ok`: the suite unsets XDG_RUNTIME_DIR and
+# CCTAB_STATE_DIR, so this is the platform axis reporting an absence with the two
+# names a reader can act on - which is the whole difference between `Support` and
+# the `Option<PathBuf>` it is lifted from.
+check 'doctor: the platform axis names both variables when there is nowhere to record' '1' \
+    "$(printf '%s\n' "$_axdoc" \
+       | grep -c '^  state dir             n/a   no CCTAB_STATE_DIR and no XDG_RUNTIME_DIR$')"
+check 'doctor: the platform axis reports the hostname rung that answered' '1' \
+    "$(printf '%s\n' "$_axdoc" | grep -c '^  hostname              ok    ')"
+# HAS_RECORD_LOCK, HAS_MODES and HAS_UNLINK_RUNNING, lifted into the same five
+# words the surface rows use. Their signatures in `sys` do not change to say this:
+# the mapping is here, at the reporting boundary, and nowhere else.
+check 'doctor: the platform constants print as the same five words' '3' \
+    "$(printf '%s\n' "$_axdoc" \
+       | grep -c '^  \(record lock\|file modes\|replace while running\) *ok  ')"
+check 'doctor: the session terminal is named by the pid it is reached through' '1' \
+    "$(printf '%s\n' "$_axdoc" \
+       | grep -c '^  session terminal      ok    CLAUDE_PID=4242 - session-start and session-end write it directly$')"
+check 'doctor: and says what is missing when it is not a hook subprocess' '1' \
+    "$(_axes CLAUDE_PID= \
+       | grep -c '^  session terminal      n/a   CLAUDE_PID is not set, so this is not a hook subprocess (session-start and session-end would do nothing)$')"
+# `CCTAB_HOST` does not make the kernel stop answering: it decides whether the
+# answer is the one that gets painted, which is `Support::gate` - our knob layered
+# over a fact the platform already stated - and `off` naming the knob is the word no
+# tri-state in this crate could say before the axis existed.
+check 'doctor: our own knob turns the platform hostname off by name' '1' \
+    "$(_axes CCTAB_HOST=box | grep -c '^  hostname              off   CCTAB_HOST$')"
+
+# The surface axis, and the provenance that is the reason the rows carry one: six of
+# the fourteen were written from vendor source and nobody has ever delivered a byte
+# to them. A reader who sees `ok` is owed the difference.
+check 'doctor: a measured surface row says it was measured' '1' \
+    "$(_axes CCTAB_TERMINAL=konsole \
+       | grep -c '^surface     konsole                      Konsole, measured on a running terminal$')"
+check 'doctor: and an unidentified one admits it was inferred' '1' \
+    "$(printf '%s\n' "$_axdoc" \
+       | grep -c '^surface     unknown                      an unidentified terminal, inferred, never read and never run$')"
+# What NAMED the leaf, as its own row, because "nothing named it" is a capability
+# this session does not have and the two ways of not having it differ in remedy.
+check 'doctor: the evidence row names the variable that answered' '1' \
+    "$(_axes KONSOLE_VERSION=260801 | grep -c '^  evidence              ok    \$KONSOLE_VERSION$')"
+check 'doctor: the override is evidence too, and outranks it' '1' \
+    "$(_axes KONSOLE_VERSION=260801 CCTAB_TERMINAL=wezterm \
+       | grep -c '^  evidence              ok    CCTAB_TERMINAL=wezterm$')"
+check 'doctor: inside a multiplexer the evidence is gone, and says why' '1' \
+    "$(_axes KONSOLE_VERSION=260801 TMUX=nonsense \
+       | grep -c "^  evidence              n/a   a multiplexer swallowed the environment's evidence\$")"
+check 'doctor: and with nothing in the environment there was none to swallow' '1' \
+    "$(printf '%s\n' "$_axdoc" \
+       | grep -c '^  evidence              n/a   nothing in the environment named it$')"
+# The arm and its restore, PRINTED AS A PAIR, because an arm whose restore drifted
+# from it is this project's named recurring defect and a report is where a drift
+# would be seen. Named, never written: doctor is read in the terminal whose tab is
+# misbehaving, and a report that echoed the real bytes would arm it.
+_axkon=$(_axes CCTAB_TERMINAL=konsole)
+check 'doctor: the arming is printed with ESC and BEL named' '1' \
+    "$(printf '%s\n' "$_axkon" \
+       | grep -c '^  arm / restore         ok    ESC\]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w BEL$')"
+check 'doctor: and the restore it is paired with, on the line under it' '1' \
+    "$(printf '%s\n' "$_axkon" \
+       | grep -c '^                              back to ESC\]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H BEL$')"
+check 'doctor: which is said to be the compiled-in default and not your profile' '1' \
+    "$(printf '%s\n' "$_axkon" | grep -c 'COMPILED-IN default, not your profile')"
+check 'doctor: writes no escape byte of its own, anywhere in the report' '0' \
+    "$(printf '%s' "$_axkon" | tr -cd '\033' | wc -c | tr -d ' ')"
+check 'doctor: a surface with no appearance bytes says which absence it is' '1' \
+    "$(printf '%s\n' "$_axdoc" \
+       | grep -c '^  arm / restore         n/a   a terminal that cannot be named is sent no appearance bytes$')"
+
+# The multiplexer axis. `none` is not one word: our kill switch, a `$TMUX` that is
+# not one, and a plain local tab are three different absences, and only the first
+# has a remedy - the name of the knob.
+check 'doctor: no multiplexer at all says what it looked for' '1' \
+    "$(printf '%s\n' "$_axdoc" \
+       | grep -c '^multiplexer none                         n/a: neither \$TMUX nor \$STY is set$')"
+check 'doctor: our kill switch is named where the multiplexer would be' '1' \
+    "$(_axes TMUX=/tmp/s,1,0 CCTAB_NO_TMUX=1 \
+       | grep -c '^multiplexer tmux                         off: CCTAB_NO_TMUX$')"
+check 'doctor: a $TMUX that is not one is claimed and not driveable' '1' \
+    "$(_axes TMUX=nonsense \
+       | grep -c '^multiplexer tmux                         n/a: \$TMUX is not <socket>,<pid>,<session>, so there is nothing to drive$')"
+# screen is in the axis to answer `$STY` and for nothing else, and the ROW says so -
+# the reason lives with the cap, not in the report. This is invariant I1 printed.
+check 'doctor: screen is named a multiplexer that renders no title' '1' \
+    "$(_axes STY=1234.pts-0.host \
+       | grep -c "^  outer title           n/a   it draws no outer tab of its own, so \$STY only suppresses the leaf's evidence\$")"
+check 'doctor: and names no client pty either' '1' \
+    "$(_axes STY=1234.pts-0.host \
+       | grep -c "^  client registry       n/a   screen names no client's pty in a format\$")"
+
+# --- doctor --surface <name> -----------------------------------------------
+# The capability table of a terminal THIS MACHINE CANNOT RUN, which is how the
+# Windows column gets read before any Windows box exists. Const data all the way
+# down: no terminal, no session, and - pinned here - no config directory either.
+_nowhere=$tmp/no-such-config-anywhere
+check 'doctor --surface: prints a table with no config directory at all' '0' \
+    "$(cd -- "$tmp/plaindir" && HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere \
+          "$bin" doctor --surface windows-terminal </dev/null >/dev/null 2>&1; printf %s $?)"
+_wt=$(cd -- "$tmp/plaindir" && HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere \
+          "$bin" doctor --surface windows-terminal </dev/null 2>&1)
+check 'doctor --surface: the row that forced a fifth word prints as that word' '1' \
+    "$(printf '%s\n' "$_wt" \
+       | grep -c '^  title (OSC 0)         ?     profiles.suppressApplicationTitle silently discards it$')"
+check 'doctor --surface: the vendor-source provenance is on the surface line' '1' \
+    "$(printf '%s\n' "$_wt" \
+       | grep -c '^surface     windows-terminal             Windows Terminal, read from vendor source, never run$')"
+check 'doctor --surface: names the override that is the only way to reach it' '1' \
+    "$(printf '%s\n' "$_wt" | grep -c 'CCTAB_TERMINAL=windows-terminal is what names this surface')"
+check 'doctor --surface: and says nothing about THIS machine' '0' \
+    "$(printf '%s\n' "$_wt" | grep -c '^platform \|^multiplexer \|^tmux:\|^title:')"
+# Every one of the fourteen, because the enum is total so that an override over ssh
+# can name a leaf this build could never detect.
+_axall=0
+for _s in unknown konsole vte kitty alacritty wezterm foot ghostty xterm iterm2 \
+          apple-terminal windows-terminal conhost vscode; do
+    _axall=$((_axall + $( ( cd -- "$tmp/plaindir" && HOME=$_nowhere \
+        CLAUDE_CONFIG_DIR=$_nowhere "$bin" doctor --surface "$_s" </dev/null 2>&1 ) \
+        | grep -c "^surface     $_s ")))
+done
+check 'doctor --surface: all fourteen names print their own row' '14' "$_axall"
+check 'doctor --surface: the name is matched case-insensitively, as the override is' '1' \
+    "$( ( cd -- "$tmp/plaindir" && HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere \
+          "$bin" doctor --surface KONSOLE </dev/null 2>&1 ) | grep -c '^surface     konsole ')"
+# A refusal must NAME the alternatives, and must not fall through to the paint path:
+# an unrecognised subcommand word paints an idle tab, and a mistyped surface must not.
+check 'doctor --surface: a name that is not one is refused, with the fourteen' '1' \
+    "$( ( cd -- "$tmp/plaindir" && HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere \
+          "$bin" doctor --surface kosnole </dev/null 2>&1 ) \
+       | grep -c '^error: no surface is named kosnole\. One of: unknown, konsole, ')"
+check 'doctor --surface: and exits non-zero' '1' \
+    "$( ( cd -- "$tmp/plaindir" && HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere \
+          "$bin" doctor --surface kosnole </dev/null >/dev/null 2>&1 ); printf %s $?)"
+check 'doctor --surface: with nothing after it, the fourteen are the message' '1' \
+    "$( ( cd -- "$tmp/plaindir" && HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere \
+          "$bin" doctor --surface </dev/null 2>&1 ) \
+       | grep -c '^error: --surface needs the terminal to print the table for, one of: unknown, ')"
+# Reproduced, not improved: doctor has always ignored every other argument, because
+# a report is the one command that has to run on the configuration that is broken.
+check 'doctor: still ignores an option it does not know' '1' \
+    "$( ( cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          "$bin" doctor --force </dev/null 2>&1 ) | grep -c '^title:')"
+# The two spellings print the SAME rows, which is the fixed-column claim as a test:
+# the block a Linux reader sees for konsole and the block they would read for a
+# surface they cannot run differ only in the evidence there is about this session.
+_axblock=$(printf '%s\n' "$_axkon" | sed -n '/^surface /,/^multiplexer /p' \
+    | grep -v '^multiplexer ' | grep -v '^  evidence ')
+_onblock=$( ( cd -- "$tmp/plaindir" && HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere \
+    "$bin" doctor --surface konsole </dev/null 2>&1 ) | sed -n '/^surface /,$p' \
+    | grep -v '^            CCTAB_TERMINAL=')
+check 'doctor --surface: the block is byte-identical to the one in the full report' \
+    "$_axblock" "$_onblock"
+
 # --- the state layer: wait ownership --------------------------------------
 # Everything above this point is the STATELESS program, because the suite unsets
 # XDG_RUNTIME_DIR and CCTAB_STATE_DIR at the top. This section is the other half:
