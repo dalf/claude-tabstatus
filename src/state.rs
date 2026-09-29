@@ -80,7 +80,8 @@
 //! walk and is therefore genuinely cheaper than a painting edge.
 //!
 //! WHEN IT IS ABSENT the binary behaves EXACTLY as it did stateless: no
-//! `XDG_RUNTIME_DIR` (and no `CCTAB_STATE_DIR`), failure to create the directory, or a
+//! `XDG_RUNTIME_DIR` (`LOCALAPPDATA` on Windows) and no `CCTAB_STATE_DIR`, failure
+//! to create the directory, or a
 //! payload with no `session_id` all leave [`Session::open`] returning `None`, and
 //! `main` then runs the stateless `Edge::resolve` path. The golden corpus tests
 //! that path - its environment sets neither
@@ -176,7 +177,7 @@ const LOCK_TRIES: usize = 64;
 /// PAIR is the point. A pid alone is forgeable by recycling; a start time is
 /// immutable for the life of a process, so `(pid, start)` names one process and
 /// not a slot, and that is what lets the reaper decide liveness with a single
-/// `/proc` read and no daemon.
+/// `/proc` read (one process handle on Windows) and no daemon.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Origin {
     pid: u32,
@@ -220,15 +221,20 @@ impl Origin {
     /// inside the same 10ms start tick, which needs 4194304 intervening spawns
     /// (`pid_max`) at `CLK_TCK` 100, both measured on this machine.
     ///
-    /// Where the platform cannot tell whether the pid is running at all (Windows),
-    /// unknown counts as alive, so the reaper keeps the record rather than guess.
+    /// On Windows the same proof holds with the process's creation time: `$CLAUDE_PID`
+    /// is the live `claude.exe` (measured), the time is set once at creation, and a
+    /// pid is not reissued while any handle to its process is open. There the error
+    /// it can make needs a reused pid inside the same 100ns creation stamp.
+    ///
+    /// Whatever cannot be asked - a process this user may not open - counts as
+    /// alive, so the reaper keeps the record rather than guess.
     fn alive(self) -> bool {
-        sys::process_start_time(self.pid) == Some(self.start)
-            || sys::process_alive(self.pid).is_none()
+        sys::same_process(self.pid, self.start) != Some(false)
     }
 }
 
-// The start time is `sys::process_start_time`: field 22 of `/proc/<pid>/stat`.
+// The start time is `sys::process_start_time`: field 22 of `/proc/<pid>/stat` on
+// Linux, the creation FILETIME from `GetProcessTimes` on Windows.
 
 /// Who owns a wait.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -415,6 +421,8 @@ fn id_str(raw: &[u8]) -> Option<String> {
 /// older readers from silently dropping background activity. The optional g
 /// epoch records known in-flight work independently of the main base and never
 /// expires. An absent `p` line means the reaper falls back to mtime for this file.
+/// On Windows the origin line is `q <pid> <creation FILETIME>` instead
+/// ([`sys::ORIGIN_KEY`]), and each platform reads the other's as no origin.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Record {
     base: Glyph,
@@ -487,10 +495,12 @@ impl Record {
                         _ => Glyph::Idle,
                     }
                 }
-                // A `p` this version cannot parse leaves the origin absent, which
+                // An origin this version cannot parse leaves it absent, which
                 // demotes this file to the mtime rule rather than inventing a
-                // liveness answer for it.
-                "p" => r.origin = Origin::parse(rest),
+                // liveness answer for it. The key is the platform's (`p` on Unix,
+                // `q` on Windows), so another platform's origin - WSL and Windows
+                // sharing CCTAB_STATE_DIR - is an unknown field here, never a pid.
+                sys::ORIGIN_KEY => r.origin = Origin::parse(rest),
                 // Earlier versions reserved g for a different, unimplemented
                 // shape. Only the current version assigns it this meaning.
                 "g" if tag == Some(TAG) => r.background = digits(rest),
@@ -534,7 +544,8 @@ impl Record {
             out.push_str(&format!("g {epoch}\n"));
         }
         if let Some(o) = self.origin {
-            out.push_str("p ");
+            out.push_str(sys::ORIGIN_KEY);
+            out.push(' ');
             out.push_str(&itoa(u64::from(o.pid)));
             out.push(' ');
             out.push_str(&itoa(o.start));
@@ -614,9 +625,15 @@ impl Record {
         if let Some(epoch) = self.background {
             s.push_str(&format!(", background reported {}s ago (last known snapshot; not expired)", now.saturating_sub(epoch)));
         }
-        match self.origin {
-            Some(o) if o.alive() => s.push_str(&format!(", session pid {} live", o.pid)),
-            Some(o) => s.push_str(&format!(", session pid {} GONE", o.pid)),
+        // Three answers, not two: `alive()` keeps what it cannot ask about (a
+        // process this user may not open, on Windows), and the report must not
+        // call that "live". Unix always has an answer, so it never prints the third.
+        match self.origin.map(|o| (o.pid, sys::same_process(o.pid, o.start))) {
+            Some((pid, Some(true))) => s.push_str(&format!(", session pid {} live", pid)),
+            Some((pid, Some(false))) => s.push_str(&format!(", session pid {} GONE", pid)),
+            Some((pid, None)) => {
+                s.push_str(&format!(", session pid {} cannot be checked, so it is kept", pid))
+            }
             None => s.push_str(", no session pid recorded"),
         }
         if self.waits.is_empty() {
@@ -732,7 +749,7 @@ fn at_the_prompt(p: &Payload) -> bool {
 
 /// Where records live, or `None` when there is nowhere to put them.
 ///
-/// `XDG_RUNTIME_DIR` and nothing else: it is per-user, mode 0700, on a tmpfs, and
+/// On Unix, `XDG_RUNTIME_DIR` and nothing else: it is per-user, mode 0700, on a tmpfs, and
 /// emptied when the last login session ends - which is the reaper for anything
 /// [`REAP_AFTER`] does not catch. There is deliberately no `$HOME` fallback: it
 /// would put a state file inside the golden corpus's fixture HOME and make every
@@ -758,21 +775,27 @@ fn at_the_prompt(p: &Payload) -> bool {
 /// the golden corpus's pty cases, which set `CLAUDE_PID` to a live helper, write
 /// records into the real `/run/user/<uid>`.
 ///
-/// Where the platform has no file identity (Windows) there is nowhere, whatever
-/// the environment says: [`Session::lock`] cannot prove it holds the live record
-/// there, so the layer is OFF rather than on-and-failing. Deciding it here, before
-/// anything is created, is what makes `None` mean the stateless version in full -
-/// `main` drains stdin as it did, no empty record file is left behind to make
-/// every later edge decline, and `purge` cannot empty a directory shared with a
-/// WSL install. [`survey`] names the reason.
+/// On Windows the variable is `LOCALAPPDATA` ([`sys::RUNTIME_DIR_VAR`]): per-user,
+/// private by inherited ACL, local rather than roaming, and - unlike `%TEMP%` -
+/// never emptied behind a live session's back by Storage Sense. Nothing empties it
+/// at logout either; the origin reaper is what clears it after a reboot, because no
+/// `(pid, creation time)` survives one.
+///
+/// Where the platform has no record lock it can prove held there is nowhere,
+/// whatever the environment says: the layer is OFF rather than on-and-failing.
+/// Deciding it here, before anything is created, is what makes `None` mean the
+/// stateless version in full - `main` drains stdin as it did, no empty record file
+/// is left behind to make every later edge decline. Both platforms have one now;
+/// [`Session::open`] makes the one per-directory check that remains, and [`survey`]
+/// names the reason for either.
 pub fn dir() -> Option<PathBuf> {
-    if !sys::HAS_FILE_ID {
+    if !sys::HAS_RECORD_LOCK {
         return None;
     }
     if let Some(d) = crate::config::var_nonempty("CCTAB_STATE_DIR") {
         return Some(PathBuf::from(d));
     }
-    let base = crate::config::var_nonempty("XDG_RUNTIME_DIR")?;
+    let base = crate::config::var_nonempty(sys::RUNTIME_DIR_VAR)?;
     let mut p = PathBuf::from(base);
     p.push("claude-tabstatus");
     Some(p)
@@ -792,9 +815,21 @@ impl Session {
     pub fn open(dir: Option<PathBuf>, p: &Payload) -> Option<Session> {
         let dir = dir?;
         let id = p.session_id().map(str::as_bytes).and_then(id_str)?;
+        // `NUL` is the null device in every Windows directory, not a file name.
+        if sys::reserved_name(&id) {
+            return None;
+        }
         // Mode 0700 on creation rather than a check afterwards: inside
         // XDG_RUNTIME_DIR, itself 0700 and owned by us, there is nobody to race.
+        // On Windows the directory takes the ACL inherited from LOCALAPPDATA's.
         if !dir.is_dir() && sys::create_private_dir(&dir).is_err() {
+            return None;
+        }
+        // Every write replaces the record while its writer still holds it open and
+        // locked. A filesystem that cannot (Windows without POSIX rename: FAT,
+        // exFAT, some network shares) would refuse every write, so the layer is off
+        // there - decided before any record file exists.
+        if !sys::replaces_open_files(&dir) {
             return None;
         }
         let mut path = dir.clone();
@@ -833,16 +868,22 @@ impl Session {
     /// Measured on the unlocked version, 300 rounds of a subagent's un-painting
     /// `PostToolUse` launched simultaneously with main's `Stop`: 43 lost the clear.
     ///
-    /// PER RECORD. `std::fs::File::lock` is std-only (stable since 1.89; this tree
-    /// builds on 1.98), and the file it is taken on is this session's own, so the
-    /// five concurrent sessions never contend - the property the prior-art note
-    /// above criticises `terminal-addons`'s single global `flock` for lacking.
+    /// PER RECORD. [`sys::lock_exclusive`] is `std::fs::File::lock` on Unix
+    /// (stable since 1.89; this tree builds on 1.98), and the file it is taken on is
+    /// this session's own, so the five concurrent sessions never contend - the
+    /// property the prior-art note above criticises `terminal-addons`'s single
+    /// global `flock` for lacking. On Windows it is a `LockFileEx` on one byte far
+    /// past the record's data, because that lock is mandatory: covering the data
+    /// would refuse every other read of the record - the reaper's, `doctor`'s, and
+    /// this very hook's own read by path below, which would then load an absent
+    /// record and write a fresh one over the real one.
     ///
-    /// The INODE CHECK is the subtlety. `write_if_changed` renames a temp file over
-    /// the record, so the path's inode changes under a waiter: it would wake
-    /// holding an exclusive lock on an unlinked inode while a third hook held the
-    /// new one. So after taking the lock we check that we hold the inode the path
-    /// names NOW, and retry when we do not.
+    /// The IDENTITY CHECK is the subtlety. `write_if_changed` renames a temp file
+    /// over the record, so the file the path names changes under a waiter: it would
+    /// wake holding an exclusive lock on an unlinked file while a third hook held
+    /// the new one. So after taking the lock we check that we hold the file the path
+    /// names NOW - device and inode on Unix, volume and file id on Windows - and
+    /// retry when we do not.
     ///
     /// BLOCKING: the normal critical section is one small read, one small write
     /// and a rename. Closing the fd or exiting releases the lock, including an
@@ -871,23 +912,22 @@ impl Session {
                 .truncate(false)
                 .open(&self.path)
                 .ok()?;
-            f.lock().ok()?;
-            // No file identity (Windows) means the lock cannot be proven to be on
-            // the live record. `dir()` already keeps the layer off there, so this
-            // is the backstop: fail closed rather than apply an unverified
-            // transition. `LockFileEx` is mandatory rather than advisory, so
-            // Windows needs its own lock design before this layer can be enabled.
-            let held = sys::file_id(&f.metadata().ok()?)?;
+            if !unlocked_control() {
+                sys::lock_exclusive(&f).ok()?;
+            }
+            // No identity means the lock cannot be proven to be on the live
+            // record: fail closed rather than apply an unverified transition.
+            let held = sys::file_id_of(&f)?;
             match fs::symlink_metadata(&self.path) {
                 Ok(m) if m.is_file() && m.len() <= MAX_RECORD as u64
-                    && sys::file_id(&m) == Some(held) => {
+                    && sys::file_id_at(&self.path, &m) == Some(held) => {
                     if matches!(stored_at(&self.path), Stored::Future) {
                         return None;
                     }
                     return Some(f);
                 }
                 // Renamed out from under us. Drop this lock and take the new
-                // inode's.
+                // file's.
                 _ => drop(f),
             }
         }
@@ -924,7 +964,9 @@ impl Session {
         tmp.set_file_name(name);
         let text = now.render();
         let wrote = fs::File::create(&tmp).and_then(|mut f| f.write_all(text.as_bytes()));
-        if wrote.is_ok() && fs::rename(&tmp, &self.path).is_ok() {
+        // Still under the lock, over the very file this hook holds locked - which
+        // on Windows takes a POSIX-semantics rename; see `sys::replace_file`.
+        if wrote.is_ok() && sys::replace_file(&tmp, &self.path).is_ok() {
             return;
         }
         let _ = fs::remove_file(&tmp);
@@ -1257,6 +1299,13 @@ impl Session {
     }
 }
 
+/// The race test's control arm: hooks that take NO lock, so the test can prove it
+/// detects the lost updates the lock prevents. Test builds only - in the shipped
+/// binary this is a constant `false` and the variable is never read.
+fn unlocked_control() -> bool {
+    cfg!(test) && std::env::var_os("CCTAB_TEST_UNLOCKED").is_some()
+}
+
 /// What a file in the state directory turned out to be.
 enum Stored {
     /// No file, or one we may not read, or one whose size or type says it cannot
@@ -1491,10 +1540,10 @@ fn writable(d: &Path) -> bool {
 pub fn survey() -> Survey {
     let Some(d) = dir() else {
         return Survey {
-            dir: Err(if sys::HAS_FILE_ID {
-                "no CCTAB_STATE_DIR and no XDG_RUNTIME_DIR"
+            dir: Err(if sys::HAS_RECORD_LOCK {
+                sys::NO_STATE_DIR
             } else {
-                "no file identity on this platform, so a record's lock cannot be proven held"
+                "no record lock on this platform that can be proven held"
             }),
             writable: None,
             records: Vec::new(),
@@ -1546,6 +1595,10 @@ pub fn survey() -> Survey {
         // first edge that has something to record.
         dir: if unreadable {
             Err("the state directory exists but cannot be read")
+        } else if !sys::replaces_open_files(&d) && d.is_dir() {
+            // `Session::open` makes the same check, so no hook keeps a record here.
+            Err("the state directory's filesystem cannot replace a file that is held \
+                 open (no POSIX rename), so no record is kept there")
         } else {
             Ok(d)
         },
@@ -1622,18 +1675,19 @@ mod tests {
     /// other's value. Every test that touches the environment holds this.
     static ENV: Mutex<()> = Mutex::new(());
 
-    // Tests that need the layer ON are `#[cfg(unix)]`: on Windows there is no
-    // file identity, so `dir()` answers `None` whatever the environment says and
-    // the layer is off by design (`the_layer_is_off_without_file_identity` pins
-    // that). The one directory test is Unix-only as well because a read-only
-    // attribute does not stop file creation in a Windows directory.
+    // The one directory test is Unix-only because a read-only attribute does not
+    // stop file creation in a Windows directory; the reaper and doctor tests need
+    // a process start time, which Linux and Windows answer.
 
     struct Fixture {
         _guard: std::sync::MutexGuard<'static, ()>,
         dir: PathBuf,
-        /// Saved so that a test which removes it cannot leak that into another:
-        /// `cargo test` runs these in threads of one process.
-        xdg: Option<OsString>,
+        /// The platform's runtime-directory variable, saved and REMOVED: with it
+        /// set, a test that clears `CCTAB_STATE_DIR` would reach the real default
+        /// directory - `%LOCALAPPDATA%` is set in every Windows session - and the
+        /// doctor's write probe would write there. Restored, because `cargo test`
+        /// runs these in threads of one process.
+        runtime: Option<OsString>,
         /// Saved for the same reason, and pinned rather than inherited: the suite
         /// runs INSIDE a Claude Code session, so a real `CLAUDE_PID` is in the
         /// environment and a write would otherwise record whichever session
@@ -1655,29 +1709,28 @@ mod tests {
             std::env::set_var("CCTAB_STATE_DIR", &dir);
             std::env::set_var("CCTAB_NOW", "1000000");
             std::env::remove_var("CCTAB_TTL_WAITING");
+            let runtime = std::env::var_os(sys::RUNTIME_DIR_VAR);
+            std::env::remove_var(sys::RUNTIME_DIR_VAR);
             let saved = std::env::var_os("CLAUDE_PID");
             std::env::set_var("CLAUDE_PID", itoa(u64::from(std::process::id())));
             Fixture {
                 _guard: guard,
                 dir,
-                xdg: std::env::var_os("XDG_RUNTIME_DIR"),
+                runtime,
                 claude_pid: saved,
             }
         }
 
         /// The origin line every write stamps under this fixture.
-        #[cfg(unix)]
         fn origin_line(&self) -> String {
             let o = Origin::mine().expect("our own pid is pinned into CLAUDE_PID");
-            format!("p {} {}\n", o.pid, o.start)
+            format!("{} {} {}\n", sys::ORIGIN_KEY, o.pid, o.start)
         }
 
-        #[cfg(unix)]
         fn session(&self, p: &Payload) -> Session {
             Session::open(dir(), p).expect("a state dir and a session id were provided")
         }
 
-        #[cfg(unix)]
         fn record(&self) -> String {
             fs::read_to_string(self.dir.join("s1")).unwrap_or_default()
         }
@@ -1689,8 +1742,8 @@ mod tests {
             std::env::remove_var("CCTAB_NOW");
             std::env::remove_var("CCTAB_TTL_WAITING");
             std::env::remove_var("CLAUDE_PID");
-            if let Some(v) = self.xdg.take() {
-                std::env::set_var("XDG_RUNTIME_DIR", v);
+            if let Some(v) = self.runtime.take() {
+                std::env::set_var(sys::RUNTIME_DIR_VAR, v);
             }
             if let Some(v) = self.claude_pid.take() {
                 std::env::set_var("CLAUDE_PID", v);
@@ -1714,7 +1767,6 @@ mod tests {
     }
 
     /// A `Stop` that retires permission and notification waits, not direct MCP waits.
-    #[cfg(unix)]
     fn quiet_stop() -> Payload {
         payload(r#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[]}"#)
     }
@@ -1735,21 +1787,18 @@ mod tests {
         )
     }
 
-    #[cfg(unix)]
     fn agent_ev(id: &str) -> Payload {
         payload(&format!(
             r#"{{"session_id":"s1","agent_id":"{id}","hook_event_name":"PostToolUse"}}"#
         ))
     }
 
-    #[cfg(unix)]
     fn notify(kind: &str) -> Payload {
         payload(&format!(
             r#"{{"session_id":"s1","hook_event_name":"Notification","notification_type":"{kind}"}}"#
         ))
     }
 
-    #[cfg(unix)]
     fn agent_stop(id: &str) -> Payload {
         payload(&format!(
             r#"{{"session_id":"s1","agent_id":"{id}","hook_event_name":"SubagentStop"}}"#
@@ -1763,7 +1812,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn direct_results_clear_only_their_server_and_request_for_every_action() {
         for action in ["accept", "decline", "cancel"] {
             let f = Fixture::new("direct-actions");
@@ -1785,7 +1833,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn direct_waits_survive_main_activity_and_unidentified_results() {
         let f = Fixture::new("direct-recovery");
         let known = elicitation("server", "A", None);
@@ -1812,7 +1859,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn completion_tombstones_handle_out_of_order_replays_without_refreshing() {
         let f = Fixture::new("direct-replay");
         let result = elicitation("server", "A", Some("accept"));
@@ -1832,7 +1878,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn only_identified_notification_duplicates_coalesce() {
         let f = Fixture::new("direct-notifications");
         let identified = payload(r#"{"session_id":"s1","hook_event_name":"Notification","notification_type":"elicitation_url_dialog","mcp_server_name":"server","elicitation_id":"A"}"#);
@@ -1875,7 +1920,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn the_captured_subagent_sequence_ends_orange_and_then_restores_the_base() {
         let f = Fixture::new("capture");
         let main = main_ev();
@@ -1914,7 +1958,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_background_subagents_tool_call_still_paints_nothing() {
         let f = Fixture::new("bg");
         let agent = agent_ev("aaa");
@@ -1926,7 +1969,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_main_thread_tool_call_does_not_repaint_over_an_agents_dialog() {
         let f = Fixture::new("overlap");
         let agent = agent_ev("aaa");
@@ -1948,7 +1990,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn two_overlapping_dialogs_both_have_to_be_answered() {
         let f = Fixture::new("two");
         let agent = agent_ev("aaa");
@@ -1971,7 +2012,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn stop_does_not_paint_idle_over_an_outstanding_agent_dialog() {
         let f = Fixture::new("stopguard");
         let agent = agent_ev("aaa");
@@ -1987,7 +2027,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn stop_does_clear_a_stale_main_wait() {
         let f = Fixture::new("stopmain");
         let main = main_ev();
@@ -2008,7 +2047,6 @@ mod tests {
     /// Esc at a subagent's dialog fires no hook at all, so without this the tab
     /// stayed orange for the whole 900s TTL - and outside tmux nothing else decays.
     #[test]
-    #[cfg(unix)]
     fn an_empty_background_tasks_at_stop_retires_an_abandoned_agent_wait() {
         let f = Fixture::new("bgempty");
         let agent = agent_ev("aaa");
@@ -2026,7 +2064,6 @@ mod tests {
     /// bounds a stale agent wait to ONE turn even when no `Stop` ever arrives - a
     /// Ctrl+C mid-tool fires nothing at all, measured on capture s5.
     #[test]
-    #[cfg(unix)]
     fn a_user_prompt_retires_every_wait_and_a_tool_call_does_not() {
         let f = Fixture::new("prompt");
         let agent = agent_ev("aaa");
@@ -2055,7 +2092,6 @@ mod tests {
     /// The defect a SHARED epoch caused: unrelated later dialogs refreshed a stale
     /// wait's clock, so it never expired and nothing painted again all session.
     #[test]
-    #[cfg(unix)]
     fn an_unrelated_dialog_does_not_refresh_a_stale_waits_clock() {
         let f = Fixture::new("epochs");
         let agent = agent_ev("aaa");
@@ -2087,7 +2123,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn an_unusable_permission_owner_is_anonymous_not_main() {
         for id in ["-".to_owned(), "?".to_owned(), "a/b".to_owned(), "a".repeat(65)] {
             let f = Fixture::new("invalid_permission_owner");
@@ -2109,7 +2144,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn an_unknown_owner_needs_more_than_unrelated_agent_progress() {
         let f = Fixture::new("unknown");
         let backstop = notify("agent_needs_input");
@@ -2142,7 +2176,6 @@ mod tests {
     /// STATELESS binary painted white. All five waiting kinds behaved that way,
     /// not the two the README named.
     #[test]
-    #[cfg(unix)]
     fn a_quiet_stop_retires_an_unknown_owner_for_every_waiting_kind() {
         for kind in [
             "permission_prompt",
@@ -2171,7 +2204,6 @@ mod tests {
     /// attributable dialog supersedes it, so one dialog is one wait and the agent
     /// that owns it can retire it.
     #[test]
-    #[cfg(unix)]
     fn an_attributable_dialog_supersedes_a_lone_unknown() {
         let f = Fixture::new("supersede");
         let backstop = notify("worker_permission_prompt");
@@ -2189,7 +2221,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_declined_dialog_is_cleared_by_the_agents_subagent_stop() {
         let f = Fixture::new("declined");
         let agent = agent_ev("aaa");
@@ -2206,7 +2237,6 @@ mod tests {
 
     /// A lone unknown wait provides no evidence linking it to a stopping agent.
     #[test]
-    #[cfg(unix)]
     fn a_subagent_stop_preserves_a_lone_unknown() {
         let f = Fixture::new("unknownstop");
         let backstop = notify("worker_permission_prompt");
@@ -2218,7 +2248,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn elicitation_notifications_survive_unrelated_completions_after_reload() {
         for kind in ["elicitation_dialog", "elicitation_url_dialog"] {
             let f = Fixture::new("elicitation-unrelated");
@@ -2245,7 +2274,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn elicitation_and_owned_permission_waits_coexist_in_both_orders() {
         for elicitation_first in [false, true] {
             let f = Fixture::new("elicitation-overlap");
@@ -2266,7 +2294,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn elicitation_and_permission_notifications_remain_independent() {
         for elicitation_first in [false, true] {
             let f = Fixture::new("elicitation-backstops");
@@ -2286,7 +2313,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn elicitation_waits_keep_main_progress_and_expiry_recovery() {
         for expire in [false, true] {
             let f = Fixture::new("elicitation-recovery");
@@ -2305,7 +2331,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn legacy_unknown_waits_are_read_and_protected_from_agents() {
         let f = Fixture::new("legacy-unknown");
         fs::create_dir_all(&f.dir).unwrap();
@@ -2322,7 +2347,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_wait_nothing_ever_cleared_expires() {
         let f = Fixture::new("ttl");
         let agent = agent_ev("aaa");
@@ -2339,7 +2363,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn session_start_resets_and_session_end_removes() {
         let f = Fixture::new("lifecycle");
         let agent = agent_ev("aaa");
@@ -2364,7 +2387,6 @@ mod tests {
     /// The origin is carried by every later write without any of them re-reading
     /// `/proc`, and its absence is not a failure - just the mtime fallback.
     #[test]
-    #[cfg(unix)]
     fn the_origin_is_written_once_and_then_carried() {
         let f = Fixture::new("origin");
         let start = payload(r#"{"session_id":"s1","hook_event_name":"SessionStart"}"#);
@@ -2394,7 +2416,6 @@ mod tests {
     /// on the 24h mtime clock for the life of the session. One such record existed
     /// on this machine, for a session that was running.
     #[test]
-    #[cfg(unix)]
     fn a_write_stamps_an_origin_the_record_is_missing() {
         let f = Fixture::new("restamp");
         fs::create_dir_all(&f.dir).expect("a writable state dir");
@@ -2405,7 +2426,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn a_mid_turn_compaction_session_start_resets_nothing() {
         let f = Fixture::new("compact");
         let agent = agent_ev("aaa");
@@ -2429,18 +2449,11 @@ mod tests {
         // A session_id that could choose the path is refused outright.
         assert!(Session::open(dir(), &payload(r#"{"session_id":"../../x"}"#)).is_none());
         assert!(Session::open(dir(), &payload(r#"{"session_id":""}"#)).is_none());
-        // Restored, because `cargo test` runs these in threads of ONE process
-        // and a removed variable would outlive this test.
-        let saved = [("XDG_RUNTIME_DIR", std::env::var_os("XDG_RUNTIME_DIR"))];
+        // The fixture has already removed the platform's runtime variable (and
+        // restores it), so this is "neither variable set".
         std::env::remove_var("CCTAB_STATE_DIR");
-        std::env::remove_var("XDG_RUNTIME_DIR");
         assert!(dir().is_none());
         assert!(Session::open(dir(), &main_ev()).is_none());
-        for (k, v) in saved {
-            if let Some(v) = v {
-                std::env::set_var(k, v);
-            }
-        }
     }
 
     #[test]
@@ -2558,7 +2571,7 @@ mod tests {
                 completed: Vec::new(),
             }
             .render(),
-            "cts5\nb w\np 42 7\nw ab-c_D:99\n"
+            format!("cts5\nb w\n{} 42 7\nw ab-c_D:99\n", sys::ORIGIN_KEY)
         );
     }
 
@@ -2567,7 +2580,7 @@ mod tests {
     /// never reapable however old it is, and nothing the reaper cannot PROVE is
     /// ours is reapable at all.
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn the_reaper_reaps_a_dead_session_and_provably_not_a_live_one() {
         let f = Fixture::new("reap");
         fs::create_dir_all(&f.dir).expect("a writable state dir");
@@ -2681,9 +2694,29 @@ mod tests {
         }
     }
 
+    /// `doctor` calls a session pid live only when it asked and was told so. A pid
+    /// it may not open - pid 4, the System process, for a user without elevation on
+    /// Windows - is kept by the reaper, and the report says why rather than "live".
+    #[test]
+    fn doctor_calls_a_session_live_only_when_it_could_check() {
+        for pid in [4, std::process::id(), u32::MAX] {
+            let text = Record {
+                origin: Some(Origin { pid, start: 12345 }),
+                ..Record::fresh()
+            }
+            .describe(1_000_000);
+            let verdict = match sys::same_process(pid, 12345) {
+                Some(true) => "live",
+                Some(false) => "GONE",
+                None => "cannot be checked, so it is kept",
+            };
+            assert!(text.contains(&format!("session pid {pid} {verdict},")), "{text}");
+        }
+    }
+
     /// `doctor`'s report is generated from the same verdicts the reaper acts on.
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     fn doctor_reports_where_the_records_are_what_they_hold_and_which_are_stale() {
         let f = Fixture::new("survey");
         fs::create_dir_all(&f.dir).expect("a writable state dir");
@@ -2753,8 +2786,8 @@ mod tests {
         // And with nowhere to keep a record the report says DISABLED and why,
         // which is the silent answer to almost every question about this layer.
         std::env::remove_var("CCTAB_STATE_DIR");
-        std::env::remove_var("XDG_RUNTIME_DIR");
-        assert_eq!(survey().dir, Err("no CCTAB_STATE_DIR and no XDG_RUNTIME_DIR"));
+        std::env::remove_var(sys::RUNTIME_DIR_VAR);
+        assert_eq!(survey().dir, Err(sys::NO_STATE_DIR));
     }
 
     /// The one failure mode that looks healthy in every other line of the report: a
@@ -2792,21 +2825,20 @@ mod tests {
     /// to paint. Off means no directory at all, before anything is created, and a
     /// survey that says why.
     #[test]
-    fn the_layer_is_off_without_file_identity() {
+    fn the_layer_is_on_exactly_where_a_record_lock_exists() {
         let f = Fixture::new("identity");
-        assert_eq!(dir().is_some(), sys::HAS_FILE_ID);
+        assert_eq!(dir().is_some(), sys::HAS_RECORD_LOCK);
         let p = payload(r#"{"session_id":"s1","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#);
-        assert_eq!(Session::open(dir(), &p).is_some(), sys::HAS_FILE_ID);
-        if !sys::HAS_FILE_ID {
+        assert_eq!(Session::open(dir(), &p).is_some(), sys::HAS_RECORD_LOCK);
+        if !sys::HAS_RECORD_LOCK {
             assert!(!f.dir.exists(), "nothing is created when the layer is off");
             assert!(purge().is_none());
             let why = survey().dir.expect_err("disabled");
-            assert!(why.contains("no file identity"), "{}", why);
+            assert!(why.contains("no record lock"), "{}", why);
         }
     }
 
     #[test]
-    #[cfg(unix)]
     fn purge_takes_our_records_and_leaves_everything_else() {
         let f = Fixture::new("purge");
         fs::create_dir_all(&f.dir).expect("a writable state dir");
@@ -2934,5 +2966,231 @@ mod tests {
         assert!(nothing_running(&payload(&format!(
             r#"{{"session_id":"s1","last_assistant_message":"{big}","background_tasks":[]}}"#
         ))));
+    }
+
+    /// While one hook holds a session's lock, that session's next update waits for
+    /// it, and nothing else does: another session's update goes straight through,
+    /// and so does every READER - the reaper's verdict and doctor's report included.
+    /// The last half is the one Windows has to be made to keep, because its lock is
+    /// mandatory: over the record's bytes it would refuse them all.
+    #[test]
+    fn a_held_lock_blocks_its_own_sessions_update_and_nothing_else() {
+        let f = Fixture::new("isolation");
+        let agent = agent_ev("aaa");
+        f.session(&agent).resolve(Edge::Waiting, &agent);
+        let other = payload(r#"{"session_id":"s2","agent_id":"aaa","hook_event_name":"PostToolUse"}"#);
+        let s2 = Session::open(dir(), &other).expect("a state dir");
+        s2.resolve(Edge::Waiting, &other);
+        let held = f.session(&agent).lock(false).expect("lockable");
+        let before = f.record();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s1 = f.session(&agent);
+        let waiter = std::thread::spawn(move || {
+            let p = agent_ev("aaa");
+            tx.send(s1.resolve(Edge::Working, &p)).expect("send");
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the same session's update waits for the lock"
+        );
+        assert_eq!(f.record(), before);
+        let path = f.dir.join("s1");
+        assert!(matches!(stored_at(&path), Stored::Ours(_)), "a reader is not refused");
+        assert_eq!(reapable(&path, Named::Record), None);
+        let report = survey();
+        let line = report.records.iter().find(|(n, _)| n == "s1").map(|(_, w)| w.clone());
+        assert!(line.as_deref().is_some_and(|w| w.contains("waiting on 1")), "{line:?}");
+        assert_eq!(s2.resolve(Edge::Working, &other), Some(Paint::Line(Glyph::Idle)), "s2 is not blocked");
+        drop(held);
+        let painted = rx.recv_timeout(Duration::from_secs(10)).expect("released, it proceeds");
+        assert_eq!(painted, Some(Paint::Line(Glyph::Idle)));
+        waiter.join().expect("join");
+        assert!(!f.record().contains("\nw "));
+    }
+
+    /// A write replaces the record while its writer still holds the old file open
+    /// and locked, and a hook queued on that old file then holds a lock on a file
+    /// the name no longer names - which is what the identity check catches. Both
+    /// halves are what Windows had to be shown to do: replace a held, locked file,
+    /// and change the identity the path reports when it does.
+    #[test]
+    fn a_write_replaces_the_record_its_writer_holds_and_a_queued_lock_goes_stale() {
+        let f = Fixture::new("replace");
+        let main = main_tool();
+        let s = f.session(&main);
+        s.resolve(Edge::Working, &main);
+        let path = f.dir.join("s1");
+        let queued = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
+        let old = s.lock(false).expect("lockable");
+        let (was, mut now) = s.load();
+        now.base = Glyph::Idle;
+        s.write_if_changed(&was, &mut now);
+        assert_eq!(f.record(), format!("cts5\nb i\n{}", f.origin_line()), "replaced while held");
+        let m = fs::symlink_metadata(&path).expect("there");
+        assert_ne!(sys::file_id_of(&queued), sys::file_id_at(&path, &m), "the queued handle is stale");
+        drop(old);
+        let _new = s.lock(false).expect("the new record locks");
+        let names: Vec<_> = fs::read_dir(&f.dir).expect("dir").flatten().map(|e| e.file_name()).collect();
+        assert_eq!(names, vec![OsString::from("s1")], "no temporary left behind");
+    }
+
+    /// Each platform writes its origin under its own key and reads the other's as
+    /// no origin at all - the mtime rule - never as a pid of its own.
+    #[test]
+    fn another_platforms_origin_reads_as_no_origin() {
+        let other = if sys::ORIGIN_KEY == "p" { "q" } else { "p" };
+        let foreign = Record::parse(&format!("cts5\nb i\n{other} 1234 5678\n")).expect("ours");
+        assert_eq!(foreign.origin, None);
+        let own = Record::parse(&format!("cts5\nb i\n{} 1234 5678\n", sys::ORIGIN_KEY)).expect("ours");
+        assert_eq!(own.origin, Some(Origin { pid: 1234, start: 5678 }));
+    }
+
+    /// A session id Windows would open as a DEVICE is no file name there: that
+    /// session runs stateless rather than half-stateful.
+    #[test]
+    fn a_device_name_is_never_a_record_file() {
+        let _f = Fixture::new("device");
+        let nul = payload(r#"{"session_id":"NUL","hook_event_name":"Stop"}"#);
+        assert_eq!(Session::open(dir(), &nul).is_none(), sys::reserved_name("NUL"));
+        assert!(Session::open(dir(), &main_ev()).is_some());
+    }
+
+    /// Not a test: one hook of the race below, in a process of its own. It opens
+    /// its session, says it is ready, and then spins until the start line exists,
+    /// so the hooks of a round hit the record together.
+    #[test]
+    #[ignore = "a child process for another test"]
+    fn one_racing_hook() {
+        let var = std::env::var_os;
+        let (Some(edge), Some(json), Some(go), Some(ready)) = (
+            var("CCTAB_TEST_EDGE"),
+            var("CCTAB_TEST_PAYLOAD"),
+            var("CCTAB_TEST_GO"),
+            var("CCTAB_TEST_READY"),
+        ) else {
+            return;
+        };
+        let p = payload(&json.to_string_lossy());
+        let session = Session::open(dir(), &p).expect("a state dir");
+        fs::write(ready, b"").expect("ready");
+        let go = PathBuf::from(go);
+        while !go.exists() {
+            std::hint::spin_loop();
+        }
+        session.resolve(Edge::parse(Some(&edge)), &p);
+    }
+
+    /// One round: `seed` in this process, then every hook of `race` in its own
+    /// process, released together once all of them are ready; what the record
+    /// holds afterwards.
+    fn race_round(f: &Fixture, unlocked: bool, seed: &[(Edge, &str)], race: &[(&str, String)]) -> Record {
+        use std::process::{Command, Stdio};
+        let _ = fs::remove_file(f.dir.join("s1"));
+        for (edge, json) in seed {
+            let p = payload(json);
+            f.session(&p).resolve(*edge, &p);
+        }
+        // Beside the state directory, so no reaper or survey ever sees them.
+        let go = f.dir.with_extension("go");
+        let _ = fs::remove_file(&go);
+        let ready: Vec<_> = (0..race.len()).map(|i| f.dir.with_extension(format!("ready{i}"))).collect();
+        for r in &ready {
+            let _ = fs::remove_file(r);
+        }
+        let exe = std::env::current_exe().expect("exe");
+        let hooks: Vec<_> = race
+            .iter()
+            .zip(&ready)
+            .map(|((edge, json), ready)| {
+                let mut c = Command::new(&exe);
+                c.args(["--exact", "state::tests::one_racing_hook", "--ignored", "--test-threads=1"])
+                    .env("CCTAB_TEST_EDGE", edge)
+                    .env("CCTAB_TEST_PAYLOAD", json)
+                    .env("CCTAB_TEST_GO", &go)
+                    .env("CCTAB_TEST_READY", ready)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+                if unlocked {
+                    c.env("CCTAB_TEST_UNLOCKED", "1");
+                }
+                c.spawn().expect("spawn")
+            })
+            .collect();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !ready.iter().all(|r| r.exists()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        fs::write(&go, b"").expect("start line");
+        for mut h in hooks {
+            assert!(h.wait().expect("wait").success());
+        }
+        let _ = fs::remove_file(&go);
+        for r in &ready {
+            let _ = fs::remove_file(r);
+        }
+        Record::parse(&f.record()).expect("one well-formed record")
+    }
+
+    /// README's measurement, as a test: `rounds` rounds each of a subagent's
+    /// un-painting `PostToolUse` against main's `Stop` (a lost update is a CLEAR
+    /// lost, the tab orange until the TTL, or the background fact lost), the reverse
+    /// direction (a WAIT lost), and every eighth round all eight wait slots raised at
+    /// once. Returns how many rounds of each lost an update.
+    fn race_rounds(f: &Fixture, unlocked: bool, rounds: usize, stop_early: bool) -> [usize; 3] {
+        let busy = r#"{"session_id":"s1","hook_event_name":"Stop","background_tasks":[{"id":"aaa","type":"subagent","status":"running"}]}"#;
+        let ask = r#"{"session_id":"s1","agent_id":"aaa","hook_event_name":"PermissionRequest"}"#;
+        let done = r#"{"session_id":"s1","agent_id":"aaa","hook_event_name":"PostToolUse"}"#;
+        let work = r#"{"session_id":"s1","hook_event_name":"PostToolUse"}"#;
+        let mut lost = [0; 3];
+        for round in 0..rounds {
+            let r = race_round(f, unlocked, &[(Edge::Waiting, ask)],
+                &[("working", done.to_owned()), ("idle", busy.to_owned())]);
+            lost[0] += usize::from(!r.waits.is_empty() || r.background.is_none());
+            let r = race_round(f, unlocked, &[(Edge::Working, work)],
+                &[("waiting", ask.to_owned()), ("idle", busy.to_owned())]);
+            lost[1] += usize::from(r.waits.len() != 1 || r.background.is_none());
+            if round % 8 == 0 {
+                let all: Vec<_> = (0..MAX_WAITS)
+                    .map(|i| ("waiting", ask.replace("\"aaa\"", &format!("\"a{i}\""))))
+                    .collect();
+                let r = race_round(f, unlocked, &[(Edge::Working, work)], &all);
+                lost[2] += usize::from(r.waits.len() != MAX_WAITS);
+            }
+            if stop_early && lost.iter().any(|&n| n > 0) {
+                break;
+            }
+        }
+        lost
+    }
+
+    /// Hooks of one session racing in separate PROCESSES lose no update.
+    #[test]
+    fn concurrent_hooks_of_one_session_lose_no_update() {
+        let f = Fixture::new("race");
+        assert_eq!(race_rounds(&f, false, 24, false), [0, 0, 0]);
+    }
+
+    /// The control: the same race with the lock switched off DOES lose updates,
+    /// which is what makes the zero above evidence. Probabilistic, so run on demand:
+    /// `cargo test race_control -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a probabilistic control; run on demand"]
+    fn race_control_without_the_lock_loses_updates() {
+        let f = Fixture::new("race-control");
+        let lost = race_rounds(&f, true, 400, true);
+        eprintln!("without the lock, rounds lost (clear, wait, eight-way): {lost:?}");
+        assert!(lost.iter().any(|&n| n > 0), "the race never lost an update, so it proves nothing");
+    }
+
+    /// README's numbers: 400 rounds each way, with and without the lock.
+    /// `cargo test race_400 -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement; run on demand"]
+    fn race_400_rounds_with_and_without_the_lock() {
+        let f = Fixture::new("race-400");
+        let with = race_rounds(&f, false, 400, false);
+        let without = race_rounds(&f, true, 400, false);
+        eprintln!("400 rounds, lost (clear, wait, eight-way of 50): with the lock {with:?}, without {without:?}");
+        assert_eq!(with, [0, 0, 0]);
     }
 }

@@ -207,9 +207,13 @@ unsupported direct events, and other early returns do not. tmux's independent
 display decay is described above.
 
 Persistence requires a valid session ID and either the dedicated
-`CCTAB_STATE_DIR` override or `$XDG_RUNTIME_DIR/claude-tabstatus`; there is no HOME
-fallback. Missing/invalid session IDs, no configured directory, or failure to
-create the directory select the stateless resolver. It cannot protect overlapping
+`CCTAB_STATE_DIR` override or `$XDG_RUNTIME_DIR/claude-tabstatus`
+(`%LOCALAPPDATA%\claude-tabstatus` on Windows); there is no HOME fallback. On
+Windows the directory must be on a volume with POSIX rename semantics (NTFS, not
+FAT, exFAT or WSL's 9P share), because every write replaces a file its writer
+holds open. Missing/invalid session IDs, no configured directory, a directory
+without that capability, or failure to create the directory select the stateless
+resolver. It cannot protect overlapping
 owners: waiting requests paint waiting, main working paints working, idle paints
 idle, agent working/stop and direct results remain silent. Metadata parsing rules
 still apply where parsing is required.
@@ -219,13 +223,17 @@ that need a lock refuse symlinks, nonregular files, records over 8 KiB, and unkn
 `cts`-family versions. Requests can still paint waiting; failed working/completion
 updates stay silent. Idle paints without a lock only if the record is genuinely
 absent. Startup can paint even if state cannot be saved. Writes are best effort:
-I/O failure cannot provide durable ownership guarantees. Handled persistence
+I/O failure cannot provide durable ownership guarantees. On Windows that includes
+another program holding the record or its temporary file open without delete
+sharing for longer than the half-second retry. Handled persistence
 failures exit successfully without a blocking hook response or an elicitation
 answer. Filesystem operations and the blocking record lock have no guaranteed
 latency bound.
 
 Ordinary state updates lock the session's own record, including its first creation,
-then verify the path still names the locked inode. Atomic temporary-file rename
+then verify the path still names the locked file (device and inode on Unix, volume
+and file ID on Windows). On Windows the lock covers one byte outside the record's
+data, so unlocked readers are never refused. Atomic temporary-file rename
 prevents partially written records; unchanged state is not rewritten. Different
 sessions have separate locks. Serialized updates preserve distinct waits and exact
 completion history within the capacity rules; they do not impose a deterministic
@@ -252,7 +260,9 @@ path checks do not promise resistance to malicious concurrent filesystem changes
 
 Startup examines at most 256 directory entries for stale records. Known records
 with a stored process ID/start-time pair can be reaped when that origin no longer
-matches. Records without origin, future-version records and recognized temporary
+matches. The pair is stored under a per-platform key (`p` on Unix, `q` with the
+process creation time on Windows); a record carrying the other platform's key reads
+as having no origin. Records without origin, future-version records and recognized temporary
 files use a 24-hour mtime recovery rule; future mtimes count as stale. Recognized
 background records without origin are exempt: missing process metadata cannot
 prove their work ended. Alien record

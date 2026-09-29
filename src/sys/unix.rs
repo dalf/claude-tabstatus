@@ -11,8 +11,9 @@ use std::path::{Path, PathBuf};
 
 use super::FileId;
 
-/// [`file_id`] always answers.
-pub const HAS_FILE_ID: bool = true;
+/// [`lock_exclusive`] locks, and [`file_id_of`] and [`file_id_at`] can prove the
+/// lock is on the file a path names: `flock`, and device and inode.
+pub const HAS_RECORD_LOCK: bool = true;
 
 /// [`mode`] always answers, and [`set_mode`] applies what it is given.
 pub const HAS_MODES: bool = true;
@@ -48,8 +49,54 @@ pub fn kernel_hostname_file() -> Option<&'static Path> {
 
 /// The identity of the file `m` describes. Always known on Unix.
 pub fn file_id(m: &Metadata) -> Option<FileId> {
-    Some((m.dev(), m.ino()))
+    Some((m.dev(), u128::from(m.ino())))
 }
+
+/// The identity of the file an open handle names: its `fstat`.
+pub fn file_id_of(f: &File) -> Option<FileId> {
+    file_id(&f.metadata().ok()?)
+}
+
+/// The identity of the entry `path` names now, a link as itself. That is in the
+/// `lstat` the caller already holds, so nothing is read again.
+pub fn file_id_at(_path: &Path, lstat: &Metadata) -> Option<FileId> {
+    file_id(lstat)
+}
+
+/// Block until `f` holds the exclusive record lock: `flock(LOCK_EX)`, advisory,
+/// released when the file is closed or the process exits.
+pub fn lock_exclusive(f: &File) -> io::Result<()> {
+    f.lock()
+}
+
+/// Replace `to` with `from` in one step: `rename(2)`, which moves a name and leaves
+/// every open handle - the writer's own locked one included - on the old inode.
+pub fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)
+}
+
+/// Whether [`replace_file`] can replace a file in `dir` that its writer holds open
+/// and locked: always - `rename(2)` does not ask who has the file open.
+pub fn replaces_open_files(_dir: &Path) -> bool {
+    true
+}
+
+/// Whether a word of the session-id grammar names a device rather than a file in a
+/// directory: never, here.
+pub fn reserved_name(_name: &str) -> bool {
+    false
+}
+
+/// The key a record's origin is written under. It differs per platform because the
+/// numbers do: a pid and a start time from one OS say nothing about a process on
+/// another, and each side reads the other's key as an unknown field - no origin.
+pub const ORIGIN_KEY: &str = "p";
+
+/// The variable naming the per-user directory the state directory defaults under.
+pub const RUNTIME_DIR_VAR: &str = "XDG_RUNTIME_DIR";
+
+/// Why there is no state directory, when neither variable is set.
+pub const NO_STATE_DIR: &str = "no CCTAB_STATE_DIR and no XDG_RUNTIME_DIR";
 
 /// The permission bits, `0o7777`-masked.
 pub fn mode(m: &Metadata) -> Option<u32> {
@@ -164,6 +211,18 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
 /// with no `/proc` this answers `Some(false)`, as the check always has there.
 pub fn process_alive(pid: u32) -> Option<bool> {
     Some(Path::new(&format!("/proc/{}", pid)).exists())
+}
+
+/// Whether the process that recorded `(pid, start)` is still that process:
+/// `Some(true)` it is, `Some(false)` provably not - gone, or the pid given to
+/// another - and `None` when that cannot be told. The same two `/proc` reads, in
+/// the same order, that the reaper has always made.
+pub fn same_process(pid: u32, start: u64) -> Option<bool> {
+    if process_start_time(pid) == Some(start) {
+        Some(true)
+    } else {
+        process_alive(pid).map(|_| false)
+    }
 }
 
 /// Resolve the session's pty from `$CLAUDE_PID`. Hook subprocesses are detached,

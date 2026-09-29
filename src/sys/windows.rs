@@ -15,18 +15,26 @@ use std::os::windows::io::AsRawHandle;
 use std::path::{Component, Path, PathBuf, Prefix};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER,
+    ERROR_SHARING_VIOLATION, FILETIME, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FindClose, FindFirstFileW, GetDriveTypeW, MoveFileExW, WIN32_FIND_DATAW,
+    FileIdInfo, FileRenameInfoEx, FindClose, FindFirstFileW, GetDriveTypeW,
+    GetFileInformationByHandleEx, GetVolumeInformationByHandleW, LockFileEx, MoveFileExW,
+    SetFileInformationByHandle, DELETE, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO,
+    LOCKFILE_EXCLUSIVE_LOCK, WIN32_FIND_DATAW,
 };
-use windows_sys::Win32::System::IO::DeviceIoControl;
+use windows_sys::Win32::System::Threading::{
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows_sys::Win32::System::IO::{DeviceIoControl, OVERLAPPED};
 
 use super::FileId;
 
-/// [`file_id`] never answers, so nothing can prove two handles name one file.
-/// The wait-ownership layer needs exactly that proof for its lock, and is off here.
-pub const HAS_FILE_ID: bool = false;
+/// [`lock_exclusive`] locks, and [`file_id_of`] and [`file_id_at`] can prove the
+/// lock is on the file a path names: a `LockFileEx` byte, and `FILE_ID_INFO` read
+/// from a handle. ([`file_id`], from `Metadata` alone, still cannot.)
+pub const HAS_RECORD_LOCK: bool = true;
 
 /// There are no mode bits: [`mode`] never answers and [`set_mode`] applies
 /// nothing, so a report must not print a mode it did not read.
@@ -79,12 +87,232 @@ pub fn kernel_hostname_file() -> Option<&'static Path> {
     None
 }
 
-/// File identity. std exposes the volume serial and file index only behind an
-/// unstable feature, so there is no identity to offer and this answers `None`;
-/// callers treat that as "cannot prove same file".
+/// File identity from `Metadata` alone. std exposes the volume serial and file
+/// index only behind an unstable feature, so this answers `None`; callers treat
+/// that as "cannot prove same file". With a handle, [`file_id_of`] answers.
 pub fn file_id(_m: &Metadata) -> Option<FileId> {
     None
 }
+
+/// The identity of the file an open handle names: `FILE_ID_INFO`, the volume serial
+/// and the 128-bit file id. Asking needs no data access, so a byte-range lock -
+/// anyone's - does not stand in the way.
+pub fn file_id_of(f: &File) -> Option<FileId> {
+    // SAFETY: FILE_ID_INFO is plain data, valid all-zero; the pointer and size
+    // describe it exactly, and the call writes nothing else and keeps nothing.
+    let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetFileInformationByHandleEx(
+            f.as_raw_handle() as HANDLE,
+            FileIdInfo,
+            (&mut info as *mut FILE_ID_INFO).cast(),
+            std::mem::size_of::<FILE_ID_INFO>() as u32,
+        )
+    };
+    (ok != 0).then(|| (info.VolumeSerialNumber, u128::from_le_bytes(info.FileId.Identifier)))
+}
+
+/// The identity of the entry `path` names now, a link as itself: a handle opened
+/// for attributes only, not following a reparse point, sharing everything. A link
+/// or junction therefore answers its OWN identity, never its target's, which is
+/// what makes a comparison with a handle opened through it fail closed.
+pub fn file_id_at(path: &Path, _lstat: &Metadata) -> Option<FileId> {
+    let f = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .ok()?;
+    file_id_of(&f)
+}
+
+/// The one byte the record lock covers: far past any record's data (8 KiB).
+///
+/// `LockFileEx` is MANDATORY: every other handle - this process's own included -
+/// gets `ERROR_LOCK_VIOLATION` reading or writing a byte it covers. std's
+/// `File::lock` covers them all, so an unlocked reader (the reaper, `doctor`) and
+/// even the holder's own read of its record by path would be refused, and a refused
+/// read is an absent record. Nothing reads or writes this byte, so the lock excludes
+/// other lockers and nobody else - an advisory lock in effect, like `flock`. SQLite's
+/// Windows locking takes bytes outside its data for the same reason.
+const LOCK_BYTE: u64 = 1 << 62;
+
+/// Block until `f` holds the exclusive record lock: `LockFileEx` on [`LOCK_BYTE`],
+/// released when the handle is closed or the process exits (measured: a waiter
+/// gets it about 1ms after its holder is killed).
+///
+/// `f` must be a synchronous handle, which every `File` std opens is: the call
+/// then returns only once the lock is held or refused.
+pub fn lock_exclusive(f: &File) -> io::Result<()> {
+    // SAFETY: OVERLAPPED is plain data, valid all-zero, and here only carries the
+    // offset. On a synchronous handle the call completes before it returns, so it
+    // keeps no pointer to `at`.
+    let mut at: OVERLAPPED = unsafe { std::mem::zeroed() };
+    at.Anonymous.Anonymous.Offset = LOCK_BYTE as u32;
+    at.Anonymous.Anonymous.OffsetHigh = (LOCK_BYTE >> 32) as u32;
+    let ok = unsafe {
+        LockFileEx(f.as_raw_handle() as HANDLE, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &mut at)
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// `FILE_RENAME_FLAG_REPLACE_IF_EXISTS` and `FILE_RENAME_FLAG_POSIX_SEMANTICS`
+/// (winbase.h), and `FILE_SUPPORTS_POSIX_UNLINK_RENAME` (winnt.h): spelled here
+/// rather than pulled in through two more windows-sys feature modules.
+const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
+const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
+const FILE_SUPPORTS_POSIX_UNLINK_RENAME: u32 = 0x400;
+
+/// Replace `to` with `from` in one step, while `to` is held open - and locked - by
+/// its writer and possibly by others: a POSIX-semantics rename.
+///
+/// That is the only kind that can. `MoveFileExW` refuses (os error 5) whenever
+/// `to` is open at all, and the writer always holds it; a POSIX rename moves the
+/// name at once and leaves every open handle on the old, now nameless file. std's
+/// `rename` reaches the same call only as a fallback after that doomed
+/// `MoveFileExW` (measured 4.2ms against 2.0ms), and reports the first error when
+/// the fallback fails too - so it is called directly here.
+///
+/// What still refuses it is a handle opened WITHOUT `FILE_SHARE_DELETE` on either
+/// file - a scanner, an indexer, an editor - which the call reports as a sharing
+/// violation. That is retried for up to half a second, all of it under the
+/// caller's lock; anything else is an answer and returns at once.
+pub fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
+    let to = rename_target(to)?;
+    let mut tries = 0;
+    loop {
+        match rename_posix(from, &to) {
+            Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32) && tries < 25 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            res => return res,
+        }
+    }
+}
+
+/// `to` spelled the way the rename call must be given it: absolute, and verbatim.
+///
+/// ABSOLUTE, because a relative name is resolved against the process's current
+/// directory, not against `from`'s (measured: the temp file moved into the cwd, the
+/// call returned success, and the record was untouched). VERBATIM (`\\?\`), because
+/// the name is converted to an NT path with the MAX_PATH cap that std escapes by
+/// the same prefix: a plain record path of 260 characters or more fails every write
+/// with os error 206 while every other operation on it succeeds (measured: 284
+/// characters fail plain and succeed verbatim). `absolute` has already folded `.`,
+/// `..` and `/`, which a verbatim path would take literally, so the prefix changes
+/// nothing else. A path that is verbatim already is used as it is.
+fn rename_target(to: &Path) -> io::Result<Vec<u16>> {
+    let abs = std::path::absolute(to)?;
+    let w = wide(&abs);
+    let kind = match abs.components().next() {
+        Some(Component::Prefix(p)) => Some(p.kind()),
+        _ => None,
+    };
+    let (lead, rest): (&str, &[u16]) = match kind {
+        Some(Prefix::Disk(_)) => (r"\\?\", &w),
+        // `\\server\share\x` is `\\?\UNC\server\share\x`: one leading `\` goes.
+        Some(Prefix::UNC(..)) => (r"\\?\UNC", w.get(1..).unwrap_or_default()),
+        // `\\?\...` and `\\.\...` already bypass the conversion.
+        _ => ("", &w),
+    };
+    let mut out: Vec<u16> = lead.encode_utf16().collect();
+    out.extend_from_slice(rest);
+    Ok(out)
+}
+
+/// `SetFileInformationByHandle(FileRenameInfoEx)`, replacing and POSIX, on a handle
+/// to `from` opened for DELETE only. `name` is [`rename_target`]'s spelling.
+fn rename_posix(from: &Path, name: &[u16]) -> io::Result<()> {
+    let src = OpenOptions::new()
+        .access_mode(DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(from)?;
+    let at = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    // The header, the name, and its NUL - the struct is variable-length.
+    let size = at + (name.len() + 1) * 2;
+    let len = u32::try_from(name.len() * 2)
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mut buf = vec![0u64; size.div_ceil(8)];
+    let info = buf.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: `buf` is zeroed, 8-aligned (FILE_RENAME_INFO's alignment) and at least
+    // `size` bytes, so the header fields are in bounds and the name's `name.len()`
+    // units plus the zeroed NUL fit after `FileName`. The pointer derives from the
+    // whole buffer, and `buf` outlives the call, which reads `size` bytes of it and
+    // keeps nothing; `RootDirectory` stays null, so `name` is taken as a full path.
+    let ok = unsafe {
+        (*info).Anonymous.Flags = FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+        (*info).FileNameLength = len;
+        let dst = std::ptr::addr_of_mut!((*info).FileName).cast::<u16>();
+        std::ptr::copy_nonoverlapping(name.as_ptr(), dst, name.len());
+        SetFileInformationByHandle(src.as_raw_handle() as HANDLE, FileRenameInfoEx, info.cast(), size as u32)
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Whether [`replace_file`] can replace a file in `dir` that its writer holds open
+/// and locked: the volume says it has POSIX rename semantics. NTFS does, since
+/// Windows 10 1709 (measured: `C:`); FAT, exFAT, the 9P share WSL exports
+/// (measured) and some SMB servers do not - and there every write would fail,
+/// because the writer itself holds the record open, so the layer stays off.
+pub fn replaces_open_files(dir: &Path) -> bool {
+    let Ok(d) = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(dir)
+    else {
+        return false;
+    };
+    let mut flags = 0u32;
+    // SAFETY: `d` is an open handle. Every buffer is null with a zero size except
+    // `flags`, a live u32; the call keeps no pointer.
+    let ok = unsafe {
+        GetVolumeInformationByHandleW(
+            d.as_raw_handle() as HANDLE,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut flags,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    ok != 0 && flags & FILE_SUPPORTS_POSIX_UNLINK_RENAME != 0
+}
+
+/// Whether a word of the session-id grammar names a DEVICE rather than a file in a
+/// directory: the DOS device names, any case. `<dir>\NUL` opens the null device
+/// (measured), and Windows 10 treats the others the same way.
+pub fn reserved_name(name: &str) -> bool {
+    let n = name.to_ascii_uppercase();
+    matches!(n.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (n.len() == 4
+            && (n.starts_with("COM") || n.starts_with("LPT"))
+            && n.as_bytes().get(3).is_some_and(u8::is_ascii_digit))
+}
+
+/// The key a record's origin is written under: not Unix's `p`, because the
+/// numbers mean something else here - a Windows pid and creation time read by a
+/// Linux build sharing `CCTAB_STATE_DIR` (WSL) would be "gone" and reaped while
+/// live, and the reverse here. Each side reads the other's key as an unknown
+/// field: no origin, the mtime rule.
+pub const ORIGIN_KEY: &str = "q";
+
+/// The variable naming the per-user directory the state directory defaults under:
+/// `%LOCALAPPDATA%` - private to the user, local rather than roaming, and not
+/// emptied by Storage Sense the way `%TEMP%` is.
+pub const RUNTIME_DIR_VAR: &str = "LOCALAPPDATA";
+
+/// Why there is no state directory, when neither variable is set.
+pub const NO_STATE_DIR: &str = "no CCTAB_STATE_DIR and no LOCALAPPDATA";
 
 /// Windows has no mode bits; the read-only attribute is not one.
 pub fn mode(_m: &Metadata) -> Option<u32> {
@@ -689,23 +917,97 @@ pub fn remove_dir_command(p: &Path) -> String {
     )
 }
 
-/// Unknown. (`OpenProcess` + `GetProcessTimes` is the real answer, and needs a
-/// Win32 binding this crate does not carry yet.)
+/// The creation time of the RUNNING process `pid`, in 100ns units since 1601, or
+/// `None` when it has exited or cannot be asked.
 ///
-/// With no start time a session records no origin, and a record with no origin
-/// is reaped on the mtime horizon (`REAP_AFTER`) like any originless record. An
-/// origin written elsewhere - by WSL into a shared `CCTAB_STATE_DIR` - has
-/// unknown liveness here, because [`process_alive`] is unknown too, so it counts
-/// as alive and is kept. (While [`HAS_FILE_ID`] is false the state layer is off
-/// here and neither path runs.)
-pub fn process_start_time(_pid: u32) -> Option<u64> {
-    None
+/// Immutable for the life of the process - a clock stepped later does not move it
+/// - and a pid is not handed out again while any handle to its process is open, so
+/// `(pid, creation)` names one process, as `(pid, start ticks)` does on Linux.
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    match probe(pid) {
+        Probe::Running(created) => Some(created),
+        Probe::Gone | Probe::Unknown => None,
+    }
 }
 
-/// Unknown, for the same reason as [`process_start_time`]. Callers treat unknown
-/// as alive, so nothing belonging to a running process is removed.
-pub fn process_alive(_pid: u32) -> Option<bool> {
-    None
+/// Whether `pid` names a running process. `Some(false)` only on proof - no such pid,
+/// or its process has exited - and `None` for a process this user may not ask about
+/// (the System process, another user's), which callers keep.
+pub fn process_alive(pid: u32) -> Option<bool> {
+    match probe(pid) {
+        Probe::Running(_) => Some(true),
+        Probe::Gone => Some(false),
+        Probe::Unknown => None,
+    }
+}
+
+/// Whether the process that recorded `(pid, start)` is still that process, from ONE
+/// handle, so the answer cannot mix two processes: `Some(true)` it is running with
+/// that creation time, `Some(false)` provably not, `None` it cannot be asked.
+pub fn same_process(pid: u32, start: u64) -> Option<bool> {
+    match probe(pid) {
+        Probe::Running(created) => Some(created == start),
+        Probe::Gone => Some(false),
+        Probe::Unknown => None,
+    }
+}
+
+/// What one look at a pid finds.
+enum Probe {
+    /// Running, with this creation time.
+    Running(u64),
+    /// Proven not running: no such pid (`ERROR_INVALID_PARAMETER`), or its process
+    /// has exited though someone still holds a handle to it.
+    Gone,
+    /// Could not be asked - access denied, or a call failed. Never read as gone.
+    Unknown,
+}
+
+/// `OpenProcess` for `PROCESS_QUERY_LIMITED_INFORMATION` alone - what a same-user
+/// process always grants, and all the two calls after it need.
+///
+/// Exit is read from the exit code rather than by waiting, which would need
+/// `SYNCHRONIZE` as well; the price is that a process that exited with code 259
+/// (`STILL_ACTIVE`) reads as running, which only keeps a record. The pid's low two
+/// bits are ignored by Windows (measured: `OpenProcess(pid + 1)` opens `pid`), and
+/// that is harmless: a record's pid came through this same call.
+fn probe(pid: u32) -> Probe {
+    // SAFETY: no pointers; a null handle is the failure, read at once.
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if h.is_null() {
+        // SAFETY: no arguments; reads this thread's last error, set by the call above.
+        return match unsafe { GetLastError() } {
+            ERROR_INVALID_PARAMETER => Probe::Gone,
+            _ => Probe::Unknown,
+        };
+    }
+    let process = Process(h);
+    let mut code = 0u32;
+    // SAFETY: an open process handle and a live u32.
+    if unsafe { GetExitCodeProcess(process.0, &mut code) } == 0 {
+        return Probe::Unknown;
+    }
+    if code != STILL_ACTIVE as u32 {
+        return Probe::Gone;
+    }
+    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: an open process handle and four live FILETIMEs.
+    let ok = unsafe { GetProcessTimes(process.0, &mut created, &mut exited, &mut kernel, &mut user) };
+    match (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime) {
+        created if ok != 0 && created != 0 => Probe::Running(created),
+        _ => Probe::Unknown,
+    }
+}
+
+/// An open process handle, closed on drop.
+struct Process(HANDLE);
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from OpenProcess and is closed exactly once.
+        unsafe { CloseHandle(self.0) };
+    }
 }
 
 /// No pty to resolve: a hook cannot name Claude Code's console from here, so
@@ -742,6 +1044,21 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    /// The replace's target is absolute and verbatim in every spelling a state
+    /// directory can take, `..` folded before the prefix makes it literal. (Pure
+    /// string work: nothing here touches a disk or a network.)
+    #[test]
+    fn a_rename_target_is_absolute_and_verbatim() {
+        let t = |p: &str| String::from_utf16(&rename_target(Path::new(p)).expect("target")).expect("utf16");
+        assert_eq!(t(r"C:\state\x\..\s1"), r"\\?\C:\state\s1");
+        assert_eq!(t("C:/state/s1"), r"\\?\C:\state\s1");
+        assert_eq!(t(r"\\srv\share\state\s1"), r"\\?\UNC\srv\share\state\s1");
+        assert_eq!(t(r"\\?\C:\state\s1"), r"\\?\C:\state\s1");
+        assert_eq!(t(r"\\?\UNC\srv\share\s1"), r"\\?\UNC\srv\share\s1");
+        let rel = t("s1");
+        assert!(rel.starts_with(r"\\?\") && rel.ends_with(r"\s1") && rel.len() > 8, "{rel}");
     }
 
     /// What makes the junction usable as THE plugin link: std reads it as a directory
