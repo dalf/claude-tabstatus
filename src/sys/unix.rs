@@ -596,13 +596,13 @@ fn fd1_path(claude_pid: &OsStr) -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 fn fd1_path(claude_pid: &OsStr) -> Option<PathBuf> {
     let pid = pid_to_ask_about(parse_pid(claude_pid)?)?;
-    let want = std::mem::size_of::<VnodeFdInfoWithPath>();
+    let want = std::mem::size_of::<abi::VnodeFdInfoWithPath>();
     let size = i32::try_from(want).ok()?;
     // SAFETY: every field of this struct, transitively, is an integer or an array
     // of integers, so all-zero is a valid value of it. Nothing is read out of it
     // except `pvip.vip_path`, and only after the byte count says the kernel filled
     // the whole of it.
-    let mut info: VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+    let mut info: abi::VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
     // SAFETY: the pointer and `size` describe that same live buffer exactly, so the
     // call writes at most `size` bytes inside it; it keeps no pointer to it, and
     // `info` outlives the call. The kernel refuses a `size` below the flavour's own
@@ -612,7 +612,7 @@ fn fd1_path(claude_pid: &OsStr) -> Option<PathBuf> {
         libc::proc_pidfdinfo(
             pid,
             1,
-            PROC_PIDFDVNODEPATHINFO,
+            abi::PROC_PIDFDVNODEPATHINFO,
             std::ptr::from_mut(&mut info).cast(),
             size,
         )
@@ -674,111 +674,107 @@ fn fd1_path_from_vnode(nb: i32, want: usize, raw: &[u8]) -> Option<PathBuf> {
     Some(PathBuf::from(os_string_from_vec(name.to_vec())))
 }
 
-/// The flavour that answers with a vnode's path. `libc` 0.2.189 declares neither
-/// this nor the struct below - measured against the crate source, not assumed - so
-/// both are written out here; see the declarations for what makes that sound.
+/// The macOS ABI: the two `proc_info.h` declarations `libc` does not carry, and
+/// the compile-time guards that pin their layout. ONE `cfg` for the whole
+/// module, because nothing in it has a Linux counterpart to sit beside.
 #[cfg(target_os = "macos")]
-const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+mod abi {
+    /// The flavour that answers with a vnode's path. `libc` 0.2.189 declares neither
+    /// this nor the struct below - measured against the crate source, not assumed - so
+    /// both are written out here; see the declarations for what makes that sound.
+    pub(super) const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
 
-/// `struct proc_fileinfo`, and below it `struct vnode_fdinfowithpath`: the two
-/// halves of what `proc_pidfdinfo`'s `PROC_PIDFDVNODEPATHINFO` copies out.
-///
-/// WHAT THIS CONFORMS TO. The interface is `xnu`'s `bsd/sys/proc_info.h` - the field
-/// order every caller of that flavour must match to interoperate at all. Nothing is
-/// copied from it: no text, no comments, no transcription. Apple's source is APSL
-/// 2.0 and this program is GPL-3.0-or-later, so an ABI is the only thing that may
-/// cross, and an ABI is an interface rather than an expression of one.
-///
-/// WHAT MAKES IT SOUND WITHOUT A MAC. No machine in this project can link a macOS
-/// binary, so a hand-written layout is normally a guess, and the last word on this
-/// function said so. It is not a guess here because the layout is ASSERTED rather
-/// than assumed: the `const _` block below fails the macOS `cargo check` - which
-/// this project does run, for both Apple ABIs - unless every size and offset is the
-/// one measured against the header. The nested types are libc's OWN
-/// (`vinfo_stat`, `vnode_info`, `vnode_info_path`), and libc checks those against
-/// Apple's real SDK on its own CI; what is added here is five scalars and two
-/// fields, all of which the asserts pin.
-///
-/// AND A WRONG SIZE WOULD NOT BE CORRUPTION ANYWAY. The kernel compares the
-/// `buffersize` it was handed against this flavour's own size and returns `ENOMEM`
-/// before it copies a byte, then copies out exactly that many. The direction is
-/// kernel to user into a buffer we sized ourselves, so a mistake is an error
-/// return that [`fd1_path_from_vnode`] reads as `None` - never a write past the end
-/// of anything.
-///
-/// WHO MAY ASK. The gate is the same-user check, not an entitlement: this asks
-/// about `$CLAUDE_PID`, which is this user's own `claude`, and it works under SIP
-/// with no privilege of any kind.
-///
-/// The fields are named for the ABI and read through `pvip` alone; the rest are
-/// here to occupy the bytes the kernel writes, which is what the asserts check.
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-#[repr(C)]
-struct ProcFileInfo {
-    fi_openflags: u32,
-    fi_status: u32,
-    fi_offset: libc::off_t,
-    fi_type: i32,
-    fi_guardflags: u32,
+    /// `struct proc_fileinfo`, and below it `struct vnode_fdinfowithpath`: the two
+    /// halves of what `proc_pidfdinfo`'s `PROC_PIDFDVNODEPATHINFO` copies out.
+    ///
+    /// WHAT THIS CONFORMS TO. The interface is `xnu`'s `bsd/sys/proc_info.h` - the field
+    /// order every caller of that flavour must match to interoperate at all. Nothing is
+    /// copied from it: no text, no comments, no transcription. Apple's source is APSL
+    /// 2.0 and this program is GPL-3.0-or-later, so an ABI is the only thing that may
+    /// cross, and an ABI is an interface rather than an expression of one.
+    ///
+    /// WHAT MAKES IT SOUND WITHOUT A MAC. No machine in this project can link a macOS
+    /// binary, so a hand-written layout is normally a guess, and the last word on this
+    /// function said so. It is not a guess here because the layout is ASSERTED rather
+    /// than assumed: the `const _` block below fails the macOS `cargo check` - which
+    /// this project does run, for both Apple ABIs - unless every size and offset is the
+    /// one measured against the header. The nested types are libc's OWN
+    /// (`vinfo_stat`, `vnode_info`, `vnode_info_path`), and libc checks those against
+    /// Apple's real SDK on its own CI; what is added here is five scalars and two
+    /// fields, all of which the asserts pin.
+    ///
+    /// AND A WRONG SIZE WOULD NOT BE CORRUPTION ANYWAY. The kernel compares the
+    /// `buffersize` it was handed against this flavour's own size and returns `ENOMEM`
+    /// before it copies a byte, then copies out exactly that many. The direction is
+    /// kernel to user into a buffer we sized ourselves, so a mistake is an error
+    /// return that [`fd1_path_from_vnode`](super::fd1_path_from_vnode) reads as
+    /// `None` - never a write past the end of anything.
+    ///
+    /// WHO MAY ASK. The gate is the same-user check, not an entitlement: this asks
+    /// about `$CLAUDE_PID`, which is this user's own `claude`, and it works under SIP
+    /// with no privilege of any kind.
+    ///
+    /// The fields are named for the ABI and read through `pvip` alone; the rest are
+    /// here to occupy the bytes the kernel writes, which is what the asserts check.
+    #[allow(dead_code)]
+    #[repr(C)]
+    pub(super) struct ProcFileInfo {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: libc::off_t,
+        fi_type: i32,
+        fi_guardflags: u32,
+    }
+
+    #[allow(dead_code)]
+    #[repr(C)]
+    pub(super) struct VnodeFdInfoWithPath {
+        pfi: ProcFileInfo,
+        pub(super) pvip: libc::vnode_info_path,
+    }
+
+    // The layout, checked by the compiler that will build for the Mac. These numbers
+    // are the header's, and a build that disagrees with any one of them does not
+    // produce a binary - which is the whole of what stands in for running this
+    // anywhere. They are not vacuous: adding one spurious `u32` to `ProcFileInfo` here
+    // fails THREE of them - `ProcFileInfo`'s size, `VnodeFdInfoWithPath`'s size and
+    // `pvip`'s offset - identically on both Apple targets. Three failed asserts, and
+    // four lines beginning `error`, because cargo appends its own summary line. The
+    // number that means something is the three, and this comment said four until the
+    // control was re-run and counted.
+    //
+    // `vip_path`'s offset is asserted too, because the path is read by flattening that
+    // array: it must begin where the header puts it and run to the end of the struct,
+    // which is 1176 - 152 = 1024 bytes, `MAXPATHLEN`.
+    //
+    // WHAT THESE CANNOT CATCH, exactly rather than roughly, because a limit described
+    // loosely is worse than one described plainly. `ProcFileInfo` is four 32-bit fields
+    // and one `off_t`, and `off_t`'s 8-byte alignment pins it to offset 8 - so ANY
+    // permutation of `fi_openflags`, `fi_status`, `fi_type` and `fi_guardflags` leaves
+    // every size and offset here unchanged and every assert green. Measured rather than
+    // argued: `fi_type` and `fi_guardflags` transposed produced zero diagnostics on
+    // both Apple targets. That is survivable here and only here, because this reads
+    // NOTHING out of `proc_fileinfo` - a swapped pair inside it has no consequence at
+    // all. What it reads is `pvip`, whose offset is asserted, and inside it `vip_path`,
+    // whose offset is asserted, in a struct that is libc's own and is checked against
+    // Apple's real SDK on libc's CI.
+    //
+    // One struct up, that hazard is not hypothetical: `darwin-libproc-sys` 0.2.0
+    // declares `vnode_info` as `vi_stat, vi_type, vi_fsid, vi_pad` where the header has
+    // `vi_stat, vi_type, vi_pad, vi_fsid`. Same 152 bytes, different offset for
+    // `vi_fsid` - invisible to a size assert. It is one reason libc's declaration is
+    // the one used here and no `libproc` wrapper crate is.
+    //
+    // One item each, and not one block: a const block stops at its first failure, and
+    // what an operator on a Mac wants from a broken build is every number that moved.
+    const _: () = assert!(size_of::<ProcFileInfo>() == 24);
+    const _: () = assert!(size_of::<libc::vinfo_stat>() == 136);
+    const _: () = assert!(size_of::<libc::vnode_info>() == 152);
+    const _: () = assert!(size_of::<libc::vnode_info_path>() == 1176);
+    const _: () = assert!(size_of::<VnodeFdInfoWithPath>() == 1200);
+    const _: () = assert!(std::mem::offset_of!(VnodeFdInfoWithPath, pvip) == 24);
+    const _: () = assert!(std::mem::offset_of!(libc::vnode_info_path, vip_path) == 152);
 }
-
-#[cfg(target_os = "macos")]
-#[allow(dead_code)]
-#[repr(C)]
-struct VnodeFdInfoWithPath {
-    pfi: ProcFileInfo,
-    pvip: libc::vnode_info_path,
-}
-
-// The layout, checked by the compiler that will build for the Mac. These numbers
-// are the header's, and a build that disagrees with any one of them does not
-// produce a binary - which is the whole of what stands in for running this
-// anywhere. They are not vacuous: adding one spurious `u32` to `ProcFileInfo` here
-// fails THREE of them - `ProcFileInfo`'s size, `VnodeFdInfoWithPath`'s size and
-// `pvip`'s offset - identically on both Apple targets. Three failed asserts, and
-// four lines beginning `error`, because cargo appends its own summary line. The
-// number that means something is the three, and this comment said four until the
-// control was re-run and counted.
-//
-// `vip_path`'s offset is asserted too, because the path is read by flattening that
-// array: it must begin where the header puts it and run to the end of the struct,
-// which is 1176 - 152 = 1024 bytes, `MAXPATHLEN`.
-//
-// WHAT THESE CANNOT CATCH, exactly rather than roughly, because a limit described
-// loosely is worse than one described plainly. `ProcFileInfo` is four 32-bit fields
-// and one `off_t`, and `off_t`'s 8-byte alignment pins it to offset 8 - so ANY
-// permutation of `fi_openflags`, `fi_status`, `fi_type` and `fi_guardflags` leaves
-// every size and offset here unchanged and every assert green. Measured rather than
-// argued: `fi_type` and `fi_guardflags` transposed produced zero diagnostics on
-// both Apple targets. That is survivable here and only here, because this reads
-// NOTHING out of `proc_fileinfo` - a swapped pair inside it has no consequence at
-// all. What it reads is `pvip`, whose offset is asserted, and inside it `vip_path`,
-// whose offset is asserted, in a struct that is libc's own and is checked against
-// Apple's real SDK on libc's CI.
-//
-// One struct up, that hazard is not hypothetical: `darwin-libproc-sys` 0.2.0
-// declares `vnode_info` as `vi_stat, vi_type, vi_fsid, vi_pad` where the header has
-// `vi_stat, vi_type, vi_pad, vi_fsid`. Same 152 bytes, different offset for
-// `vi_fsid` - invisible to a size assert. It is one reason libc's declaration is
-// the one used here and no `libproc` wrapper crate is.
-//
-// One item each, and not one block: a const block stops at its first failure, and
-// what an operator on a Mac wants from a broken build is every number that moved.
-#[cfg(target_os = "macos")]
-const _: () = assert!(size_of::<ProcFileInfo>() == 24);
-#[cfg(target_os = "macos")]
-const _: () = assert!(size_of::<libc::vinfo_stat>() == 136);
-#[cfg(target_os = "macos")]
-const _: () = assert!(size_of::<libc::vnode_info>() == 152);
-#[cfg(target_os = "macos")]
-const _: () = assert!(size_of::<libc::vnode_info_path>() == 1176);
-#[cfg(target_os = "macos")]
-const _: () = assert!(size_of::<VnodeFdInfoWithPath>() == 1200);
-#[cfg(target_os = "macos")]
-const _: () = assert!(std::mem::offset_of!(VnodeFdInfoWithPath, pvip) == 24);
-#[cfg(target_os = "macos")]
-const _: () = assert!(std::mem::offset_of!(libc::vnode_info_path, vip_path) == 152);
 
 /// `$CLAUDE_PID` as a pid: 1-10 ASCII digits, canonical, and nothing else. The
 /// `/proc` body needs no such thing - a bad name is a failed `read_link` - but a
