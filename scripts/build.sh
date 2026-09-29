@@ -4,11 +4,15 @@
 #   sh scripts/build.sh                 the host target
 #   sh scripts/build.sh --all           every target listed in TARGETS
 #
+# On Windows it runs under Git Bash (the sh Claude Code already requires there).
+#
 # bin/ holds a binary per platform, plus bin/tabstatus, a relative
 # symlink to the one for this machine - that is the binary you RUN to install,
-# so a user needs no toolchain. It is not the path hooks.json invokes: install
-# copies it into the generated plugin tree, and hooks.json invokes the copy
-# there, so a git checkout cannot change what a running session executes.
+# so a user needs no toolchain. On Windows it is bin/tabstatus.exe, a COPY: a
+# symlink needs Developer Mode or elevation there, and Git Bash resolves
+# ./bin/tabstatus to the .exe anyway. It is not the path hooks.json invokes:
+# install copies it into the generated plugin tree, and hooks.json invokes the
+# copy there, so a git checkout cannot change what a running session executes.
 #
 # bin/ is gitignored build output; binaries ship as GitHub release assets.
 # bin/sources.sha256 and bin/sources.cksum are the staleness guard. Git does not
@@ -47,23 +51,30 @@ if [ -z "$CARGO" ]; then
     fi
 fi
 
-# musl, not gnu, and deliberately so. Measured on this machine, best-of-N with a
+# On Linux the host is musl, not gnu, and deliberately so. Measured, best-of-N with a
 # 319us exec floor: musl static-pie 211us, glibc dynamic 528us - the static build
 # beats even /bin/true, because it never enters ld.so. It also drops a hard
 # GLIBC_2.34 requirement, which matters because the binary's main home is a remote
 # Linux box reached over ssh whose glibc we do not control: a gnu build simply
 # refuses to start on an older distro.
-host=x86_64-unknown-linux-musl
-
-# Only targets that actually COMPILE. x86_64-pc-windows-gnu is deliberately not
-# here: the source is Unix-only by construction (std::os::unix, /proc, symlinks,
-# character devices) and does not compile for it at all - measured, 53 errors
-# across six source files. Listing it made `sh scripts/build.sh --all`, one of the
-# two commands the README documents, exit 1 on every run even when the host build
-# had succeeded, so the documented release step was permanently red and useless as
-# a success signal. Windows is a port, not a cross-compile; README's Build table
-# says so.
-TARGETS="x86_64-unknown-linux-musl x86_64-unknown-linux-gnu"
+#
+# Only targets that actually build ON THIS HOST, so `--all` is a success signal:
+# a target that cannot build here would make it exit 1 on every run. Windows is a
+# native port behind src/sys, built with the MSVC toolchain on Windows and not
+# cross-compiled from Linux, so each host lists only its own family. MSVC, not
+# windows-gnu: it is rustup's default there and needs no mingw, and
+# .cargo/config.toml links its C runtime statically, so the .exe does not need
+# the Visual C++ Redistributable.
+case $(uname -s) in
+MINGW* | MSYS* | CYGWIN* | Windows_NT)
+    host=x86_64-pc-windows-msvc
+    TARGETS=$host
+    ;;
+*)
+    host=x86_64-unknown-linux-musl
+    TARGETS="x86_64-unknown-linux-musl x86_64-unknown-linux-gnu"
+    ;;
+esac
 
 build_one() {
     _t=$1
@@ -71,15 +82,19 @@ build_one() {
     # Always --target, even for the host: musl is a cross-target on a glibc box,
     # and routing every build the same way keeps the output path predictable.
     ${CARGO} build --locked --release --target "$_t" || return 1
-    _out=target/$_t/release/tabstatus
-    [ -f "$_out" ] || _out=target/$_t/release/tabstatus.exe
+    # Where cargo put it: CARGO_TARGET_DIR moves the whole tree.
+    _out=${CARGO_TARGET_DIR:-target}/$_t/release/tabstatus
+    [ -f "$_out" ] || _out=$_out.exe
     case $_t in
     *windows*) _name=tabstatus-$_t.exe ;;
     *) _name=tabstatus-$_t ;;
     esac
-    mkdir -p bin
-    cp -f "$_out" "bin/$_name"
-    chmod 755 "bin/$_name"
+    # Every step returns on failure: the caller runs this on the left of ||,
+    # which suspends set -e in here, and a copy that failed silently would leave
+    # the previous binary in bin/ with a fresh manifest vouching for it.
+    mkdir -p bin || return 1
+    cp -f "$_out" "bin/$_name" || return 1
+    chmod 755 "bin/$_name" || return 1
     printf 'bin/%s  %s bytes\n' "$_name" "$(wc -c <"bin/$_name")"
 }
 
@@ -94,8 +109,18 @@ for t in $list; do
 done
 
 # bin/tabstatus -> the host binary, as a RELATIVE link so moving the checkout
-# does not break it.
-ln -sfn "tabstatus-$host" bin/tabstatus
+# does not break it. On Windows a copy named bin/tabstatus.exe instead, see the
+# top of this file - refreshed only when the host build succeeded, so a failed
+# build cannot leave it pointing at nothing.
+case $host in
+*windows*)
+    case " $failed " in
+    *" $host "*) ;;
+    *) cp -f "bin/tabstatus-$host.exe" bin/tabstatus.exe ;;
+    esac
+    ;;
+*) ln -sfn "tabstatus-$host" bin/tabstatus ;;
+esac
 
 # The staleness manifests. Sorted by path so the file is stable, and listing
 # exactly the inputs a rebuild depends on - which now includes the two manifests,
@@ -104,8 +129,10 @@ ln -sfn "tabstatus-$host" bin/tabstatus
 # JSON re-triggers a compile), and this is the layer that covers what rustc cannot:
 # a PREBUILT binary, already copied into bin/ or uploaded as a release asset, going
 # stale against an edited hooks.json without anyone rebuilding. tests/run.sh
-# recomputes this exact list, so both spellings must stay in the same order.
-sources="Cargo.toml Cargo.lock .claude-plugin/plugin.json hooks/hooks.json $(ls src/*.rs | sort)"
+# recomputes this exact list, so both spellings must stay in the same order. Every
+# .rs under src/, src/sys/ included, and .cargo/config.toml, which sets the
+# Windows binary's rustflags, when there is one.
+sources="Cargo.toml Cargo.lock .claude-plugin/plugin.json hooks/hooks.json $(ls .cargo/config.toml 2>/dev/null) $(find src -type f -name '*.rs' | LC_ALL=C sort)"
 have_sha256=
 command -v sha256sum >/dev/null 2>&1 && have_sha256=yes
 for t in $list; do

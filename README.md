@@ -1930,13 +1930,22 @@ Binaries ship as **GitHub release assets** rather than in git history, so that
 installing needs no toolchain. The [Test workflow](.github/workflows/test.yml)
 builds both Linux targets and runs Rust unit tests, the shell integration suite
 (including tmux), the semantic state traces and persistence checks, and the golden
-corpus on every branch push and pull request.
+corpus on every branch push and pull request. A second job on a Windows runner
+builds `x86_64-pc-windows-msvc` natively, runs the Rust unit tests there
+(including the Windows-only ConPTY, lock and junction tests), checks that the
+`.exe` imports no Visual C++ runtime DLL, and runs the Python suites that work on
+native Windows Python: `test_payload`, `test_state_contract`, `test_background`
+and `test_elicitation`. `tests/run.sh`, the golden corpus, `test_state_guarantees`
+and `test_tmux_status` assume a Unix userland (`fcntl`, tmux) and run on Linux only.
 The tested binaries are also available as workflow artifacts.
 
 Pushing a Git tag runs the [Release workflow](.github/workflows/release.yml).
 It runs the same checks on the tagged commit, then creates a GitHub release with
-`tabstatus-x86_64-unknown-linux-musl`, `tabstatus-x86_64-unknown-linux-gnu`, and
-`SHA256SUMS` attached. For example, after updating the package and plugin versions
+`tabstatus-x86_64-unknown-linux-musl`, `tabstatus-x86_64-unknown-linux-gnu`,
+`tabstatus-x86_64-pc-windows-msvc.exe` (unsigned), and one `SHA256SUMS` covering
+all three attached. Only binaries that passed the Test workflow are published: each
+is checked against the digest its own test job recorded, and `SHA256SUMS` is those
+recorded lines. For example, after updating the package and plugin versions
 and committing the changes, push `v0.1.0` with `git tag v0.1.0` followed by
 `git push origin v0.1.0`. All tag names trigger a release; use a new tag for each
 release. macOS support is tracked in [issue #1](https://github.com/dalf/claude-tabstatus/issues/1).
@@ -1944,11 +1953,24 @@ release. macOS support is tracked in [issue #1](https://github.com/dalf/claude-t
 After downloading a binary and `SHA256SUMS` from the same release, verify it with
 `sha256sum --check --ignore-missing SHA256SUMS` and make it executable with
 `chmod +x tabstatus-x86_64-unknown-linux-musl` (adjust the name for the GNU build).
+The same command works in Git Bash for the Windows `.exe`; in PowerShell, compare
+`(Get-FileHash tabstatus-x86_64-pc-windows-msvc.exe).Hash` with its line in
+`SHA256SUMS`. The `.exe` is not code-signed, so SmartScreen may warn on first run.
 
 ```sh
 sh scripts/build.sh          # the host target, refresh bin/ and its digests
-sh scripts/build.sh --all    # every target in the list
+sh scripts/build.sh --all    # every target in this host's list
 ```
+
+On Windows, run both under **Git Bash**. The host there is
+`x86_64-pc-windows-msvc`, `--all` builds just that one, and `bin/tabstatus.exe`
+is a **copy** of `bin/tabstatus-x86_64-pc-windows-msvc.exe` rather than a symlink,
+because a symlink needs Developer Mode or elevation; Git Bash runs
+`./bin/tabstatus` as that `.exe`. [`.cargo/config.toml`](.cargo/config.toml) links
+the C runtime statically for that target (`+crt-static`), so a local build is the
+same binary CI tests and needs no Visual C++ Redistributable. A `RUSTFLAGS`
+environment variable replaces that setting, so leave it unset when building one
+to hand out.
 
 **Serde and serde_json parse hook metadata**, without enabling `serde_derive`.
 `Cargo.lock` pins their dependency graph and release builds use `--locked`.
@@ -1970,17 +1992,14 @@ triple's binary behind while a verify read fully green.
 |---|---|
 | `x86_64-unknown-linux-musl` | **default**, static-pie |
 | `x86_64-unknown-linux-gnu` | builds |
-| `x86_64-pc-windows-gnu` | **does not build**, see below |
+| `x86_64-pc-windows-msvc` | **default on Windows**, static CRT, built on Windows only |
 
-Windows is deliberately **not** in the build script's target list. The target and
-its mingw linker are both installed here and the failure is not theirs: the source
-is Unix-only by construction. Measured, it is 53 compile errors across six source
-files, every one a `std::os::unix` error - byte-oriented paths (`OsStrExt`), file
-modes, symlinks, and the `/proc/$CLAUDE_PID/fd/1` lookup the two direct-write edges
-need. Windows has no byte paths at all (its `OsString` is WTF-16), so this is a
-port, not a cross-compile, and it is not faked with an untested `.exe`. Listing it
-made `sh scripts/build.sh --all` exit 1 on every run even when the host build had
-succeeded, which made the documented release step useless as a success signal.
+Each host lists only the targets it can build, so `sh scripts/build.sh --all` stays
+a success signal: on Linux it is exactly the two Linux targets, on Windows the one
+MSVC target. Windows is a native port behind `src/sys`, not a cross-compile, so it
+is built and tested on Windows - CI does not ship an `.exe` a Windows machine never
+ran. `x86_64-pc-windows-gnu` is not a target: MSVC is rustup's default on Windows
+and needs no mingw.
 
 **On a platform with no committed binary**, build one *before* installing:
 
@@ -2109,7 +2128,7 @@ excluding outer-title escape sequences so they cannot satisfy the assertion.
 Each test uses a unique socket and isolated configuration directories.
 
 Two of the assertions exist only to guard the committed binaries: `bin/` carries
-a digest including `src/*.rs`, `Cargo.toml` and `Cargo.lock` it was built from, *per triple built*
+a digest including every `.rs` under `src/` (`src/sys/` too), `Cargo.toml`, `Cargo.lock` and `.cargo/config.toml` it was built from, *per triple built*
 plus an unsuffixed copy for the host, and the suite recomputes it. The per-triple
 split matters: one manifest written for all sources after building only the host left
 the other triple's binary silently behind while `sha256sum -c` read fully green. Git does not preserve mtimes, so "is the binary older than the

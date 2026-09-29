@@ -24,15 +24,34 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download tested binaries
+      - name: Download tested Linux binaries
         uses: actions/download-artifact@v8
         with:
           name: linux-binaries
-          path: dist
+          path: artifacts/linux
 
-      - name: Verify binary checksums
-        working-directory: dist
-        run: sha256sum --check SHA256SUMS
+      - name: Download tested Windows binary
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-binaries
+          path: artifacts/windows
+
+      # Each artifact is checked against the SHA256SUMS written by the job that
+      # tested it, so a corrupted download fails here. The published SHA256SUMS
+      # is those same lines joined, never a digest recomputed from what arrived,
+      # and it is checked once more against the files that are published.
+      - name: Verify and merge binary checksums
+        run: |
+          (cd artifacts/linux && sha256sum --check --strict SHA256SUMS)
+          (cd artifacts/windows && sha256sum --check --strict SHA256SUMS)
+          mkdir dist
+          cp artifacts/linux/tabstatus-x86_64-unknown-linux-musl \
+            artifacts/linux/tabstatus-x86_64-unknown-linux-gnu \
+            artifacts/windows/tabstatus-x86_64-pc-windows-msvc.exe \
+            dist/
+          cat artifacts/linux/SHA256SUMS artifacts/windows/SHA256SUMS > dist/SHA256SUMS
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+          test "$(wc -l < dist/SHA256SUMS)" -eq 3
 
       - name: Create GitHub release
         env:
@@ -46,4 +65,5 @@ jobs:
             --title "$RELEASE_TAG" \
             dist/tabstatus-x86_64-unknown-linux-musl \
             dist/tabstatus-x86_64-unknown-linux-gnu \
+            dist/tabstatus-x86_64-pc-windows-msvc.exe \
             dist/SHA256SUMS

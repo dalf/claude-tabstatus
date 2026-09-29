@@ -1402,7 +1402,7 @@ check 'bin/tabstatus exists and is executable' 'yes' \
     "$([ -x "$repo/bin/tabstatus" ] && printf yes)"
 check 'bin/tabstatus resolves to a committed platform binary' 'yes' \
     "$(_t=$(readlink "$repo/bin/tabstatus") && [ -f "$repo/bin/$_t" ] && printf yes)"
-_sources="Cargo.toml Cargo.lock .claude-plugin/plugin.json hooks/hooks.json $(cd -- "$repo" && ls src/*.rs | sort)"
+_sources="Cargo.toml Cargo.lock .claude-plugin/plugin.json hooks/hooks.json $(cd -- "$repo" && { ls .cargo/config.toml 2>/dev/null; find src -type f -name '*.rs' | LC_ALL=C sort; })"
 if command -v sha256sum >/dev/null 2>&1 && [ -f "$repo/bin/sources.sha256" ]; then
     check 'the committed binaries are not stale (sha256 of src/ and Cargo.toml)' '' \
         "$(cd -- "$repo" && sha256sum $_sources | diff - bin/sources.sha256)"
