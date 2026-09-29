@@ -23,6 +23,7 @@ carries the management verbs (`install`, `uninstall`, `doctor`, `version`,
 | `src/text.rs` | the crossing from filesystem bytes to display text (`repair`) |
 | `src/render.rs` | `compose`: length cap, ssh prefix, JSON-safety pass, glyph placement, in that order |
 | `src/emit.rs` | delivery: `terminalSequence` JSON, raw OSC to a pane pty, or a console title |
+| `src/support.rs` | one vocabulary for absence: `Support<T>` says available, unsupported, disabled by a knob of ours, unverifiable or failed, each with the reason a user can act on |
 | `src/tmux.rs` | the tmux integration: the record, `set-titles-string`, window-status formats, restore |
 | `src/manage.rs` | all management verbs: `install`, `uninstall`, `doctor`, `version`, `tmux-format`, `tmux-arm`, `print-embedded`, `help` |
 | `src/tree.rs` | the generated plugin tree that `install` materialises and Claude Code loads |

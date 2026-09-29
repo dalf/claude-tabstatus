@@ -48,6 +48,7 @@ mod payload;
 mod render;
 mod settings;
 mod state;
+mod support;
 mod sys;
 mod text;
 mod tmux;
