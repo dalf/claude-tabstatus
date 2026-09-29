@@ -78,21 +78,6 @@ pub fn is_line_end(b: u8) -> bool {
     b == b'\n'
 }
 
-/// The file the kernel publishes its host name in, read without a fork.
-#[cfg(not(target_os = "macos"))]
-pub fn kernel_hostname_file() -> Option<&'static Path> {
-    Some(Path::new("/proc/sys/kernel/hostname"))
-}
-
-/// No file publishes it here: macOS has no `/proc`, and `kern.hostname` is a
-/// `sysctl` and not a path. `None` sends [`crate::location::hostname`] straight on
-/// to `$HOSTNAME` and then to `hostname(1)`, which is where it arrived anyway -
-/// one guaranteed-failing `open` later.
-#[cfg(target_os = "macos")]
-pub fn kernel_hostname_file() -> Option<&'static Path> {
-    None
-}
-
 /// Whether a resolved gitdir, `GIT_DIR` or `HEAD` path may be handed to the
 /// filesystem call that probes it. Always yes on Unix: a path is just a path, there
 /// is no network share a bare `stat` can reach and so no credential to leak, and the
@@ -176,6 +161,21 @@ pub const RUNTIME_DIR_VAR: &str = "TMPDIR";
 pub const NO_STATE_DIR: &str = "no CCTAB_STATE_DIR and no XDG_RUNTIME_DIR";
 #[cfg(target_os = "macos")]
 pub const NO_STATE_DIR: &str = "no CCTAB_STATE_DIR and no TMPDIR";
+
+/// The file the kernel publishes its host name in, read without a fork.
+#[cfg(not(target_os = "macos"))]
+pub fn kernel_hostname_file() -> Option<&'static Path> {
+    Some(Path::new("/proc/sys/kernel/hostname"))
+}
+
+/// No file publishes it here: macOS has no `/proc`, and `kern.hostname` is a
+/// `sysctl` and not a path. `None` sends [`crate::location::hostname`] straight on
+/// to `$HOSTNAME` and then to `hostname(1)`, which is where it arrived anyway -
+/// one guaranteed-failing `open` later.
+#[cfg(target_os = "macos")]
+pub fn kernel_hostname_file() -> Option<&'static Path> {
+    None
+}
 
 /// The permission bits, `0o7777`-masked.
 pub fn mode(m: &Metadata) -> Option<u32> {
