@@ -35,6 +35,19 @@ pub fn flag(key: &str) -> bool {
     var_nonempty(key).is_some()
 }
 
+/// Whether this session arrived over an ssh hop.
+///
+/// ONE definition, used by both the host prefix and [`Terminal::detect`], because
+/// the two have to agree: a report that withheld the Konsole verdict as
+/// unknowable-over-ssh while the title beside it painted no host prefix would be
+/// contradicting itself on the same page, and whichever of the two a later reader
+/// believed would be a coin toss. `sshd` sets `SSH_CONNECTION` for every session
+/// and `SSH_TTY` only when it allocated a pty, so either one alone is enough and
+/// neither is redundant.
+pub fn over_ssh() -> bool {
+    flag("SSH_CONNECTION") || flag("SSH_TTY")
+}
+
 /// `${VAR-default}` as display text: the default applies only to an UNSET
 /// variable, and anything set is repaired rather than rejected.
 fn var_or(key: &str, default: &str) -> String {
@@ -51,11 +64,26 @@ fn var_or(key: &str, default: &str) -> String {
 /// was first started under Konsole, so inside a multiplexer those variables say
 /// nothing about the terminal actually drawing the tab.
 ///
+/// `SSH_*` takes out the other one, and for a reason worth stating rather than
+/// assuming. `KONSOLE_*` does not normally cross a hop - OpenSSH accepts no
+/// environment by default at either end - so over ssh the variables are usually
+/// absent and `CCTAB_TERMINAL` is already the answer. When they DO arrive, from a
+/// deliberate `SendEnv`/`AcceptEnv` pair or from a remote rc, nothing here can
+/// tell those two apart: the first is a statement about this hop, the second a
+/// statement about nothing. Trusting them anyway would make the rare case behave
+/// unlike the common one, and it is the case where being wrong actually lands -
+/// outside tmux the Konsole verdict writes OSC 50 STRAIGHT to the pty, and OSC 50
+/// is xterm's SET FONT. Konsole's own header concedes the clash. So a terminal
+/// identity that crossed a host boundary is not evidence here, which is the same
+/// rule the in-tmux case already follows by proving ownership instead.
+///
 /// `CCTAB_TERMINAL` overrides all of it, and is the only honest signal in the
-/// topology this exists for: ssh does not forward `KONSOLE_*`, so a session
-/// reached over ssh from a Konsole tab - inside tmux or not - has nothing to
-/// detect. `konsole` names it; any other value says explicitly that it is NOT
-/// Konsole, which is how a false positive from a leaked `KONSOLE_*` is turned off.
+/// topology this exists for: over ssh there is nothing to detect - Konsole's DBus
+/// is unreachable from the remote, and the one probe that would be proof,
+/// `XTVERSION` on the pty, cannot be read by a hook without stealing bytes from
+/// the TUI that owns that pty. `konsole` names it; any other value says
+/// explicitly that it is NOT Konsole, which is how a false positive from a leaked
+/// `KONSOLE_*` is turned off.
 ///
 /// It is the one knob in this file that changes what paints OUTSIDE tmux as well
 /// as in, which is why it is opt-in and why the name is matched case-INSENSITIVELY
@@ -85,6 +113,7 @@ impl Terminal {
         }
         if !flag("TMUX")
             && !flag("STY")
+            && !over_ssh()
             && (flag("KONSOLE_VERSION") || flag("KONSOLE_DBUS_SESSION"))
         {
             Terminal::Konsole
@@ -225,7 +254,7 @@ impl Config {
                 DEFAULT_MAX_HOST,
                 MIN_MAX_HOST,
             ),
-            ssh: flag("SSH_CONNECTION") || flag("SSH_TTY"),
+            ssh: over_ssh(),
             host_override: var_nonempty("CCTAB_HOST"),
             hostname_env: var("HOSTNAME"),
             home: var_nonempty("HOME").as_deref().and_then(home_dir),

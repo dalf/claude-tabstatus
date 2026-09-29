@@ -2387,9 +2387,15 @@ fn report_runtime() {
         ""
     };
     let konsole = Terminal::detect() == Terminal::Konsole;
-    // The REASON matters more than the answer, because there are now three of
-    // them and they disagree: an explicit CCTAB_TERMINAL, inherited KONSOLE_*,
-    // and a multiplexer that makes the inherited kind meaningless.
+    // The SAME predicate `Terminal::detect` suppresses on and the host prefix is
+    // painted from, not a third reading of SSH_CONNECTION and SSH_TTY here: a
+    // report that called the verdict unknowable-over-ssh while the title: line
+    // below painted no host prefix would contradict itself on one page.
+    let ssh = config::over_ssh();
+    // The REASON matters more than the answer, because there are now four of them
+    // and they disagree: an explicit CCTAB_TERMINAL, inherited KONSOLE_*, a
+    // multiplexer that makes the inherited kind meaningless, and an ssh hop that
+    // makes it describe somebody else's terminal.
     let override_ = config::var_nonempty("CCTAB_TERMINAL");
     say(&format!(
         "terminal:  {}",
@@ -2407,28 +2413,30 @@ fn report_runtime() {
                 "inside a multiplexer, so the inherited KONSOLE_* is ignored - set \
                  CCTAB_TERMINAL=konsole if the outer terminal really is Konsole"
                     .to_owned(),
-            (None, false, true, true) => "KONSOLE_* set".to_owned(),
+            // Reachable ONLY over ssh, and provably so rather than by inspection:
+            // with no override, `detect` returns Konsole exactly when there is no
+            // multiplexer, no ssh and a KONSOLE_* - and this arm already has the
+            // first and third, so the hop is the only suppressor left. It was dead
+            // code until ssh became one.
+            (None, false, true, true) =>
+                "not Konsole: KONSOLE_* is set, but it crossed an ssh hop, so it \
+                 describes the terminal it came FROM, not this tab"
+                    .to_owned(),
             (None, false, false, _) =>
                 "not Konsole (no CCTAB_TERMINAL, no KONSOLE_VERSION, no \
                  KONSOLE_DBUS_SESSION)"
                     .to_owned(),
         }
     ));
-    // The ssh fact is ASKED of Config rather than re-derived from SSH_CONNECTION
-    // and SSH_TTY here: a doctor that disagreed with the host prefix the title:
-    // line below paints from that same field would be worse than saying
-    // nothing. Config::from_env() is env reads only - Tmux::detect() parses $TMUX
-    // and execs nothing - and doctor builds two more of them below.
-    let ssh = Config::from_env().ssh;
     // KONSOLE_* is inherited environment, and two topologies leave the verdict
     // above resting on nothing: inside a multiplexer it describes whichever
-    // terminal started the SERVER, and over ssh it is not forwarded - no stock
-    // ssh config sends it - so its absence there is silence, not a verdict. One
-    // that a SendEnv or a remote rc DID set is taken at its word, by the
-    // !konsole term below. LOCALLY and outside a multiplexer an absent
-    // KONSOLE_* IS the evidence, so that case says nothing: a Konsole hint in
-    // every xterm, Alacritty and GNOME Terminal tab is the noise that teaches
-    // people to skim the report.
+    // terminal started the SERVER, and over ssh it describes the terminal at the
+    // OTHER end of the hop - when it arrives at all, which by default it does
+    // not, since OpenSSH accepts no environment at either end. Either way the
+    // answer there comes from CCTAB_TERMINAL or not at all. LOCALLY and outside a
+    // multiplexer an absent KONSOLE_* IS the evidence, so that case says nothing:
+    // a Konsole hint in every xterm, Alacritty and GNOME Terminal tab is the
+    // noise that teaches people to skim the report.
     //
     // Both end at the same remedy, so only the line naming the situation differs.
     // An explicit CCTAB_TERMINAL has already answered the question - offering it
@@ -2443,10 +2451,16 @@ fn report_runtime() {
         ));
         unknowable
     } else if unknowable && ssh {
-        say(
-            "           ssh: KONSOLE_* does not survive the hop, so its absence \
-             here is no evidence",
-        );
+        // An ABSENT KONSOLE_* needs this line, because the verdict above can only
+        // list what is missing and that reads like a conclusion. A PRESENT one
+        // already got its explanation in the verdict itself, and saying it twice
+        // reads as two separate problems.
+        if !konsole_vars {
+            say(
+                "           ssh: KONSOLE_* does not survive the hop, so its absence \
+                 here is no evidence",
+            );
+        }
         true
     } else {
         false
