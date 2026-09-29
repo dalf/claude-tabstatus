@@ -600,6 +600,27 @@ ssh vm 'chmod +x ~/tabstatus && ~/tabstatus install && ~/tabstatus doctor'
 The build step is temporary: binaries are not committed, and will ship as
 GitHub release assets so that installing needs no toolchain.
 
+**On native Windows** it is the same verb, `tabstatus.exe install`, and the plugin
+link is a directory **junction** rather than a symlink - so it needs neither
+Developer Mode nor an elevated shell. `install` makes and removes a probe junction
+before its first write, so a volume that cannot hold one is refused with nothing
+changed. The tree's binary is `bin\tabstatus.exe`; `hooks.json` still names
+`.../bin/tabstatus`, and Git Bash - which Claude Code requires on Windows and runs
+hooks through - resolves that to the `.exe`. Two mechanics are weaker than on
+Unix, and are said rather than hidden. Windows will not replace a program while it
+runs, so a re-install during a hook renames the running binary aside first: there
+are two renames' worth of time with no `bin\tabstatus.exe`, and the aside copy is
+named when it is made and deleted - and named again - by a later `install` or
+`uninstall` once nothing runs it. Repointing the junction is one rename on NTFS,
+atomic as on Unix; only a filesystem that refuses that falls back to the same
+rename-aside. `uninstall` run *by the tree's own binary* is refused, because that
+file cannot be deleted while it runs - run it from another copy, or pass
+`--keep-tree`; and an `uninstall` that meets a hook running it names the file it
+could not remove and keeps the tree's marker, so a later `install` still reuses the
+tree. Paths are compared the way NTFS compares them - any letter case, an 8.3 short
+name or a `\\?\` prefix is the same directory - and a removal hint is a PowerShell
+`Remove-Item -Recurse -Force -LiteralPath '...'` rather than `rm -rf`.
+
 ### The plugin directory is build output
 
 **`install` never links your checkout. It writes a plugin directory and links

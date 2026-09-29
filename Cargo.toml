@@ -17,6 +17,14 @@ publish = false
 serde = "1"
 serde_json = "1"
 
+# Windows only: DeviceIoControl, to make the plugin link a directory junction.
+# std can make only a symlink, which Windows refuses without Developer Mode or
+# elevation. Storage_FileSystem for the rest of that link's mechanics and for path
+# identity: a no-replace rename, the drive type, and a directory's stored spelling
+# of a name. Declarations only; no Unix build sees this crate.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO"] }
+
 [[bin]]
 name = "tabstatus"
 path = "src/main.rs"

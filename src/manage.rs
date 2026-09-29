@@ -12,6 +12,11 @@
 //!   3. a symlink  <config>/skills/claude-tabstatus -> that tree
 //!   4. a record   <config>/claude-tabstatus.state -> the prior state, and the tree
 //!
+//! On Windows the link in 3 is a directory JUNCTION (`sys::link_dir`): a directory
+//! symlink there needs Developer Mode or elevation, a junction needs neither, and std
+//! reads either back as a symlink - so below, "symlink" means whichever the platform
+//! made, and every report line says which through `sys::DIR_LINK`.
+//!
 //! THE PLUGIN DIRECTORY IS BUILD OUTPUT, like `bin/`. It is materialised from the
 //! manifests compiled into this binary (`src/embedded.rs`), never symlinked to a
 //! checkout, and `src/tree.rs` carries why: when the checkout WAS the plugin
@@ -32,7 +37,12 @@
 //!
 //! And the symlink is repointed with rename(2), not unlink-then-symlink. Hooks fire
 //! constantly; a path that resolves to nothing for even a moment is a hook exec'ing a
-//! missing file, and a non-zero PreToolUse hook BLOCKS A TOOL.
+//! missing file, and a non-zero PreToolUse hook BLOCKS A TOOL. On Windows the repoint
+//! goes through `sys::replace_dir_link`: one rename on NTFS, atomic like this one, and
+//! where a filesystem refuses that, a rename-aside sequence with a window of two
+//! renames that no ordering here can close - the seam documents it. What Windows CAN
+//! always do is fail early: the install preflight makes and removes a probe junction,
+//! so a volume that refuses one refuses it before settings.json is touched.
 //!
 //! CLAUDE_CONFIG_DIR overrides the config directory, which is how the tests
 //! point all of this at a throwaway tree instead of a real one.
@@ -42,12 +52,10 @@ use crate::settings::{self, Outcome};
 use crate::tree;
 use crate::config::{self, Config, Terminal};
 use crate::edge::{Glyph, Paint};
-use crate::{json, render, state, tmux};
+use crate::{json, render, state, sys, tmux};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 const KEY: &str = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE";
@@ -66,7 +74,7 @@ enum Flag {
 
 impl Flag {
     fn parse(a: &OsStr) -> Option<Flag> {
-        match a.as_bytes() {
+        match a.as_encoded_bytes() {
             b"--force" => Some(Flag::Force),
             b"--restore-backup" => Some(Flag::RestoreBackup),
             b"--keep-tree" => Some(Flag::KeepTree),
@@ -114,7 +122,7 @@ pub enum Subcommand {
     /// tab instead of one governed by Konsole's `RemoteTabTitleFormat`.
     ///
     /// The argument is `None` only when a human typed the verb with nothing after
-    /// it; the guard on the path itself is `emit::tty_write`.
+    /// it; the guard on the path itself is `sys::write_tty`.
     TmuxArm(Option<OsString>),
     Version,
     Help,
@@ -138,7 +146,7 @@ impl Subcommand {
     /// `session-end` - so no hook can reach this half, and no typo of a subcommand
     /// can reach the paint path carrying a real edge's name.
     pub fn parse(first: Option<&OsStr>, rest: &[OsString]) -> Option<Subcommand> {
-        Some(match first?.as_bytes() {
+        Some(match first?.as_encoded_bytes() {
             b"install" => install_options(rest),
             b"uninstall" => uninstall_options(rest),
             // These three take no options and IGNORE any argument given, which is
@@ -209,7 +217,7 @@ impl Subcommand {
             Subcommand::BadOption(arg) => {
                 fail(&format!(
                     "unknown option {}",
-                    String::from_utf8_lossy(arg.as_bytes())
+                    String::from_utf8_lossy(arg.as_encoded_bytes())
                 ));
                 1
             }
@@ -233,7 +241,7 @@ fn install_options(rest: &[OsString]) -> Subcommand {
     while let Some(arg) = it.next() {
         if matches!(Flag::parse(arg), Some(Flag::Tree)) {
             match it.next() {
-                Some(d) if !d.is_empty() && !d.as_bytes().starts_with(b"-") => {
+                Some(d) if !d.is_empty() && !d.as_encoded_bytes().starts_with(b"-") => {
                     tree = Some(d.clone())
                 }
                 // A mistyped flag must not be silently taken as a directory name and
@@ -242,7 +250,7 @@ fn install_options(rest: &[OsString]) -> Subcommand {
                     return Subcommand::BadUsage(format!(
                         "--tree takes the directory to write the plugin tree into, and \
                          {:?} is not one",
-                        String::from_utf8_lossy(d.as_bytes())
+                        String::from_utf8_lossy(d.as_encoded_bytes())
                     ))
                 }
                 None => {
@@ -256,7 +264,7 @@ fn install_options(rest: &[OsString]) -> Subcommand {
             continue;
         }
         // Every other option, real or mistyped, is one install does not accept.
-        if arg.as_bytes().starts_with(b"-") {
+        if arg.as_encoded_bytes().starts_with(b"-") {
             return Subcommand::BadOption(arg.clone());
         }
         // A bare path. `standalone <dir>` took one; install spells it out, so muscle
@@ -264,7 +272,7 @@ fn install_options(rest: &[OsString]) -> Subcommand {
         return Subcommand::BadUsage(format!(
             "install takes no bare directory. To choose where the plugin tree goes: \
              tabstatus install --tree {}",
-            String::from_utf8_lossy(arg.as_bytes())
+            String::from_utf8_lossy(arg.as_encoded_bytes())
         ));
     }
     Subcommand::Install { tree }
@@ -378,6 +386,10 @@ fn target_triple() -> &'static str {
         "x86_64-apple-darwin"
     } else if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
         "aarch64-apple-darwin"
+    } else if cfg!(all(target_arch = "x86_64", target_os = "windows", target_env = "msvc")) {
+        "x86_64-pc-windows-msvc"
+    } else if cfg!(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc")) {
+        "aarch64-pc-windows-msvc"
     } else {
         "unknown-target"
     }
@@ -403,12 +415,12 @@ enum TreeFrom {
 }
 
 impl TreeFrom {
-    fn why(self) -> &'static str {
+    fn why(self) -> String {
         match self {
-            TreeFrom::Explicit => "from --tree",
-            TreeFrom::Link => "from the plugin symlink",
-            TreeFrom::Record => "from the state record",
-            TreeFrom::Default => "the default path",
+            TreeFrom::Explicit => "from --tree".to_string(),
+            TreeFrom::Link => format!("from the plugin {}", sys::DIR_LINK),
+            TreeFrom::Record => "from the state record".to_string(),
+            TreeFrom::Default => "the default path".to_string(),
         }
     }
 }
@@ -447,7 +459,7 @@ fn config_dir() -> Result<PathBuf, String> {
         // Absolute, so that `<config>/skills` is comparable with the tree and every
         // path this half prints or records is the same path from any directory.
         Some(v) => absolute(&PathBuf::from(v)),
-        None => match config::var_nonempty("HOME") {
+        None => match config::home_var() {
             Some(home) => absolute(&PathBuf::from(home).join(".claude")),
             None => Err("neither CLAUDE_CONFIG_DIR nor HOME is set, so there \
                          is no config directory to work on"
@@ -471,6 +483,11 @@ fn config_dir() -> Result<PathBuf, String> {
 /// `fs::canonicalize` is the wrong tool: it resolves symlinks - which is what makes it
 /// right for settings.json and wrong here - and it FAILS on a path that does not exist
 /// yet, which the tree usually does not. So `..` and `.` are folded textually.
+///
+/// Before that, `sys::normalize` picks the ONE spelling this path is compared,
+/// printed and recorded by. Nothing on Unix; on Windows, where `\\?\C:\x`,
+/// `C:\X` and `C:\PROGRA~1`-style short names all name one directory, it is what keeps
+/// a re-install from reading its own live tree as an orphan.
 fn absolute(p: &Path) -> Result<PathBuf, String> {
     let abs = if p.is_absolute() {
         p.to_path_buf()
@@ -486,6 +503,7 @@ fn absolute(p: &Path) -> Result<PathBuf, String> {
             })?
             .join(p)
     };
+    let abs = sys::normalize(&abs);
     let mut out = PathBuf::new();
     for c in abs.components() {
         match c {
@@ -554,7 +572,7 @@ impl Ctx {
     /// legitimate ways to run `install`, and what must exist afterwards is the copy
     /// inside the tree.
     fn hook_binary(&self) -> PathBuf {
-        self.tree.join(tree::BIN)
+        tree::bin_path(&self.tree)
     }
 }
 
@@ -601,7 +619,7 @@ fn recorded_tree(config: &Path) -> Option<PathBuf> {
     let raw = fs::read(config.join(format!("{}.state", PLUGIN))).ok()?;
     let v = json::parse(&raw).ok()?;
     let t = v.as_obj()?.get("tree")?.val.as_str()?.to_vec();
-    let p = PathBuf::from(OsString::from_vec(t));
+    let p = PathBuf::from(sys::os_string_from_vec(t));
     // Absolute or nothing. `install` writes it absolute; a relative one could only
     // come from a hand-edited record, and resolving it against whatever directory
     // `uninstall` happens to be run from is how a tool removes files somewhere it was
@@ -646,26 +664,39 @@ fn plugin_dir_above(from: &Path) -> Option<PathBuf> {
 // --- atomic writes ----------------------------------------------------------
 
 fn mode_of(p: &Path) -> Option<u32> {
-    fs::metadata(p).ok().map(|m| m.permissions().mode() & 0o7777)
+    sys::mode(&fs::metadata(p).ok()?)
+}
+
+/// `" (mode 0600)"` for a report line, with `tail` inside the parentheses - or
+/// nothing where the platform has no modes (Windows), where printing the bits we
+/// asked for would claim a protection nothing applied.
+fn mode_note(mode: u32, tail: &str) -> String {
+    if sys::HAS_MODES {
+        format!(" (mode {:04o}{})", mode, tail)
+    } else {
+        String::new()
+    }
 }
 
 /// Write through a temp file in the same directory and rename, with an explicit
 /// mode: the settings.json we replace holds the user's `env` block, so a mode of
 /// 0600 has to stay 0600. The shell installer widened it to 0644 through a
 /// redirection, which is the bug this signature exists to make impossible.
+///
+/// On Windows there is no mode to apply: the temp file takes its directory's
+/// inherited ACL and the rename carries that over the original, so an explicit
+/// ACL someone set on settings.json itself is NOT preserved. Keeping it needs
+/// `ReplaceFileW` or a security-descriptor copy, which this crate does not bind yet.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     let dir = path.parent().unwrap_or(Path::new("."));
-    let name = path.file_name().map(|n| n.as_bytes().to_vec()).unwrap_or_default();
+    let name = path.file_name().map(|n| n.as_encoded_bytes().to_vec()).unwrap_or_default();
     let mut tmp_name = b".".to_vec();
     tmp_name.extend_from_slice(&name);
     tmp_name.extend_from_slice(format!(".cctab-tmp.{}", std::process::id()).as_bytes());
-    let tmp = dir.join(OsString::from_vec(tmp_name));
+    let tmp = dir.join(sys::os_string_from_vec(tmp_name));
     let _ = fs::remove_file(&tmp);
     let res = (|| -> std::io::Result<()> {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(mode)
+        let mut f = sys::with_mode(fs::OpenOptions::new().write(true).create_new(true), mode)
             .open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
@@ -673,7 +704,7 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), S
         // create_new honours `mode` only through the open(2) mode argument,
         // which umask narrows. Set it explicitly so a umask of 022 cannot
         // widen - or narrow - what we asked for.
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(mode))?;
+        sys::set_mode(&tmp, mode)?;
         fs::rename(&tmp, path)
     })();
     match res {
@@ -734,10 +765,10 @@ fn state_text(c: &Ctx, s: &State) -> Vec<u8> {
     // read back by anything, which is why renaming it costs nothing - and it has to
     // be READ back now, because it is how `uninstall` finds the tree when the link no
     // longer points at it.
-    out.push_str(&format!("  \"tree\": {},\n", json::quote(c.tree.as_os_str().as_bytes())));
+    out.push_str(&format!("  \"tree\": {},\n", json::quote(c.tree.as_os_str().as_encoded_bytes())));
     out.push_str(&format!(
         "  \"settings_path\": {},\n",
-        json::quote(c.settings.as_os_str().as_bytes())
+        json::quote(c.settings.as_os_str().as_encoded_bytes())
     ));
     out.push_str(&format!("  \"env_key\": {},\n", json::quote(KEY.as_bytes())));
     out.push_str(&format!(
@@ -872,8 +903,24 @@ fn sweep_litter(dir: &Path) {
         let raw = e.file_name();
         let Some(name) = raw.to_str() else { continue };
         let Some(pid) = scratch_pid(name) else { continue };
-        if !Path::new(&format!("/proc/{}", pid)).exists() {
-            let _ = fs::remove_file(e.path());
+        // A digit string that is not a pid's canonical spelling (too large, or a
+        // leading zero) names no process, exactly as it names no /proc entry. Unknown
+        // liveness (Windows) counts as alive: keeping litter is harmless, removing a
+        // concurrent install's temp file is not.
+        let alive = pid
+            .parse::<u32>()
+            .ok()
+            .filter(|p| p.to_string() == pid)
+            .map_or(Some(false), sys::process_alive);
+        if alive == Some(false) {
+            // The swap's temp LINK is one of these, and on Windows a directory link is
+            // not a file `remove_file` will take. On Unix both calls are unlink(2).
+            let p = e.path();
+            if fs::symlink_metadata(&p).is_ok_and(|m| m.file_type().is_symlink()) {
+                let _ = sys::remove_dir_link(&p);
+            } else {
+                let _ = fs::remove_file(&p);
+            }
         }
     }
 }
@@ -917,6 +964,15 @@ fn sweep_all(c: &Ctx) {
         sweep_litter(d);
     }
     sweep_litter(&c.tree.join("bin"));
+    // What a non-atomic replace set aside and could not delete at the time - on
+    // Windows a binary a hook was still running, or the old junction. Nothing on
+    // Unix, where every replace is one rename. Named, because it is something an
+    // earlier run left on this disk and this one removed.
+    for d in [&c.config, &c.skills, &c.tree.join("bin")] {
+        for p in sys::sweep_replaced(d) {
+            say(&format!("swept:    {} (set aside by an earlier run)", p.display()));
+        }
+    }
 }
 
 fn refuse_link(p: &Path, what: &str) -> String {
@@ -1052,8 +1108,8 @@ fn install_preflight(c: &Ctx) -> Result<(Option<Vec<u8>>, Option<State>), String
         }
     }
     match link_state(&c.link) {
-        LinkState::Dir => return Err(refuse_link(&c.link, "a real directory, not a symlink")),
-        LinkState::Other => return Err(refuse_link(&c.link, "not a symlink")),
+        LinkState::Dir => return Err(refuse_link(&c.link, &format!("a real directory, not a {}", sys::DIR_LINK))),
+        LinkState::Other => return Err(refuse_link(&c.link, &format!("not a {}", sys::DIR_LINK))),
         _ => {}
     }
     // `<config>/skills` itself, which the last step has to create or write into.
@@ -1066,9 +1122,10 @@ fn install_preflight(c: &Ctx) -> Result<(Option<Vec<u8>>, Option<State>), String
         }
         if !dir_writable(&c.skills) {
             return Err(format!(
-                "{} is not writable, and the plugin symlink goes in it. Nothing \
+                "{} is not writable, and the plugin {} goes in it. Nothing \
                  has been changed.",
-                c.skills.display()
+                c.skills.display(),
+                sys::DIR_LINK
             ));
         }
     }
@@ -1078,6 +1135,25 @@ fn install_preflight(c: &Ctx) -> Result<(Option<Vec<u8>>, Option<State>), String
         }
         if !dir_writable(&c.config) {
             return Err(format!("{} is not writable. Nothing has been changed.", c.config.display()));
+        }
+    }
+    // The link itself, for the same reason as `skills` above: it is the LAST write, so
+    // a refusal there comes after settings.json. Writability settles it on Unix and the
+    // seam touches nothing; on Windows a junction is made and removed where the real
+    // one will go, because that is the only way to ask - it is how an install that
+    // could not make its link used to fail with the env key already set.
+    if let Some(d) = nearest_existing(&c.skills).filter(|d| d.is_dir()) {
+        if let Err(e) = sys::probe_dir_link(&c.tree, &d) {
+            return Err(format!(
+                "cannot make a {} in {} to {}: {}. The plugin {} goes {}, and it is the \
+                 last thing install writes. Nothing has been changed.",
+                sys::DIR_LINK,
+                d.display(),
+                c.tree.display(),
+                e,
+                sys::DIR_LINK,
+                if d == c.skills { "there" } else { "under it" }
+            ));
         }
     }
     let existing = if c.settings.exists() {
@@ -1176,7 +1252,7 @@ fn install_header(c: &Ctx, exe: &Path) {
 /// the first write, that a directory they have been editing stops being the plugin.
 fn repoint_warning(c: &Ctx) {
     let LinkState::Link(t, _) = link_state(&c.link) else { return };
-    if t == c.tree {
+    if sys::same_path(&t, &c.tree) {
         return;
     }
     say(&format!("plugin:   {}", c.link.display()));
@@ -1231,7 +1307,7 @@ fn record_state(c: &Ctx, prior: Option<State>, existing: Option<&[u8]>) -> Resul
         }
         None => {
             let (link_had, link_target) = match link_state(&c.link) {
-                LinkState::Link(t, _) => (true, Some(t.as_os_str().as_bytes().to_vec())),
+                LinkState::Link(t, _) => (true, Some(t.as_os_str().as_encoded_bytes().to_vec())),
                 _ => (false, None),
             };
             let env_raw = match existing {
@@ -1276,7 +1352,7 @@ fn write_env_key(c: &Ctx, existing: Option<Vec<u8>>) -> Result<(), String> {
             let mode = mode_of(&c.settings).unwrap_or(0o600);
             let text = format!("{{\n  \"env\": {{\n    {}: \"1\"\n  }}\n}}\n", json::quote(KEY.as_bytes()));
             write_atomic(&c.settings, text.as_bytes(), mode)?;
-            say(&format!("settings: created {} (mode {:04o})", c.settings.display(), mode));
+            say(&format!("settings: created {}{}", c.settings.display(), mode_note(mode, "")));
             say(&format!("          env.{} = \"1\"", KEY));
         }
         Some(doc) => match settings::set_env_key(&doc, KEY, "1")? {
@@ -1303,7 +1379,7 @@ fn write_env_key(c: &Ctx, existing: Option<Vec<u8>>) -> Result<(), String> {
                     ));
                 }
                 write_atomic(&c.settings, &text, mode)?;
-                say(&format!("settings: set env.{} = \"1\" (mode {:04o} kept)", KEY, mode));
+                say(&format!("settings: set env.{} = \"1\"{}", KEY, mode_note(mode, " kept")));
                 if before.had {
                     say(&format!(
                         "          the previous value {} is recorded in the state file",
@@ -1357,7 +1433,7 @@ impl RecordedPrior {
                     .clone()
                     .filter(|_| s.link_had)
                     .filter(|b| !b.is_empty())
-                    .map(|b| PathBuf::from(OsString::from_vec(b))),
+                    .map(|b| PathBuf::from(sys::os_string_from_vec(b))),
             ),
         }
     }
@@ -1368,16 +1444,16 @@ fn link_the_plugin(c: &Ctx, promise: &RecordedPrior) -> Result<(), String> {
     match link_state(&c.link) {
         LinkState::Absent => {
             symlink(&c.tree, &c.link).map_err(|e| late_failure(c, &e))?;
-            say("symlink:  created");
+            say(&format!("{}created", link_label()));
             say(&format!("          {} -> {}", c.link.display(), c.tree.display()));
         }
-        LinkState::Link(t, resolves) if t == c.tree => {
+        LinkState::Link(t, resolves) if sys::same_path(&t, &c.tree) => {
             if resolves {
-                say("symlink:  already correct");
+                say(&format!("{}already correct", link_label()));
                 say(&format!("          {} -> {}", c.link.display(), c.tree.display()));
             } else {
                 swap_symlink(&c.tree, &c.link).map_err(|e| late_failure(c, &e))?;
-                say("symlink:  points here but does not resolve - recreated");
+                say(&format!("{}points here but does not resolve - recreated", link_label()));
                 say(&format!("          {} -> {}", c.link.display(), c.tree.display()));
             }
         }
@@ -1389,14 +1465,22 @@ fn link_the_plugin(c: &Ctx, promise: &RecordedPrior) -> Result<(), String> {
             // was simply false.
             let was_ours = tree::is_generated(&t);
             swap_symlink(&c.tree, &c.link).map_err(|e| late_failure(c, &e))?;
-            say(if was_checkout {
-                "symlink:  REPOINTED from the checkout to the generated tree"
+            say(&if was_checkout {
+                format!("{}REPOINTED from the checkout to the generated tree", link_label())
             } else if was_ours {
-                "symlink:  MOVED the plugin to a different generated tree"
+                format!("{}MOVED the plugin to a different generated tree", link_label())
             } else if resolves {
-                "symlink:  WARNING - repointed a symlink this installer did not create"
+                format!(
+                    "{}WARNING - repointed a {} this installer did not create",
+                    link_label(),
+                    sys::DIR_LINK
+                )
             } else {
-                "symlink:  WARNING - replaced a BROKEN symlink this installer did not create"
+                format!(
+                    "{}WARNING - replaced a BROKEN {} this installer did not create",
+                    link_label(),
+                    sys::DIR_LINK
+                )
             });
             say(&format!("          {}", c.link.display()));
             say(&format!("          was  {}", t.display()));
@@ -1408,7 +1492,7 @@ fn link_the_plugin(c: &Ctx, promise: &RecordedPrior) -> Result<(), String> {
                     "          {} is left behind and is now an orphan - remove it with",
                     t.display()
                 ));
-                say(&format!("          `rm -rf {}`", t.display()));
+                say(&format!("          `{}`", sys::remove_dir_command(&t)));
             } else {
                 match promise {
                     RecordedPrior::ThisRun => say("          uninstall puts the old target back."),
@@ -1439,8 +1523,8 @@ fn link_the_plugin(c: &Ctx, promise: &RecordedPrior) -> Result<(), String> {
                 }
             }
         }
-        LinkState::Dir => return Err(refuse_link(&c.link, "a real directory, not a symlink")),
-        LinkState::Other => return Err(refuse_link(&c.link, "not a symlink")),
+        LinkState::Dir => return Err(refuse_link(&c.link, &format!("a real directory, not a {}", sys::DIR_LINK))),
+        LinkState::Other => return Err(refuse_link(&c.link, &format!("not a {}", sys::DIR_LINK))),
     }
     Ok(())
 }
@@ -1450,20 +1534,30 @@ fn link_the_plugin(c: &Ctx, promise: &RecordedPrior) -> Result<(), String> {
 ///
 /// The single most important call in this module. Everything else here can be retried;
 /// a hook that execs a missing `bin/tabstatus` cannot be un-run.
+///
+/// On Windows the link is a junction, and the last step is still one rename on NTFS;
+/// `sys::replace_dir_link` documents the rename-aside fallback for a filesystem that
+/// refuses it, and the window that fallback cannot close.
 fn swap_symlink(target: &Path, link: &Path) -> Result<(), String> {
     let tmp = tree::scratch_beside(link);
-    let _ = fs::remove_file(&tmp);
-    std::os::unix::fs::symlink(target, &tmp)
-        .map_err(|e| format!("cannot create the symlink {}: {}", tmp.display(), e))?;
-    fs::rename(&tmp, link).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("cannot move the symlink into place at {}: {}", link.display(), e)
+    let _ = sys::remove_dir_link(&tmp);
+    sys::link_dir(target, &tmp)
+        .map_err(|e| format!("cannot create the {} {}: {}", sys::DIR_LINK, tmp.display(), e))?;
+    sys::replace_dir_link(&tmp, link).map_err(|e| {
+        let _ = sys::remove_dir_link(&tmp);
+        format!("cannot move the {} into place at {}: {}", sys::DIR_LINK, link.display(), e)
     })
 }
 
 fn symlink(target: &Path, link: &Path) -> Result<(), String> {
-    std::os::unix::fs::symlink(target, link)
-        .map_err(|e| format!("cannot create the symlink {}: {}", link.display(), e))
+    sys::link_dir(target, link)
+        .map_err(|e| format!("cannot create the {} {}: {}", sys::DIR_LINK, link.display(), e))
+}
+
+/// The label the plugin link's report lines start with: `symlink:  ` on Unix and
+/// `junction: ` on Windows - ten columns either way, so the lines under it align.
+fn link_label() -> String {
+    format!("{:<10}", format!("{}:", sys::DIR_LINK))
 }
 
 /// A failure inside `materialise`, which is the FIRST write - and it lands directly
@@ -1477,12 +1571,13 @@ fn early_failure(c: &Ctx, what: &str) -> String {
     format!(
         "{}\n\
          \n\
-         The plugin symlink {} was NOT touched, and neither were settings.json or the \
+         The plugin {} {} was NOT touched, and neither were settings.json or the \
          state record at {} - so live sessions still paint through whatever the header \
          above printed as `now`, and nothing has become live wiring.\n\
          Part of {} may have been written. It carries {}, so a re-run resumes into it \
          rather than refusing.",
         what,
+        sys::DIR_LINK,
         c.link.display(),
         c.state.display(),
         c.tree.display(),
@@ -1543,7 +1638,7 @@ fn print_embedded(which: Option<&OsStr>) -> i32 {
         fail(&format!("print-embedded needs a name: {}", embedded::NAMES));
         return 1;
     };
-    match embedded::by_name(name.as_bytes()) {
+    match embedded::by_name(name.as_encoded_bytes()) {
         Some((_, text)) => {
             let out = std::io::stdout();
             let mut l = out.lock();
@@ -1555,7 +1650,7 @@ fn print_embedded(which: Option<&OsStr>) -> i32 {
         None => {
             fail(&format!(
                 "no embedded file called {}; the names are: {}",
-                String::from_utf8_lossy(name.as_bytes()),
+                String::from_utf8_lossy(name.as_encoded_bytes()),
                 embedded::NAMES
             ));
             1
@@ -1577,7 +1672,7 @@ struct Prior {
 /// The mirror of install: settings first, the link next, the tree last. See the module
 /// header for why that order is the sharper of the two.
 fn uninstall(c: &Ctx, force: bool, restore_backup: bool, keep_tree: bool) -> Result<(), String> {
-    let prior = match uninstall_preflight(c, force, restore_backup)? {
+    let prior = match uninstall_preflight(c, force, restore_backup, keep_tree)? {
         Preflight::Go(prior) => prior,
         Preflight::Refused => return Ok(()),
     };
@@ -1642,9 +1737,9 @@ fn remove_tree(c: &Ctx, keep: bool) -> Result<(), String> {
     }
     if keep {
         say(&format!(
-            "tree:     {} was kept (--keep-tree). Remove it with `rm -rf {}`.",
+            "tree:     {} was kept (--keep-tree). Remove it with `{}`.",
             c.tree.display(),
-            c.tree.display()
+            sys::remove_dir_command(&c.tree)
         ));
         return Ok(());
     }
@@ -1652,6 +1747,8 @@ fn remove_tree(c: &Ctx, keep: bool) -> Result<(), String> {
     // candidate, and naming the directory we just emptied as an orphan would be a lie.
     let orphans = orphan_trees(c);
     let r = tree::remove(&c.tree)?;
+    // `failed` is empty on every path that removed what it meant to, so everything
+    // below reads exactly as it did before it existed unless a removal failed.
     if r.dir_gone {
         say(&format!(
             "tree:     removed the plugin tree {} ({} generated file{})",
@@ -1671,9 +1768,9 @@ fn remove_tree(c: &Ctx, keep: bool) -> Result<(), String> {
         // directory is a thing it leaves behind. This arm IS the survival arm, so it
         // must never be the one that says "empty": there is a directory there, and the
         // honest instruction for somebody who wants it gone is `rm -rf`.
-        if r.left.is_empty() {
+        if r.left.is_empty() && r.failed.is_empty() {
             say("          the directory itself survived - it holds no file this report can");
-            say(&format!("          name, only empty directories. Remove it with `rm -rf {}`", c.tree.display()));
+            say(&format!("          name, only empty directories. Remove it with `{}`", sys::remove_dir_command(&c.tree)));
         }
     }
     // Paths the marker listed that were NOT taken, because they could not be proved to
@@ -1682,12 +1779,26 @@ fn remove_tree(c: &Ctx, keep: bool) -> Result<(), String> {
     for why in &r.blocked {
         say(&format!("tree:     LEFT a file the marker listed - {}", why));
     }
+    // Files of ours that would not go - on Windows, the binary a running hook holds.
+    // The marker was kept for them, which is what keeps the tree re-enterable.
+    for f in &r.failed {
+        say(&format!("tree:     could NOT remove {}", f));
+    }
+    if !r.failed.is_empty() {
+        say(&format!(
+            "          {} still carries its {}, so it is still a tree `tabstatus install`",
+            c.tree.display(),
+            tree::MARKER
+        ));
+        say("          wrote and will reuse. Once nothing is running what is left, remove");
+        say(&format!("          it with `{}`", sys::remove_dir_command(&c.tree)));
+    }
     for o in orphans {
         say(&format!(
             "tree:     {} is another generated tree and was NOT the live one, so it is \
-             left behind. Remove it with `rm -rf {}`.",
+             left behind. Remove it with `{}`.",
             o.display(),
-            o.display()
+            sys::remove_dir_command(&o)
         ));
     }
     Ok(())
@@ -1722,14 +1833,34 @@ enum Preflight {
 }
 
 /// Every refusal, decided before anything is removed.
-fn uninstall_preflight(c: &Ctx, force: bool, restore_backup: bool) -> Result<Preflight, String> {
+fn uninstall_preflight(c: &Ctx, force: bool, restore_backup: bool, keep_tree: bool) -> Result<Preflight, String> {
     if let Some(e) = refuse_unresolved(c) {
         return Err(e);
     }
     match link_state(&c.link) {
-        LinkState::Dir => return Err(refuse_link(&c.link, "a real directory, not a symlink")),
-        LinkState::Other => return Err(refuse_link(&c.link, "not a symlink")),
+        LinkState::Dir => return Err(refuse_link(&c.link, &format!("a real directory, not a {}", sys::DIR_LINK))),
+        LinkState::Other => return Err(refuse_link(&c.link, &format!("not a {}", sys::DIR_LINK))),
         _ => {}
+    }
+    // The tree goes LAST and holds the binary. Where a running program's file cannot
+    // be deleted (Windows), an uninstall run BY that binary would undo everything else
+    // and then fail to remove it - a half-removed tree reported as removed - so that
+    // is refused here, before anything changes. A hook running it at the same instant
+    // is a race this cannot see; the file survives and a later run can take it.
+    if !sys::HAS_UNLINK_RUNNING && !keep_tree && tree::is_generated(&c.tree) {
+        let hook = c.hook_binary();
+        let running = std::env::current_exe()
+            .and_then(fs::canonicalize)
+            .is_ok_and(|e| fs::canonicalize(&hook).is_ok_and(|h| h == e));
+        if running {
+            return Err(format!(
+                "{} is the binary running this uninstall, and this platform cannot \
+                 delete a running program's file, so the plugin tree could not be \
+                 removed. Run uninstall from another copy of tabstatus - the one in your \
+                 checkout's bin - or pass --keep-tree. Nothing has been changed.",
+                hook.display()
+            ));
+        }
     }
     let mut blank_settings = false;
     if c.settings.exists() {
@@ -1752,6 +1883,27 @@ fn uninstall_preflight(c: &Ctx, force: bool, restore_backup: bool) -> Result<Pre
     }
     let state = read_state(c)?;
 
+    // The put-back, asked before anything changes, as install asks about its link:
+    // `unlink_the_plugin` removes the current link BEFORE it makes the recorded one,
+    // so a target this platform cannot link to would cost the user both. Nothing to
+    // ask on Unix, where symlink(2) takes any target; on Windows a junction cannot
+    // name a share, which a directory symlink install found here may well have.
+    if let (LinkState::Link(..), Some(old)) = (link_state(&c.link), put_back_target(state.as_ref())) {
+        if let Some(d) = nearest_existing(&c.skills).filter(|d| d.is_dir()) {
+            if let Err(e) = sys::probe_dir_link(&old, &d) {
+                return Err(format!(
+                    "uninstall puts {} back to {}, the target install found there, and a {} \
+                     to it cannot be made: {}. The link is removed before that one is made, \
+                     so both would be lost. Nothing has been changed.",
+                    c.link.display(),
+                    old.display(),
+                    sys::DIR_LINK,
+                    e
+                ));
+            }
+        }
+    }
+
     // The "not ours to delete" decision is a PURE function of data already in
     // hand, so it belongs here rather than in step 2. It used to run after the
     // symlink had been removed, which left the one combination that paints no tab
@@ -1762,7 +1914,7 @@ fn uninstall_preflight(c: &Ctx, force: bool, restore_backup: bool) -> Result<Pre
         if settings::env_raw_text(&doc, KEY)?.is_some() {
             fail(&format!("env.{} IS set, but there is no record that we set it.", KEY));
             fail("Not removing a key this uninstaller cannot prove it created, and");
-            fail("not removing the plugin symlink either - the two together are what");
+            fail(&format!("not removing the plugin {} either - the two together are what", sys::DIR_LINK));
             fail("paints the tab, and removing only one leaves a tab nothing paints.");
             fail("Re-run with --force to remove both anyway: tabstatus uninstall --force");
             return Ok(Preflight::Refused);
@@ -1874,7 +2026,9 @@ fn remove_env_key(c: &Ctx, prior: &Prior, force: bool, restore_backup: bool) -> 
                             });
                         }
                     }
-                    say(&format!("          (mode {:04o} kept)", mode));
+                    if sys::HAS_MODES {
+                        say(&format!("          (mode {:04o} kept)", mode));
+                    }
                 }
             }
         }
@@ -1929,13 +2083,13 @@ fn unlink_the_plugin(c: &Ctx, prior: &Prior) -> Result<(), String> {
             });
             let recorded = recorded
                 .filter(|old| !old.is_empty())
-                .map(|old| PathBuf::from(OsString::from_vec(old)));
+                .map(|old| PathBuf::from(sys::os_string_from_vec(old)));
             let refuse_restore = recorded.as_deref().filter(|p| is_checkout(p)).map(Path::to_path_buf);
-            fs::remove_file(&c.link)
+            sys::remove_dir_link(&c.link)
                 .map_err(|e| format!("cannot remove {}: {}", c.link.display(), e))?;
             match (refuse_restore, recorded) {
                 (Some(co), _) => {
-                    say(&format!("symlink:  removed {}", c.link.display()));
+                    say(&format!("{}removed {}", link_label(), c.link.display()));
                     say(&format!("          (was -> {})", t.display()));
                     say(&format!(
                         "          the recorded prior target was the checkout at {};",
@@ -1946,20 +2100,28 @@ fn unlink_the_plugin(c: &Ctx, prior: &Prior) -> Result<(), String> {
                 }
                 (None, Some(old)) => {
                     symlink(&old, &c.link)?;
-                    say("symlink:  put back the target install found here");
+                    say(&format!("{}put back the target install found here", link_label()));
                     say(&format!("          {} -> {}", c.link.display(), old.display()));
                 }
                 (None, None) => {
-                    say(&format!("symlink:  removed {}", c.link.display()));
+                    say(&format!("{}removed {}", link_label(), c.link.display()));
                     say(&format!("          (was -> {})", t.display()));
                 }
             }
         }
-        LinkState::Absent => say("symlink:  not present - nothing to remove"),
-        LinkState::Dir => return Err(refuse_link(&c.link, "a real directory, not a symlink")),
-        LinkState::Other => return Err(refuse_link(&c.link, "not a symlink")),
+        LinkState::Absent => say(&format!("{}not present - nothing to remove", link_label())),
+        LinkState::Dir => return Err(refuse_link(&c.link, &format!("a real directory, not a {}", sys::DIR_LINK))),
+        LinkState::Other => return Err(refuse_link(&c.link, &format!("not a {}", sys::DIR_LINK))),
     }
     Ok(())
+}
+
+/// The link target `unlink_the_plugin` would put back: the one the record says
+/// install found, unless there was none or it is a checkout, which it declines.
+fn put_back_target(state: Option<&State>) -> Option<PathBuf> {
+    let s = state.filter(|s| s.link_had)?;
+    let old = s.link_target.clone().filter(|b| !b.is_empty())?;
+    Some(PathBuf::from(sys::os_string_from_vec(old))).filter(|p| !is_checkout(p))
 }
 
 /// Step 3: the record itself, which has served its purpose by now.
@@ -2080,7 +2242,10 @@ fn report_tree(c: &Ctx) {
 fn orphan_trees(c: &Ctx) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for cand in [recorded_tree(&c.config), tree::default_tree().ok()].into_iter().flatten() {
-        if cand != c.tree && !out.contains(&cand) && tree::is_generated(&cand) {
+        if !sys::same_path(&cand, &c.tree)
+            && !out.iter().any(|o| sys::same_path(o, &cand))
+            && tree::is_generated(&cand)
+        {
             out.push(cand);
         }
     }
@@ -2168,10 +2333,15 @@ fn report_embedded(c: &Ctx) {
 fn report_binary(c: &Ctx) {
     let hook = c.hook_binary();
     match fs::metadata(&hook) {
-        Ok(m) if m.permissions().mode() & 0o111 != 0 => {
-            say(&format!("binary:    OK   {}", hook.display()))
-        }
-        Ok(_) => say(&format!("binary:    FAIL {} is not executable", hook.display())),
+        Ok(m) => match sys::is_executable(&m) {
+            Some(true) => say(&format!("binary:    OK   {}", hook.display())),
+            Some(false) => say(&format!("binary:    FAIL {} is not executable", hook.display())),
+            None => say(&format!(
+                "binary:    OK   {} is present - this platform has no execute bit, so \
+                 whether it runs is only known when a hook runs it",
+                hook.display()
+            )),
+        },
         Err(_) => say(&format!(
             "binary:    FAIL {} is missing - hooks/hooks.json invokes it, so \
              nothing paints",
@@ -2230,7 +2400,7 @@ fn report_plugin(c: &Ctx) {
             "plugin:    FAIL not linked. Run `tabstatus install`. ({})",
             c.link.display()
         )),
-        LinkState::Link(t, true) if t == c.tree && is_checkout(&t) => {
+        LinkState::Link(t, true) if sys::same_path(&t, &c.tree) && is_checkout(&t) => {
             say(&format!(
                 "plugin:    WARN {} points at a CHECKOUT, not at a generated tree:",
                 c.link.display()
@@ -2240,7 +2410,7 @@ fn report_plugin(c: &Ctx) {
             say("           output - a `git checkout` there changes what every running session");
             say("           runs. `tabstatus install` repoints it at a generated tree.");
         }
-        LinkState::Link(t, true) if t == c.tree => {
+        LinkState::Link(t, true) if sys::same_path(&t, &c.tree) => {
             say(&format!("plugin:    OK   linked, {} -> {}", c.link.display(), t.display()))
         }
         LinkState::Link(t, true) => say(&format!(
@@ -2249,8 +2419,9 @@ fn report_plugin(c: &Ctx) {
             t.display()
         )),
         LinkState::Link(t, false) => say(&format!(
-            "plugin:    FAIL {} is a broken symlink to {}",
+            "plugin:    FAIL {} is a broken {} to {}",
             c.link.display(),
+            sys::DIR_LINK,
             t.display()
         )),
         LinkState::Dir => say(&format!(
@@ -2258,7 +2429,7 @@ fn report_plugin(c: &Ctx) {
             c.link.display()
         )),
         LinkState::Other => {
-            say(&format!("plugin:    WARN {} exists and is not a symlink", c.link.display()))
+            say(&format!("plugin:    WARN {} exists and is not a {}", c.link.display(), sys::DIR_LINK))
         }
     }
 }
@@ -2305,9 +2476,9 @@ fn report_env_key(c: &Ctx) -> Result<(), String> {
         }
         }
         say(&format!(
-            "settings:  {} (mode {:04o}){}",
+            "settings:  {}{}{}",
             c.settings.display(),
-            mode_of(&c.settings).unwrap_or(0),
+            mode_note(mode_of(&c.settings).unwrap_or(0), ""),
             if c.settings_link.is_some() { ", reached through a symlink" } else { "" }
         ));
     } else {
@@ -2396,11 +2567,11 @@ fn report_runtime() {
         match (&override_, konsole, konsole_vars, mux.is_empty()) {
             (Some(v), true, _, _) => format!(
                 "Konsole, from CCTAB_TERMINAL={} - the only signal that survives ssh",
-                String::from_utf8_lossy(v.as_bytes())
+                String::from_utf8_lossy(v.as_encoded_bytes())
             ),
             (Some(v), false, _, _) => format!(
                 "not Konsole: CCTAB_TERMINAL={} says so explicitly",
-                String::from_utf8_lossy(v.as_bytes())
+                String::from_utf8_lossy(v.as_encoded_bytes())
             ),
             (None, true, _, _) => "Konsole (KONSOLE_* in the environment, no multiplexer)".to_owned(),
             (None, false, true, false) =>
@@ -2441,14 +2612,19 @@ fn report_runtime() {
         "glyph:     {}{}",
         match &pos {
             None => String::new(),
-            Some(p) => format!("{} ", String::from_utf8_lossy(p.as_bytes())),
+            Some(p) => format!("{} ", String::from_utf8_lossy(p.as_encoded_bytes())),
         },
         implied
     ));
     match config::var_nonempty("CLAUDE_PID") {
+        Some(p) if !sys::HAS_SESSION_TTY => say(&format!(
+            "pty:       CLAUDE_PID={} - but this platform has no pty to resolve from it, so \
+             session-start and session-end paint nothing directly",
+            String::from_utf8_lossy(p.as_encoded_bytes())
+        )),
         Some(p) => say(&format!(
             "pty:       CLAUDE_PID={} - session-start and session-end write it directly",
-            String::from_utf8_lossy(p.as_bytes())
+            String::from_utf8_lossy(p.as_encoded_bytes())
         )),
         None => say("pty:       CLAUDE_PID is not set, so this is not a hook subprocess \
                   (session-start and session-end would do nothing)"),
@@ -2741,10 +2917,12 @@ mod tests {
     /// A config directory whose name is not valid UTF-8 still has to produce a
     /// record the parser accepts - and the per-byte replacement rule the length cap
     /// depends on elsewhere is the same one `json::quote` applies here.
+    // Non-UTF-8 path bytes exist only on Unix; a Windows OsString cannot hold them.
+    #[cfg(unix)]
     #[test]
     fn an_invalid_utf8_path_is_quoted_one_replacement_per_byte() {
         let mut c = ctx();
-        c.tree = PathBuf::from(OsString::from_vec(b"/tree/tr\xf0\x9f\x98x".to_vec()));
+        c.tree = PathBuf::from(sys::os_string_from_vec(b"/tree/tr\xf0\x9f\x98x".to_vec()));
         let raw = state_text(&c, &State {
             env_had: false,
             env_raw: None,

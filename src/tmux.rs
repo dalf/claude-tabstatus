@@ -49,9 +49,9 @@
 use crate::config::{self, Config, GlyphPos, Terminal};
 use crate::edge::{Glyph, Paint};
 use crate::emit;
+use crate::sys;
 use std::ffi::{OsStr, OsString};
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -251,7 +251,7 @@ impl Tmux {
             return None;
         }
         let raw = config::var_nonempty("TMUX")?;
-        if !is_tmux_env(raw.as_bytes()) {
+        if !is_tmux_env(raw.as_encoded_bytes()) {
             return None;
         }
         Some(Tmux {
@@ -315,7 +315,7 @@ pub fn now() -> u64 {
 }
 
 fn epoch(raw: Option<&OsStr>) -> u64 {
-    if let Some(b) = raw.map(OsStr::as_bytes) {
+    if let Some(b) = raw.map(OsStr::as_encoded_bytes) {
         if b.len() <= 10 && digits(b) {
             return b.iter().fold(0u64, |a, c| a * 10 + u64::from(c - b'0'));
         }
@@ -363,7 +363,7 @@ pub fn ttl_secs(key: &str, default: u32) -> u64 {
 }
 
 fn ttl_of(raw: Option<&OsStr>, default: u32) -> u32 {
-    match raw.map(OsStr::as_bytes) {
+    match raw.map(OsStr::as_encoded_bytes) {
         // "never", expressed as a deadline no age can reach rather than as a
         // second shape of format.
         Some(b"0") => NEVER,
@@ -565,10 +565,10 @@ fn exe_path() -> Option<String> {
 ///
 /// It takes the pty as an argument instead of asking tmux, so the hook costs one
 /// fork and no socket round trip, and so the verb needs no `$TMUX` of its own.
-/// [`emit::tty_write`] is the guard: /dev/pts or /dev/tty, a character device,
+/// [`sys::write_tty`] is the guard: /dev/pts or /dev/tty, a character device,
 /// writable, and silent about any of that failing.
 pub fn arm_tty(path: &OsStr) {
-    emit::tty_write(Path::new(path), emit::KONSOLE_ARM);
+    sys::write_tty(Path::new(path), emit::KONSOLE_ARM);
 }
 
 /// Take the re-arm hook back off.
@@ -631,7 +631,7 @@ pub fn session_end(cfg: &Config) {
 /// racing that would silently skip the restore.
 fn others_expr(t: &Tmux) -> String {
     let mine = match &t.pane {
-        Some(p) => inert(&String::from_utf8_lossy(p.as_bytes())),
+        Some(p) => inert(&String::from_utf8_lossy(p.as_encoded_bytes())),
         None => String::new(),
     };
     format!("#{{W:#{{P:#{{?#{{==:#{{pane_id}},{mine}}},,{IS}}}}}}}")
@@ -646,7 +646,7 @@ fn to_clients(cfg: &Config, bytes: &[u8]) {
     c.arg("-F").arg("#{client_tty}");
     let Ok(out) = capture(c) else { return };
     for line in out.lines().filter(|l| !l.is_empty()) {
-        emit::tty_write(Path::new(line), bytes);
+        sys::write_tty(Path::new(line), bytes);
     }
 }
 
@@ -1068,7 +1068,7 @@ pub fn report(cfg: &Config) -> Vec<String> {
         out.push("tmux:      -    not inside tmux ($TMUX is not set)".to_owned());
         return out;
     };
-    let shown = String::from_utf8_lossy(raw.as_bytes()).into_owned();
+    let shown = String::from_utf8_lossy(raw.as_encoded_bytes()).into_owned();
     let Some(t) = Tmux::detect() else {
         out.push(format!(
             "tmux:      WARN $TMUX={shown} is not <socket>,<pid>,<session>, so it is \
@@ -1128,7 +1128,7 @@ pub fn report(cfg: &Config) -> Vec<String> {
         t.pane
             .as_ref()
             .map_or("(no $TMUX_PANE)".to_owned(), |p| String::from_utf8_lossy(
-                p.as_bytes()
+                p.as_encoded_bytes()
             )
             .into_owned())
     ));

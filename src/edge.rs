@@ -7,7 +7,6 @@
 
 use crate::payload::Payload;
 use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
 
 /// The edge argument, as `hooks.json` spells it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -74,7 +73,7 @@ impl Paint {
 
 impl Edge {
     pub fn parse(arg: Option<&OsStr>) -> Edge {
-        match arg.map(OsStr::as_bytes) {
+        match arg.map(OsStr::as_encoded_bytes) {
             Some(b"session-start") => Edge::SessionStart,
             Some(b"working") => Edge::Working,
             Some(b"waiting") => Edge::Waiting,

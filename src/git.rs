@@ -11,11 +11,11 @@
 //! or none at all. The branch is the single value that becomes text, and it crosses
 //! the moment it is extracted, because nothing after that opens anything.
 
+use crate::sys;
 use crate::text;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Read;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 pub struct Repo {
@@ -59,7 +59,7 @@ pub fn find_repo(logical: &Path, phys: &Path, git_dir: Option<&OsStr>) -> Option
 /// A relative `GIT_DIR` resolves against the LOGICAL cwd, which is what a shell
 /// would have done with it.
 fn absolute(logical: &Path, git_dir: &OsStr) -> PathBuf {
-    if git_dir.as_bytes().starts_with(b"/") {
+    if git_dir.as_encoded_bytes().starts_with(b"/") {
         PathBuf::from(git_dir)
     } else {
         logical.join(git_dir)
@@ -72,7 +72,7 @@ fn absolute(logical: &Path, git_dir: &OsStr) -> PathBuf {
 /// A suffix strip on the path's bytes, because `Path` has no way to say "drop
 /// four bytes from the last component".
 fn repo_top(git_dir: &Path) -> PathBuf {
-    let b = git_dir.as_os_str().as_bytes();
+    let b = git_dir.as_os_str().as_encoded_bytes();
     let b = b.strip_suffix(b"/").unwrap_or(b);
     let b = b
         .strip_suffix(b"/.git")
@@ -81,15 +81,15 @@ fn repo_top(git_dir: &Path) -> PathBuf {
     path_of(b)
 }
 
-/// One step up the tree: everything before the LAST slash, with an empty result
-/// mapped back to `/`.
+/// One step up the tree: everything before the LAST separator (`/`, and on
+/// Windows `\` as well), with an empty result mapped back to `/`.
 ///
 /// Not `Path::parent`, which normalises a trailing slash away first and so
 /// answers `/a` for `/a/b/` where this answers `/a/b`. The walk's input can be a
 /// `$PWD` kept verbatim, which is the one way a trailing slash gets here.
 fn parent_of(dir: &Path) -> PathBuf {
-    let b = dir.as_os_str().as_bytes();
-    let cut = match b.iter().rposition(|&c| c == b'/') {
+    let b = dir.as_os_str().as_encoded_bytes();
+    let cut = match b.iter().rposition(|&c| std::path::is_separator(c as char)) {
         Some(i) => &b[..i],
         None => b,
     };
@@ -190,7 +190,7 @@ fn resolve_gitdir(candidate: &Path) -> Option<PathBuf> {
     Some(if rest.starts_with(b"/") {
         path_of(rest)
     } else {
-        parent_of(candidate).join(OsStr::from_bytes(rest))
+        parent_of(candidate).join(&*sys::os_str_from_bytes(rest))
     })
 }
 
@@ -211,7 +211,7 @@ pub fn first_line(path: &Path) -> Option<Vec<u8>> {
 }
 
 fn path_of(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(OsStr::from_bytes(bytes))
+    PathBuf::from(&*sys::os_str_from_bytes(bytes))
 }
 
 #[cfg(test)]
