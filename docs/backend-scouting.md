@@ -17,6 +17,17 @@ Base commit for every code citation: **`9bfd987`**, on 2026-09-28. Claims about
 [#18](https://github.com/dalf/claude-tabstatus/issues/18) work and are **not** in
 this tree; where that matters it is said so explicitly.
 
+**Citation drift, stated once rather than chased into every line.** This is a dated
+snapshot and the branch carrying it has since moved the code it cites — *this branch
+is what moved it*. Six citations now name a path or line that reads differently:
+`src/tmux.rs` is `src/mux/tmux.rs`; the `exec 3>/dev/tty` prose once at
+`emit.rs:167-172` is at `surface/rows.rs:42`; the `TabColor` seam note is at
+`surface/rows.rs:86`; `emit.rs:106` and `tmux.rs:596` are both inside `mux::route()`
+now; `Command::new` is **18** sites rather than 14, across more files; and
+`location.rs:194`'s "the ONLY fork in this binary" comment sits at line 220 — still
+there, and still false. Every *finding* below survives its citation moving. Follow
+the prose, not the line number.
+
 > ## What this branch's base has overtaken
 >
 > This file is a **dated snapshot**, and it is carried unchanged except for the
@@ -271,7 +282,7 @@ detail.
 
 ## 5. Dependencies: the gate, and the verdicts
 
-The project has five crates today (`serde`, `serde_core`, `serde_json`, `itoa`,
+The project had six crates when this was written (`serde`, `serde_core`, `serde_json`, `itoa`,
 `memchr`, plus `zmij`) and no `[features]` section. Proposed gate — a dependency is
 right only when **all four** hold:
 
@@ -284,7 +295,7 @@ right only when **all four** hold:
 
 | crate | transitive | verdict | reason |
 |---|---|---|---|
-| `windows-sys` 0.61 | 1 | **depend**, `cfg(windows)` only | raw declarations plus link directives; hand-rolling `raw-dylib` externs is the same code without the maintenance |
+| `windows-sys` 0.61 | 1 | **depend**, `cfg(windows)` only — **and #28 since did exactly this**, target-gated with seven features plus a dev-dependency, so this row is settled rather than proposed | raw declarations plus link directives; hand-rolling `raw-dylib` externs is the same code without the maintenance |
 | `libc` 0.2 | 0 | **depend**, `cfg(target_os="macos")` only | zero transitive deps; but confirm it declares `proc_pidinfo`/`proc_pidfdinfo` and the `proc_info.h` structs, or they are hand-declared anyway |
 | D-Bus (`zbus` 5.19) | **49 required** | **reject** | async runtime, MSRV 1.87, 49 crates for one method call that measured 255 µs hand-rolled |
 | `notify-rust` 4.18 | 31 | **reject** | wraps zbus on Linux; same cost, less control |

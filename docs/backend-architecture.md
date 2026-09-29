@@ -120,7 +120,7 @@ it. Today there are five unrelated tri-states and **none of them can say "you tu
 it off"**.
 
 ```rust
-pub enum Support<T> {
+pub enum Support<T = ()> {
     Available(T),
     Unsupported(&'static str),   // this build / this terminal cannot
     Disabled(&'static str),      // OUR knob, named so a user can grep for it
@@ -351,7 +351,7 @@ an async runtime, for one method call.
 
 ### What has landed, on this branch
 
-This work was first written against `9bfd987` as twelve commits on
+This work was first written against `9bfd987` as thirteen commits on
 `feat/14-backend-abstraction` ([#21](https://github.com/dalf/claude-tabstatus/pull/21)).
 It is **re-landed here as a curated subset** on top of
 [#28](https://github.com/dalf/claude-tabstatus/pull/28)'s Windows port, not rebased:
@@ -388,9 +388,16 @@ passed 0 failed; `sh tests/corpus/replay.sh` 312 passed 0 failed 0 diverged, wit
 all six Python suites OK. `cargo check --locked --offline --target
 x86_64-pc-windows-gnu` **0 errors, 0 warnings**; `--target aarch64-apple-darwin` 0
 errors, 0 warnings; host `--all-targets` warning-free.
-`sh scripts/bench-hot.sh <the windows-port baseline>`: working +14 µs, waiting −1 µs,
-idle −6 µs, notify +4 µs, every one inside the 50 µs band, and every hot edge forks
-nothing, bare and tmux-shaped.
+`sh scripts/bench-hot.sh <the windows-port baseline>`: every hot edge inside the
+50 µs band, and every hot edge forks nothing, bare and tmux-shaped.
+
+**The band is the claim; the individual microsecond figures are not.** One run here
+measured working +14 µs, waiting −1 µs, idle −6 µs, notify +4 µs; an independent run
+against the same baseline binary measured +1, +17, −4, −5. Both pass, and the
+disagreement between them is the point: each is one machine-moment on a desktop that
+is also doing something else, which is why `bench-state.sh`'s method reports a spread
+and why the gate is a band rather than a number. Re-run the script; do not read any
+single figure here as a spec.
 
 ### Windows: what the counts mean now
 
@@ -458,9 +465,10 @@ Four decisions in that block are load-bearing rather than cosmetic:
 * **The columns are FIXED**, so a report from Linux and one from Windows diff
   cleanly — which is the only way to compare a row that was measured with one that
   was read out of vendor source.
-* **Every surface line carries its `CapSource`**, because six of the fourteen rows
-  have never had a byte delivered to them and a reader who sees `ok` is owed the
-  difference between measured and inferred.
+* **Every surface line carries its `CapSource`**, because **thirteen of the fourteen
+  rows have never had a byte delivered to them** - exactly one, Konsole, is
+  `Measured`; eleven are `VendorSource` and two are `Inferred` - and a reader who
+  sees `ok` is owed the difference.
 * **No escape byte is ever written.** doctor is read in the terminal whose tab is
   misbehaving; a report that echoed the arming would arm it while describing it.
   `tests/run.sh` pins zero escape bytes in the whole report.
@@ -502,7 +510,7 @@ it is a statement about where the seam was put.
 
 **This was already fixed on this base, independently, by
 [#28](https://github.com/dalf/claude-tabstatus/pull/28), and the credit is theirs.**
-`scripts/build.sh:135` and `tests/run.sh:1405` both spell
+`scripts/build.sh:135` and `tests/run.sh:1420` both spell
 `find src -type f -name '*.rs' | LC_ALL=C sort` on this branch, landed in `a1e4153`
 — the same two halves of the fix the old branch reached, and reached for the same
 reason: `src/sys/` gave `src/` a subdirectory. Nothing in these four commits

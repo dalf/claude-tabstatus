@@ -1301,8 +1301,10 @@ nothing we can read says which", which is what Windows Terminal's
 is an attempt the OS refused. Escape bytes are **named, never written** - doctor is
 read in the terminal whose tab is misbehaving.
 
-Each surface line says how far its row should be trusted, because six of the fourteen
-have never had a byte delivered to them by this program. They exist because
+Each surface line says how far its row should be trusted, because **thirteen of the
+fourteen have never had a byte delivered to them** by this program: one row, Konsole,
+was measured on a running terminal, eleven were read out of vendor source and two are
+inferred. They exist because
 `CCTAB_TERMINAL` can name them over ssh, and their table can be read without them:
 
 ```sh

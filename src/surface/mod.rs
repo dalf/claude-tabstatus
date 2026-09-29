@@ -139,10 +139,17 @@ pub enum Elide {
 
 /// Where a row's claim came from.
 ///
-/// Six of the fourteen surfaces below - Windows Terminal, conhost, iTerm2,
-/// Terminal.app, Ghostty and VS Code - have never had a byte delivered to them
-/// by this program. The rows exist because `CCTAB_TERMINAL` can name them over
-/// ssh; this field is the row admitting how far it should be trusted.
+/// THIRTEEN of the fourteen surfaces below have never had a byte delivered to them
+/// by this program: exactly one row, Konsole, is [`CapSource::Measured`], eleven are
+/// [`CapSource::VendorSource`] and two are [`CapSource::Inferred`]. The rows exist
+/// because `CCTAB_TERMINAL` can name them over ssh; this field is the row admitting
+/// how far it should be trusted.
+///
+/// The count is spelled out here, with the discriminants that produce it, BECAUSE it
+/// was got wrong: this comment and three others said "six", which quietly told a
+/// reader that eight rows had been measured when one had. An error in the direction
+/// that flatters the table is precisely what this field exists to prevent, so the
+/// number is now checkable against `rows.rs` with a grep.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CapSource {
     /// Read off a running terminal by this project.
@@ -155,9 +162,9 @@ pub enum CapSource {
 
 impl CapSource {
     /// How far a reader should trust the row, in one phrase, on the surface line of
-    /// doctor's capability table. Six of the fourteen rows have never had a byte
-    /// delivered to them, and a table that prints `ok` without saying whether that
-    /// was MEASURED invites a reader to trust all fourteen equally.
+    /// doctor's capability table. Thirteen of the fourteen rows have never had a
+    /// byte delivered to them, and a table that prints `ok` without saying whether
+    /// that was MEASURED invites a reader to trust all fourteen equally.
     pub fn why(self) -> &'static str {
         match self {
             CapSource::Measured => "measured on a running terminal",
