@@ -14,8 +14,10 @@ import pty
 import re
 import select
 import shutil
+import signal
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import time
@@ -37,6 +39,73 @@ MARKED_PILL_FORMATS = tuple(fmt.replace("#I:#W", "#{T:@cctab_window_strip} #I:#W
 SAVED = ("@cctab_window_format_saved", "@cctab_prev_window_format",
          "@cctab_prev_window_format_local", "@cctab_window_current_saved",
          "@cctab_prev_window_current", "@cctab_prev_window_current_local")
+# The two OSC 50 writes, byte for byte as src/emit.rs holds them. Both of them
+# SET THE FONT in xterm rather than being ignored, which is why every assertion
+# below is about which pty they reach and not merely whether they were sent.
+KONSOLE_ARM = b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07"
+KONSOLE_RESTORE = b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07"
+HOOK = "client-attached[1971]"
+# A STAND-IN TERMINAL EMULATOR, run as its own process so the name it takes is
+# the name a walk over /proc reads. Same shape as the one tests/run.sh uses for
+# the same rule: TAKE THE COMM, then OWN THE PTY. The client is what calls
+# setsid() and TIOCSCTTY, so that pty is the CLIENT's controlling terminal and
+# never the emulator's - which is exactly what makes the emulator the first
+# ancestor the walk meets with a different tty_nr, and so the process whose name
+# decides the verdict.
+EMULATOR = '''\
+"""Stand in for konsole or xterm: take a comm, then put a client in a pty."""
+import ctypes
+import fcntl
+import os
+import signal
+import sys
+import termios
+
+slave, name, argv = int(sys.argv[1]), sys.argv[2], sys.argv[3:]
+# PR_SET_NAME is 15. It sets `comm` without an exec, so this stays a python
+# process while /proc reports it as `konsole` - which is all the walk reads.
+ctypes.CDLL("libc.so.6", use_errno=True).prctl(
+    15, ctypes.c_char_p(name.encode()), 0, 0, 0)
+child = os.fork()
+if child == 0:
+    # setsid() first, because TIOCSCTTY is refused to anyone who already has a
+    # controlling terminal or leads a process group. Inheriting the slave as an
+    # fd is NOT enough: without this the client has no ctty at all.
+    os.setsid()
+    fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+    for fd in (0, 1, 2):
+        os.dup2(slave, fd)
+    if slave > 2:
+        os.close(slave)
+    try:
+        os.execvp(argv[0], argv)
+    except OSError:
+        os._exit(127)
+# The emulator keeps no slave of its own, so the client is the last holder and
+# the suite's master reads EOF the moment it goes.
+os.close(slave)
+
+
+def bye(*_):
+    """Killing the emulator takes its client with it, as a real one does."""
+    try:
+        os.kill(child, signal.SIGKILL)
+        os.waitpid(child, 0)
+    except OSError:
+        pass
+    os._exit(0)
+
+
+signal.signal(signal.SIGTERM, bye)
+signal.signal(signal.SIGHUP, bye)
+os.waitpid(child, 0)
+'''
+# The hook a user's ASSERTION installs, and the one EVIDENCE installs. The arity
+# is the policy: the second re-proves the attaching client before it writes.
+ARM_HOOK = "run-shell -b \"'#{@cctab_exe}' tmux-arm '#{client_tty}'\""
+ARM_HOOK_PROBE = "run-shell -b \"'#{@cctab_exe}' tmux-arm '#{client_tty}' '#{client_pid}'\""
+PREFIX_STRING = "#{s|^ ||:#{T:@cctab_title}}"
+SUFFIX_STRING = "#{s| $||:#{T:@cctab_title}}"
 
 
 def terminal_text_and_backgrounds(data, foreground=False):
@@ -67,6 +136,60 @@ def terminal_text_and_backgrounds(data, foreground=False):
         text.append(token)
         backgrounds.append(background)
     return "".join(text), backgrounds
+
+
+class Attached:
+    """One attached tmux client, its pty master, and what tmux has sent it.
+
+    Reading is deliberately on demand rather than from a drain thread: every
+    assertion here is either "these bytes arrived" - which short-circuits as soon
+    as they do - or "these bytes never arrived", which has to wait out its
+    timeout regardless.
+    """
+
+    def __init__(self, master, proc, tty):
+        self.master, self.proc, self.tty = master, proc, tty
+        self.seen = bytearray()
+
+    def read(self, want=None, timeout=3):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if want is not None and want in self.seen:
+                break
+            if select.select([self.master], [], [], 0.1)[0]:
+                try:
+                    chunk = os.read(self.master, 65536)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                self.seen += chunk
+        return bytes(self.seen)
+
+    def forget(self):
+        """Drop what has already arrived, so the next assertion is about NOW."""
+        self.read(timeout=0.3)
+        self.seen = bytearray()
+
+    def close(self):
+        # The emulator's whole GROUP, by the leader's pid rather than by
+        # getpgid. The client calls setsid(), so it is NOT in that group: what
+        # reaps it is the emulator's own SIGTERM handler, and the group kill is
+        # what covers an emulator that died before installing one. Terminating
+        # only what Popen knows about would leave a real client attached and the
+        # next assertion's client count wrong.
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(self.proc.pid, sig)
+            except (ProcessLookupError, PermissionError, OSError):
+                break
+            time.sleep(0.1)
+        try:
+            self.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=3)
+        os.close(self.master)
 
 
 @unittest.skipUnless(TMUX_OVERRIDE or shutil.which("tmux"), "tmux is required for window-status integration tests")
@@ -109,7 +232,15 @@ class TmuxStatusTests(unittest.TestCase):
                    CCTAB_TERMINAL="other", CCTAB_GLYPH_POS="prefix")
         if pane is not None:
             env["TMUX_PANE"] = pane
-        env.update(extra_env or {})
+        for key, value in (extra_env or {}).items():
+            # A None DELETES the key. The pins above exist so this suite renders
+            # the same on any machine, but the detection tests are precisely
+            # about what happens with CCTAB_TERMINAL and CCTAB_GLYPH_POS UNSET,
+            # and an env they cannot clear would make every one of them vacuous.
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
         data = json.dumps(payload).encode() if payload is not None else b""
         p = subprocess.run([str(BIN), edge], input=data, env=env, cwd=self.root,
                            capture_output=True, timeout=10)
@@ -126,6 +257,84 @@ class TmuxStatusTests(unittest.TestCase):
                            capture_output=True, timeout=10)
         self.assertEqual(p.returncode, 0, p.stderr)
         return p.stdout.decode()
+
+    # --- attached clients, and how one is made to look like Konsole -----------
+
+    def emulator(self):
+        """`emulator.py`, written into this test's own tree, and its path."""
+        path = self.root / "emulator.py"
+        if not path.exists():
+            path.write_text(EMULATOR)
+        return path
+
+    def clients(self):
+        listing = self.tm("list-clients", "-t", "alpha", "-F", "#{client_tty}")
+        return [line for line in listing.splitlines() if line]
+
+    def attach(self, konsole=False):
+        """Attach a real pty client whose ancestry is exactly what it claims.
+
+        The chain the probe walks is built deliberately, and what makes it a
+        fixture for THIS rule is OWNERSHIP of the client's pty, not mere
+        membership of its ancestry:
+
+          `tmux: client` -> <konsole|xterm> -> the suite
+
+        The emulator takes its name with `prctl(PR_SET_NAME)` and then hands the
+        pty to a child that calls `setsid()` and `TIOCSCTTY`, so the client's
+        controlling terminal is that pty and the emulator's is not. The walk
+        climbs while `tty_nr` matches the client's, stops on the emulator - the
+        first ancestor where it differs - and reads the name there.
+
+        TWO EARLIER SHAPES ARE DELIBERATELY GONE, and both of them passed for
+        the wrong reason. A renamed copy of `/bin/sh` running INSIDE the pty is
+        a passenger: it shares the client's `tty_nr`, so the walk skips straight
+        over it to whatever really owns the pty, and no amount of renaming
+        rescues it. And a client whose slave is merely an INHERITED FD never
+        issues `TIOCSCTTY`, which leaves it with no controlling terminal at all
+        and declines before a single hop. The double fork to init went with
+        them: the emulator is now the stop, so nothing behind it is ever
+        reached and there is nothing left to hide from the walk.
+        """
+        before = set(self.clients())
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
+        argv = self.base + ["attach-session", "-t", "alpha"]
+        name = "konsole" if konsole else "xterm"
+        # The slave travels as a NUMBERED FD and the emulator's own three are
+        # /dev/null, so a traceback out of it can never land in the pty and be
+        # read back as terminal output by an assertion about OSC 50 bytes.
+        proc = subprocess.Popen(
+            [sys.executable, str(self.emulator()), str(slave), name] + argv,
+            env=self.env, cwd=self.root, pass_fds=(slave,),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        os.close(slave)
+        client = Attached(master, proc, None)
+        self.addCleanup(client.close)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            new = set(self.clients()) - before
+            if new:
+                client.tty = new.pop()
+                return client
+            time.sleep(0.02)
+        self.fail("the client never attached")
+
+    def detach(self, client):
+        self.tm("detach-client", "-t", client.tty)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if client.tty not in self.clients():
+                return
+            time.sleep(0.02)
+        self.fail(f"{client.tty} never detached")
+
+    def hook_value(self):
+        return self.tm("display-message", "-p", "-t", self.pane, "#{" + HOOK + "}")
+
+    def titles_string(self):
+        return self.tm("show-options", "-gv", "set-titles-string")
 
     def new_window(self, name, session="alpha"):
         return self.tm("new-window", "-d", "-t", session, "-n", name,
@@ -807,6 +1016,202 @@ class TmuxStatusTests(unittest.TestCase):
                 client.kill()
                 client.wait(timeout=3)
             os.close(master)
+
+    # --- detecting Konsole from the attached client's ancestry ----------------
+
+    def start_undetermined(self, pane=None, **extra):
+        """SessionStart with nothing asserted, so evidence is what decides."""
+        return self.start(pane, CCTAB_TERMINAL=None, CCTAB_GLYPH_POS=None, **extra)
+
+    def test_a_client_descending_from_konsole_is_detected_with_nothing_set(self):
+        client = self.attach(konsole=True)
+        client.forget()
+        self.start_undetermined()
+        # All three halves of the verdict, because setting only the terminal
+        # arms the tab and leaves the strip on the end Konsole elides away.
+        self.assertEqual(self.hook_value(), ARM_HOOK_PROBE)
+        self.assertEqual(self.titles_string(), SUFFIX_STRING)
+        self.assertIn(KONSOLE_ARM, client.read(KONSOLE_ARM))
+
+    def test_a_plain_client_proves_nothing_and_nothing_is_armed(self):
+        # The false-positive guard. A stray OSC 50 here would SET THE FONT in an
+        # xterm, which is why the ALL rule is worth a false negative.
+        client = self.attach()
+        client.forget()
+        self.start_undetermined()
+        self.assertEqual(self.hook_value(), "")
+        self.assertEqual(self.titles_string(), PREFIX_STRING)
+        self.assertNotIn(KONSOLE_ARM, client.read(timeout=1))
+
+    def test_the_rearm_hook_reproves_the_attaching_client_before_it_writes(self):
+        # THE REGRESSION THIS FEATURE COULD OTHERWISE INTRODUCE. The hook
+        # outlives the SessionStart that installed it: detect Konsole locally,
+        # detach, and reattach from somewhere else, and an unconditional arm
+        # would push OSC 50 into that terminal.
+        proving = self.attach(konsole=True)
+        self.start_undetermined()
+        self.assertEqual(self.hook_value(), ARM_HOOK_PROBE)
+        self.detach(proving)
+        plain = self.attach()
+        self.assertNotIn(KONSOLE_ARM, plain.read(timeout=2))
+        # And it discriminates rather than merely being silent: the same hook,
+        # still installed, still arms a client that does prove itself.
+        self.assertEqual(self.hook_value(), ARM_HOOK_PROBE)
+        again = self.attach(konsole=True)
+        self.assertIn(KONSOLE_ARM, again.read(KONSOLE_ARM))
+
+    def test_one_client_that_cannot_prove_it_declines_the_whole_session(self):
+        # ALL, not ANY, as a decision rather than an accident.
+        # `set-titles-string` is a SESSION option with no per-client form, so
+        # the strip is one value for every client and a mixed session has to
+        # decline as a whole.
+        proving = self.attach(konsole=True)
+        plain = self.attach()
+        proving.forget()
+        plain.forget()
+        self.start_undetermined()
+        self.assertEqual(self.hook_value(), "")
+        self.assertEqual(self.titles_string(), PREFIX_STRING)
+        self.assertNotIn(KONSOLE_ARM, proving.read(timeout=1))
+        self.assertNotIn(KONSOLE_ARM, plain.read(timeout=1))
+        # Take the stray client away and the same session detects.
+        self.detach(plain)
+        self.start_undetermined()
+        self.assertEqual(self.hook_value(), ARM_HOOK_PROBE)
+        self.assertEqual(self.titles_string(), SUFFIX_STRING)
+
+    def test_an_asserted_konsole_still_arms_a_client_that_cannot_prove_it(self):
+        # THE ESCAPE HATCH, and the reason the re-probe must never be applied to
+        # the asserted hook: over ssh the client's ancestry ends in sshd and
+        # always will, so re-proving there would destroy Konsole -> ssh -> tmux,
+        # the topology this whole slice was built for.
+        client = self.attach()
+        client.forget()
+        self.start(CCTAB_TERMINAL="konsole", CCTAB_GLYPH_POS=None)
+        self.assertEqual(self.hook_value(), ARM_HOOK)
+        self.assertEqual(self.titles_string(), SUFFIX_STRING)
+        self.assertIn(KONSOLE_ARM, client.read(KONSOLE_ARM))
+        # And on a reattach the hook still arms it, unconditionally.
+        self.detach(client)
+        again = self.attach()
+        self.assertIn(KONSOLE_ARM, again.read(KONSOLE_ARM))
+
+    def test_session_end_learns_the_mode_from_the_server_not_its_own_env(self):
+        # A SessionEnd builds a FRESH Config, and in the detected topology that
+        # Config says Unknown - so asking our own environment here would arm
+        # tabs that are never restored and leak the hook forever. The server
+        # knows which hook it is carrying; that is what is asked.
+        proving = self.attach(konsole=True)
+        self.start_undetermined()
+        self.assertEqual(self.hook_value(), ARM_HOOK_PROBE)
+        plain = self.attach()
+        proving.forget()
+        plain.forget()
+        self.hook("session-end", self.pane, {"CCTAB_TERMINAL": None})
+        self.assertIn(KONSOLE_RESTORE, proving.read(KONSOLE_RESTORE))
+        self.assertNotIn(KONSOLE_RESTORE, plain.read(timeout=1))
+        self.assertEqual(self.hook_value(), "")
+
+    def test_session_end_restores_an_asserted_session_with_nothing_in_its_env(self):
+        # The older shape of the same leak: CCTAB_TERMINAL set at SessionStart
+        # and gone by SessionEnd used to return early, arming with no un-arming.
+        client = self.attach()
+        self.start(CCTAB_TERMINAL="konsole", CCTAB_GLYPH_POS=None)
+        self.assertEqual(self.hook_value(), ARM_HOOK)
+        client.forget()
+        self.hook("session-end", self.pane, {"CCTAB_TERMINAL": None})
+        self.assertIn(KONSOLE_RESTORE, client.read(KONSOLE_RESTORE))
+        self.assertEqual(self.hook_value(), "")
+
+    def test_session_end_restores_an_asserted_session_whose_hook_was_taken_away(self):
+        # AN EMPTY HOOK IS NOT "WE ARMED NOTHING". `arm_konsole` writes as soon
+        # as CCTAB_TERMINAL says Konsole and never waits on the hook, while the
+        # hook is the one command in SessionStart's batch a tmux older than 3.0
+        # cannot run and a path holding a quote cannot carry - and `uninstall`
+        # and a later declining SessionStart both take it off. Every one of
+        # those leaves a tab armed, and reading the absent hook as "nothing to
+        # restore" is the named defect, an arming with no matching un-arming.
+        client = self.attach()
+        self.start(CCTAB_TERMINAL="konsole", CCTAB_GLYPH_POS=None)
+        self.assertIn(KONSOLE_ARM, client.read(KONSOLE_ARM))
+        self.tm("set-hook", "-u", "-t", "alpha", HOOK)
+        self.assertEqual(self.hook_value(), "")
+        client.forget()
+        self.hook("session-end", self.pane, {"CCTAB_TERMINAL": "konsole"})
+        self.assertIn(KONSOLE_RESTORE, client.read(KONSOLE_RESTORE))
+
+    def test_a_declining_session_start_un_arms_before_it_takes_the_hook_off(self):
+        # The detected mode has no CCTAB_TERMINAL to fall back on, so the hook
+        # IS the record. Removing it without un-arming first would leave the tab
+        # on LocalTabTitleFormat=%w with nothing left anywhere that could put it
+        # back - and this is the path the README's own recovery, attaching a
+        # second terminal and running /clear, walks straight into.
+        proving = self.attach(konsole=True)
+        self.start_undetermined()
+        self.assertEqual(self.hook_value(), ARM_HOOK_PROBE)
+        self.assertIn(KONSOLE_ARM, proving.read(KONSOLE_ARM))
+        plain = self.attach()
+        proving.forget()
+        plain.forget()
+        self.start_undetermined()
+        self.assertEqual(self.hook_value(), "")
+        self.assertEqual(self.titles_string(), PREFIX_STRING)
+        self.assertIn(KONSOLE_RESTORE, proving.read(KONSOLE_RESTORE))
+        # KONSOLE_RESTORE is an OSC 50 as much as the arming is, so it goes only
+        # to a client that proved itself.
+        self.assertNotIn(KONSOLE_RESTORE, plain.read(timeout=1))
+
+    def test_uninstall_un_arms_the_tab_it_is_putting_back(self):
+        # uninstall is the other remover of the record. Putting the title
+        # formats back while leaving the tab armed would restore the half that
+        # is easy to see.
+        client = self.attach(konsole=True)
+        self.start_undetermined()
+        self.assertIn(KONSOLE_ARM, client.read(KONSOLE_ARM))
+        client.forget()
+        self.uninstall()
+        self.assertEqual(self.hook_value(), "")
+        self.assertIn(KONSOLE_RESTORE, client.read(KONSOLE_RESTORE))
+
+    def test_a_detected_session_never_arms_what_it_cannot_record(self):
+        # A path holding a single quote has no representation inside the hook's
+        # sh quoting, so SessionStart installs no hook at all - and a detected
+        # session has nothing else to leave behind. The verdict's other half,
+        # moving the strip off the end Konsole elides, needs nothing to undo it
+        # and still lands.
+        odd = self.root / "o'brien"
+        odd.mkdir()
+        shutil.copy(BIN, odd / "tabstatus")
+        (odd / "tabstatus").chmod(0o755)
+        client = self.attach(konsole=True)
+        client.forget()
+        env = dict(self.env, TMUX=f"{self.socket},1,0", TMUX_PANE=self.pane,
+                   CLAUDE_PID="0")
+        p = subprocess.run([str(odd / "tabstatus"), "session-start"], input=b"",
+                           env=env, cwd=self.root, capture_output=True, timeout=10)
+        self.assertEqual((p.returncode, p.stderr), (0, b""))
+        self.assertEqual(self.hook_value(), "")
+        self.assertEqual(self.titles_string(), SUFFIX_STRING)
+        self.assertNotIn(KONSOLE_ARM, client.read(timeout=1))
+
+    def test_a_paint_edge_never_probes_and_never_changes_the_server(self):
+        # The enforceable version of "no cost on the painting path". If the
+        # probe ever migrates into Terminal::detect() or Config::from_env(), a
+        # Line edge adopts Konsole here and this test catches it - everything
+        # would still be CORRECT, just an exec per tool call, which is exactly
+        # why it would otherwise ship.
+        self.attach(konsole=True)
+        self.start()
+        before = (self.titles_string(),
+                  self.tm("show-options", "-sv", "@cctab_title"),
+                  self.hook_value())
+        self.assertEqual(before[0], PREFIX_STRING)
+        pid = self.tm("display-message", "-p", "-t", self.pane, "#{pane_pid}")
+        self.hook("working", self.pane,
+                  {"CLAUDE_PID": pid, "CCTAB_TERMINAL": None, "CCTAB_GLYPH_POS": None})
+        self.assertEqual((self.titles_string(),
+                          self.tm("show-options", "-sv", "@cctab_title"),
+                          self.hook_value()), before)
 
 
 if __name__ == "__main__":

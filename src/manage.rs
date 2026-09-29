@@ -107,15 +107,24 @@ pub enum Subcommand {
     /// rather than a copy of it, and a user who would rather pin the format in
     /// `~/.tmux.conf` than have it set at runtime can paste these two lines.
     TmuxFormat,
-    /// `tmux-arm <tty>` - write Konsole's per-tab arming to ONE terminal. Invoked
-    /// by the `client-attached` hook SessionStart installs, never by a hook event
-    /// and never by hand in normal use: tmux substitutes the attaching client's
-    /// pty, so a reattach - closing the laptop and coming back - lands in an armed
-    /// tab instead of one governed by Konsole's `RemoteTabTitleFormat`.
+    /// `tmux-arm <tty> [<client pid>]` - write Konsole's per-tab arming to ONE
+    /// terminal. Invoked by the `client-attached` hook SessionStart installs,
+    /// never by a hook event and never by hand in normal use: tmux substitutes
+    /// the attaching client's pty, so a reattach - closing the laptop and coming
+    /// back - lands in an armed tab instead of one governed by Konsole's
+    /// `RemoteTabTitleFormat`.
     ///
-    /// The argument is `None` only when a human typed the verb with nothing after
-    /// it; the guard on the path itself is `emit::tty_write`.
-    TmuxArm(Option<OsString>),
+    /// `usage` keeps the one-argument form. The pid is tmux's to supply and is
+    /// never typed by hand, so printing it would document a shape nobody has a
+    /// use for; `show-hooks` is where the real invocation is read.
+    ///
+    /// The pty is `None` only when a human typed the verb with nothing after it;
+    /// the guard on the path itself is `emit::tty_write`. The optional second
+    /// argument is the attaching client's pid, and its PRESENCE is the policy:
+    /// with one the arm re-proves who owns that client's pty before writing,
+    /// which is what a hook installed from evidence needs and what an asserted
+    /// one must not do.
+    TmuxArm(Option<OsString>, Option<OsString>),
     Version,
     Help,
     /// A verb this half owns, given an option that verb does not accept. It
@@ -147,7 +156,7 @@ impl Subcommand {
             b"standalone" => Subcommand::StandaloneGone,
             b"print-embedded" => Subcommand::PrintEmbedded(rest.first().cloned()),
             b"tmux-format" => Subcommand::TmuxFormat,
-            b"tmux-arm" => Subcommand::TmuxArm(rest.first().cloned()),
+            b"tmux-arm" => Subcommand::TmuxArm(rest.first().cloned(), rest.get(1).cloned()),
             b"version" | b"--version" | b"-V" => Subcommand::Version,
             b"help" | b"--help" | b"-h" => Subcommand::Help,
             _ => return None,
@@ -183,14 +192,21 @@ impl Subcommand {
             }
             Subcommand::PrintEmbedded(which) => print_embedded(which.as_deref()),
             Subcommand::TmuxFormat => {
-                for line in tmux::format_lines(&Config::from_env()) {
+                // Probed, because the whole purpose of this verb is to print what
+                // SessionStart WOULD install: without it, it lies about the glyph
+                // end inside a local Konsole tmux.
+                let mut cfg = Config::from_env();
+                let _ = tmux::adopt_konsole(&mut cfg);
+                for line in tmux::format_lines(&cfg) {
                     say(&line);
                 }
                 0
             }
-            Subcommand::TmuxArm(tty) => match tty {
+            Subcommand::TmuxArm(tty, pid) => match tty {
                 Some(t) => {
-                    tmux::arm_tty(&t);
+                    tmux::arm_tty(&t, pid.as_deref());
+                    // A DECLINE still exits 0: a non-zero tmux-arm would put noise
+                    // into `run-shell -b`'s output on every single attach.
                     0
                 }
                 None => {
@@ -2015,9 +2031,14 @@ fn doctor(c: &Ctx) -> Result<(), String> {
     report_env_key(c)?;
     report_state(c);
     report_record();
-    report_runtime();
-    report_tmux();
-    report_title();
+    // ONE probed Config, built once and threaded through all three, so doctor
+    // cannot exec three list-clients or print two different verdicts because a
+    // client detached between them.
+    let mut cfg = Config::from_env();
+    let ev = tmux::adopt_konsole(&mut cfg);
+    report_runtime(&cfg, &ev);
+    report_tmux(&cfg, &ev);
+    report_title(&cfg);
     Ok(())
 }
 
@@ -2377,7 +2398,11 @@ fn report_record() {
 
 /// What the runtime half would decide from this environment: which terminal, which
 /// glyph position, and whether there is a pty to write to.
-fn report_runtime() {
+///
+/// `cfg` is the one doctor PROBED, so the verdict here is the verdict a
+/// SessionStart in this pane would reach, evidence included, and not a second
+/// environment-only guess that could disagree with the tmux lines below it.
+fn report_runtime(cfg: &Config, ev: &tmux::Evidence) {
     let konsole_vars = config::flag("KONSOLE_VERSION") || config::flag("KONSOLE_DBUS_SESSION");
     let mux = if config::flag("TMUX") {
         "tmux"
@@ -2386,16 +2411,17 @@ fn report_runtime() {
     } else {
         ""
     };
-    let konsole = Terminal::detect() == Terminal::Konsole;
-    // The SAME predicate `Terminal::detect` suppresses on and the host prefix is
-    // painted from, not a third reading of SSH_CONNECTION and SSH_TTY here: a
-    // report that called the verdict unknowable-over-ssh while the title: line
-    // below painted no host prefix would contradict itself on one page.
-    let ssh = config::over_ssh();
-    // The REASON matters more than the answer, because there are now four of them
-    // and they disagree: an explicit CCTAB_TERMINAL, inherited KONSOLE_*, a
-    // multiplexer that makes the inherited kind meaningless, and an ssh hop that
-    // makes it describe somebody else's terminal.
+    let konsole = cfg.terminal == Terminal::Konsole;
+    // The REASON matters more than the answer, because there are now FIVE of them
+    // and they disagree: an explicit CCTAB_TERMINAL; inherited KONSOLE_*; a
+    // multiplexer that makes the inherited kind meaningless; an ssh hop, which
+    // makes it describe the terminal at the other END; and the process that owns
+    // the pty of each client attached to this session, which is the only one of
+    // the five that describes the terminal drawing the tab RIGHT NOW.
+    //
+    // The last two are the same principle reaching two topologies: inherited
+    // environment is not evidence, so inside tmux it is replaced by proof and
+    // across a hop it is refused outright, there being no proof available.
     let override_ = config::var_nonempty("CCTAB_TERMINAL");
     say(&format!(
         "terminal:  {}",
@@ -2408,19 +2434,37 @@ fn report_runtime() {
                 "not Konsole: CCTAB_TERMINAL={} says so explicitly",
                 String::from_utf8_lossy(v.as_bytes())
             ),
-            (None, true, _, _) => "Konsole (KONSOLE_* in the environment, no multiplexer)".to_owned(),
+            (None, true, _, true) =>
+                "Konsole (KONSOLE_* in the environment, no multiplexer)".to_owned(),
+            // Crediting KONSOLE_* for a verdict the PROCESS TREE produced is the
+            // precise claim this detection exists to stop making.
+            (None, true, _, false) =>
+                "Konsole - konsole owns the attached tmux client's pty, so the \
+                 inherited KONSOLE_* is not what decided this"
+                    .to_owned(),
             (None, false, true, false) =>
                 "inside a multiplexer, so the inherited KONSOLE_* is ignored - set \
                  CCTAB_TERMINAL=konsole if the outer terminal really is Konsole"
                     .to_owned(),
             // Reachable ONLY over ssh, and provably so rather than by inspection:
-            // with no override, `detect` returns Konsole exactly when there is no
-            // multiplexer, no ssh and a KONSOLE_* - and this arm already has the
-            // first and third, so the hop is the only suppressor left. It was dead
-            // code until ssh became one.
+            // no multiplexer here means the probe was never asked, so the verdict
+            // is `detect`'s alone, and with no override `detect` returns Konsole
+            // exactly when there is no multiplexer, no ssh and a KONSOLE_*. This
+            // arm already holds the first and third, so the hop is the only
+            // suppressor left. It was dead code until ssh became one.
             (None, false, true, true) =>
                 "not Konsole: KONSOLE_* is set, but it crossed an ssh hop, so it \
                  describes the terminal it came FROM, not this tab"
+                    .to_owned(),
+            // Inside a multiplexer a PROBE ran and refused, and explaining the
+            // verdict by absent environment variables alone would credit the
+            // environment for an answer the process tree gave - the same
+            // asymmetry the positive arm above was split to remove. Keyed on the
+            // evidence and not on `mux`, so a malformed $TMUX, where nothing was
+            // asked, keeps the outside-tmux wording byte for byte.
+            (None, false, false, _) if matches!(ev, tmux::Evidence::Declined) =>
+                "not Konsole - not every attached tmux client's pty is owned by \
+                 konsole, and nothing in the environment says otherwise"
                     .to_owned(),
             (None, false, false, _) =>
                 "not Konsole (no CCTAB_TERMINAL, no KONSOLE_VERSION, no \
@@ -2428,6 +2472,13 @@ fn report_runtime() {
                     .to_owned(),
         }
     ));
+    // Read off the Config rather than asked again here. That field and the
+    // suppression inside `Terminal::detect` are now one predicate,
+    // `config::over_ssh`, so this line, the verdict above and the host prefix the
+    // title: line paints cannot disagree - and a report calling the verdict
+    // unknowable-over-ssh beside a title with no host prefix would be
+    // contradicting itself on one page.
+    let ssh = cfg.ssh;
     // KONSOLE_* is inherited environment, and two topologies leave the verdict
     // above resting on nothing: inside a multiplexer it describes whichever
     // terminal started the SERVER, and over ssh it describes the terminal at the
@@ -2443,12 +2494,30 @@ fn report_runtime() {
     // one line under a verdict that quotes the value back is arguing with what
     // was typed - and a Konsole that WAS detected needs nothing.
     let unknowable = !konsole && override_.is_none();
+    // Keyed on the EVIDENCE, so this line can never claim a probe that did not
+    // run: a malformed $TMUX sets the `mux` flag but leaves cfg.tmux None, and
+    // that case is NotAsked and keeps the original wording. Under a Konsole
+    // verdict the original wording would read as self-contradiction one line
+    // below it.
     let remedy = if !mux.is_empty() {
-        say(&format!(
-            "           multiplexer: {}, so KONSOLE_* says nothing about the outer \
-             terminal",
-            mux
-        ));
+        say(&match ev {
+            tmux::Evidence::Konsole(_) => format!(
+                "           multiplexer: {mux} - KONSOLE_* says nothing here, so who \
+                 owns the attached client's pty decided instead"
+            ),
+            // "not every", because the rule is ALL and at least one: a mixed
+            // session declines with a client that DID prove konsole listed two
+            // lines down, and a summary that contradicts them is worse than
+            // none. It reads true for the zero-client session as well.
+            tmux::Evidence::Declined => format!(
+                "           multiplexer: {mux} - KONSOLE_* says nothing here, and not \
+                 every attached client's pty is owned by konsole"
+            ),
+            tmux::Evidence::NotAsked => format!(
+                "           multiplexer: {mux}, so KONSOLE_* says nothing about the \
+                 outer terminal"
+            ),
+        });
         unknowable
     } else if unknowable && ssh {
         // An ABSENT KONSOLE_* needs this line, because the verdict above can only
@@ -2506,16 +2575,16 @@ fn report_runtime() {
 /// Two tmux invocations, both read-only, both on a cold path. Nothing here is a
 /// copy of what the runtime half decides: [`tmux::report`] is in the module that
 /// decides it.
-fn report_tmux() {
-    for line in tmux::report(&Config::from_env()) {
+fn report_tmux(cfg: &Config, ev: &tmux::Evidence) {
+    for line in tmux::report(cfg, ev) {
         say(&line);
     }
 }
 
 /// The runtime half's own pipeline, CALLED rather than copied, so this line cannot
 /// drift from what actually paints.
-fn report_title() {
-    let title = render::compose(Paint::Line(Glyph::Idle), &Config::from_env()).title;
+fn report_title(cfg: &Config) {
+    let title = render::compose(Paint::Line(Glyph::Idle), cfg).title;
     let mut line = b"title:     ".to_vec();
     line.extend_from_slice(title.as_bytes());
     line.push(b'\n');

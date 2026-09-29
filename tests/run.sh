@@ -3148,6 +3148,18 @@ else
     tsession_start "$tmp/code/one"
     check 'a later plain session-start removes the hook again' '' \
         "$(tm display-message -p -t t:w0.0 '#{client-attached[1971]}')"
+    # THE ZERO-CLIENT DECLINE. With CCTAB_TERMINAL unset, Konsole is now detected
+    # from the ancestry of the clients attached to our session - and this private
+    # server has none, by construction, so there is nothing to prove and the
+    # prefix pair is what a start installs. Pinning it here also stops a future
+    # case that DOES attach a client from silently making this suite pass only on
+    # machines that are not running Konsole.
+    check 'with no client attached there is nothing to detect' \
+        '#{s|^ ||:#{T:@cctab_title}}' \
+        "$(tsession_start "$tmp/code/one"
+           tm show -gv set-titles-string)"
+    check 'and the strip stays at the prefix end' '#{s|^ ||:#{T:@cctab_title}}' \
+        "$(tm display-message -p '#{@cctab_string}')"
     # A user's own hooks live in the same array, and a BARE `set-hook -g
     # client-attached` replaces the WHOLE of it - measured. Ours is one index.
     tm set-hook -ga client-attached 'run-shell -b "true"'
@@ -3292,6 +3304,43 @@ else
     check 'and says nothing about arming outside konsole mode' '0' \
         "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
               TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" doctor 2>&1 | grep -c 'arm:')"
+
+    # DOCTOR ON THE DETECTION. This server has no client attached, so the probe
+    # asks and is refused - which is the reportable state a user over ssh, after a
+    # reattach from elsewhere, or with a stray second client will actually see.
+    # Machine-independent because run.sh:47 unsets TMUX and every case here pins
+    # its own.
+    tdoc=$tmp/tdoctor.txt
+    (cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+        TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" doctor) >"$tdoc" 2>&1
+    check 'doctor says no client proved konsole' '1' \
+        "$(grep -c "multiplexer: tmux - KONSOLE_[*] says nothing here, and not every" "$tdoc")"
+    # "not every", never "no": the rule is ALL and at least one, so a mixed
+    # session declines with a client: line above that DOES say konsole, and a
+    # summary contradicting the lines it summarises is the one way this report
+    # can mislead. Zero clients reads true under the same sentence.
+    check 'and names what would have to prove it' '1' \
+        "$(grep -c "konsole: off  not every attached client's pty is owned by konsole" "$tdoc")"
+    # A decline is exactly the case CCTAB_TERMINAL stays documented for, so the
+    # #17 remedy has to survive the new line above it.
+    check 'and the remedy still prints under a decline' '1' \
+        "$(grep -c 'If the outer terminal IS Konsole, set CCTAB_TERMINAL=konsole' "$tdoc")"
+    # And the verdict line names the PROBE rather than the absent variables: a
+    # refusal explained by KONSOLE_* would credit the environment for an answer
+    # the process tree gave.
+    check 'and the verdict is still not Konsole' '1' \
+        "$(grep -c "^terminal: *not Konsole - not every attached tmux client's" "$tdoc")"
+    # An explicit CCTAB_TERMINAL means the probe is never ASKED, so the line keeps
+    # its original wording and the remedy stays silent - the #17 pin at the top of
+    # this file, re-checked against a real server rather than a malformed $TMUX.
+    (cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+        TMUX="$tsock,1,0" TMUX_PANE=%0 CCTAB_TERMINAL=wezterm "$bin" doctor) >"$tdoc" 2>&1
+    check 'an override means the probe is never asked' '1' \
+        "$(grep -c 'multiplexer: tmux, so KONSOLE_[*] says nothing about the outer' "$tdoc")"
+    check 'and it has already answered the question' '0' \
+        "$(grep -c 'If the outer terminal IS Konsole' "$tdoc")"
+    check 'and doctor quotes the value back instead' '1' \
+        "$(grep -c "konsole: off  CCTAB_TERMINAL says this is not Konsole" "$tdoc")"
     # The LAYOUT is server-wide too, and `title: OK` can never catch a drift: the
     # SessionStart that changed the layout rewrote @cctab_string in the same batch,
     # so those two always agree. The server is on suffix here, from the konsole
@@ -3339,6 +3388,97 @@ else
     check 'screen gets nothing, deliberately' \
         '{"terminalSequence":"\u001b]0;🔵 ~/plain\u0007","suppressOutput":true}' \
         "$(cd -- "$tmp/plain" && HOME=$tmp STY=1234.pts-0.host "$bin" working </dev/null)"
+
+    # --- ISSUE #18: WHO OWNS THE PTY, not who is somewhere in the ancestry ----
+    #
+    # The two checks below are the only ones in this file that need a real pty,
+    # and they are the reason the detection rule is what it is. `fakterm.py`
+    # stands in for a terminal emulator: it renames itself with prctl, allocates
+    # a pty, runs a command inside it and HOLDS THE MASTER - which is exactly
+    # what makes it the owner of that pty in /proc, and what a real konsole or
+    # xterm does. Nothing here is a fixture: the kernel fills in tty_nr.
+    #
+    #   A2  konsole -> tmux client                     must ARM
+    #   B2  konsole -> xterm -> tmux client            must DECLINE
+    #
+    # B2 is the regression: an xterm launched from a Konsole shell leaves a
+    # konsole in the chain behind it, the old any-ancestor-at-any-depth walk
+    # claimed it, and the OSC 50 that followed SET THAT XTERM'S FONT.
+    #
+    # On its OWN private server, `tmux -L cctabtty`, killed after each case.
+    tts=cctabtty
+    ttysock=/tmp/tmux-$(id -u)/$tts
+    tmux_tty_gone() { tmux -L "$tts" kill-server 2>/dev/null; }
+    cleanup() { tmux_gone; tmux_tty_gone; rm -rf "$tmp"; }
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf 'SKIP  pty-owner checks (no python3 to allocate a pty)\n'
+    else
+        cat > "$tmp/fakterm.py" <<'FAKTERM'
+"""Stand in for a terminal emulator: take a comm via prctl, allocate a pty, run
+a command inside it, hold the MASTER side and stay alive until it goes away."""
+import ctypes, os, pty, select, signal, sys, time
+name, cmd = sys.argv[1], sys.argv[2:]
+ctypes.CDLL("libc.so.6", use_errno=True).prctl(15, ctypes.c_char_p(name.encode()), 0, 0, 0)
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(cmd[0], cmd)
+deadline = time.time() + 30
+while time.time() < deadline:
+    r, _, _ = select.select([fd], [], [], 0.5)
+    if r:
+        try:
+            if not os.read(fd, 65536):
+                break
+        except OSError:
+            break
+    if os.waitpid(pid, os.WNOHANG)[0] == pid:
+        break
+try:
+    os.kill(pid, signal.SIGKILL)
+except OSError:
+    pass
+FAKTERM
+        # ttyverdict <shell command> -- start a fresh private server, launch the
+        # chain, wait for its client to attach, and print what the detection
+        # made of it: `on`, `off`, or `noclient` when the chain never attached.
+        ttyverdict() {
+            tmux_tty_gone
+            tmux -L "$tts" -f /dev/null new-session -d -s probe -x 80 -y 24
+            nohup bash -c "$1" </dev/null >"$tmp/ttyrun.out" 2>&1 &
+            _top=$!
+            _i=0
+            _v=noclient
+            while [ "$_i" -lt 80 ]; do
+                if [ -n "$(tmux -L "$tts" list-clients -F '#{client_pid}' 2>/dev/null)" ]; then
+                    _v=$( (cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+                             TMUX="$ttysock,1,0" TMUX_PANE=%0 "$bin" doctor 2>&1) \
+                          | sed -n 's/^ *konsole: \(o[nf]*\)  *.*/\1/p' | head -1)
+                    break
+                fi
+                sleep 0.25 2>/dev/null || sleep 1
+                _i=$((_i + 1))
+            done
+            # Killing the server drops the client, the pty reads EOF and the
+            # whole chain unwinds; the kills are the belt to that braces.
+            tmux_tty_gone
+            pkill -P "$_top" >/dev/null 2>&1
+            kill "$_top" >/dev/null 2>&1
+            printf '%s\n' "${_v:-none}"
+        }
+        _fk="python3 $tmp/fakterm.py"
+        check 'a client whose pty konsole owns proves Konsole' 'on' \
+            "$(ttyverdict "$_fk konsole bash -c 'tmux -L $tts attach -t probe'")"
+        # THE REGRESSION. The konsole is still in the ancestry, two hops up, and
+        # it must not count: the xterm holds the master of the client's pty.
+        check 'an xterm launched from a konsole shell does NOT' 'off' \
+            "$(ttyverdict "$_fk konsole bash -c \"$_fk xterm bash -c 'tmux -L $tts attach -t probe'\"")"
+        # A pty owner named nothing in particular is the same decline, which is
+        # what makes the check above about OWNERSHIP and not about the name
+        # `xterm` having been special-cased.
+        check 'and neither does any other owner of that pty' 'off' \
+            "$(ttyverdict "$_fk konsole bash -c \"$_fk wezterm bash -c 'tmux -L $tts attach -t probe'\"")"
+        printf 'pty-owner checks: private server %s, killed.\n' "$ttysock"
+    fi
 
     tmux_gone
     printf 'tmux section: private server %s, killed.\n' "$tsock"

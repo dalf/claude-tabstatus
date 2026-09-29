@@ -1147,10 +1147,13 @@ Konsole's default tab title** and nothing survives closing the tab.
 
 OSC 50 means "set font" in xterm and is unrecognised in most other terminals,
 so it is sent only when `KONSOLE_VERSION` or `KONSOLE_DBUS_SESSION` is in the
-environment and the session is not inside tmux or screen - or when
+environment and the session is not inside tmux or screen; when
 `CCTAB_TERMINAL=konsole` says so explicitly, which is the only signal that
-survives an ssh. Inside tmux the arming goes to the attached tmux client's pty
-instead of to our own pane; see [tmux](#tmux).
+survives an ssh; or - inside a **local** tmux - when every attached tmux client
+*proves* it, by speaking through a pty that a process named `konsole` owns.
+Inside tmux the arming
+goes to the attached tmux client's pty instead of to our own pane; see
+[tmux](#tmux).
 
 **Windows Terminal needs no configuration**, and neither does any other
 terminal that honours a plain OSC 0 title.
@@ -1297,12 +1300,21 @@ set -w -t <window> window-status-current-format  a strip plus the saved current 
 ```
 
 In Konsole mode only, two more - this binary's path, and the hook that re-arms a
-reattached tab with it:
+reattached tab with it. *Which* of the two hook shapes is installed is decided by
+how Konsole was established, and the arity is the whole policy:
 
 ```text
 set -s @cctab_exe                        this binary, for the hook to run
+
+# CCTAB_TERMINAL=konsole asserted it: arm unconditionally, which is what the
+# Konsole -> ssh -> tmux topology needs, where nothing can ever be proved.
 set-hook -t <our session> 'client-attached[1971]' \
     'run-shell -b "'\''#{@cctab_exe}'\''  tmux-arm '\''#{client_tty}'\''"'
+
+# Detected from who owns the client's pty: the attaching client's pid rides along,
+# and the arm re-proves it before it writes a byte.
+set-hook -t <our session> 'client-attached[1971]' \
+    'run-shell -b "'\''#{@cctab_exe}'\''  tmux-arm '\''#{client_tty}'\'' '\''#{client_pid}'\''"'
 ```
 
 `tabstatus tmux-format` prints the outer `set-titles-string` and generated title
@@ -1351,17 +1363,23 @@ with the one-line remedy:
 tmux:      OK   tmux 3.7c on /tmp/tmux-1000/default, pane %3
            decay: OK   status on, status-interval 15s - the tab re-renders on that timer
            title: OK   set-titles-string is the one SessionStart installed
-           client: /dev/pts/3 xterm-256color HASTITLE
-           konsole: off  set CCTAB_TERMINAL=konsole when the outer terminal is Konsole
+           client: 860233 /dev/pts/3 xterm-256color HASTITLE no konsole owns its pty
+           konsole: off  not every attached client's pty is owned by konsole - the client: lines say which. Over ssh none ever can: set CCTAB_TERMINAL=konsole when the outer terminal is Konsole
            ttl: working 1200s, waiting 900s, gone 3600s (0 = never)
 ```
 
-In Konsole mode it also reports the re-arm hook, and it warns when the strip on
+The `client:` line carries each attached client's pid and the pid of the process
+that owns its pty, so the verdict below it can be checked by hand against `ps`. In
+Konsole mode doctor also reports the re-arm hook, and it warns when the strip on
 the server is on the other end from the one this session would install:
 
 ```text
-           arm: OK   client-attached re-arms this tab's Konsole format on every reattach
            layout: WARN the server has the strip last, but this session would install it first
+                   CCTAB_TERMINAL and CCTAB_GLYPH_POS are server-wide and the LAST SessionStart wins - and with neither set, so is whichever clients proved Konsole then.
+                   Set them the same for every claude here.
+           arm: OK   client-attached re-checks who owns the attaching client's pty, then re-arms
+           client: 1379066 /dev/pts/3 xterm-256color HASTITLE konsole (pid 5892)
+           konsole: on   every attached client's pty is owned by konsole - OSC 50 goes only to a client that proves it
 ```
 
 ### The TTLs
@@ -1399,11 +1417,13 @@ is no reason for it to linger longer.
 
 They are server-wide, so the last `SessionStart` on a server wins for every
 window on it. So are `CCTAB_TERMINAL` and `CCTAB_GLYPH_POS`, which decide the
-*layout*: a plain `SessionStart` after a `CCTAB_TERMINAL=konsole` one flips the
-strip back to the elided end while the Konsole arming stays in force. Set them the
-same for every claude on one tmux server - `doctor`'s `layout: WARN` line is there
-because the `title: OK` test cannot catch it (the same `SessionStart` rewrites
-`@cctab_string`, so those two always agree).
+*layout* - and so, with neither of them set, is whichever clients
+[proved Konsole](#konsole-inside-tmux) at that last `SessionStart`. A plain
+`SessionStart` after a `CCTAB_TERMINAL=konsole` one flips the strip back to the
+elided end, and un-arms the tab on its way past so the two halves cannot
+disagree. Set the variables the same for every claude on one tmux server -
+`doctor`'s `layout: WARN` line is there because the `title: OK` test cannot catch
+it (the same `SessionStart` rewrites `@cctab_string`, so those two always agree).
 
 ### Save and restore
 
@@ -1451,14 +1471,100 @@ not restore rather than claiming it did. A tmux server restart loses the
 installed format and the saved values together, which is self-consistent:
 nothing to restore, nothing left behind.
 
+### Konsole inside tmux
+
+Inside tmux, `KONSOLE_*` describes the terminal the tmux **server** was born
+under, not the one drawing the tab: the server is daemonised and reparented to
+`systemd`, so after a detach and an ssh in from somewhere else those variables
+lie. That is why they are ignored inside a multiplexer, and it is why the answer
+is taken from somewhere else entirely.
+
+**A local tmux needs no configuration.** The tmux *client* is not daemonised - it
+is a direct child of the shell the terminal spawned - so at `SessionStart` the
+plugin asks `tmux list-clients -t <our pane> -F '#{client_pid} #{client_tty}'`
+and, for each client, finds **the process that owns that client's pty**. Nothing
+in any environment is trusted, and no process's `environ` is ever read.
+
+Ownership is decided by the controlling terminal and nothing else. Field 7 of
+`/proc/<pid>/stat` is `tty_nr`: every process a terminal emulator spawns *inside*
+a pty carries that pty as its controlling terminal, while the emulator holds the
+**master** side and therefore has a different `tty_nr` - its own, or `0` when it
+was launched from a desktop menu. So the walk climbs the ppid chain while
+`tty_nr` stays equal to the client's, and the first ancestor whose `tty_nr`
+*differs* is the owner. Konsole is claimed if, and only if, that one process is
+named exactly `konsole`.
+
+Measured here: `tmux: client` (pts/8) → `bash` (pts/8) → `konsole` (none) →
+`systemd`, so `konsole` is the owner and the answer is yes. One round trip to
+ask and one more to read the re-arm hook back before anything is armed, on an
+edge that already makes four - and **nothing at all on the painting path**,
+because inside tmux the glyph position lives in server options this same
+`SessionStart` writes.
+
+If the client has no controlling terminal of its own (`tty_nr` 0 - a client
+started under `setsid`), the comparison has nothing to compare and the answer is
+no. `0` means "no controlling terminal", not a terminal identity, so every
+tty-less ancestor would otherwise compare equal and the walk would answer by
+accident.
+
+The verdict is **all clients, and at least one**: every attached client has to
+prove it. `set-titles-string` is a session option with no per-client form, so the
+strip is one value for everybody, and a session with a stray non-Konsole client
+declines as a whole rather than arming a terminal where OSC 50 sets the font.
+`doctor`'s `client:` line names the pid of each client and says which one refused.
+
+Because it is a function of *who was attached at the last `SessionStart`*,
+attaching from a second terminal and running `/clear` can swap the verdict. The
+two halves do not have the same blast radius: `set-titles-string` is set with
+`set -g`, so the strip end moves for every claude window on that tmux **server**,
+while the arming and its hook are scoped to the session that detected. A
+`SessionStart` that declines un-arms before it removes the hook, so a tab is
+never left armed with the strip back on the end Konsole elides.
+`CCTAB_TERMINAL`, set the same way everywhere, is what pins all of it.
+
 ### Konsole over ssh
 
-`KONSOLE_*` does not survive an ssh, so in the topology this exists for - Konsole
-→ ssh → tmux → claude - there is nothing to detect. `CCTAB_TERMINAL=konsole`
-says it explicitly, and then the OSC 50 arming goes to **each attached client's
-pty**, named by `tmux list-clients -F '#{client_tty}'`, never to our own pane
-(where tmux would swallow it). The strip also moves to the end Konsole does not
-elide.
+`KONSOLE_*` does not survive an ssh, and over the hop the client's pty is owned
+by `sshd` - so in the topology this exists for - Konsole → ssh → tmux → claude -
+there is nothing to detect and nothing to prove. `CCTAB_TERMINAL=konsole` says it
+explicitly, and then the OSC 50 arming goes to **each attached client's pty**,
+named by `tmux list-clients -F '#{client_tty}'`, never to our own pane (where
+tmux would swallow it). The strip also moves to the end Konsole does not elide.
+
+`CCTAB_TERMINAL` still overrides in **both directions**, and it stays the answer
+for everything detection cannot reach:
+
+| detection declines | why |
+|---|---|
+| over ssh | the pty is owned by `sshd`, structurally and always |
+| a terminal launched from a Konsole shell | the xterm (or alacritty, or anything else) owns the pty; the `konsole` behind it is somebody else's terminal. **This is the case the ownership rule exists for**: in xterm OSC 50 sets the font |
+| yakuake and other Konsole KPart hosts | the KPart host owns the pty under its own name (`yakuake`, `dolphin`, `kate`), even though Konsole's own code is what would handle the sequence |
+| a session under `script`, `su --pty`, `socat -pty` or `expect` | the relay owns the pty. It would have worked - the bytes are forwarded up to Konsole - but from `/proc` alone this shape is *identical* to the xterm row above, differing only in the owner's name, so no rule can be right about both |
+| a client started under `setsid` | it has no controlling terminal, so there is nothing to compare against |
+| GNU screen | `$STY` has no `#{client_pid}` equivalent to build on |
+| a `SessionStart` with no client attached | a detached session, cron, a script: nothing is there to prove it. `/clear` from the attached tab re-runs it |
+| a non-Konsole client attached alongside | all clients have to prove it, see above |
+| a chain more than 16 hops long on one pty | the walk is capped, and a cap is what bounds a reparent happening underneath it |
+| a tmux older than 2.1 | `#{client_pid}` renders empty and the probe declines, into exactly today's behaviour |
+| a tmux between 2.1 and 3.0 | the pid is there but the indexed `set-hook` is not, so the strip moves and the tab is deliberately **not** armed - nothing would be left that could un-arm it |
+| macOS, or any host with no `/proc` | as with the pty resolution, which is Linux-only already |
+
+Every row above is a **false negative**, and `CCTAB_TERMINAL=konsole` is the
+answer to all of them. That is the deliberate direction: a false negative costs
+one environment variable, while a false positive costs an OSC 50 written into a
+terminal that reads it as *set font*, which the user sees.
+
+The rule identifies the pty's owner exactly; the only thing that can still be
+wrong is the single question asked about that owner's *name* - a KPart host
+answers `dolphin` when Konsole is really underneath, a relay answers `socat` when
+Konsole is really above. A process that deliberately renames itself `konsole`
+with `prctl` would be believed, which is not a privilege boundary: every process
+in that chain already holds your tty and can write OSC 50 to it directly.
+
+Stopping the walk at the first *terminal emulator* by name was the obvious
+alternative, and it is the one that would have needed a list of emulators to
+guess at. None is needed, because `/proc` answers "who owns this pty" directly
+and the only name asked about afterwards is `konsole` itself.
 
 That route was chosen over `allow-passthrough`, which does work - `on` passes the
 active pane, `all` also passes background windows, every inner ESC has to be
@@ -1479,6 +1585,26 @@ new terminal receives `CSI 22;0;0t`, the current title, and the OSC 50 arming 1m
 later. The hook is set on *our session*, not globally, so a tab whose tmux session
 holds no claude is never armed; it is removed with the restore at the last
 `SessionEnd`, and by `uninstall`.
+
+A hook the *detection* installed also carries `#{client_pid}` and **re-proves the
+attaching client before it writes**, because the hook outlives the `SessionStart`
+that set it: detect Konsole locally, detach, reattach from an xterm, and the
+unconditional form would set that terminal's font. A hook `CCTAB_TERMINAL=konsole`
+installed does not re-prove and must not - over ssh the pty is owned by `sshd`,
+and re-proving there would break the very topology the arming exists for.
+
+**The hook is also the record of the arming.** A detected session leaves nothing
+in its own environment, so `SessionEnd` asks the server which hook it is carrying
+rather than asking `CCTAB_TERMINAL`, and falls back to `CCTAB_TERMINAL` only when
+the server has no answer at all - which is where an *asserted* session is left
+when the hook could not be installed (a tmux older than 3.0, a binary path
+holding a quote). Because the hook is the record, nothing removes it without
+un-arming first: a declining `SessionStart` and `uninstall` both put Konsole's
+formats back on the way past, and `SessionStart` reads the hook back out of the
+server before it arms a *detected* session at all, rather than assume the
+`set-hook` at the end of its batch landed. An arming with no matching un-arming
+is this project's named defect, and an empty hook is not the same claim as "we
+armed nothing".
 
 The path travels in `@cctab_exe` rather than inside the hook's text, because a
 hook value is parsed when it is *set*: measured, `$rd` inside tmux's double quotes
@@ -1604,6 +1730,14 @@ invocation, no arming.
 - **Konsole repaints the tab on a ~2s tick**, not when the title arrives, so
   the dot trails the actual state change by up to about two seconds. That, not
   the ~2ms hook, is the responsiveness ceiling.
+- **A tab left armed after a detach that never returns.** Inside tmux the
+  arming is written to the attached client's pty; detach that client and never
+  come back, and Konsole keeps `LocalTabTitleFormat=%w` for the life of that
+  tab. This used to affect only people who had typed `CCTAB_TERMINAL=konsole`;
+  now that Konsole is detected inside a local tmux, it affects **anyone running
+  Konsole under tmux**. The hand fix is the same one below: run
+  `CLAUDE_PID=$$ ~/code/claude-tabstatus/bin/tabstatus session-end` from a shell
+  in that tab.
 - **A session killed ungracefully leaves the tab armed.** `SessionEnd` runs on
   a clean shutdown, on `/clear` and on `/resume`, but not after `kill -9`, an
   OOM kill or a crash: that Konsole tab keeps `LocalTabTitleFormat=%w` and its
@@ -1624,28 +1758,37 @@ invocation, no arming.
   multiplexer case out; the launched-from-Konsole case would still misfire, and
   in xterm OSC 50 sets the font rather than being ignored.
 
-  **`SSH_*` takes out the other case.** A `KONSOLE_*` that crossed a hop
-  describes the terminal it came *from*, so it is not evidence about this tab.
-  Normally it does not cross at all — OpenSSH accepts no environment at either
-  end by default, which is why over ssh you are setting `CCTAB_TERMINAL`
-  already. When it does arrive, from a deliberate `SendEnv`/`AcceptEnv` pair or
-  from a remote rc, nothing here can tell those apart: one describes this hop,
-  the other describes nothing. So it is declined, and `doctor` says which side
-  of the hop the variable is talking about.
+  Inside a **local** tmux the process that owns the attached client's pty answers
+  instead, which is evidence about the client attached *now* rather than
+  inheritance from whenever the server was started - and it takes the
+  launched-from-Konsole case out as well, because that xterm owns the pty and the
+  `konsole` behind it is never reached. What is left there is the opposite error:
+  a transparent pty relay (`script`, `su --pty`) below Konsole owns the pty under
+  its own name and declines, see
+  [Konsole inside tmux](#konsole-inside-tmux).
+
+  **Across an ssh hop the same principle refuses instead of proving.** A
+  `KONSOLE_*` that crossed a hop describes the terminal it came *from*, and no
+  proof is available on the far side, so it is declined. Normally it does not
+  cross at all - OpenSSH accepts no environment at either end by default, which
+  is why over ssh you are setting `CCTAB_TERMINAL` already. When it does arrive,
+  from a deliberate `SendEnv`/`AcceptEnv` pair or from a remote rc, nothing here
+  can tell those apart: one describes this hop, the other describes nothing.
+  `doctor` says which side of the hop the variable is talking about.
 
   That is deliberately stricter than the convention. iTerm2 forwards
   `LC_TERMINAL` by default and Ghostty's `+ssh` adds `SendEnv=TERM_PROGRAM`, so
-  pushing an identity variable across is normal practice — but what those
+  pushing an identity variable across a hop is normal practice - but what those
   variables gate is inert if misread (OSC 133, OSC 7, OSC 1337). Outside tmux
   this verdict writes OSC 50 straight to the pty, and OSC 50 is xterm's *set
-  font*; Konsole's own header notes the clash. A sequence that does something
+  font*; Konsole's own header notes the clash. A sequence that means something
   else when wrong does not get to rest on inherited environment.
 
-  `CCTAB_TERMINAL=konsole` is the explicit answer, and `CCTAB_TERMINAL=<anything
-  else>` is how a leaked `KONSOLE_*` is turned off. It is also the only way to
-  know, over a plain ssh, that the tab at the far end is Konsole's — and it
-  outranks the ssh rule, which removes an accidental path to Konsole, never the
-  deliberate one.
+  `CCTAB_TERMINAL=konsole` is the explicit answer, `CCTAB_TERMINAL=<anything
+  else>` is how a misfire outside tmux is turned off, and over a plain ssh
+  `CCTAB_TERMINAL` is still the only way to know that the tab at the far end is
+  Konsole's. It outranks both rules, which remove accidental paths to Konsole,
+  never the deliberate one.
 - **`session-start`, `session-end`, and all tmux paints are Linux-only.** They resolve the pty
   through `/proc/$CLAUDE_PID/fd/1`, which macOS and Git Bash do not have, so on
   those platforms Konsole arming does not happen (fine, they are not Konsole)
@@ -1713,7 +1856,11 @@ goes on whichever end that terminal preserves:
 Detection uses `KONSOLE_VERSION` / `KONSOLE_DBUS_SESSION`, and is deliberately
 suppressed inside `tmux` or `screen`, where those variables leak in from
 whichever terminal first started the server and say nothing about the one
-drawing the tab.
+drawing the tab. Inside `tmux` the process that owns the attached client's pty
+decides instead, so a local Konsole gets `suffix` with nothing set; under `screen`, and
+in a tmux session with nothing attached that proves it, the suppression is the
+whole story and the default stays `prefix`. See
+[Konsole inside tmux](#konsole-inside-tmux).
 
 **Over ssh the local terminal cannot be detected** - its variables do not
 travel - so a remote session defaults to `prefix`. If you ssh *from* Konsole,
@@ -1797,7 +1944,7 @@ Everything the runtime half reads, in one place:
 | `CCTAB_MAX_HOST` | `16` | characters for the ssh host prefix; `0` = no limit |
 | `CCTAB_ELLIPSIS` | `…` | the elision marker |
 | `CCTAB_HOST` | `/proc`'s hostname | the ssh prefix, instead of this machine's name |
-| `CCTAB_TERMINAL` | unset | `konsole` (matched case-insensitively) arms Konsole's per-tab format even over ssh or inside tmux, and moves the strip to the end Konsole does not elide; any other value says explicitly NOT Konsole. **The one knob here that changes what paints outside tmux as well as in.** |
+| `CCTAB_TERMINAL` | unset | `konsole` (matched case-insensitively) arms Konsole's per-tab format even over ssh or inside tmux, and moves the strip to the end Konsole does not elide; any other value says explicitly NOT Konsole. It outranks detection in **both** directions. **The one knob here that changes what paints outside tmux as well as in.** |
 | `CCTAB_TTL_WORKING` | `1200` | seconds before 🔵 decays to ⚪ in a tmux tab; `0` = never |
 | `CCTAB_TTL_WAITING` | `900` | seconds before 🟠 decays to ⚪ in a tmux tab, **and** before an outstanding wait in the state record expires; `0` = never |
 | `CCTAB_TTL_GONE` | `3600` | seconds before a cell leaves the tmux strip; `0` = never |
