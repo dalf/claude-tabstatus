@@ -305,17 +305,35 @@ pub fn is_set_aside(_name: &str) -> bool {
 }
 
 /// Field 22 of `/proc/<pid>/stat`: the process start time, in clock ticks since
-/// boot. `None` when the process is gone - or on a Unix with no `/proc`.
-///
-/// Parsed after the LAST `") "`, never by splitting the whole line on spaces.
-/// Field 2 is the executable name in parentheses and may itself contain both -
-/// measured on this machine, `/proc/1259713/stat` holds `(npm exec chrome...)`, so
-/// the naive split reads the wrong field for exactly the processes a `claude`
-/// session spawns. The tail begins at field 3, so field 22 is its 20th word.
+/// boot. `None` when the process is gone. The read is the only part of this that
+/// is a system call; [`start_time_from_stat`] is the parse.
 #[cfg(not(target_os = "macos"))]
 pub fn process_start_time(pid: u32) -> Option<u64> {
-    let raw = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    let w = raw.rsplit_once(") ")?.1.split(' ').nth(19)?;
+    start_time_from_stat(&fs::read(format!("/proc/{}/stat", pid)).ok()?)
+}
+
+/// That parse, as a pure function of the bytes the file holds - the same rule the
+/// rest of this page follows, and here it is what makes the non-UTF-8 case below
+/// reachable from a test at all.
+///
+/// Read after the LAST `") "`, never by splitting the whole line on spaces. Field 2
+/// is the executable name in parentheses and may itself contain both - measured on
+/// this machine, `/proc/1259713/stat` holds `(npm exec chrome...)`, so the naive
+/// split reads the wrong field for exactly the processes a `claude` session spawns.
+/// The tail begins at field 3, so field 22 is its 20th word.
+///
+/// BYTES, and no longer `read_to_string`: field 2 is `comm`, the first 15 bytes of
+/// the executable's name, which the kernel copies out unvalidated. `read_to_string`
+/// answers `Err` for a name that is not UTF-8, so a LIVE and fully readable process
+/// reported no start time - measured here by running a copy of `sleep` renamed with
+/// a `0xff` byte in it, whose `/proc/<pid>/stat` fails to decode while every field
+/// this reads is plain ASCII. `from_utf8_lossy` replaces bytes only INSIDE the
+/// parenthesised name, which the split below skips past, so the fields it reads are
+/// unchanged and a valid-UTF-8 `stat` parses byte for byte as it did.
+#[cfg(not(target_os = "macos"))]
+fn start_time_from_stat(raw: &[u8]) -> Option<u64> {
+    let text = String::from_utf8_lossy(raw);
+    let w = text.rsplit_once(") ")?.1.split(' ').nth(19)?;
     if w.is_empty() || w.len() > 20 || !w.bytes().all(|c| c.is_ascii_digit()) {
         return None;
     }
@@ -339,9 +357,7 @@ pub fn process_alive(pid: u32) -> Option<bool> {
 /// would be memory corruption that no test here could catch.
 #[cfg(target_os = "macos")]
 pub fn process_start_time(pid: u32) -> Option<u64> {
-    // A pid outside `pid_t` is not a pid this system ever handed out, and the
-    // question is unanswerable rather than answered "dead".
-    let pid = i32::try_from(pid).ok()?;
+    let pid = pid_to_ask_about(pid)?;
     let want = std::mem::size_of::<libc::proc_bsdinfo>();
     let size = i32::try_from(want).ok()?;
     // SAFETY: `proc_bsdinfo` is plain integers and byte arrays, so all-zero is a
@@ -368,13 +384,34 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
 /// decides what the answer means.
 #[cfg(target_os = "macos")]
 pub fn process_alive(pid: u32) -> Option<bool> {
-    let pid = i32::try_from(pid).ok()?;
+    let pid = pid_to_ask_about(pid)?;
     // SAFETY: two integers to a libc wrapper round a syscall; it reads and writes
     // no memory of ours, and signal 0 sends no signal to anything.
     let rc = unsafe { libc::kill(pid, 0) };
     // `last_os_error` is read unconditionally and is stale when `rc` is 0 - which
     // is the one case the mapping decides without looking at it.
     liveness_from_kill(rc, io::Error::last_os_error().raw_os_error().unwrap_or(0))
+}
+
+/// `pid` as the `pid_t` these two ASK ABOUT, or `None` when it is not one - the
+/// third decision on this page, and pure for the same reason the other two are.
+///
+/// `kill(2)` does not take a pid alone: it reads 0 as "every process in MY OWN
+/// process group" and a negative number as "the group whose id is -pid". Both
+/// SUCCEED, and `kill(0, 0)` succeeds always, because the caller is in its own
+/// group - so a record naming pid 0 would be answered `Some(true)`, a live process
+/// that does not exist, by the one function whose whole purpose is to answer only
+/// what it can prove. `i32::try_from` rules out the negatives already, since a
+/// `u32` above `i32::MAX` does not convert; 0 is what has to be named, and it is
+/// named HERE rather than in either body so that a Linux test runs it.
+///
+/// `None`, not `Some(false)`: this is a question that cannot be asked, and the
+/// invariant is that only evidence - `ESRCH` - claims a death. Linux answers
+/// `Some(false)` for the same pids because `/proc/0` genuinely is not there, which
+/// is evidence; macOS has none to offer and says so.
+#[cfg(any(target_os = "macos", test))]
+fn pid_to_ask_about(pid: u32) -> Option<i32> {
+    i32::try_from(pid).ok().filter(|p| *p > 0)
 }
 
 /// The two `errno` values the mapping below names. POSIX fixes both, and macOS and
@@ -440,21 +477,28 @@ pub fn same_process(pid: u32, start: u64) -> Option<bool> {
 }
 
 /// That decision, as a pure function of the two answers, with the second asked only
-/// when the first did not settle it - which is also what makes the one case `/proc`
-/// cannot produce testable here.
+/// when the first did not settle it - which is also what puts every combination,
+/// including ones this machine cannot stage, in front of a test.
 ///
 /// A start time settles it either way: it is the process under that pid NOW. Without
 /// one, only a pid PROVEN not to exist says the record's process is gone. "Alive but
 /// unreadable" is `None`, and the reaper keeps the record.
 ///
-/// On a default `/proc` that pair cannot arise - `stat` is world-readable wherever
-/// the directory is - which is why the old shape, "alive, therefore some OTHER
-/// process has this pid", was safe on Linux. It is not safe on macOS, where a
+/// The old shape was "alive, therefore some OTHER process has this pid", and it was
+/// safe only where that pair cannot arise. It arises immediately on macOS, where a
 /// process this user may not inspect answers `EPERM`: alive, with no start time.
-/// Reading that as a reused pid unlinks a live session's record. (A `hidepid` mount
-/// is the same pair on Linux, and gets the same conservative answer now.) Windows'
-/// backend has always had this shape - `Probe::Unknown` -> `None` - and this is the
-/// Unix side agreeing with it.
+/// Reading that as a reused pid unlinks a LIVE session's record.
+///
+/// It is reachable on Linux too, which is worth saying plainly rather than claiming
+/// `/proc` makes it impossible. A `hidepid` mount is one way. The other was found
+/// here by measurement: `/proc/<pid>/stat` embeds `comm` verbatim, so a process
+/// whose executable name is not UTF-8 decoded as `Err` and reported no start time
+/// while being perfectly readable and alive. [`start_time_from_stat`] closes that
+/// one at the source by parsing bytes, but the pair itself is not hypothetical and
+/// this function is what makes it harmless either way.
+///
+/// Windows' backend has always had this shape - `Probe::Unknown` -> `None` - and
+/// this is the Unix side agreeing with it.
 fn same_as_recorded(
     now: Option<u64>,
     recorded: u64,
@@ -573,6 +617,24 @@ mod tests {
         }
     }
 
+    /// The pid a liveness question may be ASKED about. `kill(2)` answers a
+    /// different question for 0 - "may I signal my own process group", which always
+    /// succeeds - so letting 0 through would have `process_alive` report a live
+    /// process for a pid nothing has: the exact mirror of the confident wrong
+    /// `Some(false)` this whole change exists to remove.
+    #[test]
+    fn a_liveness_question_is_asked_only_about_a_pid_kill_reads_as_a_pid() {
+        assert_eq!(pid_to_ask_about(0), None, "kill(0, 0) asks about MY process group");
+        assert_eq!(pid_to_ask_about(1), Some(1));
+        assert_eq!(pid_to_ask_about(99_999), Some(99_999));
+        let top = u32::try_from(i32::MAX).expect("i32::MAX is a u32");
+        assert_eq!(pid_to_ask_about(top), Some(i32::MAX));
+        // Above `pid_t` nothing converts, so no `u32` can reach `kill` as the
+        // negative number that would name a process GROUP.
+        assert_eq!(pid_to_ask_about(top + 1), None);
+        assert_eq!(pid_to_ask_about(u32::MAX), None);
+    }
+
     /// `proc_pidinfo` returns the byte count it filled, so a partial fill is a
     /// buffer still holding its own zeros - and a start time of 0 would compare
     /// equal to the next one, which is a dead pid reading as the same process.
@@ -606,10 +668,10 @@ mod tests {
         assert_ne!(ORIGIN_KEY, "q", "the Windows FILETIME key");
     }
 
-    /// The reaper's other decision, including the pair `/proc` cannot produce: no
-    /// start time and a process that is ALIVE. Reading that as "a different process
-    /// has the pid" is what would unlink a live session's record on macOS, where a
-    /// process this user may not inspect answers exactly that way.
+    /// The reaper's other decision, including the awkward pair: no start time and a
+    /// process that is ALIVE. Reading that as "a different process has the pid" is
+    /// what would unlink a live session's record on macOS, where a process this user
+    /// may not inspect answers exactly that way - and on Linux under `hidepid`.
     #[test]
     fn a_missing_start_time_is_a_different_process_only_for_a_pid_proven_gone() {
         let unasked = || unreachable!("a start time settles it without a second call");
@@ -618,6 +680,34 @@ mod tests {
         assert_eq!(same_as_recorded(None, 7, || Some(false)), Some(false), "gone");
         assert_eq!(same_as_recorded(None, 7, || Some(true)), None, "alive, unreadable");
         assert_eq!(same_as_recorded(None, 7, || None), None, "nothing could be asked");
+    }
+
+    /// The `/proc` parse, on the bytes the kernel actually writes. The last two
+    /// cases are why it takes bytes: `comm` is copied out unvalidated, so a live
+    /// process whose executable name is not UTF-8 used to report NO start time,
+    /// which is the "alive, but no start time" pair [`same_as_recorded`] is careful
+    /// about - reached on an ordinary unprivileged process, with no `hidepid`.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn a_start_time_is_the_word_after_the_last_paren_whatever_the_name_holds() {
+        let line = |comm: &[u8]| {
+            let mut v = b"4242 (".to_vec();
+            v.extend_from_slice(comm);
+            v.extend_from_slice(b") S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 ");
+            v.extend_from_slice(b"907861 19 20\n");
+            v
+        };
+        assert_eq!(start_time_from_stat(&line(b"sleep")), Some(907_861));
+        // The name that broke the naive split: it holds both a space and a `)`.
+        assert_eq!(start_time_from_stat(&line(b"npm exec chrome)")), Some(907_861));
+        // The name that broke `read_to_string`: one byte that is not UTF-8.
+        assert_eq!(start_time_from_stat(&line(b"sl\xffeep")), Some(907_861));
+        assert_eq!(start_time_from_stat(&line(b"\xff\xfe\xfd")), Some(907_861));
+        // And the refusals, unchanged: nothing, no paren, and a field that is not
+        // twenty digits of ASCII.
+        assert_eq!(start_time_from_stat(b""), None);
+        assert_eq!(start_time_from_stat(b"4242 sleep S 1 2 3"), None);
+        assert_eq!(start_time_from_stat(&line(b"x")[..30]), None);
     }
 
     /// `doctor` prints [`NO_STATE_DIR`] when there is nowhere to write, and the

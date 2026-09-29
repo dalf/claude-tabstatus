@@ -213,8 +213,9 @@ impl Origin {
     }
 
     /// Whether the process that wrote this record is STILL the process under that
-    /// pid. False means gone: either `/proc/<pid>` has disappeared, or something
-    /// else has since been given the number.
+    /// pid. False means gone: the process is provably not there - no `/proc/<pid>`
+    /// on Linux, `ESRCH` from `kill(pid, 0)` on macOS - or something else has since
+    /// been given the number.
     ///
     /// This is the reaper's whole decision, and it PROVABLY cannot reap a live
     /// session. A hook process is a child of `$CLAUDE_PID`, so while any of a
@@ -228,7 +229,8 @@ impl Origin {
     /// On Windows the same proof holds with the process's creation time: `$CLAUDE_PID`
     /// is the live `claude.exe` (measured), the time is set once at creation, and a
     /// pid is not reissued while any handle to its process is open. There the error
-    /// it can make needs a reused pid inside the same 100ns creation stamp.
+    /// it can make needs a reused pid inside the same 100ns creation stamp. On macOS
+    /// it holds with `proc_pidinfo`'s start time, to the microsecond.
     ///
     /// Whatever cannot be asked - a process this user may not open - counts as
     /// alive, so the reaper keeps the record rather than guess.
@@ -238,7 +240,9 @@ impl Origin {
 }
 
 // The start time is `sys::process_start_time`: field 22 of `/proc/<pid>/stat` on
-// Linux, the creation FILETIME from `GetProcessTimes` on Windows.
+// Linux, the creation FILETIME from `GetProcessTimes` on Windows, and
+// `proc_pidinfo`'s start `timeval` in microseconds on macOS. Three encodings, which
+// is why there are three `sys::ORIGIN_KEY`s and not one.
 
 /// Who owns a wait.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -660,9 +664,11 @@ impl Record {
         if let Some(epoch) = self.background {
             s.push_str(&format!(", background reported {}s ago (last known snapshot; not expired)", now.saturating_sub(epoch)));
         }
-        // Three answers, not two: `alive()` keeps what it cannot ask about (a
-        // process this user may not open, on Windows), and the report must not
-        // call that "live". Unix always has an answer, so it never prints the third.
+        // Three answers, not two: `alive()` keeps what it cannot ask about - a
+        // process this user may not open on Windows, one this user may not signal
+        // on macOS, a `hidepid` mount on Linux - and the report must not call that
+        // "live". Every platform can reach the third answer now; before macOS had
+        // its own liveness primitive, Linux's `/proc` check answered two.
         match self.origin.map(|o| (o.pid, sys::same_process(o.pid, o.start))) {
             Some((pid, Some(true))) => s.push_str(&format!(", session pid {} live", pid)),
             Some((pid, Some(false))) => s.push_str(&format!(", session pid {} GONE", pid)),
