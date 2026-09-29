@@ -117,9 +117,10 @@
 //     loses updates and a lost CLEAR is a tab stuck orange - but it is taken on the
 //     session's OWN record, so five concurrent sessions never contend.
 
+use crate::clock;
 use crate::edge::{Edge, Glyph, Notification, Paint};
 use crate::payload::{Payload, MAX_ELICITATION_ID_BYTES};
-use crate::{sys, tmux};
+use crate::sys;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
@@ -838,8 +839,8 @@ impl Session {
         Some(Session {
             dir,
             path,
-            now: tmux::now(),
-            ttl: tmux::ttl_secs("CCTAB_TTL_WAITING", tmux::DEFAULT_TTL_WAITING),
+            now: clock::now(),
+            ttl: clock::ttl_secs("CCTAB_TTL_WAITING", clock::DEFAULT_TTL_WAITING),
         })
     }
 
@@ -1644,8 +1645,8 @@ pub fn survey() -> Survey {
             stale: 0,
         };
     };
-    let now = tmux::now();
-    let ttl = tmux::ttl_secs("CCTAB_TTL_WAITING", tmux::DEFAULT_TTL_WAITING);
+    let now = clock::now();
+    let ttl = clock::ttl_secs("CCTAB_TTL_WAITING", clock::DEFAULT_TTL_WAITING);
     let mut records = Vec::new();
     let mut stale = 0;
     let listed = fs::read_dir(&d);

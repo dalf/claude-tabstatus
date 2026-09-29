@@ -19,7 +19,8 @@
 //!     behind a headless guard, and elsewhere (macOS) nothing is painted.
 
 use crate::config::Config;
-use crate::surface::{compose, Surface};
+use crate::mux::{Channel, Route};
+use crate::surface::compose;
 use crate::sys;
 use std::fmt::Write as _;
 use std::io::{self, Write};
@@ -89,11 +90,18 @@ fn escape_into(out: &mut String, s: &str) {
     }
 }
 
-/// Arm this tab and paint it, in one write.
-pub fn session_start(title: &str, cfg: &Config) -> io::Result<()> {
-    let caps = cfg.surface.caps();
+/// Arm this tab and paint it, in ONE write.
+///
+/// One write, and therefore one guarded acquisition of the session's tab, is why
+/// the arming is composed here rather than sent by whoever decided it: the arming
+/// has to precede the title in the same byte stream. WHETHER it belongs in this
+/// buffer is [`crate::mux::route`]'s answer - `Channel::Direct` means the session's
+/// own tab, which is this buffer, and `Channel::Clients` means the multiplexer's
+/// clients, which is not.
+pub fn session_start(title: &str, cfg: &Config, route: Route) -> io::Result<()> {
+    let caps = cfg.stack.leaf.caps();
     let mut out: Vec<u8> = Vec::with_capacity(title.len() + 96);
-    if cfg.surface == Surface::Konsole && cfg.tmux.is_none() {
+    if route.appearance == Some(Channel::Direct) {
         // %w makes the OSC 0 payload the entire tab text. Under Konsole's stock
         // formats an OSC 0 title is invisible in the tab, which is why Claude's
         // own title never shows up there. Konsole applies profile properties per
@@ -103,7 +111,8 @@ pub fn session_start(title: &str, cfg: &Config) -> io::Result<()> {
         //
         // Inside tmux this pane is not the tab, so the sequence would be
         // swallowed; `tmux::arm_konsole` writes it to the attached client's pty
-        // instead, which is why the Konsole test above also asks for no tmux.
+        // instead, which is why `route` answers `Channel::Clients` there and this
+        // block is skipped.
         let _ = compose::push_arm(&mut out, caps);
     }
     // The arming has to precede the title, or the tab is painted before it can
@@ -113,10 +122,10 @@ pub fn session_start(title: &str, cfg: &Config) -> io::Result<()> {
 }
 
 /// Restore the tab and blank its title, in one write.
-pub fn session_end(cfg: &Config) -> io::Result<()> {
-    let caps = cfg.surface.caps();
+pub fn session_end(cfg: &Config, route: Route) -> io::Result<()> {
+    let caps = cfg.stack.leaf.caps();
     let mut out: Vec<u8> = Vec::with_capacity(96);
-    if cfg.surface == Surface::Konsole && cfg.tmux.is_none() {
+    if route.appearance == Some(Channel::Direct) {
         // We own restore: with the built-in terminal title disabled - which the
         // installer does, otherwise it repaints over ours every 960ms - Claude
         // Code no longer clears the title on exit either. The two formats in the
@@ -132,12 +141,14 @@ pub fn session_end(cfg: &Config) -> io::Result<()> {
 
 /// Deliver session-start or session-end: `bytes` to the pty - or, where the session's
 /// tab is a console rather than a pty (Windows), `title` alone as that console's
-/// title. Never inside tmux there: the title is then tmux's carrier, not a tab's.
+/// title. Never where the layer above RENDERS the tab: the title is then that
+/// layer's carrier, not a tab's. The test is the cap and not `mux.is_some()`,
+/// because screen renders nothing and its title is still a tab's.
 fn write_session(cfg: &Config, bytes: &[u8], title: &str) -> io::Result<()> {
     if sys::HAS_SESSION_CONSOLE {
-        return match (cfg.claude_pid.as_deref(), &cfg.tmux) {
+        return match (cfg.claude_pid.as_deref(), cfg.stack.renders_title()) {
             // Refused or painted, it is not a failure: see `write_pty`.
-            (Some(pid), None) => sys::set_session_title(pid, title).map(drop),
+            (Some(pid), false) => sys::set_session_title(pid, title).map(drop),
             _ => Ok(()),
         };
     }

@@ -25,7 +25,8 @@ carries the management verbs (`install`, `uninstall`, `doctor`, `version`,
 | `src/emit.rs` | delivery: `terminalSequence` JSON, raw OSC to a pane pty, or a console title |
 | `src/support.rs` | one vocabulary for absence: `Support<T>` says available, unsupported, disabled by a knob of ours, unverifiable or failed, each with the reason a user can act on |
 | `src/surface/` | the leaf terminal, chosen at runtime and dispatched statically: `probe.rs` the detection table and the `CCTAB_TERMINAL` override, `rows.rs` the fourteen capability rows as `const` data with their provenance, `compose.rs` the bytes a row spells |
-| `src/tmux.rs` | the tmux integration: the record, `set-titles-string`, window-status formats, restore |
+| `src/mux/` | the multiplexer axis: `mod.rs` detects tmux or screen and `route`s who owns the title and which channel the leaf's bytes ride; `tmux.rs` the tmux integration: the record, `set-titles-string`, window-status formats, restore |
+| `src/clock.rs` | the one clock (`CCTAB_NOW` pins it) and the one TTL grammar, shared by the state record's expiry and the tmux carrier |
 | `src/manage.rs` | all management verbs: `install`, `uninstall`, `doctor`, `version`, `tmux-format`, `tmux-arm`, `print-embedded`, `help` |
 | `src/tree.rs` | the generated plugin tree that `install` materialises and Claude Code loads |
 | `src/embedded.rs` | `hooks/hooks.json` and `.claude-plugin/plugin.json`, compiled in with `include_str!` |

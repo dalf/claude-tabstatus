@@ -158,16 +158,22 @@ fn detect_in<F: Fn(&str) -> bool>(probes: &[Probe], flag: F, in_mux: bool) -> Su
     Surface::Unknown
 }
 
-/// Which surface is drawing the tab, to the extent it can be known.
+/// Which surface is drawing the tab, to the extent it can be known: step 3 of
+/// [`crate::mux::resolve`].
 ///
-/// `CCTAB_TERMINAL` first, then the environment, then nothing. A multiplexer
-/// vetoes the signals that leak into it; it is asked here rather than inside a
-/// probe because no backend in this crate tests `$TMUX` or `$STY` for itself.
-pub fn detect() -> Surface {
+/// `CCTAB_TERMINAL` first, then whatever the multiplexer said, then the
+/// environment, then nothing. Both of the multiplexer's contributions ARRIVE as
+/// arguments - the leaf it named, and whether it swallowed the environment
+/// evidence - because no backend in this crate reads `$TMUX` or `$STY` for
+/// itself, and because the outer layer may be the only source of leaf identity
+/// there is and must therefore be asked before this runs rather than after.
+pub fn resolve_leaf(hint: Option<Surface>, in_mux: bool) -> Surface {
     if let Some(s) = from_override(config::var_nonempty("CCTAB_TERMINAL").as_deref()) {
         return s;
     }
-    let in_mux = config::flag("TMUX") || config::flag("STY");
+    if let Some(s) = hint {
+        return s;
+    }
     detect_in(PROBES, config::flag, in_mux)
 }
 

@@ -36,6 +36,7 @@
 //! `tests/oracle/tabstatus.sh` retained so any of them can be re-derived rather
 //! than trusted.
 
+mod clock;
 mod config;
 mod edge;
 mod embedded;
@@ -44,6 +45,7 @@ mod git;
 mod json;
 mod location;
 mod manage;
+mod mux;
 mod payload;
 mod render;
 mod settings;
@@ -52,11 +54,11 @@ mod support;
 mod surface;
 mod sys;
 mod text;
-mod tmux;
 mod tree;
 
 use config::Config;
 use edge::{Edge, Paint};
+use mux::{tmux, Channel};
 use payload::Payload;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal};
@@ -128,30 +130,45 @@ fn paint(edge: Edge) -> io::Result<()> {
         return emit::dry_run(&composed.title);
     }
 
+    // Who writes what, decided ONCE, before any byte is composed: which channel
+    // carries the title, and which - if any - carries the leaf's appearance bytes.
+    let route = mux::route(&cfg.stack, paint);
+
     // Inside tmux an OSC 0 emitted in a pane never reaches the outer terminal: it
-    // sets `pane_title`, and tmux re-emits a title of its OWN. So inside tmux the
-    // same sequence becomes the record `tmux::title_format` reads back. Both
-    // carrier composition and direct pane delivery execute no subprocess.
-    let payload = match cfg.tmux {
-        Some(_) => tmux::carrier(paint, &composed.place),
-        None => composed.title,
+    // sets `pane_title`, and tmux re-emits a title of its OWN. So when the layer
+    // above us RENDERS the tab, the same sequence becomes the record
+    // `tmux::title_format` reads back. The test is that cap and not `mux.is_some()`:
+    // screen renders nothing, so under `$STY` this is still a plain tab title -
+    // which is what `pty-session-start-konsole-in-screen` pins. Both carrier
+    // composition and direct pane delivery execute no subprocess.
+    let payload = if cfg.stack.renders_title() {
+        tmux::carrier(paint, &composed.place)
+    } else {
+        composed.title
     };
     match paint {
         Paint::SessionStart => {
             // Before the first title lands, for the same reason the Konsole
             // arming precedes it: a tab painted before it can show the paint.
-            tmux::session_start(&cfg);
-            tmux::arm_konsole(&cfg);
-            emit::session_start(&payload, &cfg)
+            tmux::session_start(&cfg, route);
+            tmux::arm_konsole(&cfg, route);
+            emit::session_start(&payload, &cfg, route)
         }
         Paint::SessionEnd => {
-            let r = emit::session_end(&cfg);
-            tmux::session_end(&cfg);
+            let r = emit::session_end(&cfg, route);
+            tmux::session_end(&cfg, route);
             r
         }
-        // Claude Code may wrap terminalSequence in tmux passthrough, which
-        // bypasses pane_title. Our carrier must reach the pane's pty as raw OSC.
-        Paint::Line(_) | Paint::LineWithBackground(_) if cfg.tmux.is_some() => emit::pane_title(&payload, &cfg),
-        Paint::Line(_) | Paint::LineWithBackground(_) => emit::json_line(&payload),
+        Paint::Line(_) | Paint::LineWithBackground(_) => match route.title {
+            // Claude Code may wrap terminalSequence in tmux passthrough, which
+            // bypasses pane_title. Our carrier must reach the pane's pty as raw OSC.
+            Channel::Direct => emit::pane_title(&payload, &cfg),
+            Channel::Protocol => emit::json_line(&payload),
+            // A title on the client registry is the RENDERER's own write - tmux
+            // emits the outer OSC 0 from the format SessionStart installed, on its
+            // own timer - so there is no byte here for us to send. `route` never
+            // asks for it; the arm exists because a `Channel` is total.
+            Channel::Clients => Ok(()),
+        },
     }
 }

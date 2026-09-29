@@ -46,15 +46,16 @@
 //! Only windows that start Claude receive local format decorators. Window names,
 //! automatic renaming, global window formats and the outer aggregate stay intact.
 
+use crate::clock::{self, DEFAULT_TTL_GONE, DEFAULT_TTL_WAITING, DEFAULT_TTL_WORKING, NEVER};
 use crate::config::{self, Config, GlyphPos};
 use crate::edge::{Glyph, Paint};
+use crate::mux::{Channel, Route};
 use crate::surface::Surface;
 use crate::sys;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The tag that marks a pane title as ours. Version 1 of the wire, so a future
 /// shape can change it and let an old format ignore the new panes rather than
@@ -266,6 +267,14 @@ impl Tmux {
             c.arg("-t").arg(p);
         }
     }
+
+    /// A handle with no pane, for the routing tests in [`crate::mux`]. The pane
+    /// is the one thing `route` never reads, and a test that had to name one would
+    /// be asserting about a target rather than about a channel.
+    #[cfg(test)]
+    pub fn for_test() -> Tmux {
+        Tmux { pane: None }
+    }
 }
 
 /// `$TMUX` is `<socket path>,<server pid>,<session id>`.
@@ -288,7 +297,7 @@ fn digits(b: &[u8]) -> bool {
 /// Session end has no glyph and therefore no record - its EMPTY title is what
 /// clears `pane_title`, which is what removes the cell.
 pub fn carrier(paint: Paint, place: &str) -> String {
-    carrier_at(paint, place, now())
+    carrier_at(paint, place, clock::now())
 }
 
 fn carrier_at(paint: Paint, place: &str, epoch: u64) -> String {
@@ -305,77 +314,12 @@ fn carrier_at(paint: Paint, place: &str, epoch: u64) -> String {
     format!("{place} {tag} {state} {epoch}")
 }
 
-/// The epoch the record carries. `CCTAB_NOW` pins it, which is the only reason
-/// a corpus case that goes through tmux can be frozen at all.
-///
-/// No width is imposed: every extraction below is anchored, not offset, so a
-/// mocked `CCTAB_NOW=5` works exactly like a real ten-digit one.
-pub fn now() -> u64 {
-    epoch(config::var_nonempty("CCTAB_NOW").as_deref())
-}
-
-fn epoch(raw: Option<&OsStr>) -> u64 {
-    if let Some(b) = raw.map(OsStr::as_encoded_bytes) {
-        if b.len() <= 10 && digits(b) {
-            return b.iter().fold(0u64, |a, c| a * 10 + u64::from(c - b'0'));
-        }
-    }
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-/// Seconds before a state decays. `0` disables the tier, which is expressed as a
-/// deadline no age can reach rather than as a second shape of format: the
-/// generated string then stays one constant per glyph position.
-const NEVER: u32 = 2_147_483_647;
-/// MEASURED, not reasoned. `working` is repainted by `UserPromptSubmit`,
-/// `PostToolUse` and `PostToolUseFailure` only, so during one long tool call
-/// nothing paints at all - `PreToolUse` is matched to `AskUserQuestion` and
-/// `ExitPlanMode` alone. Over the 91 most recent real transcripts on this
-/// machine, 7709 WITHIN-TURN gaps between two successive `working` paints:
-/// median 9.9s, p95 77s, p99 173s, p99.9 646s, and 39 gaps (0.51%) over 300s -
-/// the old default. 1200s covers 99.95% of them; the four above it are 3343s,
-/// 5677s, 23700s and 27751s, which are sessions resumed the next day rather than
-/// a tool call still running.
-///
-/// The asymmetry is the whole argument: a lingering blue says "still busy" about
-/// a session that has finished, which the next paint corrects in seconds, while a
-/// premature white says "finished, come back" about a build that is still
-/// running - the exact class of lie this slice exists to remove, pointed the
-/// other way. The 3600s disappear horizon still catches a genuinely stuck one.
-const DEFAULT_TTL_WORKING: u32 = 1200;
-pub const DEFAULT_TTL_WAITING: u32 = 900;
-const DEFAULT_TTL_GONE: u32 = 3600;
-
 /// One to six digits with no leading zero; `0` is "never"; anything else is the
-/// default. The same grammar `Cap` uses, for the same reason - `str::parse`
-/// would read `08` as 8 and `0000000` as 0.
+/// default, as a STRING for the format the server evaluates. The grammar and the
+/// clock behind it are [`crate::clock`]'s, because the state layer expires waits
+/// on the same setting without needing a multiplexer to do it.
 fn ttl(key: &str, default: u32) -> String {
-    ttl_secs(key, default).to_string()
-}
-
-/// The same TTL as a NUMBER for state wait expiry. State and tmux share the
-/// setting and grammar, but expire independently: state on an eligible hook,
-/// the tmux carrier against its last paint time.
-pub fn ttl_secs(key: &str, default: u32) -> u64 {
-    u64::from(ttl_of(config::var(key).as_deref(), default))
-}
-
-fn ttl_of(raw: Option<&OsStr>, default: u32) -> u32 {
-    match raw.map(OsStr::as_encoded_bytes) {
-        // "never", expressed as a deadline no age can reach rather than as a
-        // second shape of format.
-        Some(b"0") => NEVER,
-        Some(v)
-            if (1..=6).contains(&v.len())
-                && (b'1'..=b'9').contains(&v[0])
-                && v.iter().all(u8::is_ascii_digit) =>
-        {
-            v.iter().fold(0u32, |a, c| a * 10 + u32::from(c - b'0'))
-        }
-        _ => default,
-    }
+    clock::ttl_secs(key, default).to_string()
 }
 
 /// Configure the server title in one batch, then decorate this pane's window.
@@ -393,8 +337,8 @@ fn ttl_of(raw: Option<&OsStr>, default: u32) -> u32 {
 /// and then never again - so a cell whitens and never disappears. Turning the
 /// status line on anyway would run a user's `#(...)` in `status-right` on our
 /// schedule, which is not ours to decide. doctor reports it instead.
-pub fn session_start(cfg: &Config) {
-    let Some(t) = &cfg.tmux else { return };
+pub fn session_start(cfg: &Config, route: Route) {
+    let Some(t) = cfg.stack.tmux() else { return };
     let fmt = title_format(cfg.glyph_pos);
     let sts = set_titles_string(cfg.glyph_pos);
     let mut c = Command::new("tmux");
@@ -420,11 +364,14 @@ pub fn session_start(cfg: &Config) {
     // which a tmux older than 3.0 has no syntax for, and measured, a command that
     // fails at the END of a `;`-chained batch leaves every command before it
     // applied. So an old tmux loses the re-arm and keeps the whole decay.
-    match (cfg.surface, exe_path()) {
+    // The hook exists to re-arm what `route` armed, so it is gated on the SAME
+    // answer and never on the leaf's name a second time: a re-arm installed for a
+    // leaf whose arming did not go out is an arming with no matching un-arming.
+    match (route.appearance, exe_path()) {
         // A path with a single quote in it has no representation inside ARM_HOOK's
         // sh quoting, and a path that is not UTF-8 cannot go into a format at all.
         // Both drop the re-arm and keep everything else.
-        (Surface::Konsole, Some(exe)) => {
+        (Some(Channel::Clients), Some(exe)) => {
             set(&mut c, OPT_EXE, &exe);
             c.arg(";").arg("set-hook");
             t.target(&mut c);
@@ -598,12 +545,19 @@ fn drop_hook(t: &Tmux) {
 /// Opt-in via `CCTAB_TERMINAL=konsole`, because in the topology this is for -
 /// Konsole, ssh, tmux - `KONSOLE_*` does not survive the ssh and there is
 /// nothing to detect.
-pub fn arm_konsole(cfg: &Config) {
-    if cfg.surface != Surface::Konsole {
+///
+/// WHETHER to arm, and to whom, is [`crate::mux::route`]'s answer and not this
+/// function's: what used to be here was `surface != Konsole` with the tmux half
+/// of the condition hidden inside [`to_clients`], while `emit::session_start`
+/// carried the complementary half. Two halves in two files is how a pane gets
+/// armed twice.
+pub fn arm_konsole(cfg: &Config, route: Route) {
+    if route.appearance != Some(Channel::Clients) {
         return;
     }
-    if let Some(a) = &cfg.surface.caps().arming {
-        to_clients(cfg, a.pair().0);
+    let Some(t) = cfg.stack.tmux() else { return };
+    if let Some(a) = &cfg.stack.leaf.caps().arming {
+        to_clients(t, a.pair().0);
     }
 }
 
@@ -613,11 +567,11 @@ pub fn arm_konsole(cfg: &Config) {
 /// Our own pane is excluded from the count rather than relied on to have been
 /// cleared already: session end's empty title travels through the pty and tmux's
 /// parser, and racing that would silently skip the restore.
-pub fn session_end(cfg: &Config) {
-    let Some(t) = &cfg.tmux else { return };
-    if cfg.surface != Surface::Konsole {
+pub fn session_end(cfg: &Config, route: Route) {
+    if route.appearance != Some(Channel::Clients) {
         return;
     }
+    let Some(t) = cfg.stack.tmux() else { return };
     let mut c = Command::new("tmux");
     c.arg("display-message").arg("-p");
     t.target(&mut c);
@@ -625,8 +579,8 @@ pub fn session_end(cfg: &Config) {
     if capture(c).is_ok_and(|s| s.contains('1')) {
         return;
     }
-    if let Some(a) = &cfg.surface.caps().arming {
-        to_clients(cfg, a.pair().1);
+    if let Some(a) = &cfg.stack.leaf.caps().arming {
+        to_clients(t, a.pair().1);
     }
     // The last claude in this session is going: nothing is left for a reattach to
     // re-arm, so the hook goes with it.
@@ -647,8 +601,12 @@ fn others_expr(t: &Tmux) -> String {
 }
 
 /// Write `bytes` to the pty of every client attached to OUR session.
-fn to_clients(cfg: &Config, bytes: &[u8]) {
-    let Some(t) = &cfg.tmux else { return };
+///
+/// It takes the handle rather than the whole `Config` because the multiplexer's
+/// presence is no longer its business: it used to carry the tmux half of the
+/// arming condition in that `let Some` - the half `emit.rs` complemented, and the
+/// half that made lifting the caller's body into a method an unconditional arm.
+fn to_clients(t: &Tmux, bytes: &[u8]) {
     let mut c = Command::new("tmux");
     c.arg("list-clients");
     t.target(&mut c);
@@ -1212,7 +1170,7 @@ pub fn report(cfg: &Config) -> Vec<String> {
                 .to_owned(),
         );
     }
-    if cfg.surface == Surface::Konsole {
+    if cfg.stack.leaf == Surface::Konsole {
         out.push(format!(
             "           arm: {}",
             match get(8) {
@@ -1257,7 +1215,7 @@ pub fn report(cfg: &Config) -> Vec<String> {
     }
     out.push(format!(
         "           konsole: {}",
-        if cfg.surface == Surface::Konsole {
+        if cfg.stack.leaf == Surface::Konsole {
             "on   CCTAB_TERMINAL=konsole - OSC 50 goes to each attached client's pty"
         } else {
             "off  set CCTAB_TERMINAL=konsole when the outer terminal is Konsole \
@@ -1340,19 +1298,6 @@ mod tests {
         // The record is what the FORMAT matches, so the two cannot drift apart.
         let place = "srv:~/a b,c}d#{host}e:f|g";
         assert!(carrier_at(Paint::Line(Glyph::Waiting), place, 5).starts_with(place));
-    }
-
-    #[test]
-    fn the_ttl_grammar_is_the_caps_grammar() {
-        let t = |v: Option<&str>| ttl_of(v.map(OsStr::new), 300);
-        assert_eq!(t(Some("0")), NEVER);
-        assert_eq!(t(Some("1")), 1);
-        assert_eq!(t(Some("999999")), 999_999);
-        // A leading zero, a seventh digit, a sign and a word are all the default.
-        for bad in ["08", "0300", "1000000", "-1", "3.5", "nope", " 8", ""] {
-            assert_eq!(t(Some(bad)), 300, "{bad:?}");
-        }
-        assert_eq!(t(None), 300);
     }
 
     /// The format is one constant per glyph position, so it can be pinned here
@@ -1478,16 +1423,5 @@ mod tests {
         // A string that is not ours at all is reported as the default end rather
         // than guessed at; the branch is only reached when it IS ours.
         assert_eq!(end_of("MY OWN TITLE"), "first");
-    }
-
-    #[test]
-    fn the_epoch_can_be_pinned_for_a_test_and_bad_values_are_ignored() {
-        let e = |v: Option<&str>| epoch(v.map(OsStr::new));
-        assert_eq!(e(Some("1700000000")), 1_700_000_000);
-        assert_eq!(e(Some("5")), 5);
-        assert_eq!(e(Some("0")), 0);
-        for bad in [None, Some(""), Some("12345678901"), Some("17000000x0"), Some("-1")] {
-            assert!(e(bad) > 1_700_000_000, "{bad:?} must not be believed");
-        }
     }
 }

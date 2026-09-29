@@ -34,7 +34,7 @@ pub mod compose;
 mod probe;
 mod rows;
 
-pub use probe::detect;
+pub use probe::resolve_leaf;
 
 use crate::support::{Presence, Support};
 

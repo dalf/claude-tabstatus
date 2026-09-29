@@ -17,10 +17,14 @@
 //! into a visible U+FFFD rather than thrown away for the default.
 
 use crate::edge::Glyph;
-use crate::surface::{Elide, Surface};
+use crate::mux::{self, Stack};
+use crate::surface::Elide;
 use crate::sys;
 use crate::text;
-use crate::tmux::Tmux;
+// Only `for_test` names a leaf: `from_env` gets the whole stack from
+// `mux::resolve` and never picks one itself.
+#[cfg(test)]
+use crate::surface::Surface;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
@@ -128,10 +132,11 @@ pub struct Config {
     /// Print the computed title and emit nothing at all. This is what makes the
     /// edge table testable with no Claude session.
     pub dry_run: bool,
-    /// The leaf terminal, resolved once. What it can do is a `&'static` row -
-    /// `surface.caps()` - reached by a `match`, so carrying it costs exactly what
-    /// carrying the two-variant `Terminal` it replaces cost.
-    pub surface: Surface,
+    /// The multiplexer, the leaf terminal and the layout the leaf implies, all
+    /// resolved ONCE and in that order. What the leaf can do is a `&'static` row -
+    /// `stack.leaf.caps()` - reached by a `match`, so carrying it costs exactly
+    /// what carrying the two-variant `Terminal` it replaces cost.
+    pub stack: Stack,
     pub glyph_pos: GlyphPos,
     pub ellipsis: String,
     glyph_working: String,
@@ -155,22 +160,20 @@ pub struct Config {
     pub pwd: Option<OsString>,
     pub git_dir: Option<OsString>,
     pub claude_pid: Option<OsString>,
-    /// The tmux server this session runs inside, when there is one. It decides
-    /// ONE thing on the paint path - whether the OSC 0 carries a tab title or a
-    /// record - and everything else it is used for is a cold path.
-    pub tmux: Option<Tmux>,
 }
 
 impl Config {
     pub fn from_env() -> Config {
-        let surface = crate::surface::detect();
+        // `NoOracle` is what makes the hot path's zero forks a TYPE fact: the
+        // multiplexer is asked for leaf evidence here, and the answer this oracle
+        // gives is a constant. An edge that wants the real answer has to name a
+        // different oracle, which is a visible edit rather than a forgotten one.
+        let stack = mux::resolve(&mut mux::NoOracle);
+        let glyph_pos = GlyphPos::parse(var_nonempty("CCTAB_GLYPH_POS").as_deref(), stack.elide);
         Config {
             dry_run: var("CCTAB_DRY_RUN").is_some_and(|v| v.as_encoded_bytes() == b"1"),
-            surface,
-            glyph_pos: GlyphPos::parse(
-                var_nonempty("CCTAB_GLYPH_POS").as_deref(),
-                surface.caps().elide,
-            ),
+            stack,
+            glyph_pos,
             ellipsis: var_or("CCTAB_ELLIPSIS", DEFAULT_ELLIPSIS),
             glyph_working: var_or("CCTAB_GLYPH_WORKING", DEFAULT_GLYPH_WORKING),
             glyph_waiting: var_or("CCTAB_GLYPH_WAITING", DEFAULT_GLYPH_WAITING),
@@ -193,7 +196,6 @@ impl Config {
             pwd: var("PWD"),
             git_dir: var_nonempty("GIT_DIR"),
             claude_pid: var_nonempty("CLAUDE_PID"),
-            tmux: Tmux::detect(),
         }
     }
 
@@ -203,7 +205,11 @@ impl Config {
     pub fn for_test() -> Config {
         Config {
             dry_run: false,
-            surface: Surface::Unknown,
+            stack: Stack {
+                mux: None,
+                leaf: Surface::Unknown,
+                elide: Elide::Unknown,
+            },
             glyph_pos: GlyphPos::Prefix,
             ellipsis: DEFAULT_ELLIPSIS.to_owned(),
             glyph_working: DEFAULT_GLYPH_WORKING.to_owned(),
@@ -219,7 +225,6 @@ impl Config {
             pwd: None,
             git_dir: None,
             claude_pid: None,
-            tmux: None,
         }
     }
 
