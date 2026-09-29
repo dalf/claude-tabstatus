@@ -38,6 +38,17 @@ serde_json = "1"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Wdk_System_Threading", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Threading"] }
 
+# macOS only: the two answers `/proc` gives on Linux and this platform has no
+# `/proc` for. `proc_pidinfo(PROC_PIDTBSDINFO)` with `struct proc_bsdinfo` for a
+# process's start time, and `kill(pid, 0)` with ESRCH/EPERM for its liveness. Both
+# are libc's OWN declarations, so no struct layout is hand-written here - which
+# matters because nothing in this project can link a macOS binary to check one.
+# libc has no required dependency of its own, and the crate sits behind this target
+# exactly as windows-sys sits behind cfg(windows): no Linux or Windows build sees
+# it. What libc does NOT declare is why session_tty stays None there - src/sys/unix.rs.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 # Tests only (tests/conpty.rs): CreateProcessW takes SECURITY_ATTRIBUTES, and an
 # optional ConPTY package's conpty.dll is loaded by name. Security_Authorization
 # for the unit tests that set and read a DACL as SDDL, independently of the code

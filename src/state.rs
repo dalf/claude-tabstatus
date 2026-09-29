@@ -426,8 +426,9 @@ fn id_str(raw: &[u8]) -> Option<String> {
 /// older readers from silently dropping background activity. The optional g
 /// epoch records known in-flight work independently of the main base and never
 /// expires. An absent `p` line means the reaper falls back to mtime for this file.
-/// On Windows the origin line is `q <pid> <creation FILETIME>` instead
-/// ([`sys::ORIGIN_KEY`]), and each platform reads the other's as no origin.
+/// On Windows the origin line is `q <pid> <creation FILETIME>` instead, and on
+/// macOS `r <pid> <microseconds since the epoch>` ([`sys::ORIGIN_KEY`]): one key
+/// per ENCODING, and each platform reads the others' as no origin.
 ///
 /// The optional `s` line is rung 2 of [`crate::armed`], and it is written ONLY by
 /// a session that actually armed something - which is what keeps every record
@@ -818,6 +819,12 @@ fn at_the_prompt(p: &Payload) -> bool {
 /// the failure that turned out not to exist, and removed - it would also have made
 /// the golden corpus's pty cases, which set `CLAUDE_PID` to a live helper, write
 /// records into the real `/run/user/<uid>`.
+///
+/// On macOS the variable is `TMPDIR`, which launchd sets per user to a directory
+/// under `/var/folders/<hash>/T` that is 0700, ours, and emptied by the OS - the
+/// same volatility `XDG_RUNTIME_DIR` has, so the reaper's rules carry over unchanged.
+/// There is no `XDG_RUNTIME_DIR` there to read, and reading it anyway is what used
+/// to leave that platform with no state directory and so no wait ownership at all.
 ///
 /// On Windows the variable is `LOCALAPPDATA` ([`sys::RUNTIME_DIR_VAR`]): per-user,
 /// private by inherited ACL, local rather than roaming, and - unlike `%TEMP%` -

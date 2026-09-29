@@ -398,9 +398,9 @@ w aec99e1f4bda1972b:1790380630 -:1790380631    one wait per word: owner, then ep
 s konsole                                      the surface this session ARMED
 ```
 
-On Windows the origin line is `q <pid> <creation FILETIME>` instead of `p`, and
-each platform reads the other's key as an unknown field - no origin, the mtime rule
-- never as a pid of its own.
+On macOS the origin line is `r <pid> <us>` and on Windows
+`q <pid> <creation FILETIME>` instead of `p`, and each platform reads the others'
+keys as unknown fields - no origin, the mtime rule - never as a pid of its own.
 
 Owner tokens on the `w` line map onto the contract's
 [wait identities](state-contract.md#wait-identities):
@@ -462,12 +462,14 @@ fires no `SessionEnd`, so the record has three independent bounds and no daemon:
 - **A `SessionStart` in any session reaps the others**, by asking whether the
   process that wrote each record is still running. Every write stamps the record
   with `$CLAUDE_PID` *and that pid's start time* - field 22 of `/proc/<pid>/stat`;
-  on Windows the process's creation FILETIME - and the reaper unlinks a record only
+  on macOS `proc_pidinfo`'s start time in microseconds; on Windows the process's
+  creation FILETIME - and the reaper unlinks a record only
   when that pair no longer names a running process. Stamping on every write, not
   only at `SessionStart`, covers a session whose `SessionStart` ran before this
   plugin was installed, which would otherwise be left on the one-day mtime rule for
   its whole life.
-- The directory is under `$XDG_RUNTIME_DIR`, which the OS empties at logout. On
+- The directory is under `$XDG_RUNTIME_DIR`, which the OS empties at logout, and
+  on macOS under `$TMPDIR` (`/var/folders/<hash>/T`), which the OS also empties. On
   Windows it is `%LOCALAPPDATA%\claude-tabstatus`, which nothing empties; after a
   reboot no origin is alive, so the next `SessionStart` reaps every record.
 

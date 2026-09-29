@@ -1,5 +1,16 @@
-//! The Unix backend of [`crate::sys`]. Linux-specific where it reads `/proc`;
-//! elsewhere those functions find nothing and answer "unknown".
+//! The Unix backend of [`crate::sys`]. One body for every Unix, except for the
+//! handful of questions whose ANSWER differs: a process's start time and its
+//! liveness, the session's pty, the record's origin key, and the variable naming
+//! the state directory. Those are `cfg`-selected in place - Linux reads `/proc`,
+//! macOS calls `libc` - and everything else on this page is shared, which is why
+//! the divergent items sit next to each other rather than in a file of their own.
+//!
+//! ONLY THE SYSTEM CALL IS `cfg`-SELECTED. Every decision either side makes - the
+//! errno-to-liveness mapping, the packing of a start time into the one number a
+//! record stores - is a pure function compiled on both and exercised by the Linux
+//! test run, because there is no Mac in this project's CI to run a macOS branch on
+//! and an untested branch is how a wrong answer ships. The `cfg` bodies are a call
+//! and a `?`; they contain no test of their own.
 
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
@@ -19,7 +30,16 @@ pub const HAS_RECORD_LOCK: bool = true;
 pub const HAS_MODES: bool = true;
 
 /// [`session_tty`] can resolve a pty - through `/proc`, so on Linux.
+#[cfg(not(target_os = "macos"))]
 pub const HAS_SESSION_TTY: bool = true;
+
+/// [`session_tty`] never resolves here: fd 1 of another process is not a path
+/// macOS will hand over through anything `libc` declares - see there. The constant
+/// and the function have to agree, because `doctor` reads the constant to say
+/// whether `session-start` and `session-end` have a route at all, and a `true`
+/// would promise a pty nothing can open.
+#[cfg(target_os = "macos")]
+pub const HAS_SESSION_TTY: bool = false;
 
 /// [`set_session_title`] has no console to title: a Unix terminal takes its title
 /// as bytes on the pty, through [`session_tty`].
@@ -53,8 +73,18 @@ pub fn is_line_end(b: u8) -> bool {
 }
 
 /// The file the kernel publishes its host name in, read without a fork.
+#[cfg(not(target_os = "macos"))]
 pub fn kernel_hostname_file() -> Option<&'static Path> {
     Some(Path::new("/proc/sys/kernel/hostname"))
+}
+
+/// No file publishes it here: macOS has no `/proc`, and `kern.hostname` is a
+/// `sysctl` and not a path. `None` sends [`crate::location::hostname`] straight on
+/// to `$HOSTNAME` and then to `hostname(1)`, which is where it arrived anyway -
+/// one guaranteed-failing `open` later.
+#[cfg(target_os = "macos")]
+pub fn kernel_hostname_file() -> Option<&'static Path> {
+    None
 }
 
 /// Whether a resolved gitdir, `GIT_DIR` or `HEAD` path may be handed to the
@@ -111,13 +141,35 @@ pub fn reserved_name(_name: &str) -> bool {
 /// The key a record's origin is written under. It differs per platform because the
 /// numbers do: a pid and a start time from one OS say nothing about a process on
 /// another, and each side reads the other's key as an unknown field - no origin.
+///
+/// Three keys because there are three ENCODINGS, not three operating systems:
+/// `p` is clock ticks since boot, `q` a 100ns FILETIME, and `r` microseconds since
+/// the epoch (see [`process_start_time`]). A number under a key this build does not
+/// know is not a start time it can compare, and `Record::parse` skips it like any
+/// unknown field - absent, never different.
+#[cfg(not(target_os = "macos"))]
 pub const ORIGIN_KEY: &str = "p";
+#[cfg(target_os = "macos")]
+pub const ORIGIN_KEY: &str = "r";
 
 /// The variable naming the per-user directory the state directory defaults under.
+#[cfg(not(target_os = "macos"))]
 pub const RUNTIME_DIR_VAR: &str = "XDG_RUNTIME_DIR";
 
+/// `XDG_RUNTIME_DIR` is a freedesktop variable and macOS does not set one, so
+/// reading it there switches the whole state layer - wait ownership included - off
+/// on a platform that has everywhere to put a record. `TMPDIR` is what launchd
+/// sets per user, to `/var/folders/<hash>/T`: 0700, owned by this user, and emptied
+/// by the OS, so its volatility matches `XDG_RUNTIME_DIR`'s and the reaper's
+/// one-day mtime fallback keeps the justification it already has.
+#[cfg(target_os = "macos")]
+pub const RUNTIME_DIR_VAR: &str = "TMPDIR";
+
 /// Why there is no state directory, when neither variable is set.
+#[cfg(not(target_os = "macos"))]
 pub const NO_STATE_DIR: &str = "no CCTAB_STATE_DIR and no XDG_RUNTIME_DIR";
+#[cfg(target_os = "macos")]
+pub const NO_STATE_DIR: &str = "no CCTAB_STATE_DIR and no TMPDIR";
 
 /// The permission bits, `0o7777`-masked.
 pub fn mode(m: &Metadata) -> Option<u32> {
@@ -260,6 +312,7 @@ pub fn is_set_aside(_name: &str) -> bool {
 /// measured on this machine, `/proc/1259713/stat` holds `(npm exec chrome...)`, so
 /// the naive split reads the wrong field for exactly the processes a `claude`
 /// session spawns. The tail begins at field 3, so field 22 is its 20th word.
+#[cfg(not(target_os = "macos"))]
 pub fn process_start_time(pid: u32) -> Option<u64> {
     let raw = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
     let w = raw.rsplit_once(") ")?.1.split(' ').nth(19)?;
@@ -269,21 +322,147 @@ pub fn process_start_time(pid: u32) -> Option<u64> {
     w.parse().ok()
 }
 
-/// Whether `pid` names a running process: its `/proc` entry exists. On a Unix
-/// with no `/proc` this answers `Some(false)`, as the check always has there.
+/// Whether `pid` names a running process: its `/proc` entry exists.
+#[cfg(not(target_os = "macos"))]
 pub fn process_alive(pid: u32) -> Option<bool> {
     Some(Path::new(&format!("/proc/{}", pid)).exists())
 }
 
+/// The macOS start time: `proc_pidinfo`'s `PROC_PIDTBSDINFO`, whose
+/// `pbi_start_tvsec`/`pbi_start_tvusec` pair [`bsdinfo_start`] packs into the one
+/// number a record stores. `None` when the pid is gone, is not a pid this platform
+/// can name, or the kernel filled less than the whole struct.
+///
+/// `libc` declares both the call and `proc_bsdinfo`, so nothing here is a
+/// hand-written `#[repr(C)]` layout - which matters because no machine in this
+/// project can LINK a macOS binary, only type-check one, and a guessed layout
+/// would be memory corruption that no test here could catch.
+#[cfg(target_os = "macos")]
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    // A pid outside `pid_t` is not a pid this system ever handed out, and the
+    // question is unanswerable rather than answered "dead".
+    let pid = i32::try_from(pid).ok()?;
+    let want = std::mem::size_of::<libc::proc_bsdinfo>();
+    let size = i32::try_from(want).ok()?;
+    // SAFETY: `proc_bsdinfo` is plain integers and byte arrays, so all-zero is a
+    // valid value of it; nothing is read out of the buffer except through
+    // `bsdinfo_start`, which answers only when the kernel says it filled all of it.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    // SAFETY: the pointer and `size` describe that same live buffer exactly, so the
+    // call writes at most `size` bytes inside it; it keeps no pointer to it, and
+    // `info` outlives the call.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::from_mut(&mut info).cast(),
+            size,
+        )
+    };
+    bsdinfo_start(filled, want, info.pbi_start_tvsec, info.pbi_start_tvusec)
+}
+
+/// Whether `pid` names a running process, asked with `kill(pid, 0)`: signal 0 is
+/// the existence-and-permission question and DELIVERS NOTHING. [`liveness_from_kill`]
+/// decides what the answer means.
+#[cfg(target_os = "macos")]
+pub fn process_alive(pid: u32) -> Option<bool> {
+    let pid = i32::try_from(pid).ok()?;
+    // SAFETY: two integers to a libc wrapper round a syscall; it reads and writes
+    // no memory of ours, and signal 0 sends no signal to anything.
+    let rc = unsafe { libc::kill(pid, 0) };
+    // `last_os_error` is read unconditionally and is stale when `rc` is 0 - which
+    // is the one case the mapping decides without looking at it.
+    liveness_from_kill(rc, io::Error::last_os_error().raw_os_error().unwrap_or(0))
+}
+
+/// The two `errno` values the mapping below names. POSIX fixes both, and macOS and
+/// Linux agree on them; naming them here rather than reaching for `libc::ESRCH` is
+/// what lets a Linux `cargo test` run the decision. The macOS build checks them
+/// against the platform's own constants at compile time - see below - so a
+/// disagreement is a build failure on the Mac and never a wrong answer on one.
+#[cfg(any(target_os = "macos", test))]
+const EPERM: i32 = 1;
+#[cfg(any(target_os = "macos", test))]
+const ESRCH: i32 = 3;
+
+// The numbers above against the platform's own. `cargo check` for the Mac evaluates
+// this, so the one fact a Linux test cannot see is checked by the compiler instead.
+#[cfg(target_os = "macos")]
+const _: () = assert!(EPERM == libc::EPERM && ESRCH == libc::ESRCH);
+
+/// What a `kill(pid, 0)` outcome says about the process, as a pure function of the
+/// return value and `errno` - so the macOS body above is a call and not a branch,
+/// and this file's only liveness DECISION is one a Linux test runs.
+///
+/// `EPERM` is `Some(true)`: a process this user may not signal is a process that
+/// EXISTS, which is the whole of what the reaper asks. Anything else is `None`,
+/// "cannot tell", which [`same_process`] passes on and the reaper reads as "keep
+/// the record". `Some(false)` is a CLAIM OF DEATH and is made for `ESRCH` alone -
+/// this function's reason for existing is that the `/proc` body above used to make
+/// that claim for every live process on macOS.
+#[cfg(any(target_os = "macos", test))]
+fn liveness_from_kill(rc: i32, errno: i32) -> Option<bool> {
+    match (rc, errno) {
+        (0, _) => Some(true),
+        (_, ESRCH) => Some(false),
+        (_, EPERM) => Some(true),
+        _ => None,
+    }
+}
+
+/// The start time a macOS record stores: MICROSECONDS since the epoch, which is
+/// `proc_bsdinfo`'s seconds-and-microseconds pair as one number. A third encoding -
+/// hence a third [`ORIGIN_KEY`] - and one `u64` holds it until the year 586524.
+///
+/// `filled` is what `proc_pidinfo` RETURNED, which is the byte count it wrote and
+/// not a status: a dead pid fills 0, and a short fill would leave the fields this
+/// reads holding the zeros the buffer was created with - a start time of 0, which
+/// compares equal to the next short fill and would make a dead session's pid look
+/// like the same process forever. Only an exactly-full struct is an answer.
+///
+/// Saturating, not wrapping: the multiply cannot overflow for any real start time,
+/// and `panic = "abort"` means the debug-build check would be a crash in a hook
+/// rather than a test failure.
+#[cfg(any(target_os = "macos", test))]
+fn bsdinfo_start(filled: i32, want: usize, tvsec: u64, tvusec: u64) -> Option<u64> {
+    (usize::try_from(filled) == Ok(want))
+        .then(|| tvsec.saturating_mul(1_000_000).saturating_add(tvusec))
+}
+
 /// Whether the process that recorded `(pid, start)` is still that process:
 /// `Some(true)` it is, `Some(false)` provably not - gone, or the pid given to
-/// another - and `None` when that cannot be told. The same two `/proc` reads, in
-/// the same order, that the reaper has always made.
+/// another - and `None` when that cannot be told. The same two questions, in the
+/// same order, that the reaper has always asked; only whom they are put to differs.
 pub fn same_process(pid: u32, start: u64) -> Option<bool> {
-    if process_start_time(pid) == Some(start) {
-        Some(true)
-    } else {
-        process_alive(pid).map(|_| false)
+    same_as_recorded(process_start_time(pid), start, || process_alive(pid))
+}
+
+/// That decision, as a pure function of the two answers, with the second asked only
+/// when the first did not settle it - which is also what makes the one case `/proc`
+/// cannot produce testable here.
+///
+/// A start time settles it either way: it is the process under that pid NOW. Without
+/// one, only a pid PROVEN not to exist says the record's process is gone. "Alive but
+/// unreadable" is `None`, and the reaper keeps the record.
+///
+/// On a default `/proc` that pair cannot arise - `stat` is world-readable wherever
+/// the directory is - which is why the old shape, "alive, therefore some OTHER
+/// process has this pid", was safe on Linux. It is not safe on macOS, where a
+/// process this user may not inspect answers `EPERM`: alive, with no start time.
+/// Reading that as a reused pid unlinks a live session's record. (A `hidepid` mount
+/// is the same pair on Linux, and gets the same conservative answer now.) Windows'
+/// backend has always had this shape - `Probe::Unknown` -> `None` - and this is the
+/// Unix side agreeing with it.
+fn same_as_recorded(
+    now: Option<u64>,
+    recorded: u64,
+    alive: impl FnOnce() -> Option<bool>,
+) -> Option<bool> {
+    match now {
+        Some(t) => Some(t == recorded),
+        None => alive().and_then(|a| (!a).then_some(false)),
     }
 }
 
@@ -297,6 +476,7 @@ pub fn same_process(pid: u32, start: u64) -> Option<bool> {
 /// /proc. `None` is therefore both "no tab to paint" and "fd 1 would not resolve",
 /// deliberately the same answer: painting on a guess is the one outcome that
 /// retitles somebody else's terminal.
+#[cfg(not(target_os = "macos"))]
 pub fn session_tty(claude_pid: &OsStr) -> Option<File> {
     let mut link = OsString::from("/proc/");
     link.push(claude_pid);
@@ -308,6 +488,32 @@ pub fn session_tty(claude_pid: &OsStr) -> Option<File> {
     // Asking whether it is writable and opening it are the same question; ask it
     // once.
     OpenOptions::new().write(true).open(&target).ok()
+}
+
+/// DELIBERATELY UNANSWERED on macOS, and the honest `None` the guard above already
+/// defines: "fd 1 would not resolve", which paints nothing rather than guessing at
+/// a terminal.
+///
+/// What it would take: `proc_pidfdinfo(pid, 1, PROC_PIDFDVNODEPATHINFO, ...)` into
+/// a `vnode_fdinfowithpath`, whose `vip_path` is the path fd 1 names. `libc` 0.2.189
+/// declares `proc_pidfdinfo` and `proc_fdinfo` but NEITHER `PROC_PIDFDVNODEPATHINFO`
+/// nor `struct vnode_fdinfowithpath` - measured, not assumed - so both would have to
+/// be hand-written `#[repr(C)]`, and no machine in this project can link a macOS
+/// binary to check a layout that a wrong guess turns into memory corruption on
+/// somebody's Mac. It is not guessed here.
+///
+/// `proc_bsdinfo.e_tdev`, which IS declared, is the CONTROLLING TERMINAL and not
+/// this: a redirected `claude -p > file` keeps its controlling terminal, so taking
+/// that route would paint a terminal that is not this session's output - exactly the
+/// substitution the headless guard exists to refuse.
+///
+/// The consequence is bounded, because it is only these two edges: the hot
+/// working/waiting/idle paint travels the hook protocol's `terminalSequence` and
+/// needs no pty at all. `session-start`'s arming and `session-end`'s clearing are
+/// what is missing, and [`HAS_SESSION_TTY`] is `false` so that `doctor` says so.
+#[cfg(target_os = "macos")]
+pub fn session_tty(_claude_pid: &OsStr) -> Option<File> {
+    None
 }
 
 /// The console route to the session's title, which Unix does not have: `Ok(false)`,
@@ -342,4 +548,82 @@ fn is_tty_path(p: &Path) -> bool {
 
 fn is_char_device(ft: &FileType) -> bool {
     ft.is_char_device()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reaper's liveness question, decided here so that the macOS body is a
+    /// call and not a branch - and run on Linux, which is the only place this
+    /// project can run anything.
+    ///
+    /// `EPERM` is the one that matters: a process this user may not signal exists,
+    /// and calling it dead would unlink a live session's record. `Some(false)` is a
+    /// claim, and `ESRCH` is the only evidence for it.
+    #[test]
+    fn a_signal_probe_claims_death_only_for_esrch() {
+        assert_eq!(liveness_from_kill(0, ESRCH), Some(true), "a stale errno is not read");
+        assert_eq!(liveness_from_kill(-1, ESRCH), Some(false));
+        assert_eq!(liveness_from_kill(-1, EPERM), Some(true), "may not signal, but exists");
+        // Everything else is "cannot tell", which the caller reads as "keep the
+        // record" - never the confident wrong answer /proc gave here before.
+        for errno in [0, 4, 9, 14, 22, 1000] {
+            assert_eq!(liveness_from_kill(-1, errno), None, "errno {errno}");
+        }
+    }
+
+    /// `proc_pidinfo` returns the byte count it filled, so a partial fill is a
+    /// buffer still holding its own zeros - and a start time of 0 would compare
+    /// equal to the next one, which is a dead pid reading as the same process.
+    #[test]
+    fn a_start_time_is_read_only_from_a_completely_filled_struct() {
+        // Any size stands in for `size_of::<proc_bsdinfo>()`: what is under test is
+        // the comparison, which is all the macOS body delegates.
+        let want: usize = 136;
+        let full = |sec, usec| bsdinfo_start(136, want, sec, usec);
+        assert_eq!(full(1_790_380_620, 123_456), Some(1_790_380_620_123_456));
+        assert_eq!(full(0, 0), Some(0), "the epoch itself is still an answer");
+        assert_eq!(bsdinfo_start(0, want, 1, 2), None, "a dead pid fills nothing");
+        assert_eq!(bsdinfo_start(135, want, 1, 2), None, "a short fill");
+        assert_eq!(bsdinfo_start(137, want, 1, 2), None, "more than we asked for");
+        assert_eq!(bsdinfo_start(-1, want, 1, 2), None, "an error is not a length");
+        // Never wraps: `panic = "abort"` makes an overflow check a crash in a hook.
+        assert_eq!(full(u64::MAX, u64::MAX), Some(u64::MAX));
+        // And what it produces is a number a record can carry back: `state::digits`
+        // parses at most twenty ASCII digits, which is every `u64`.
+        assert!(u64::MAX.to_string().len() <= 20);
+    }
+
+    /// Three encodings, three keys. A reader meeting a key it does not know skips
+    /// it like any unknown field, so another platform's origin is ABSENT here and
+    /// never a pid of ours - which is what makes a state directory shared between
+    /// two of them safe.
+    #[test]
+    fn each_start_time_encoding_has_its_own_origin_key() {
+        let mine = if cfg!(target_os = "macos") { "r" } else { "p" };
+        assert_eq!(ORIGIN_KEY, mine);
+        assert_ne!(ORIGIN_KEY, "q", "the Windows FILETIME key");
+    }
+
+    /// The reaper's other decision, including the pair `/proc` cannot produce: no
+    /// start time and a process that is ALIVE. Reading that as "a different process
+    /// has the pid" is what would unlink a live session's record on macOS, where a
+    /// process this user may not inspect answers exactly that way.
+    #[test]
+    fn a_missing_start_time_is_a_different_process_only_for_a_pid_proven_gone() {
+        let unasked = || unreachable!("a start time settles it without a second call");
+        assert_eq!(same_as_recorded(Some(7), 7, unasked), Some(true));
+        assert_eq!(same_as_recorded(Some(8), 7, unasked), Some(false), "the pid was reused");
+        assert_eq!(same_as_recorded(None, 7, || Some(false)), Some(false), "gone");
+        assert_eq!(same_as_recorded(None, 7, || Some(true)), None, "alive, unreadable");
+        assert_eq!(same_as_recorded(None, 7, || None), None, "nothing could be asked");
+    }
+
+    /// `doctor` prints [`NO_STATE_DIR`] when there is nowhere to write, and the
+    /// operator's next move is to set the variable it names. The two are one fact.
+    #[test]
+    fn the_refusal_names_the_state_directory_variable() {
+        assert!(NO_STATE_DIR.ends_with(RUNTIME_DIR_VAR), "{NO_STATE_DIR}");
+    }
 }
