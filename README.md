@@ -1263,7 +1263,9 @@ file's ACL, or takes the backup's if there is no live file. An ACL `install` or
 `uninstall` cannot read is refused up front, with nothing changed, and so is a
 `settings.json` on a filesystem that keeps no Windows ACL (a symlink into a WSL
 share, where a rewrite from Windows would turn 0600 into 0644): edit that one
-from the system it lives on. Integrity labels and auditing entries (the SACL) are
+from the system it lives on, or pass `--force` to `install` or `uninstall` to write
+it anyway after a warning. `--force` lifts only that refusal; an ACL that exists
+but cannot be read stays refused. Integrity labels and auditing entries (the SACL) are
 not carried. A new `settings.json` inherits from its directory, as before.
 
 `settings.json` is written first and the symlink last, so a failure while
@@ -2068,7 +2070,8 @@ bin/tabstatus install
 That refusal is not pedantry: the env key it would write switches Claude Code's
 own title painting off, and all thirteen hooks would then resolve to a command that
 exits 127 - a tab nothing paints at all, which is strictly worse than no install.
-`install --force` overrides it for the case where you are about to build.
+`install --force` no longer overrides that; it now means only "write settings.json
+even where its Windows permissions cannot be kept" (see the settings notes above).
 The first build needs registry access (or a populated Cargo cache). Once cached,
 `cargo build --locked --offline` works without network access. The lockfile can
 list optional derive/proc-macro packages that are not compiled; inspect

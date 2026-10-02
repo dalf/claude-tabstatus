@@ -1273,14 +1273,14 @@ check 'install: and settings.json was never written either' '' \
 check 'install: nor the tree, for the same reason' '' "$(ls -d "$_itree" 2>/dev/null)"
 # The missing-bin refusal and its --force escape hatch are GONE with their subject:
 # install supplies the binary itself now, copying the running one into the tree, so
-# there is nothing to be missing and nothing to force. What survives is that install
-# names an option it does not accept rather than ignoring it - and --force is now one
-# of those.
+# there is nothing to be missing. What survives is that install names an option it
+# does not accept rather than ignoring it - including uninstall's own flags. (--force
+# is accepted again: on Windows it writes a settings.json whose ACL cannot be kept.)
 rm -rf "$_cfg"; mkdir -p "$_cfg"
 check 'install: an unknown option is refused' 'yes' \
     "$(_ins install --nonsense | grep -q 'unknown option' && printf yes)"
-check 'install: --force went with the check it forced, and is refused by name' 'yes' \
-    "$(_ins install --force | grep -q 'unknown option --force' && printf yes)"
+check 'install: an option only uninstall takes is refused by name' 'yes' \
+    "$(_ins install --restore-backup | grep -q 'unknown option --restore-backup' && printf yes)"
 check 'install: and a refused option writes nothing' '' \
     "$(ls "$_cfg/settings.json" "$_cfg/skills/claude-tabstatus" 2>/dev/null)"
 # --tree is the only option here that takes a value, so both ways of getting it wrong
@@ -1295,7 +1295,7 @@ check 'install: and nothing called --force was materialised' '' "$(ls -d -- "--f
 check 'install: a bare directory points at the spelling that works' 'yes' \
     "$(_ins install "$tmp/nope" | grep -q -- "--tree $tmp/nope" && printf yes)"
 check 'install: exits nonzero on a refusal so a wrapper can see it' '1' \
-    "$(_ins install --force >/dev/null 2>&1; printf %s $?)"
+    "$(_ins install --nonsense >/dev/null 2>&1; printf %s $?)"
 # `standalone` was a second install verb. It is gone, and the word says so instead of
 # erroring obscurely - and it must stay a SUBCOMMAND: a word that fell through to the
 # paint path would start painting an idle tab.
