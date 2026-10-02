@@ -34,13 +34,23 @@ const WALK_LIMIT: usize = 64;
 pub fn find_repo(logical: &Path, phys: &Path, git_dir: Option<&OsStr>) -> Option<Repo> {
     if let Some(gd) = git_dir {
         let abs = absolute(logical, gd);
+        // An explicit GIT_DIR is judged against the LOGICAL cwd: a GIT_DIR on a
+        // network share while the session sits on a local drive is the hostile
+        // shape and is refused, where one on the same share the cwd is on is kept.
+        if !sys::gitpath_allowed(&abs, logical) {
+            return None;
+        }
         let branch = branch_of(&abs)?;
         return Some(Repo { top: repo_top(&abs), branch });
     }
     let mut dir = phys.to_path_buf();
     for _ in 0..WALK_LIMIT {
         let probe = dir.join(".git");
-        if probe.exists() {
+        // Guard before the `exists` stat: a `.git` that is a reparse point to a
+        // share would otherwise send this very probe to the network. The spelling
+        // of `probe` is `dir`'s own, so the string half is a no-op here and the
+        // reparse half is the one that bites.
+        if sys::gitpath_allowed(&probe, &dir) && probe.exists() {
             if let Some(branch) = branch_of(&probe) {
                 return Some(Repo { top: dir, branch });
             }
@@ -109,9 +119,24 @@ fn parent_of(dir: &Path) -> PathBuf {
 /// without which an empty `/tmp/.git` would make every path under `/tmp` render
 /// as `tmp`.
 fn branch_of(candidate: &Path) -> Option<String> {
+    // The directory the candidate sits in is the trusted root a derived path is
+    // judged against: a gitdir or HEAD on the same volume or share is kept, one
+    // that jumps to another share or a device is refused before it is probed.
+    let base = parent_of(candidate);
+    // The candidate itself, in case it is a reparse point to a share - the `.git`
+    // the walk probes is already guarded, but `GIT_DIR` reaches here unprobed, and
+    // `resolve_gitdir` below opens the candidate.
+    if !sys::gitpath_allowed(candidate, &base) {
+        return None;
+    }
     let git_dir = resolve_gitdir(candidate)?;
+    // A `gitdir:` line may name any path at all; refuse a network or device one
+    // before HEAD under it is ever stat-ed.
+    if !sys::gitpath_allowed(&git_dir, &base) {
+        return None;
+    }
     let head_path = git_dir.join("HEAD");
-    if !head_path.is_file() {
+    if !sys::gitpath_allowed(&head_path, &git_dir) || !head_path.is_file() {
         return None;
     }
     // From here on HEAD's content is display text and never a path, so it can
@@ -444,5 +469,87 @@ mod tests {
         assert_eq!(first_line(&d.file("c", b"a\0b\n")), Some(b"ab".to_vec()));
         assert_eq!(first_line(&d.file("d", b"")), Some(Vec::new()));
         assert_eq!(first_line(&d.0.join("no-such-file")), None);
+    }
+
+    /// Windows only, and the whole point of the guard: a hostile repository whose
+    /// `.git` gitfile points its `gitdir:` at a network share makes every hook stat a
+    /// path on that share, which opens an SMB connection and leaks an NTLM handshake.
+    /// Each spelling must yield NO repository - so the tab falls back to the plain
+    /// path - and it does so because the share path is refused on its SPELLING, before
+    /// any stat, which is why this test never contacts the non-resolving host it names.
+    #[cfg(windows)]
+    #[test]
+    fn a_gitfile_pointing_at_a_share_or_device_is_not_a_repository() {
+        let d = Dir::new("unc-gitfile");
+        for (i, line) in [
+            r"gitdir: \\cctab-nohost\share\x",
+            "gitdir: //cctab-nohost/share/x",
+            r"gitdir: \\?\UNC\cctab-nohost\share\x",
+            r"gitdir: \\127.0.0.1\share\q",
+            r"gitdir: \\.\pipe\x",
+            r"gitdir: \\?\GLOBALROOT\Device\HarddiskVolume1\x",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let ptr = d.file(&format!("dg{i}"), line.as_bytes());
+            assert_eq!(branch_of(&ptr), None, "{line}");
+            // And the guard decision is timing-free: the spelling is refused outright.
+            assert!(!sys::gitpath_allowed(Path::new(line.strip_prefix("gitdir: ").unwrap()), &d.0));
+        }
+    }
+
+    /// The same share path reached through `GIT_DIR` yields no repository, and a
+    /// hostile `.git` gitfile in an ANCESTOR of the cwd is stepped over - refused like
+    /// any non-repository, so a real repository above it is still the one found.
+    #[cfg(windows)]
+    #[test]
+    fn git_dir_on_a_share_is_refused_and_a_hostile_ancestor_is_stepped_over() {
+        let d = Dir::new("unc-git-dir");
+        d.repo(b"ref: refs/heads/outer\n");
+        let cwd = d.0.join("a").join("b").join("c");
+        fs::create_dir_all(&cwd).expect("mkdir");
+        for gd in [r"\\cctab-nohost\share\g", "//cctab-nohost/share/g"] {
+            assert!(find_repo(&cwd, &cwd, Some(OsStr::new(gd))).is_none(), "{gd}");
+        }
+        // A hostile gitfile in an ancestor is refused and does not shadow the real
+        // repository above it; the walk steps over it rather than stalling on a share.
+        let hostile = d.0.join("a").join(".git");
+        fs::write(&hostile, br"gitdir: \\cctab-nohost\share\x").expect("write");
+        assert_eq!(branch_of(&hostile), None, "the hostile ancestor is not a repository");
+        let r = find_repo(&cwd, &cwd, None).expect("the real repository above is found");
+        assert_eq!(r.branch, "outer");
+        assert_eq!(r.top, d.0);
+    }
+
+    /// Windows only: a `.git` that is a JUNCTION to a local repository is followed, so
+    /// a hand-made local link keeps painting `repo@branch`. (A junction needs no
+    /// privilege; this is the local counterpart of the refused share-junction.)
+    #[cfg(windows)]
+    #[test]
+    fn a_git_junction_to_a_local_repository_still_resolves() {
+        let d = Dir::new("local-junction");
+        let store = d.0.join("real-git");
+        fs::create_dir_all(&store).expect("mkdir");
+        fs::write(store.join("HEAD"), b"ref: refs/heads/linked\n").expect("write");
+        crate::sys::link_dir(&store, &d.0.join(".git")).expect("junction");
+        let r = find_repo(&d.0, &d.0, None).expect("the junction resolves");
+        assert_eq!(r.branch, "linked");
+        assert_eq!(r.top, d.0);
+    }
+
+    /// Windows only: the ordinary linked-worktree and separate-git-dir shapes, whose
+    /// gitdir is a LOCAL path - relative or absolute - must keep working untouched.
+    #[cfg(windows)]
+    #[test]
+    fn a_local_worktree_or_separate_git_dir_still_resolves() {
+        let d = Dir::new("local-gitdir");
+        let real = d.repo(b"ref: refs/heads/wt\n");
+        // Relative local gitdir.
+        let rel = d.file("rel", b"gitdir: .git\n");
+        assert_eq!(branch_of(&rel).as_deref(), Some("wt"));
+        // Absolute local gitdir (separate-git-dir).
+        let abs = d.file("abs", format!("gitdir: {}\n", real.display()).as_bytes());
+        assert_eq!(branch_of(&abs).as_deref(), Some("wt"));
     }
 }

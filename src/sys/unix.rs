@@ -51,6 +51,17 @@ pub fn kernel_hostname_file() -> Option<&'static Path> {
     Some(Path::new("/proc/sys/kernel/hostname"))
 }
 
+/// Whether a resolved gitdir, `GIT_DIR` or `HEAD` path may be handed to the
+/// filesystem call that probes it. Always yes on Unix: a path is just a path, there
+/// is no network share a bare `stat` can reach and so no credential to leak, and the
+/// repository walk is meant to follow a `.git` that lives anywhere a symlink points.
+/// `base` - the trusted directory the path was derived from - is unused here, and no
+/// system call is made, so the hot path keeps exactly the shape it had before this
+/// guard existed. The Windows backend is where the check has teeth.
+pub fn gitpath_allowed(_path: &Path, _base: &Path) -> bool {
+    true
+}
+
 /// The identity of the file `m` describes. Always known on Unix.
 pub fn file_id(m: &Metadata) -> Option<FileId> {
     Some((m.dev(), u128::from(m.ino())))

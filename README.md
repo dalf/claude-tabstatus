@@ -614,6 +614,24 @@ directly and parsing it with shell parameter expansion. `git` is never
 executed: one `git rev-parse` costs 15-40ms, where the whole location costs
 about 0.12ms, and a later slice will run this on every tool call.
 
+**A `.git` names where the real git directory lives** - a gitfile's `gitdir:`
+line, a `GIT_DIR`, or, on Windows, a reparse point standing in for `.git` or
+`HEAD` - and on Windows a hostile checkout can aim that at a **network share**.
+The first `stat` of a path on a share opens an SMB connection whose automatic
+NTLM handshake leaks the user's credentials off-box, and stalls the hook for
+seconds. So before any resolved gitdir, `GIT_DIR` or `HEAD` is probed, a network
+or device path is refused and the tab falls back to the plain path, exactly as
+for a directory that is not a repository: a UNC path (`\\server\share`, a mapped
+network drive, `\\?\UNC\…`) or a device path (`\\.\…`, `\\?\GLOBALROOT…`) is
+allowed only when it is the very volume or share the session already sits on, so
+a repository deliberately kept on a share still paints `repo@branch` while one
+that jumps to another share does not; a drive mapped to that same share counts as
+the share, so a worktree opened through a mapped drive still resolves. A reparse
+point is walked to the end of its chain by reading each link's target rather than
+following it, so a `.git` junction to a local directory resolves while one that
+leads - directly or through a local link - to a share is refused. On Unix a bare
+`stat` reaches no share, so the check is a no-op and the hot path is unchanged.
+
 ## Install
 
 ```sh
