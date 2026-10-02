@@ -416,7 +416,13 @@ The record is one file per `session_id`, so five concurrent sessions never conte
 It is written temp-then-`rename`, because two hooks of one turn do overlap -
 measured 1ms apart - and a reader must see the old record or the new one, never a
 torn one. 240 concurrent hooks against one record leave one well-formed file and no
-temporary.
+temporary. The temporary is `<id>.<pid>.<16 hex digits>.tmp`, the hex a fresh
+random nonce for each attempt, and it is *created*, never opened (`O_CREAT|O_EXCL`,
+`CREATE_NEW`): a file, hard link or symlink someone planted at that name is
+skipped, left alone, and never written through. Older versions named it
+`<id>.<pid>.tmp`, opened it with a truncating create, and so would overwrite
+whatever a hard link planted in a shared `CCTAB_STATE_DIR` pointed at; leftovers of
+that shape are still recognized and reaped by the rule above.
 
 **Each read-modify-write holds an exclusive `flock` on that session's own record**,
 and "a lost update self-corrects on the next edge" - which this section used to

@@ -141,9 +141,10 @@ const MAX_WAITS: usize = 8;
 
 /// The FALLBACK reaper's horizon, for a file that does not say which process it
 /// belongs to - a record from a version that wrote no origin, or a `.tmp` a
-/// crashed write left behind. A day, because mtime cannot prove a session dead: an
-/// idle session touches nothing, so a short horizon here WOULD delete a live
-/// session's record. The origin rule below is the one that can prove it.
+/// crashed write left behind (either temp-name shape, see [`Named::Tmp`]). A day,
+/// because mtime cannot prove a session dead: an idle session touches nothing, so
+/// a short horizon here WOULD delete a live session's record. The origin rule
+/// below is the one that can prove it.
 const REAP_AFTER: Duration = Duration::from_secs(86_400);
 
 /// The most records one `SessionStart` will look at. The bound is what keeps the
@@ -952,24 +953,9 @@ impl Session {
         }
         // Temp-then-rename, so a reader in a concurrently running hook of the same
         // session - or the reaper, or `doctor`, neither of which takes the lock -
-        // sees the old record or the new one and never a torn one.
-        let mut tmp = self.path.clone();
-        let mut name = match self.path.file_name().map(|n| n.to_owned()) {
-            Some(n) => n,
-            None => return,
-        };
-        name.push(".");
-        name.push(itoa(u64::from(std::process::id())));
-        name.push(".tmp");
-        tmp.set_file_name(name);
-        let text = now.render();
-        let wrote = fs::File::create(&tmp).and_then(|mut f| f.write_all(text.as_bytes()));
-        // Still under the lock, over the very file this hook holds locked - which
-        // on Windows takes a POSIX-semantics rename; see `sys::replace_file`.
-        if wrote.is_ok() && sys::replace_file(&tmp, &self.path).is_ok() {
-            return;
-        }
-        let _ = fs::remove_file(&tmp);
+        // sees the old record or the new one and never a torn one. A failed write
+        // leaves the old record in place, as any I/O failure always has.
+        let _ = replace_via_temp(&self.path, now.render().as_bytes(), tmp_nonce);
     }
 
     fn remove(&self) {
@@ -1364,6 +1350,87 @@ fn stored_at(path: &Path) -> Stored {
     }
 }
 
+/// How many fresh temp names one write tries before it gives up. Nobody can
+/// predict a name, so in practice the first try succeeds; the bound is what keeps
+/// a directory that somehow answers "exists" to every name from holding a hook in
+/// a loop.
+const TMP_TRIES: u32 = 4;
+
+/// Write `bytes` over `path` through a temp file beside it and a rename. `true`
+/// when the new bytes are in place; on `false` the old file is untouched.
+///
+/// The temp file is CREATED, never opened: `create_new` is `O_CREAT|O_EXCL` on
+/// Unix and `CREATE_NEW` on Windows, which refuse ANY entry already at that name -
+/// a file, a hard link, a symlink (dangling or not), a junction - instead of
+/// following or truncating it. `File::create` used to open whatever sat at a
+/// predictable `<id>.<pid>.tmp`, so whoever could write in a shared
+/// `CCTAB_STATE_DIR` could plant a hard link there and have the next hook
+/// overwrite the link's target, as this user, with record bytes. The name carries
+/// a [`tmp_nonce`] too, so a planted entry cannot even make the write fail.
+///
+/// A taken name is skipped and LEFT ALONE - it may be somebody else's - and after
+/// [`TMP_TRIES`] the write is dropped exactly as an I/O failure drops it. Only a
+/// temp file this call created is ever removed.
+fn replace_via_temp(path: &Path, bytes: &[u8], mut nonce: impl FnMut() -> u64) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    for _ in 0..TMP_TRIES {
+        let tmp = path.with_file_name(tmp_name(name, nonce()));
+        let mut f = match fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return false,
+        };
+        let wrote = f.write_all(bytes);
+        // Closed before the rename, as it always was.
+        drop(f);
+        // Still under the lock, over the very file this hook holds locked - which
+        // on Windows takes a POSIX-semantics rename; see `sys::replace_file`.
+        if wrote.is_ok() && sys::replace_file(&tmp, path).is_ok() {
+            return true;
+        }
+        let _ = fs::remove_file(&tmp);
+        return false;
+    }
+    false
+}
+
+/// `<record>.<pid>.<nonce as 16 lowercase hex digits>.tmp`: the shape [`Named::of`]
+/// reads as [`Named::Tmp`]. The pid is there for whoever reads the directory; the
+/// nonce is what makes the name unguessable.
+fn tmp_name(record: &OsStr, nonce: u64) -> std::ffi::OsString {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let hex: String = (0..16)
+        .rev()
+        .map(|i| char::from(HEX[(nonce >> (i * 4)) as usize & 0xf]))
+        .collect();
+    let mut name = record.to_owned();
+    name.push(".");
+    name.push(itoa(u64::from(std::process::id())));
+    name.push(".");
+    name.push(hex);
+    name.push(".tmp");
+    name
+}
+
+/// 64 bits nobody else can predict, without a dependency: std's `RandomState` is
+/// SipHash keyed from the OS's random source, and a call counter and the clock
+/// make every call in this process distinct as well.
+fn tmp_nonce() -> u64 {
+    use std::hash::BuildHasher;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    std::collections::hash_map::RandomState::new().hash_one((
+        CALLS.fetch_add(1, Ordering::Relaxed),
+        now,
+        std::process::id(),
+    ))
+}
+
 /// What a file in the state directory is, by NAME alone. Checked BEFORE anything
 /// is read, because `CCTAB_STATE_DIR` is a documented user knob: a directory that
 /// holds other things is the wrong thing to point it at, but it must not be
@@ -1372,9 +1439,10 @@ fn stored_at(path: &Path) -> Stored {
 enum Named {
     /// A session id, which is what a record is filed under.
     Record,
-    /// `<id>.<pid>.tmp`, which a write in flight leaves and a crashed write leaves
-    /// behind. `.` is outside the id grammar, so this can never collide with a
-    /// record's name.
+    /// `<id>.<pid>.<16 lowercase hex>.tmp` ([`tmp_name`]), or `<id>.<pid>.tmp` from
+    /// a version before the nonce, which a write in flight leaves and a crashed
+    /// write leaves behind. `.` is outside the id grammar, so this can never
+    /// collide with a record's name.
     Tmp,
     /// Anything else. Never reaped, whatever its age.
     Foreign,
@@ -1387,14 +1455,29 @@ impl Named {
         };
         match n.split_once('.') {
             None if id_str(n.as_bytes()).is_some() => Named::Record,
-            Some((id, rest))
-                if id_str(id.as_bytes()).is_some()
-                    && matches!(rest.rsplit_once('.'), Some((pid, "tmp")) if digits(pid).is_some()) =>
-            {
+            Some((id, rest)) if id_str(id.as_bytes()).is_some() && Named::tmp_tail(rest) => {
                 Named::Tmp
             }
             _ => Named::Foreign,
         }
+    }
+
+    /// `<pid>.<16 lowercase hex>.tmp` or `<pid>.tmp`, exactly: nothing looser, so
+    /// the grammar claims no name this program did not write.
+    fn tmp_tail(rest: &str) -> bool {
+        let Some(rest) = rest.strip_suffix(".tmp") else {
+            return false;
+        };
+        let pid = match rest.split_once('.') {
+            None => rest,
+            Some((pid, nonce))
+                if nonce.len() == 16 && nonce.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+            {
+                pid
+            }
+            Some(_) => return false,
+        };
+        digits(pid).is_some()
     }
 }
 
@@ -2515,7 +2598,13 @@ mod tests {
         let name = |n: &str| Named::of(OsStr::new(n));
         assert_eq!(name("aec0f2b1-4d31-4e11-9a41-2c7d55e1a900"), Named::Record);
         assert_eq!(name("s1"), Named::Record);
+        // Both temp shapes: an older version's, and this one's with its nonce.
         assert_eq!(name("s1.1234.tmp"), Named::Tmp);
+        assert_eq!(name("s1.1234.0123456789abcdef.tmp"), Named::Tmp);
+        for nonce in [0, 1, 0xdead_beef, u64::MAX, tmp_nonce()] {
+            let ours = tmp_name(OsStr::new("s1"), nonce);
+            assert_eq!(Named::of(&ours), Named::Tmp, "{:?}", ours);
+        }
         // A user's own files, in a CCTAB_STATE_DIR they pointed somewhere shared.
         assert_eq!(name("notes.txt"), Named::Foreign);
         assert_eq!(name("id_rsa.pub"), Named::Foreign);
@@ -2523,6 +2612,145 @@ mod tests {
         assert_eq!(name("s1.tmp"), Named::Foreign);
         assert_eq!(name("s1.abc.tmp"), Named::Foreign);
         assert_eq!(name(&"x".repeat(MAX_ID + 1)), Named::Foreign);
+        // Near misses of the nonce shape are not ours either.
+        for near in [
+            "s1.1234.0123456789ABCDEF.tmp",
+            "s1.1234.0123456789abcde.tmp",
+            "s1.1234.0123456789abcdef0.tmp",
+            "s1.1234.0123456789abcdeg.tmp",
+            "s1.x.0123456789abcdef.tmp",
+            "s1..0123456789abcdef.tmp",
+            "s1.1234.0123456789abcdef.1.tmp",
+            "s1.1234.0123456789abcdef.tmp.txt",
+            "s1.1234.0123456789abcdef",
+        ] {
+            assert_eq!(name(near), Named::Foreign, "{}", near);
+        }
+    }
+
+    /// The nonce is what makes a temp name unguessable: two calls never agree.
+    #[test]
+    fn temp_names_differ_on_every_call() {
+        let s1 = OsStr::new("s1");
+        let names: std::collections::HashSet<OsString> =
+            (0..64).map(|_| tmp_name(s1, tmp_nonce())).collect();
+        assert_eq!(names.len(), 64);
+    }
+
+    /// A deterministic nonce sequence, so a test can plant something at exactly
+    /// the names the next write will try.
+    fn nonces(seq: &[u64]) -> impl FnMut() -> u64 + '_ {
+        let mut it = seq.iter().copied();
+        move || it.next().expect("no more nonces than TMP_TRIES are drawn")
+    }
+
+    /// What the directory holds, sorted, for before/after comparisons.
+    fn listing(d: &Path) -> Vec<OsString> {
+        let mut v: Vec<OsString> = fs::read_dir(d)
+            .expect("a readable state dir")
+            .map(|e| e.expect("an entry").file_name())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// THE PLANTED HARD LINK. Someone who can write in a shared `CCTAB_STATE_DIR`
+    /// links a file of the user's at the temp name the next write uses. The write
+    /// must not open it - the target keeps its bytes - and must still land, under
+    /// the next name. The planted links are not ours, so they stay.
+    #[test]
+    fn a_planted_hard_link_at_a_temp_name_is_never_written_through() {
+        let f = Fixture::new("plant-hardlink");
+        fs::create_dir_all(&f.dir).expect("a writable state dir");
+        let rec = f.dir.join("s1");
+        fs::write(&rec, "cts5\nb i\n").expect("a writable state dir");
+        let victim = f.dir.join("victim.txt");
+        fs::write(&victim, b"precious").expect("a writable state dir");
+        let s1 = OsStr::new("s1");
+        let planted = [f.dir.join(tmp_name(s1, 1)), f.dir.join(tmp_name(s1, 2))];
+        for p in &planted {
+            fs::hard_link(&victim, p).expect("hard links need no privilege");
+        }
+        // The exact name the version before this one would have opened, too.
+        let legacy = f.dir.join(format!("s1.{}.tmp", std::process::id()));
+        fs::hard_link(&victim, &legacy).expect("hard links need no privilege");
+
+        assert!(replace_via_temp(&rec, b"cts5\nb w\n", nonces(&[1, 2, 3])));
+        assert_eq!(fs::read_to_string(&rec).expect("the record"), "cts5\nb w\n");
+        assert_eq!(fs::read(&victim).expect("the victim"), b"precious");
+        for p in planted.iter().chain([&legacy]) {
+            assert_eq!(fs::read(p).expect("left in place"), b"precious", "{}", p.display());
+        }
+        // Nothing of ours left behind: the third name was renamed onto the record.
+        assert!(!f.dir.join(tmp_name(s1, 3)).exists());
+        assert_eq!(listing(&f.dir).len(), 2 + planted.len() + 1);
+
+        // And through a real edge, whose names are unpredictable: the record is
+        // written and the link at the legacy name is still not opened.
+        fs::write(&rec, "cts5\nb i\n").expect("a writable state dir");
+        let main = main_tool();
+        f.session(&main).resolve(Edge::Working, &main);
+        assert_eq!(f.record(), format!("cts5\nb w\n{}", f.origin_line()));
+        assert_eq!(fs::read(&victim).expect("the victim"), b"precious");
+    }
+
+    /// Every name taken: the write is dropped as an I/O failure drops it. The
+    /// record keeps its old bytes, nothing planted is opened or removed, and
+    /// nothing new is left in the directory.
+    #[test]
+    fn every_temp_name_taken_fails_closed() {
+        let f = Fixture::new("plant-exhaust");
+        fs::create_dir_all(&f.dir).expect("a writable state dir");
+        let rec = f.dir.join("s1");
+        fs::write(&rec, "cts5\nb i\n").expect("a writable state dir");
+        let victim = f.dir.join("victim.txt");
+        fs::write(&victim, b"precious").expect("a writable state dir");
+        let seq: Vec<u64> = (10..10 + u64::from(TMP_TRIES)).collect();
+        for &n in &seq {
+            fs::hard_link(&victim, f.dir.join(tmp_name(OsStr::new("s1"), n)))
+                .expect("hard links need no privilege");
+        }
+        let before = listing(&f.dir);
+        assert!(!replace_via_temp(&rec, b"cts5\nb w\n", nonces(&seq)));
+        assert_eq!(fs::read_to_string(&rec).expect("the record"), "cts5\nb i\n");
+        assert_eq!(fs::read(&victim).expect("the victim"), b"precious");
+        assert_eq!(listing(&f.dir), before);
+    }
+
+    /// The symlink variant, including a DANGLING one: `O_CREAT` without `O_EXCL`
+    /// follows it and creates its target. Windows needs a privilege or Developer
+    /// Mode to make a symlink, so there the test says so and stops.
+    #[test]
+    fn a_planted_symlink_at_a_temp_name_is_never_followed() {
+        let f = Fixture::new("plant-symlink");
+        fs::create_dir_all(&f.dir).expect("a writable state dir");
+        let rec = f.dir.join("s1");
+        fs::write(&rec, "cts5\nb i\n").expect("a writable state dir");
+        let victim = f.dir.join("victim.txt");
+        fs::write(&victim, b"precious").expect("a writable state dir");
+        let nowhere = f.dir.join("created-by-following");
+        let s1 = OsStr::new("s1");
+        #[cfg(unix)]
+        let link = |to: &Path, at: &Path| std::os::unix::fs::symlink(to, at);
+        #[cfg(windows)]
+        let link = |to: &Path, at: &Path| std::os::windows::fs::symlink_file(to, at);
+        if let Err(e) = link(&victim, &f.dir.join(tmp_name(s1, 1))) {
+            if cfg!(windows) {
+                eprintln!("skipped: cannot create a symlink here ({e}); the hard-link test covers this");
+                return;
+            }
+            panic!("symlink: {e}");
+        }
+        link(&nowhere, &f.dir.join(tmp_name(s1, 2))).expect("a second symlink");
+
+        assert!(replace_via_temp(&rec, b"cts5\nb w\n", nonces(&[1, 2, 3])));
+        assert_eq!(fs::read_to_string(&rec).expect("the record"), "cts5\nb w\n");
+        assert_eq!(fs::read(&victim).expect("the victim"), b"precious");
+        assert!(fs::symlink_metadata(&nowhere).is_err(), "a dangling link was followed");
+        for n in [1, 2] {
+            let p = f.dir.join(tmp_name(s1, n));
+            assert!(fs::symlink_metadata(&p).expect("left in place").is_symlink());
+        }
     }
 
     /// Every field the wire carries survives a render and a parse unchanged. This
@@ -2650,6 +2878,12 @@ mod tests {
         let old_tmp = write("t.2.tmp", "half a rec");
         age(&old_tmp);
         assert!(verdict(&old_tmp).is_some());
+        // This version's temp shape, with the nonce: the same rule.
+        let nonce_tmp = write("t.3.0123456789abcdef.tmp", "half a rec");
+        assert_eq!(verdict(&nonce_tmp), None);
+        let old_nonce_tmp = write("t.4.fedcba9876543210.tmp", "half a rec");
+        age(&old_nonce_tmp);
+        assert!(verdict(&old_nonce_tmp).is_some());
 
         // WHAT THE REAPER MAY NOT TOUCH, whatever its age: a user's own file in a
         // CCTAB_STATE_DIR they pointed at a shared directory, an unparseable file
@@ -2661,6 +2895,8 @@ mod tests {
             ("notes.txt", "a shopping list"),
             ("id_rsa", "-----BEGIN OPENSSH PRIVATE KEY-----"),
             ("garbage", "not a record at all"),
+            ("t.5.0123456789ABCDEF.tmp", "half a rec"),
+            ("t.6.0123456789abcdef.tmp.bak", "half a rec"),
         ] {
             let p = write(name, body);
             age(&p);
@@ -2683,13 +2919,13 @@ mod tests {
         // And the reaper acts on exactly those verdicts, skipping its own file.
         let s = f.session(&main_ev());
         s.reap();
-        for kept in [&live, &anon, &tmp, &newer] {
+        for kept in [&live, &anon, &tmp, &nonce_tmp, &newer] {
             assert!(kept.exists(), "{}", kept.display());
         }
         for kept in &untouchable {
             assert!(kept.exists(), "{}", kept.display());
         }
-        for gone in [&dead, &recycled, &old_anon, &old_tmp, &old_newer] {
+        for gone in [&dead, &recycled, &old_anon, &old_tmp, &old_nonce_tmp, &old_newer] {
             assert!(!gone.exists(), "{}", gone.display());
         }
     }
@@ -2846,19 +3082,25 @@ mod tests {
             ("s1", "cts5\nb w\n"),
             ("s2", "cts5\nb i\n"),
             ("s2.99.tmp", "half"),
+            ("s2.99.0123456789abcdef.tmp", "half"),
+            // Not a name this writes (15 hex digits), so not ours to take. Not an
+            // uppercase variant: NTFS would fold it onto the line above.
+            ("s2.99.0123456789abcde.tmp", "theirs"),
             ("notes.txt", "mine"),
         ] {
             fs::write(f.dir.join(name), body).expect("a writable state dir");
         }
         let (where_, gone, dir_gone) = purge().expect("a state dir");
-        assert_eq!((where_, gone, dir_gone), (f.dir.clone(), 3, false));
-        let left: Vec<String> = fs::read_dir(&f.dir)
+        assert_eq!((where_, gone, dir_gone), (f.dir.clone(), 4, false));
+        let mut left: Vec<String> = fs::read_dir(&f.dir)
             .expect("still there")
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(left, vec!["notes.txt".to_owned()]);
+        left.sort();
+        assert_eq!(left, vec!["notes.txt".to_owned(), "s2.99.0123456789abcde.tmp".to_owned()]);
         // With only our own files in it, the directory goes too.
+        fs::remove_file(f.dir.join("s2.99.0123456789abcde.tmp")).expect("planted by this test");
         fs::remove_file(f.dir.join("notes.txt")).expect("our own file");
         fs::write(f.dir.join("s3"), "cts5\nb i\n").expect("a writable state dir");
         assert_eq!(purge(), Some((f.dir.clone(), 1, true)));

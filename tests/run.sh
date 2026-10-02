@@ -2566,8 +2566,8 @@ check 'state: SessionStart does not reap a live record' 'present' \
 # directory is not always one we created - and `reapable` used to fall back to
 # mtime for anything it could not parse, which deleted a 30-day-old private key out
 # of a directory that had other things in it. The name grammar cannot tell `id_rsa`
-# from a session id, so the rule is now CONTENT: only a record, or a `<id>.<pid>.tmp`,
-# is ever a candidate.
+# from a session id, so the rule is now CONTENT: only a record, or a temp file
+# named `<id>.<pid>[.<nonce>].tmp`, is ever a candidate.
 rm -rf "$_sd"; mkdir -p "$_sd"
 printf 'a shopping list\n' >"$_sd/notes.txt"
 printf -- '-----BEGIN OPENSSH PRIVATE KEY-----\n' >"$_sd/id_rsa"

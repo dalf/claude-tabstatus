@@ -234,7 +234,13 @@ Ordinary state updates lock the session's own record, including its first creati
 then verify the path still names the locked file (device and inode on Unix, volume
 and file ID on Windows). On Windows the lock covers one byte outside the record's
 data, so unlocked readers are never refused. Atomic temporary-file rename
-prevents partially written records; unchanged state is not rewritten. Different
+prevents partially written records; unchanged state is not rewritten. The
+temporary file is named `<id>.<pid>.<16 lowercase hex>.tmp` with a fresh random
+nonce and is created exclusively (`O_CREAT|O_EXCL` / `CREATE_NEW`): an existing
+entry at that name, including a planted hard link or symlink, is never opened or
+removed. A taken name is retried under a new nonce a bounded number of times
+(4); if every try is taken the update fails like any other I/O failure and the
+old record stays. Different
 sessions have separate locks. Serialized updates preserve distinct waits and exact
 completion history within the capacity rules; they do not impose a deterministic
 winner for simultaneous unrelated base transitions or order terminal output after
@@ -263,7 +269,7 @@ with a stored process ID/start-time pair can be reaped when that origin no longe
 matches. The pair is stored under a per-platform key (`p` on Unix, `q` with the
 process creation time on Windows); a record carrying the other platform's key reads
 as having no origin. Records without origin, future-version records and recognized temporary
-files use a 24-hour mtime recovery rule; future mtimes count as stale. Recognized
+files (`<id>.<pid>.<16 lowercase hex>.tmp`, and the older `<id>.<pid>.tmp`) use a 24-hour mtime recovery rule; future mtimes count as stale. Recognized
 background records without origin are exempt: missing process metadata cannot
 prove their work ended. Alien record
 contents and unrelated filenames are not startup-reaped. Explicit uninstall has
