@@ -923,6 +923,160 @@ fn resolved(p: &Path) -> PathBuf {
     }
 }
 
+/// Whether a resolved gitdir, `GIT_DIR` or `HEAD` path at `p` may be handed to the
+/// filesystem call that probes it, given `base` - the already-trusted directory it
+/// was derived from (the walk's directory, the gitfile's own directory, or the
+/// logical cwd for `GIT_DIR`).
+///
+/// This is the whole of the UNC/NTLM defence. A path that names a NETWORK SHARE -
+/// `\\server\share\...`, `//server/share/...`, `\\?\UNC\...`, or a drive letter
+/// mapped to a share - makes the first `exists`/`is_file`/`open` open an SMB
+/// connection and hand the server an automatic NTLM authentication, which leaks the
+/// user's hashed credentials off-box and stalls the hook for seconds; a DEVICE path
+/// (`\\.\pipe\...`, `\\?\GLOBALROOT\...`) reaches a device object instead. A hostile
+/// repository plants exactly such a path - in a `.git` gitfile's `gitdir:` line, in
+/// `GIT_DIR`, or as a reparse point (junction or symlink) standing in for `.git` or
+/// `HEAD`. On a refusal the caller yields no repository, so the tab falls back to the
+/// plain path, exactly as for a directory that is not a repository.
+///
+/// ALLOWED: a local fixed/removable drive-letter path, OR any path that shares
+/// `base`'s own volume or share - so a repository a user has deliberately opened on
+/// `\\server\share` or on a mapped drive keeps painting `repo@branch`, as long as its
+/// gitdir stays on that same root. REFUSED: every other UNC path, every device path,
+/// and a mapped network drive (`DRIVE_REMOTE`) that points off `base`'s root.
+///
+/// The literal spelling is judged FIRST, with no system call, so a UNC or device
+/// string is rejected before anything can touch it. Only once the spelling is local
+/// is `p` stat-ed - a no-follow `symlink_metadata`, which cannot reach the network -
+/// and if it is a reparse point its WHOLE chain is walked with `read_link` (which
+/// does not follow a link either), every hop judged the same way. So a `.git` or
+/// `HEAD` junction to a share - even behind a local junction that fronts for it - is
+/// refused on its target, while a chain that stays local is followed.
+pub fn gitpath_allowed(p: &Path, base: &Path) -> bool {
+    if !spelling_local(p, base) {
+        return false;
+    }
+    // Walk a reparse chain WITHOUT ever following it on the network. Each hop is read
+    // with the no-follow `read_link` and its target judged by the same local-spelling
+    // rule, so a chain that ends at - or merely passes through - a share is refused
+    // before any following call (`exists`/`is_file`/`open`) can reach it: a single
+    // local junction placed in front of a symlink-to-share would otherwise sail past
+    // a one-hop check. The cap stops a cyclic or adversarially deep chain.
+    let mut cur = p.to_path_buf();
+    for _ in 0..MAX_REPARSE_HOPS {
+        match fs::symlink_metadata(&cur) {
+            // `cur`'s spelling is already known local, so this no-follow stat stays
+            // on-box; a reparse point is judged on where it points, never by following.
+            Ok(m) if m.file_type().is_symlink() => {
+                let target = match fs::read_link(&cur) {
+                    Ok(t) => t,
+                    Err(_) => return false,
+                };
+                // A relative target resolves against the link's own directory.
+                cur = if target.is_absolute() {
+                    target
+                } else {
+                    cur.parent().unwrap_or(Path::new(".")).join(target)
+                };
+                if !spelling_local(&cur, base) {
+                    return false;
+                }
+            }
+            // Absent (the caller's own `exists`/`is_file` handles that) or a plain
+            // file or directory: the chain ends on a local volume.
+            _ => return true,
+        }
+    }
+    false
+}
+
+/// How many reparse hops the guard follows before giving up. A `.git` or `HEAD` is a
+/// link or two in practice; a longer chain is cyclic or adversarial and is refused
+/// rather than followed onto who-knows-where.
+const MAX_REPARSE_HOPS: usize = 40;
+
+/// Whether `p`'s spelling names a local volume, or `base`'s own volume or share. No
+/// system call but [`drive_type`], which only classifies a drive letter.
+fn spelling_local(p: &Path, base: &Path) -> bool {
+    let p = strip_verbatim(p);
+    match p.components().next() {
+        Some(Component::Prefix(q)) => match q.kind() {
+            // A fixed or removable drive is local; a mapped network drive counts as
+            // network unless it is `base`'s own root.
+            Prefix::Disk(d) | Prefix::VerbatimDisk(d) => {
+                drive_type(d) != DRIVE_REMOTE || same_root(&p, base)
+            }
+            // A UNC share is allowed only when it is the one `base` lives on.
+            Prefix::UNC(..) | Prefix::VerbatimUNC(..) => same_root(&p, base),
+            // `\\.\device`, `\\?\GLOBALROOT\...` and the like: never a repository.
+            _ => false,
+        },
+        // No prefix - a relative path, or one rooted on the current drive like
+        // `\x` - resolves on the local cwd volume.
+        _ => true,
+    }
+}
+
+/// Whether `candidate`'s volume or share is the same as `base`'s, case-folded.
+///
+/// `candidate` is read from its SPELLING alone and is never opened - it may be the
+/// hostile path. `base` is the trusted cwd-derived directory, so when it sits on a
+/// drive mapped to a network share its letter is resolved to that share; this opens
+/// only the share the session is already on, and it lets a repository reached through
+/// `\\server\share` directly, or through a drive mapped to it, match a gitdir git
+/// spelled the other way - git records a worktree's gitdir as `//server/share/...`,
+/// which never string-matches a `\\server\share` or `Y:` base.
+fn same_root(candidate: &Path, base: &Path) -> bool {
+    let c = match root_prefix(candidate) {
+        Some(c) => c,
+        None => return false,
+    };
+    if root_prefix(base).is_some_and(|b| b == c) {
+        return true;
+    }
+    // `base` on a mapped network drive: compare against the share it resolves to. Only
+    // `base` is canonicalized (the share the session already sits on); the hostile
+    // `candidate` is never opened, so a second drive mapped elsewhere to the same share
+    // is not matched - a documented corner, not a hole.
+    if base_on_remote_disk(base) {
+        if let Some(b) = fs::canonicalize(base).ok().and_then(|r| root_prefix(&r)) {
+            return b == c;
+        }
+    }
+    false
+}
+
+/// The volume-or-share prefix of `p`, normalized for a case-insensitive compare: `C:`
+/// for a drive, `\\SERVER\SHARE` for a UNC share whatever its separators (`\\` or
+/// `//`) or verbatim form, or `None` when `p` has no prefix. Read from the spelling.
+fn root_prefix(p: &Path) -> Option<String> {
+    match strip_verbatim(p).components().next() {
+        Some(Component::Prefix(q)) => match q.kind() {
+            Prefix::Disk(d) | Prefix::VerbatimDisk(d) => {
+                Some(format!("{}:", (d as char).to_ascii_uppercase()))
+            }
+            // Built from the parsed server and share, so `//h/s` and `\\h\s` agree.
+            Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => Some(
+                format!(r"\\{}\{}", server.to_string_lossy(), share.to_string_lossy())
+                    .to_uppercase(),
+            ),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Whether `base` sits on a drive letter mapped to a network share.
+fn base_on_remote_disk(base: &Path) -> bool {
+    match strip_verbatim(base).components().next() {
+        Some(Component::Prefix(q)) => match q.kind() {
+            Prefix::Disk(d) | Prefix::VerbatimDisk(d) => drive_type(d) == DRIVE_REMOTE,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// The command a report hands an operator to remove the directory `p` outright: a
 /// PowerShell one, the path single-quoted - a profile path with a space in it is the
 /// ordinary case here, and `rm -rf` is a parameter error in PowerShell.
@@ -1747,5 +1901,137 @@ mod tests {
             remove_dir_command(Path::new(r"C:\Users\A B\it's")),
             r"Remove-Item -Recurse -Force -LiteralPath 'C:\Users\A B\it''s'"
         );
+    }
+
+    /// The spelling half of the gitdir guard, judged on strings alone - no disk and,
+    /// crucially, no network, because a UNC or device spelling is refused before any
+    /// call could reach it. Every vector a hostile repository can spell is here.
+    #[test]
+    fn a_network_or_device_spelling_is_refused_and_a_local_one_allowed() {
+        let local = Path::new(r"C:\repo");
+        // Every UNC spelling, against a LOCAL base: refused.
+        for p in [
+            r"\\cctab-nohost\share\x",
+            "//cctab-nohost/share/x",
+            r"\\?\UNC\cctab-nohost\share\x",
+            r"\\127.0.0.1\share\q",
+            r"\\localhost\c$\x",
+        ] {
+            assert!(!spelling_local(Path::new(p), local), "UNC {p}");
+        }
+        // Device namespaces: never a repository, whatever the base.
+        for p in [r"\\.\pipe\x", r"\\?\GLOBALROOT\Device\HarddiskVolume1\x", r"\\.\PhysicalDrive0"] {
+            assert!(!spelling_local(Path::new(p), local), "device {p}");
+        }
+        // A local drive-letter path, a verbatim one, and a rooted-but-local one: kept
+        // regardless of the base (a fixed drive is not DRIVE_REMOTE).
+        for p in [r"C:\repo\.git", r"\\?\C:\repo\.git", r"\on-current-drive\x", r"..\sib\.git"] {
+            assert!(spelling_local(Path::new(p), local), "local {p}");
+        }
+    }
+
+    /// The share exception: a gitdir ON the share the session already sits on is kept,
+    /// and one on any OTHER share - the credential-leak shape - is refused. Pure string
+    /// work: `same_root` touches nothing, so the non-resolving host is never contacted.
+    #[test]
+    fn a_gitdir_on_the_sessions_own_share_is_kept_and_another_share_is_not() {
+        let on_share = Path::new(r"\\cctab-nohost\share\repo");
+        assert!(spelling_local(Path::new(r"\\cctab-nohost\share\repo\.git"), on_share), "same share");
+        assert!(
+            spelling_local(Path::new(r"\\CCTAB-NOHOST\SHARE\repo\.git\HEAD"), on_share),
+            "same share, case-folded"
+        );
+        assert!(!spelling_local(Path::new(r"\\cctab-nohost\other\x"), on_share), "sibling share");
+        assert!(!spelling_local(Path::new(r"\\cctab-evil\share\x"), on_share), "another host");
+        // And `same_root` itself, drive letters included.
+        assert!(same_root(Path::new(r"C:\a"), Path::new(r"C:\b\c")));
+        assert!(same_root(Path::new(r"c:\a"), Path::new(r"C:\b")), "case");
+        assert!(!same_root(Path::new(r"C:\a"), Path::new(r"D:\a")));
+        assert!(!same_root(Path::new(r"\\h\s\a"), Path::new(r"\\h\s2\a")), "share differs");
+        // Separators must not matter: git records a worktree's gitdir with forward
+        // slashes (`//server/share/...`), which must still match a `\\server\share`
+        // base the session was opened on, or a worktree on a share stops resolving.
+        assert!(
+            same_root(Path::new("//h/s/r/.git/worktrees/w"), Path::new(r"\\h\s\r")),
+            "forward-slash UNC gitdir matches a back-slash base on the same share"
+        );
+        assert!(same_root(Path::new(r"\\h\s\a"), Path::new("//H/S/b")), "case + separators");
+    }
+
+    /// The reparse half: a `.git` (or HEAD) junction to a LOCAL directory is followed,
+    /// and `gitpath_allowed` says yes without ever following it to decide.
+    #[test]
+    fn a_git_junction_to_a_local_directory_is_allowed() {
+        let d = scratch("guard-junction-local");
+        let target = d.join("real-git");
+        fs::create_dir_all(&target).expect("mkdir");
+        let dotgit = d.join(".git");
+        link_dir(&target, &dotgit).expect("junction");
+        assert!(gitpath_allowed(&dotgit, &d), "a junction to a local dir is followed");
+        // An absent path is the caller's business, not a refusal.
+        assert!(gitpath_allowed(&d.join("nope"), &d));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The residual the critic found: a `.git` that is a reparse point to a SHARE. The
+    /// link is judged on its target by `read_link`, which does not follow it, so the
+    /// non-resolving host is never contacted - and the guard refuses. A directory
+    /// symlink needs Developer Mode or elevation, so where the OS refuses to create
+    /// one the test says why and stops rather than failing.
+    #[test]
+    fn a_git_symlink_to_a_share_is_refused_without_following_it() {
+        let d = scratch("guard-symlink-unc");
+        let link = d.join(".git");
+        let unc = Path::new(r"\\cctab-nohost\share\x");
+        if let Err(e) = std::os::windows::fs::symlink_dir(unc, &link) {
+            eprintln!("skipped: cannot create a directory symlink here ({e}); needs Developer Mode");
+            let _ = fs::remove_dir_all(&d);
+            return;
+        }
+        // read_link hands back the UNC target; the guard refuses it. Nothing follows
+        // the link, so no SMB connection is attempted.
+        assert_eq!(fs::read_link(&link).ok().as_deref(), Some(unc), "the link names the share");
+        assert!(!gitpath_allowed(&link, &d), "a reparse point to a share is refused");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A reparse CHAIN: a `.git` junction (no privilege) fronting a symlink that
+    /// points at a share. A one-hop check would read only the junction's LOCAL target
+    /// and wave it through, then the caller's `exists` would follow the rest to the
+    /// share. The guard must walk every hop, so it refuses on the symlink's UNC target
+    /// without any following call. The symlink hop needs Developer Mode; where the OS
+    /// refuses it the test says why and stops rather than failing.
+    #[test]
+    fn a_git_junction_fronting_a_symlink_to_a_share_is_refused() {
+        let d = scratch("guard-chain-unc");
+        let mid = d.join("mid"); // a symlink -> share
+        let unc = Path::new(r"\\cctab-nohost\share\x");
+        if let Err(e) = std::os::windows::fs::symlink_dir(unc, &mid) {
+            eprintln!("skipped: cannot create a directory symlink here ({e}); needs Developer Mode");
+            let _ = fs::remove_dir_all(&d);
+            return;
+        }
+        let dotgit = d.join(".git"); // a junction -> the local `mid`
+        link_dir(&mid, &dotgit).expect("junction");
+        assert!(
+            !gitpath_allowed(&dotgit, &d),
+            "the chain is walked to the share's symlink and refused"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// An all-local reparse chain - a junction to a junction to a real directory - is
+    /// followed to the end, so a legitimate layered link keeps resolving.
+    #[test]
+    fn a_local_reparse_chain_is_followed() {
+        let d = scratch("guard-chain-local");
+        let real = d.join("real");
+        fs::create_dir_all(&real).expect("mkdir");
+        let hop1 = d.join("hop1");
+        link_dir(&real, &hop1).expect("junction 1");
+        let dotgit = d.join(".git");
+        link_dir(&hop1, &dotgit).expect("junction 2");
+        assert!(gitpath_allowed(&dotgit, &d), "a local chain is followed to the end");
+        let _ = fs::remove_dir_all(&d);
     }
 }
