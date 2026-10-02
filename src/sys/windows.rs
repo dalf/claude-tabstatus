@@ -18,6 +18,7 @@ use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use windows_sys::Wdk::System::SystemServices::RtlUpcaseUnicodeChar;
 use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, ERROR_ACCESS_DENIED,
@@ -72,27 +73,83 @@ pub const HAS_SESSION_CONSOLE: bool = true;
 /// Bytes back into an `OsStr` - the inverse of [`OsStr::as_encoded_bytes`].
 ///
 /// An `OsStr` here is WTF-8 and std offers no safe way back from arbitrary bytes,
-/// so valid UTF-8 borrows and anything else is converted lossily, with U+FFFD for
-/// each invalid sequence. What that costs depends on where the bytes came from:
-/// bytes sliced out of an `OsStr` at ASCII boundaries are lossy only when the
-/// path holds an unpaired surrogate, but bytes read from a FILE (a `.git` gitfile,
-/// a marker's JSON) are lossy for any invalid UTF-8. Either way the result
-/// displays rather than failing. Nothing relies on the round trip for safety: the
-/// marker's paths were written through `json::quote`, so are UTF-8 already, and
-/// `tree::in_tree` confines whatever they spell to the tree.
+/// so valid UTF-8 borrows and anything else is decoded by [`from_wtf8`]: an unpaired
+/// surrogate in WTF-8's own three-byte form comes back as itself, so bytes sliced
+/// out of an `OsStr` at ASCII boundaries - a `$HOME` losing its trailing separator,
+/// a gitdir - round-trip exactly, and every other invalid sequence is U+FFFD, which
+/// is what bytes read from a FILE (a `.git` gitfile, a marker's JSON) can hold.
+/// Either way the result displays rather than failing. Nothing relies on the round
+/// trip for safety: the marker's paths were written through `json::quote`, so are
+/// UTF-8 already, and `tree::in_tree` confines whatever they spell to the tree.
 pub fn os_str_from_bytes(b: &[u8]) -> Cow<'_, OsStr> {
     match std::str::from_utf8(b) {
         Ok(s) => Cow::Borrowed(OsStr::new(s)),
-        Err(_) => Cow::Owned(OsString::from(String::from_utf8_lossy(b).into_owned())),
+        Err(_) => Cow::Owned(from_wtf8(b)),
     }
+}
+
+/// A path's encoded bytes as a title shows them: each unpaired surrogate - WTF-8's
+/// `ED A0..BF 80..BF`, the only bytes here that are not UTF-8 - becomes ONE U+FFFD,
+/// as `to_string_lossy` makes it, where `text::repair` would see three bad bytes and
+/// paint (and count against the length cap) three.
+pub fn display_bytes(b: &[u8]) -> Cow<'_, [u8]> {
+    if std::str::from_utf8(b).is_ok() {
+        return Cow::Borrowed(b);
+    }
+    let mut out = Vec::with_capacity(b.len());
+    let mut rest = b;
+    while let [c, tail @ ..] = rest {
+        rest = match rest {
+            [0xED, 0xA0..=0xBF, 0x80..=0xBF, after @ ..] => {
+                out.extend_from_slice("\u{fffd}".as_bytes());
+                after
+            }
+            _ => {
+                out.push(*c);
+                tail
+            }
+        };
+    }
+    Cow::Owned(out)
 }
 
 /// The owned form of [`os_str_from_bytes`], without a copy when it is UTF-8.
 pub fn os_string_from_vec(v: Vec<u8>) -> OsString {
     match String::from_utf8(v) {
         Ok(s) => OsString::from(s),
-        Err(e) => OsString::from(String::from_utf8_lossy(e.as_bytes()).into_owned()),
+        Err(e) => from_wtf8(e.as_bytes()),
     }
+}
+
+/// `b` decoded as WTF-8: UTF-8, plus `ED A0..BF 80..BF` for an unpaired surrogate
+/// (`D800`-`DFFF`). Any other invalid sequence is one U+FFFD, as
+/// `String::from_utf8_lossy` would make it.
+fn from_wtf8(b: &[u8]) -> OsString {
+    let mut w = Vec::with_capacity(b.len());
+    let mut rest = b;
+    while !rest.is_empty() {
+        let (good, bad) = match std::str::from_utf8(rest) {
+            Ok(s) => (s, &[][..]),
+            Err(e) => {
+                let (good, bad) = rest.split_at(e.valid_up_to());
+                (std::str::from_utf8(good).unwrap_or_default(), bad)
+            }
+        };
+        w.extend(good.encode_utf16());
+        rest = match bad {
+            [] => bad,
+            [0xED, b1 @ 0xA0..=0xBF, b2 @ 0x80..=0xBF, tail @ ..] => {
+                w.push(0xD000 | (u16::from(b1 & 0x3F) << 6) | u16::from(b2 & 0x3F));
+                tail
+            }
+            _ => {
+                w.push(0xFFFD);
+                let len = std::str::from_utf8(bad).err().and_then(|e| e.error_len());
+                &bad[len.unwrap_or(bad.len())..]
+            }
+        };
+    }
+    OsString::from_wide(&w)
 }
 
 /// Where the home directory is when `HOME` is unset, which native Windows shells
@@ -1128,17 +1185,115 @@ fn stored_name(p: &Path) -> Option<OsString> {
     (n > 0).then(|| OsString::from_wide(&data.cFileName[..n]))
 }
 
-/// A path as NTFS compares it: its components, each upper-cased one character at a
-/// time (the simple mapping, as the volume's upcase table does).
-fn folded(p: &Path) -> Vec<String> {
-    let up = |c: char| {
-        let mut u = c.to_uppercase();
-        match (u.next(), u.next()) {
-            (Some(x), None) => x,
-            _ => c,
-        }
+/// One name as NTFS compares it without regard to case: each UTF-16 unit through
+/// the system's own upcase table, `RtlUpcaseUnicodeChar`.
+///
+/// Lossless: a name is UTF-16 units, not text, and the table maps every surrogate
+/// unit to itself - so `<D800>`, `<D801>` and a real U+FFFD stay three different
+/// names, as they are on disk, where a lossy decode made them one.
+///
+/// Unit to unit, as NTFS's own `$UpCase` table is: `é` folds to `É`; `ß`, a
+/// character outside the BMP (`𐐨`/`𐐀`) and the letters a Unicode-derived fold
+/// would merge but NTFS keeps apart (`ı`/`I`, `ſ`/`S`, `ς`/`Σ`, Cherokee, the
+/// Georgian capitals...) all stay what they are, and `ᾳ`/`ᾼ`, which Unicode
+/// upper-cases to two letters, fold to one. On a Windows 11 NTFS volume this agreed
+/// with the disk on every BMP case pair, where Unicode's own upper case disagreed on
+/// 253. `$UpCase` is written when a volume is formatted, so one formatted by a much
+/// older Windows can still differ on a letter added since. A lookup in memory, no
+/// filesystem call: the tab title's `~` folds on every hook.
+fn fold(units: &[u16]) -> Vec<u16> {
+    let up = |u: u16| match u8::try_from(u) {
+        Ok(b) if b.is_ascii() => b.to_ascii_uppercase().into(),
+        // SAFETY: takes and returns a plain value; it reads only the system's
+        // in-memory case table.
+        _ => unsafe { RtlUpcaseUnicodeChar(u) },
     };
-    p.components().map(|c| c.as_os_str().to_string_lossy().chars().map(up).collect()).collect()
+    units.iter().map(|&u| up(u)).collect()
+}
+
+/// The key of a volume or share prefix: `C:` for a drive, `\\SERVER\SHARE` for a
+/// share whatever its separators or `\\?\` form, and any other prefix (`\\.\pipe`,
+/// `\\?\GLOBALROOT`) folded as it is spelled.
+///
+/// The SERVER is folded in ASCII only, every other unit kept exact: it names a host,
+/// and [`same_root`] lets a gitdir through on its say-so - so a name that merely
+/// looks like the session's own host, `\\fıleserver` for `\\fileserver`, must be a
+/// different root, refused before anything opens it, whatever a case table says.
+fn prefix_key(q: &std::path::PrefixComponent) -> Vec<u16> {
+    match q.kind() {
+        Prefix::Disk(d) | Prefix::VerbatimDisk(d) => vec![d.to_ascii_uppercase().into(), b':'.into()],
+        Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+            let mut k = vec![b'\\'.into(), b'\\'.into()];
+            k.extend(server.encode_wide().map(|u| match u8::try_from(u) {
+                Ok(b) => b.to_ascii_uppercase().into(),
+                Err(_) => u,
+            }));
+            k.push(b'\\'.into());
+            k.extend(fold(&share.encode_wide().collect::<Vec<_>>()));
+            k
+        }
+        _ => fold(&q.as_os_str().encode_wide().collect::<Vec<_>>()),
+    }
+}
+
+/// `p` as its SPELLING compares, with no filesystem call: one key per component - the
+/// prefix's ([`prefix_key`]), `\` for the root, and each name [`fold`]ed - paired
+/// with the offset in `p`'s UTF-16 units where that component ends. `/` and `\` are
+/// both separators, an empty or `.` component is skipped, and `..` is kept as it is.
+///
+/// This is the one comparison under [`same_path`], [`is_within`], [`same_root`] and
+/// [`strip_home_prefix`]: the first two apply it after [`normalize`], the `~` of a
+/// tab title to the spelling it has, so all of them agree on what "the same" means.
+fn lexical(p: &Path) -> Vec<(Vec<u16>, usize)> {
+    let w = wide(p);
+    let sep = |u: &u16| *u == u16::from(b'\\') || *u == u16::from(b'/');
+    let mut out = Vec::new();
+    let mut at = 0;
+    if let Some(Component::Prefix(q)) = p.components().next() {
+        at = q.as_os_str().encode_wide().count();
+        out.push((prefix_key(&q), at));
+    }
+    if w.get(at).is_some_and(sep) {
+        at += 1;
+        out.push((vec![b'\\'.into()], at));
+    }
+    for name in w[at..].split(sep) {
+        let end = at + name.len();
+        if !(name.is_empty() || name == [u16::from(b'.')]) {
+            out.push((fold(name), end));
+        }
+        at = end + 1;
+    }
+    out
+}
+
+/// The keys of [`lexical`] alone.
+fn folded(p: &Path) -> Vec<Vec<u16>> {
+    lexical(p).into_iter().map(|(k, _)| k).collect()
+}
+
+/// What follows `home` in `path`, when `path` is `home` or lies beneath it: empty for
+/// `home` itself, else the rest from its separator on, spelled as `path` spells it.
+///
+/// Judged by [`lexical`] on the spelling alone, because the tab title asks it on
+/// every hook: `c:\users\me\x`, `C:/Users/ME/x` and `\\?\C:\Users\me\x` are all under
+/// `C:\Users\me`. What only the disk could tell is NOT seen - an 8.3 short name
+/// (`C:\Users\ALEXAN~1`) or a junction is a different spelling, and keeps its path.
+///
+/// A home that names no directory IN a volume - `C:\`, the `C:` that `config` trims
+/// it to, `\\srv\share` - claims only itself, as `/` does on Unix: `C:\code` stays
+/// `C:/code`, not `~/code`.
+pub fn strip_home_prefix(path: &Path, home: &Path) -> Option<OsString> {
+    let (p, h) = (lexical(path), lexical(home));
+    let n = h.len();
+    if n == 0 || p.len() < n || p.iter().zip(&h).any(|((a, _), (b, _))| a != b) {
+        return None;
+    }
+    if !home.components().any(|c| matches!(c, Component::Normal(_) | Component::ParentDir)) {
+        return (p.len() == n).then(OsString::new);
+    }
+    // `home` ends in a name, so the rest is empty or starts at the separator after it.
+    Some(OsString::from_wide(&wide(path)[p[n - 1].1..]))
 }
 
 /// Whether `a` and `b` name the same directory by their spelling: equal once both
@@ -1272,7 +1427,8 @@ fn spelling_local(p: &Path, base: &Path) -> bool {
     }
 }
 
-/// Whether `candidate`'s volume or share is the same as `base`'s, case-folded.
+/// Whether `candidate`'s volume or share is the same as `base`'s, compared by
+/// [`prefix_key`] - the server in ASCII case only.
 ///
 /// `candidate` is read from its SPELLING alone and is never opened - it may be the
 /// hostile path. `base` is the trusted cwd-derived directory, so when it sits on a
@@ -1301,20 +1457,16 @@ fn same_root(candidate: &Path, base: &Path) -> bool {
     false
 }
 
-/// The volume-or-share prefix of `p`, normalized for a case-insensitive compare: `C:`
-/// for a drive, `\\SERVER\SHARE` for a UNC share whatever its separators (`\\` or
-/// `//`) or verbatim form, or `None` when `p` has no prefix. Read from the spelling.
-fn root_prefix(p: &Path) -> Option<String> {
-    match strip_verbatim(p).components().next() {
+/// The volume-or-share prefix of `p` as [`prefix_key`] compares it - `C:`, or
+/// `\\SERVER\SHARE` whatever its separators (`\\` or `//`) or verbatim form, built
+/// from the parsed server and share - or `None` when `p` has no drive or share
+/// prefix. Read from the spelling.
+fn root_prefix(p: &Path) -> Option<Vec<u16>> {
+    match p.components().next() {
         Some(Component::Prefix(q)) => match q.kind() {
-            Prefix::Disk(d) | Prefix::VerbatimDisk(d) => {
-                Some(format!("{}:", (d as char).to_ascii_uppercase()))
+            Prefix::Disk(_) | Prefix::VerbatimDisk(_) | Prefix::UNC(..) | Prefix::VerbatimUNC(..) => {
+                Some(prefix_key(&q))
             }
-            // Built from the parsed server and share, so `//h/s` and `\\h\s` agree.
-            Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => Some(
-                format!(r"\\{}\{}", server.to_string_lossy(), share.to_string_lossy())
-                    .to_uppercase(),
-            ),
             _ => None,
         },
         _ => None,
@@ -2351,6 +2503,190 @@ mod tests {
         assert!(!is_within(&d.join("cfg").join("skills2").join("x"), &skills), "a sibling");
         assert!(!is_within(&d.join("cfg"), &skills), "the parent");
         let _ = fs::remove_dir_all(&d);
+    }
+
+    /// `head` followed by `units`, which may hold an unpaired surrogate.
+    fn wide_path(head: &str, units: &[u16]) -> PathBuf {
+        let mut w: Vec<u16> = head.encode_utf16().collect();
+        w.extend_from_slice(units);
+        PathBuf::from(OsString::from_wide(&w))
+    }
+
+    /// An unpaired surrogate shows as one U+FFFD, as `to_string_lossy` shows it; a
+    /// surrogate PAIR, being a real character, and plain UTF-8 pass untouched.
+    #[test]
+    fn a_surrogate_displays_as_one_replacement_character() {
+        for units in [&[0x61, 0xD800, 0x5C, 0xDFFF, 0xDBFF][..], &[0xD801, 0xDC28, 0xDC00], &[0x41, 0xE9]] {
+            let os = OsString::from_wide(units);
+            let shown = display_bytes(os.as_encoded_bytes());
+            assert_eq!(std::str::from_utf8(&shown).expect("utf-8"), os.to_string_lossy());
+        }
+    }
+
+    /// Bytes sliced out of an `OsStr` come back as the units they were, an unpaired
+    /// surrogate included; bytes no `OsStr` holds become U+FFFD, one per sequence.
+    #[test]
+    fn wtf8_bytes_round_trip_and_anything_else_is_a_replacement_character() {
+        for units in [&[0x61, 0xD800, 0x62][..], &[0xDFFF], &[0xD801, 0x5C], &[0xFFFD, 0xDC00]] {
+            let os = OsString::from_wide(units);
+            let back = os_str_from_bytes(os.as_encoded_bytes()).into_owned();
+            assert_eq!(back.encode_wide().collect::<Vec<_>>(), units);
+            assert_eq!(os_string_from_vec(os.as_encoded_bytes().to_vec()), os);
+        }
+        assert_eq!(
+            os_str_from_bytes(b"a\xffb\xf0\x9f\x98x\xed\x9f"),
+            OsStr::new("a\u{fffd}b\u{fffd}x\u{fffd}")
+        );
+    }
+
+    /// The comparison key is the UTF-16 units:`<D800>`, `<D801>` and U+FFFD - one
+    /// string to a lossy decode - stay three, while case, separators, `\\?\` and empty
+    /// or `.` components still do not count.
+    #[test]
+    fn the_comparison_key_keeps_an_unpaired_surrogate_and_folds_case() {
+        let (d800, d801, fffd) = (
+            wide_path(r"C:\x\a", &[0xD800]),
+            wide_path(r"C:\x\a", &[0xD801]),
+            wide_path(r"C:\x\a", &[0xFFFD]),
+        );
+        assert_eq!(d800.to_string_lossy(), fffd.to_string_lossy(), "what the lossy fold compared");
+        assert_ne!(folded(&d800), folded(&d801));
+        assert_ne!(folded(&d800), folded(&fffd));
+        assert_ne!(folded(&d801), folded(&fffd));
+        assert_eq!(folded(&d800), folded(&wide_path(r"c:/X/A", &[0xD800])), "case around a surrogate");
+        let plain = folded(Path::new(r"C:\Users\Me\x"));
+        for v in [r"c:\USERS\me\x", "C:/Users/Me/x", r"\\?\C:\Users\me\x", r"C:\Users\\me\.\x\"] {
+            assert_eq!(folded(Path::new(v)), plain, "{v}");
+        }
+        assert_ne!(folded(Path::new(r"C:\Users\Me2\x")), plain);
+        // One unit to one unit, as `$UpCase` maps: `é` folds, `ß` has no one-letter
+        // upper case, and a character beyond the BMP is left alone.
+        assert_eq!(folded(Path::new("C:\\\u{e9}")), folded(Path::new("C:\\\u{c9}")));
+        assert_ne!(folded(Path::new("C:\\stra\u{df}e")), folded(Path::new(r"C:\STRASSE")));
+        assert_ne!(folded(Path::new("C:\\\u{10428}")), folded(Path::new("C:\\\u{10400}")));
+        // What NTFS keeps apart stays apart, though Unicode upper-cases one onto the
+        // other: dotless `ı` and long `ſ` are not `I` and `S`, final `ς` is not `Σ`.
+        let k = |s: &str| fold(&s.encode_utf16().collect::<Vec<_>>());
+        for (a, b) in [("\u{131}", "I"), ("\u{131}", "i"), ("\u{17f}", "S"), ("\u{3c2}", "\u{3a3}")] {
+            assert_ne!(k(a), k(b), "{a:?} {b:?}");
+        }
+        assert_eq!(k("\u{3c3}"), k("\u{3a3}"));
+        assert_eq!(k("\u{1fb3}"), k("\u{1fbc}"), "two letters to Unicode, one unit to NTFS");
+        // Share prefixes, whatever their form, by server and share.
+        assert_eq!(folded(Path::new(r"\\?\UNC\h\s\x")), folded(Path::new("//H/S/x")));
+    }
+
+    /// Real directories whose names differ only by a surrogate are different
+    /// directories to `same_path` and `is_within`, and each still matches its own
+    /// case and `\\?\` spellings.
+    #[test]
+    fn names_that_differ_only_by_a_surrogate_are_different_directories() {
+        let d = normalize(&scratch("surrogate"));
+        let named = |units: &[u16]| d.join(OsString::from_wide(units));
+        let (a, b, r) = (named(&[0x61, 0xD800]), named(&[0x61, 0xD801]), named(&[0x61, 0xFFFD]));
+        for x in [&a, &b, &r] {
+            fs::create_dir(x).expect("mkdir");
+        }
+        assert_eq!(fs::read_dir(&d).expect("list").count(), 3, "three names on disk");
+        assert!(!same_path(&a, &b) && !same_path(&a, &r) && !same_path(&b, &r));
+        let upper = named(&[0x41, 0xD800]);
+        let mut verbatim = OsString::from(r"\\?\");
+        verbatim.push(&a);
+        for v in [&a, &upper, Path::new(&verbatim)] {
+            assert!(same_path(v, &a), "{}", v.display());
+            assert!(is_within(&v.join("new"), &a), "{}", v.display());
+        }
+        assert!(!is_within(&b.join("x"), &a) && !is_within(&r.join("x"), &a));
+        assert!(!is_within(&a.join("x"), &r));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The gitdir guard's root compare is lossless too, and touches nothing on a share.
+    #[test]
+    fn a_share_named_with_a_surrogate_is_its_own_root() {
+        let share = |units: &[u16]| wide_path(r"\\cctab-nohost\s", units);
+        let own = share(&[0xD800]);
+        assert!(same_root(&own.join("r"), &own));
+        assert!(same_root(&wide_path(r"//CCTAB-NOHOST/S", &[0xD800]).join("r"), &own), "case + /");
+        assert!(same_root(&wide_path(r"\\?\UNC\cctab-nohost\s", &[0xD800]), &own), "verbatim");
+        assert!(!same_root(&share(&[0xD801]), &own));
+        assert!(!same_root(&share(&[0xFFFD]), &own));
+        assert!(!spelling_local(&share(&[0xFFFD]).join(".git"), &own));
+    }
+
+    /// A host is the same host only up to ASCII case: a name that merely looks like
+    /// the session's own server is another root, so its gitdir is refused unopened.
+    #[test]
+    fn a_lookalike_server_is_another_root() {
+        let base = Path::new(r"\\cctab-nohost\proj\repo");
+        assert!(same_root(Path::new("//CCTAB-NOHOST/Proj/x/.git"), base));
+        assert!(same_root(Path::new(r"\\?\UNC\cctab-nohost\PROJ\x"), base));
+        for p in [
+            "\\\\cctab-noh\u{131}st\\proj\\x\\.git",
+            "//cctab-no\u{17f}t/proj/x/.git",
+            "\\\\?\\UNC\\cctab-noh\u{131}st\\proj\\x",
+        ] {
+            assert!(!same_root(Path::new(p), base), "{p}");
+            assert!(!spelling_local(Path::new(p), base), "{p}");
+        }
+        // Beyond ASCII a host matches exactly, case and all; the share, on the one
+        // host already trusted, still folds.
+        let accented = Path::new("\\\\serv\u{e9}r\\\u{e9}t\u{e9}\\repo");
+        assert!(same_root(Path::new("\\\\SERV\u{e9}R\\\u{c9}T\u{c9}\\x"), accented));
+        assert!(!same_root(Path::new("\\\\SERV\u{c9}R\\\u{e9}t\u{e9}\\x"), accented));
+    }
+
+    /// The fold agrees with the volume the tests run on, measured with real
+    /// directories: a name created one way is found the other way exactly when the
+    /// two fold alike - ASCII, the letters a Unicode fold would merge but NTFS does
+    /// not, and the one-unit fold Unicode spells as two letters.
+    #[test]
+    fn the_fold_agrees_with_the_volume() {
+        let d = scratch("fold");
+        let pairs = [
+            ("a", "A"), ("\u{e9}", "\u{c9}"), ("\u{131}", "I"), ("\u{17f}", "S"),
+            ("\u{3c2}", "\u{3a3}"), ("\u{3c3}", "\u{3a3}"), ("\u{b5}", "\u{39c}"),
+            ("\u{1c5}", "\u{1c4}"), ("\u{1fb3}", "\u{1fbc}"), ("\u{10428}", "\u{10400}"),
+        ];
+        for (i, (a, b)) in pairs.iter().enumerate() {
+            let (x, y) = (d.join(format!("{i}{a}")), d.join(format!("{i}{b}")));
+            fs::create_dir(&x).expect("mkdir");
+            assert_eq!(y.exists(), folded(&x) == folded(&y), "{a:?} {b:?}");
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// HOME is recognised by its spelling alone, and what follows it keeps the path's.
+    #[test]
+    fn home_is_recognised_by_spelling_alone() {
+        let s = |p: &str, h: &str| {
+            strip_home_prefix(Path::new(p), Path::new(h)).map(|r| r.into_string().expect("utf-8"))
+        };
+        let home = r"C:\Users\Me";
+        assert_eq!(s(home, home).as_deref(), Some(""));
+        assert_eq!(s(r"c:\users\me\Code\x", home).as_deref(), Some(r"\Code\x"));
+        assert_eq!(s(r"\\?\C:\Users\Me\Code", home).as_deref(), Some(r"\Code"));
+        assert_eq!(s("C:/USERS/ME/Code", home).as_deref(), Some("/Code"));
+        assert_eq!(s(r"C:\Users\Me\\Code\", home).as_deref(), Some(r"\\Code\"), "spelled as is");
+        assert_eq!(s(r"C:\Users\Me\x", r"c:/users/me/").as_deref(), Some(r"\x"));
+        assert_eq!(s(r"C:\", r"C:\").as_deref(), Some(""));
+        assert_eq!(s("c:/", r"C:\").as_deref(), Some(""));
+        // Not under HOME: a sibling, the parent, another drive, a bare-root home's
+        // children (as `/` on Unix), no home at all - and an 8.3 short name, which
+        // only the disk could expand.
+        for (p, h) in [
+            (r"C:\Users\Me2\x", home),
+            (r"C:\Users", home),
+            (r"D:\Users\Me", home),
+            (r"C:\x", r"C:\"),
+            (r"C:\x", "C:"),
+            (r"C:\", "C:"),
+            (r"\\srv\share\x", r"\\srv\share"),
+            (r"C:\x", ""),
+            (r"C:\Users\ALEXAN~1\x", r"C:\Users\Alexandre Flament"),
+        ] {
+            assert_eq!(s(p, h), None, "{p} under {h}");
+        }
     }
 
     #[test]

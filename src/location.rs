@@ -123,7 +123,7 @@ pub fn place(c: &Cwd, cfg: &Config) -> Place {
                 .unwrap_or_else(|| strip_git_suffix(last_component(&c.logical)));
             // The display boundary for the repo name: it came from a path, so it
             // may not be valid UTF-8. The branch crossed already, in `git`.
-            let mut out = text::repair(name);
+            let mut out = text::repair(&sys::display_bytes(name));
             // A repo checked out at / has no label to show.
             if out.is_empty() {
                 out.push('/');
@@ -183,36 +183,31 @@ fn strip_git_suffix(name: &[u8]) -> &[u8] {
 /// `~` for HOME itself, `~/x/y` beneath it, and anything outside HOME left
 /// absolute.
 ///
-/// The prefix test insists on the `/` (on Windows, `/` or `\`) that follows HOME,
-/// so `/home/alex` cannot claim `/home/alex2`, and it is taken on path BYTES rather
-/// than through `Path::starts_with`, which would silently normalise a doubled
-/// slash that a `$PWD` kept verbatim can still hold.
+/// Whether the path lies under HOME is [`sys::strip_home_prefix`]'s answer, the same
+/// comparison install uses, minus the disk: on Unix exact bytes, with the `/` after
+/// HOME required, so `/home/alex` cannot claim `/home/alex2` and a doubled slash a
+/// `$PWD` kept verbatim still counts; on Windows component-wise and case-blind, so
+/// `c:\users\me`, `C:/Users/me` and `\\?\C:\Users\me` all paint `~` - but not the
+/// 8.3 `C:\Users\ALEXAN~1`, which only the disk could expand. What follows HOME keeps
+/// the path's own spelling.
 ///
 /// Every separator comes out as `/`. On Unix that is every byte `is_sep` matches, so
 /// nothing changes; on Windows `C:\x` and the `C:/x` Git Bash hands a program are the
 /// same directory and now paint the same text - and `\` is a byte `render` DELETES as
-/// JSON-hostile, so a native-shell cwd used to paint `C:Usersalexcode`. The HOME
-/// prefix is compared after the same mapping, so either spelling of either abbreviates.
+/// JSON-hostile, so a native-shell cwd used to paint `C:Usersalexcode`. An unpaired
+/// surrogate in a Windows name comes out as one U+FFFD ([`sys::display_bytes`]).
 fn abbreviate(logical: &Path, home: Option<&Path>) -> Vec<u8> {
-    let slashed = |p: &Path| -> Vec<u8> {
-        p.as_os_str().as_encoded_bytes().iter().map(|&c| if is_sep(c) { b'/' } else { c }).collect()
+    let slashed = |p: &OsStr| -> Vec<u8> {
+        sys::display_bytes(p.as_encoded_bytes()).iter().map(|&c| if is_sep(c) { b'/' } else { c }).collect()
     };
-    let l = slashed(logical);
-    let home = match home {
-        Some(h) => slashed(h),
-        None => return l,
-    };
-    if l == home {
-        return b"~".to_vec();
-    }
-    if let Some(rest) = l.strip_prefix(&home[..]) {
-        if rest.starts_with(b"/") {
+    match home.and_then(|h| sys::strip_home_prefix(logical, h)) {
+        Some(rest) => {
             let mut out = b"~".to_vec();
-            out.extend_from_slice(rest);
-            return out;
+            out.extend(slashed(&rest));
+            out
         }
+        None => slashed(logical.as_os_str()),
     }
-    l
 }
 
 /// The host name, in order: `CCTAB_HOST` overrides outright, `/proc` is the
@@ -362,6 +357,8 @@ mod tests {
         assert_eq!(a("/home/alex", Some("/home/alex")), "~");
         assert_eq!(a("/home/alex/code", Some("/home/alex")), "~/code");
         assert_eq!(a("/home/alex/", Some("/home/alex")), "~/");
+        // What follows HOME is shown as spelled, a doubled slash included.
+        assert_eq!(a("/home/alex//code", Some("/home/alex")), "~//code");
         // The sibling a naive string prefix would swallow.
         assert_eq!(a("/home/alex2/code", Some("/home/alex")), "/home/alex2/code");
         assert_eq!(a("/etc", Some("/home/alex")), "/etc");
@@ -380,6 +377,62 @@ mod tests {
         assert_eq!(a("C:/Users/alex/code", r"C:\Users\alex"), "~/code");
         assert_eq!(a(r"C:\Users\alex", "C:/Users/alex"), "~");
         assert_eq!(last_component(Path::new(r"C:\code\repo\")), b"repo");
+    }
+
+    /// Windows names are case-blind, and `\\?\` is only a spelling: any of them paints
+    /// `~`, the rest as the path spells it. An 8.3 short name is NOT seen through - that
+    /// takes the disk, and this runs on every hook.
+    #[cfg(windows)]
+    #[test]
+    fn any_spelling_of_home_paints_a_tilde_on_windows_but_a_short_name() {
+        let a = |cwd: &str, home: &str| {
+            String::from_utf8(abbreviate(Path::new(cwd), Some(Path::new(home)))).expect("ascii")
+        };
+        let home = r"C:\Users\Alex";
+        assert_eq!(a(r"c:\users\alex\code\x", home), "~/code/x");
+        assert_eq!(a(r"\\?\C:\Users\Alex\code\x", home), "~/code/x");
+        assert_eq!(a(r"C:\USERS\ALEX\Code", home), "~/Code", "the rest keeps its spelling");
+        assert_eq!(a(r"C:\Users\Alex\\x\", home), "~//x/");
+        assert_eq!(a(r"C:\Users\Alex2\x", home), "C:/Users/Alex2/x");
+        assert_eq!(
+            a(r"C:\Users\ALEXAN~1\code", r"C:\Users\Alexandre Flament"),
+            "C:/Users/ALEXAN~1/code"
+        );
+    }
+
+    /// A HOME whose name holds an unpaired surrogate is still HOME - exactly, not by a
+    /// lossy decode - so a sibling differing only in that unit, or holding a real
+    /// U+FFFD there, keeps its full path. The surrogate itself shows as U+FFFD.
+    #[cfg(windows)]
+    #[test]
+    fn a_home_named_with_an_unpaired_surrogate_matches_itself_and_no_sibling() {
+        use std::os::windows::ffi::OsStringExt;
+        let d = std::env::temp_dir().join(format!("cctab-loc-surrogate-{}", std::process::id()));
+        let named = |units: &[u16]| d.join(std::ffi::OsString::from_wide(units));
+        let home = named(&[0x68, 0xD800]);
+        let (d801, fffd) = (named(&[0x68, 0xD801]), named(&[0x68, 0xFFFD]));
+        for x in [&home, &d801, &fffd] {
+            std::fs::create_dir_all(x.join("code")).expect("mkdir");
+        }
+        let t = |cwd: &Path| text::repair(&abbreviate(cwd, Some(&home)));
+        assert_eq!(t(&home), "~");
+        assert_eq!(t(&home.join("code")), "~/code");
+        assert_eq!(t(&named(&[0x48, 0xD800]).join("code")), "~/code", "case still folds");
+        for sib in [&d801, &fffd] {
+            let shown = t(&sib.join("code"));
+            assert!(!shown.starts_with('~') && shown.ends_with("/h\u{fffd}/code"), "{shown}");
+        }
+        // One U+FFFD per surrogate, not one per byte of its WTF-8 form.
+        let odd = home.join(std::ffi::OsString::from_wide(&[0x62, 0xDC00]));
+        assert_eq!(t(&odd), "~/b\u{fffd}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_is_matched_case_sensitively_on_unix() {
+        let home = Path::new("/home/alex");
+        assert_eq!(abbreviate(Path::new("/home/Alex/code"), Some(home)), b"/home/Alex/code");
     }
 
     #[cfg(unix)]

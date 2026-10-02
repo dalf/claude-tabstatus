@@ -31,6 +31,12 @@ pub fn os_str_from_bytes(b: &[u8]) -> Cow<'_, OsStr> {
     Cow::Borrowed(OsStr::from_bytes(b))
 }
 
+/// A path's encoded bytes as a title shows them: on Unix exactly as they are, and
+/// `text::repair` makes each invalid byte one U+FFFD.
+pub fn display_bytes(b: &[u8]) -> Cow<'_, [u8]> {
+    Cow::Borrowed(b)
+}
+
 /// The owned form of [`os_str_from_bytes`], without a copy.
 pub fn os_string_from_vec(v: Vec<u8>) -> OsString {
     OsString::from_vec(v)
@@ -214,6 +220,16 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
 /// Whether `p` is `base` or lies beneath it: a component-prefix test, lexical.
 pub fn is_within(p: &Path, base: &Path) -> bool {
     p == base || p.starts_with(base)
+}
+
+/// What follows `home` in `path`, when `path` is `home` or lies beneath it: empty for
+/// `home` itself, else the rest from its `/` on. Exact bytes, case and all - a doubled
+/// slash in a `$PWD` kept verbatim stays doubled, which `Path::starts_with` would not
+/// allow - and the `/` after `home` is required, so `/home/alex` cannot claim
+/// `/home/alex2`.
+pub fn strip_home_prefix(path: &Path, home: &Path) -> Option<OsString> {
+    let rest = path.as_os_str().as_bytes().strip_prefix(home.as_os_str().as_bytes())?;
+    (rest.is_empty() || rest[0] == b'/').then(|| OsStr::from_bytes(rest).to_owned())
 }
 
 /// The command a report hands an operator to remove the directory `p` outright,

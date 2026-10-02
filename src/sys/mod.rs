@@ -26,7 +26,10 @@
 //! is its bytes and all three are the plain comparison. On Windows one directory has
 //! many spellings - any letter case, an 8.3 short name, a `\\?\` prefix - and every
 //! refusal, "already correct" and "orphan" decision install makes compares paths, so
-//! they have to agree on what "the same directory" means.
+//! they have to agree on what "the same directory" means. [`strip_home_prefix`] is
+//! the same comparison for the tab title's `~`, by spelling alone, with no filesystem
+//! call: on Windows letter case, `/` or `\` and a `\\?\` prefix still do not matter,
+//! but an 8.3 short name - which only the disk can expand - does.
 //!
 //! And THE RECORD LOCK, which is the state layer's whole concurrency story and the
 //! same algorithm on both: lock the record's file with [`lock_exclusive`], prove the
@@ -67,12 +70,12 @@ mod windows;
 use windows as imp;
 
 pub use imp::{
-    create_private_dir, create_secured, file_id, file_id_at, file_id_of, gitpath_allowed, home_fallback,
+    create_private_dir, create_secured, display_bytes, file_id, file_id_at, file_id_of, gitpath_allowed, home_fallback,
     is_executable, is_line_end, is_set_aside, is_within, kernel_hostname_file, link_dir, lock_exclusive, mode,
     normalize, os_str_from_bytes, os_string_from_vec, probe_dir_link, process_alive,
     process_start_time, remove_dir_command, remove_dir_link, replace_dir_link, replace_file,
     replace_running, replaces_open_files, reserved_name, same_path, same_process, security_of,
-    session_tty, set_mode, set_session_title, sweep_replaced, with_mode, write_tty, Security, DIR_LINK, HAS_MODES,
+    session_tty, set_mode, set_session_title, strip_home_prefix, sweep_replaced, with_mode, write_tty, Security, DIR_LINK, HAS_MODES,
     HAS_RECORD_LOCK, HAS_SESSION_CONSOLE, HAS_SESSION_TTY, HAS_UNLINK_RUNNING, NO_STATE_DIR,
     ORIGIN_KEY, RUNTIME_DIR_VAR,
 };

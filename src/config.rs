@@ -418,5 +418,20 @@ mod tests {
         assert_eq!(h(r"C:\Users\a\"), Some(PathBuf::from(r"C:\Users\a")));
         assert_eq!(h(r"C:\Users\a"), Some(PathBuf::from(r"C:\Users\a")));
         assert_eq!(h(r"\"), None);
+        // A name holding an unpaired surrogate keeps it, or HOME is not itself.
+        use std::os::windows::ffi::OsStringExt;
+        let a = |tail: &[u16]| {
+            let mut v: Vec<u16> = r"C:\Users\a".encode_utf16().collect();
+            v.push(0xD800);
+            v.extend_from_slice(tail);
+            OsString::from_wide(&v)
+        };
+        assert_eq!(home_dir(&a(&[0x5C])), Some(PathBuf::from(a(&[]))));
+        // A drive or share root is trimmed to `C:`, and claims no path beneath it -
+        // as HOME=/ claims nothing on Unix.
+        for (root, under) in [(r"C:\", r"C:\code\x"), (r"\\srv\share\", r"\\srv\share\x")] {
+            let home = h(root).expect("a home");
+            assert_eq!(sys::strip_home_prefix(std::path::Path::new(under), &home), None, "{root}");
+        }
     }
 }
