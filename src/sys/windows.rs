@@ -21,14 +21,24 @@ use std::time::{Duration, Instant};
 use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, ERROR_ACCESS_DENIED,
-    ERROR_INVALID_PARAMETER, ERROR_SHARING_VIOLATION, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
-    STILL_ACTIVE,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_FUNCTION, ERROR_INVALID_PARAMETER,
+    ERROR_NOT_SUPPORTED, ERROR_SHARING_VIOLATION, FILETIME, GENERIC_WRITE, HANDLE,
+    INVALID_HANDLE_VALUE, STILL_ACTIVE,
+};
+use windows_sys::Win32::Security::{
+    AddAccessAllowedAce, GetKernelObjectSecurity, GetSecurityDescriptorControl, InitializeAcl,
+    InitializeSecurityDescriptor, SetKernelObjectSecurity, SetSecurityDescriptorControl,
+    SetSecurityDescriptorDacl, ACL, ACL_REVISION, DACL_SECURITY_INFORMATION,
+    GROUP_SECURITY_INFORMATION, OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SE_DACL_AUTO_INHERITED, SE_DACL_AUTO_INHERIT_REQ,
+    SE_DACL_PROTECTED,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FileIdInfo, FileRenameInfoEx, FindClose, FindFirstFileW, GetDriveTypeW,
+    CreateFileW, FileIdInfo, FileRenameInfoEx, CREATE_NEW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FindClose, FindFirstFileW, GetDriveTypeW,
     GetFileInformationByHandleEx, GetFileType, GetVolumeInformationByHandleW, LockFileEx,
     MoveFileExW, SetFileInformationByHandle, DELETE, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
-    FILE_RENAME_INFO, FILE_TYPE_CHAR, LOCKFILE_EXCLUSIVE_LOCK, WIN32_FIND_DATAW,
+    FILE_RENAME_INFO, FILE_TYPE_CHAR, LOCKFILE_EXCLUSIVE_LOCK, READ_CONTROL, WIN32_FIND_DATAW,
+    WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Console::{
     AttachConsole, FreeConsole, GetConsoleScreenBufferInfo, SetConsoleCtrlHandler,
@@ -346,6 +356,189 @@ pub fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
 /// takes its directory's inherited ACL.
 pub fn with_mode(opts: &mut OpenOptions, _mode: u32) -> &mut OpenOptions {
     opts
+}
+
+/// What a rewrite carries over from the file it replaces where there is no mode: its
+/// access control list. A self-relative security descriptor holding the DACL - with
+/// its protected and auto-inherited flags - and the owner and group, read by
+/// [`security_of`] and given to the replacement by [`create_secured`]. Held in
+/// `u64`s because the descriptor's fields are 4-aligned and a `Vec<u8>` promises 1.
+pub struct Security {
+    sd: Vec<u64>,
+}
+
+impl Security {
+    /// For calls that only READ the descriptor, which is all [`set_security`] makes.
+    fn ptr(&self) -> *mut core::ffi::c_void {
+        self.sd.as_ptr().cast_mut().cast()
+    }
+}
+
+/// `path`'s access control list, for the file that is about to replace it - or `None`
+/// when there is no file there, and the new one takes its directory's inherited ACL
+/// exactly as before.
+///
+/// WHY: a file written beside `path` and renamed over it brings its own security
+/// descriptor - the one its directory gave it - so an ACL someone set on settings.json
+/// itself (inheritance off, a group removed, a deny) was flattened by every install and
+/// uninstall, and each backup of it, made by `CopyFileExW`, which copies no DACL, was
+/// born with the directory's too. Unix keeps the mode; this is the same promise.
+///
+/// WHY A COPY, NOT `ReplaceFileW`, which keeps the target's ACL by itself. Measured
+/// here with a reader holding the target open: under Node's share flags (read, write
+/// and delete) the rename write_atomic does and `ReplaceFileW` both succeed; under
+/// read-and-write or read only, both are refused (5 and 32). So neither is more robust
+/// - but `ReplaceFileW` without a backup name documents a failure
+/// (`ERROR_UNABLE_TO_MOVE_REPLACEMENT`) that leaves the target GONE and the new
+/// file under its temp name, where the one rename leaves the old file or the new one;
+/// and it copies the ACL only at the end, after the temp file was written with the
+/// directory's. Copying the DACL first, onto an empty temp born private
+/// ([`create_secured`]), keeps the rename and closes that window too.
+///
+/// An `Err` is a file that is there and whose ACL this user may not read; the caller
+/// refuses rather than write a file it cannot make as private as the one it replaces.
+/// Its kind is `Unsupported` when the FILESYSTEM keeps no Windows ACL at all - the
+/// 9P share WSL exports answers the query with error 1 (measured) - where a file
+/// written from Windows would not keep its permissions either (measured there: a
+/// 0600 settings.json came back 0644); the caller says that rather than "cannot read".
+/// FAT and exFAT never get here: the I/O manager answers for a filesystem with no
+/// security of its own with a world-access descriptor, which costs nothing to carry.
+pub fn security_of(path: &Path) -> io::Result<Option<Security>> {
+    let f = match OpenOptions::new().access_mode(READ_CONTROL).open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let info = DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION;
+    let mut sd: Vec<u64> = Vec::new();
+    loop {
+        let len = u32::try_from(sd.len() * 8).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
+        let mut need = 0u32;
+        let buf = if sd.is_empty() { std::ptr::null_mut() } else { sd.as_mut_ptr().cast() };
+        // SAFETY: `f` is an open handle. `buf` is null with a length of 0, or `sd`'s
+        // live, writable `len` bytes; `need` is a live u32. The call keeps no pointer.
+        let ok = unsafe { GetKernelObjectSecurity(f.as_raw_handle() as HANDLE, info, buf, len, &mut need) };
+        if ok != 0 {
+            break;
+        }
+        let e = io::Error::last_os_error();
+        let code = e.raw_os_error();
+        if code == Some(ERROR_INVALID_FUNCTION as i32) || code == Some(ERROR_NOT_SUPPORTED as i32) {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, e));
+        }
+        if code != Some(ERROR_INSUFFICIENT_BUFFER as i32) || need <= len {
+            return Err(e);
+        }
+        sd = vec![0u64; (need as usize).div_ceil(8)];
+    }
+    let (mut ctl, mut rev) = (0u16, 0u32);
+    // SAFETY: `sd` holds the self-relative descriptor the call above wrote; the two
+    // outputs are live locals.
+    if unsafe { GetSecurityDescriptorControl(sd.as_mut_ptr().cast(), &mut ctl, &mut rev) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // An inheriting DACL is given back as one: without this request the kernel sets
+    // its entries but drops the auto-inherited flag (measured: `D:AI(...)` came back
+    // `D:(...)`), and the file would stop taking its directory's changes. With it, the
+    // DACL is set exactly as given - its inherited entries included, which are the
+    // ORIGINAL's, not recomputed from the directory: a file moved in from a directory
+    // that gave it a deny keeps that deny (measured, and tested) - and keeps the flag.
+    // A protected DACL needs nothing: that flag is kept.
+    if ctl & SE_DACL_AUTO_INHERITED != 0 {
+        // SAFETY: as above, through a pointer from the owned, mutable `sd`: the call
+        // sets one control bit inside the buffer and keeps no pointer.
+        let ok = unsafe {
+            SetSecurityDescriptorControl(sd.as_mut_ptr().cast(), SE_DACL_AUTO_INHERIT_REQ, SE_DACL_AUTO_INHERIT_REQ)
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(Some(Security { sd }))
+}
+
+/// Create `path` - a new temp file, opened for writing as `create_new` does - with
+/// `sec`'s DACL, before a byte is written to it.
+///
+/// It is BORN private ([`create_private`]): a protected DACL that grants its owner -
+/// this process's user - and no one else, so between its creation and the DACL set
+/// below nothing else can open it at all. Share mode 0 alone would not do: it bars a
+/// second handle with data access, but one asking only for `READ_CONTROL`,
+/// `WRITE_DAC` or `WRITE_OWNER` gets through it (measured), and access is checked at
+/// open - a handle opened while the file had its directory's ACL would keep
+/// `WRITE_DAC` after the DACL changed.
+///
+/// The DACL must apply, or the file is not made; the owner and group are carried
+/// where this user may set them, and otherwise left as created - setting another
+/// account's ownership takes a privilege, and the DACL is what decides who reads.
+pub fn create_secured(path: &Path, sec: &Security) -> io::Result<File> {
+    let f = create_private(path)?;
+    set_security(&f, DACL_SECURITY_INFORMATION, sec)?;
+    let _ = set_security(&f, OWNER_SECURITY_INFORMATION, sec);
+    let _ = set_security(&f, GROUP_SECURITY_INFORMATION, sec);
+    Ok(f)
+}
+
+/// `CreateFileW(CREATE_NEW)` of `path` - nothing there may be opened or replaced -
+/// unshared, for writing and for setting its security, with a protected DACL whose
+/// one entry is OWNER RIGHTS: full access for the file's owner, this process's user,
+/// and nothing for anyone else - not even the implicit `READ_CONTROL` and `WRITE_DAC`
+/// an owner has without it. Not an EMPTY DACL, which would do the same for others:
+/// the handle that creates a file under one still writes, but is not counted for its
+/// data in the share check, so once the real DACL is set another reader can open the
+/// file beside it (measured). std's `OpenOptions` cannot pass a security descriptor,
+/// hence the raw call.
+fn create_private(path: &Path) -> io::Result<File> {
+    // `SECURITY_DESCRIPTOR_REVISION`, from a feature this crate does not otherwise need.
+    const SD_REVISION: u32 = 1;
+    // OWNER RIGHTS, S-1-3-4: revision 1, one sub-authority, authority 3, then 4.
+    // Spelled as bytes, in memory order, held in u32s for the alignment a SID needs.
+    let mut owner_rights: [u32; 3] =
+        [u32::from_ne_bytes([1, 1, 0, 0]), u32::from_ne_bytes([0, 0, 0, 3]), u32::from_ne_bytes([4, 0, 0, 0])];
+    // The ACL header, one ACCESS_ALLOWED_ACE (8 bytes before its SID) and that SID.
+    let mut acl = [0u32; 7];
+    let mut sd = SECURITY_DESCRIPTOR::default();
+    let sdp: *mut core::ffi::c_void = (&mut sd as *mut SECURITY_DESCRIPTOR).cast();
+    let aclp: *mut ACL = acl.as_mut_ptr().cast();
+    // SAFETY: `acl` (4-aligned, 28 bytes, the size passed), `owner_rights` (a valid
+    // 12-byte SID) and `sd` are live, writable locals; the calls write only inside
+    // them, and `sd` (absolute) keeps pointers to `acl` alone, which outlives the
+    // CreateFileW below that only reads it. No call keeps a pointer past it.
+    let ok = unsafe {
+        InitializeAcl(aclp, std::mem::size_of_val(&acl) as u32, ACL_REVISION) != 0
+            && AddAccessAllowedAce(aclp, ACL_REVISION, FILE_ALL_ACCESS, owner_rights.as_mut_ptr().cast()) != 0
+            && InitializeSecurityDescriptor(sdp, SD_REVISION) != 0
+            && SetSecurityDescriptorDacl(sdp, 1, aclp, 0) != 0
+            && SetSecurityDescriptorControl(sdp, SE_DACL_PROTECTED, SE_DACL_PROTECTED) != 0
+    };
+    if !ok {
+        return Err(io::Error::last_os_error());
+    }
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sdp,
+        bInheritHandle: 0,
+    };
+    let name = wide_nul_long(path);
+    let access = GENERIC_WRITE | READ_CONTROL | WRITE_DAC | WRITE_OWNER;
+    // SAFETY: `name` is NUL-terminated; `sa` and the descriptor and ACL it points at
+    // are live locals the call only reads; no template handle.
+    let h = unsafe { CreateFileW(name.as_ptr(), access, 0, &sa, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, std::ptr::null_mut()) };
+    if h == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `h` is a valid file handle just opened and owned by nothing else.
+    Ok(unsafe { File::from_raw_handle(h as _) })
+}
+
+fn set_security(f: &File, what: OBJECT_SECURITY_INFORMATION, sec: &Security) -> io::Result<()> {
+    // SAFETY: `f` is an open handle with WRITE_DAC and WRITE_OWNER; `sec` holds a
+    // valid self-relative descriptor, which the call only reads.
+    if unsafe { SetKernelObjectSecurity(f.as_raw_handle() as HANDLE, what, sec.ptr()) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// Unknown for a regular file: executability is the extension's business on
@@ -1563,6 +1756,105 @@ fn read_word(p: &Process, at: usize) -> Option<usize> {
 /// tmux client ptys do not exist on native Windows.
 pub fn write_tty(_path: &Path, _bytes: &[u8]) {}
 
+/// A file's DACL read and set through the Win32 named-object calls - not through
+/// [`security_of`] and [`create_secured`], which the tests using these are grading.
+#[cfg(test)]
+pub(crate) mod test_acl {
+    use super::wide_nul;
+    use std::path::Path;
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSecurityDescriptorToStringSecurityDescriptorW,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW, SetNamedSecurityInfoW,
+        SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorControl, GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SE_DACL_PROTECTED,
+        UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    /// `p`'s DACL as SDDL (`D:PAI(...)...`): the flags and every entry, in order.
+    pub fn sddl(p: &Path) -> String {
+        let name = wide_nul(p);
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let (owner, group, dacl, sacl) = (null_mut(), null_mut(), null_mut(), null_mut());
+        // SAFETY: `name` is NUL-terminated; only the descriptor is asked for, and the
+        // call allocates it with LocalAlloc, freed below.
+        let rc = unsafe {
+            GetNamedSecurityInfoW(name.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, owner, group, dacl, sacl, &mut sd)
+        };
+        assert_eq!(rc, 0, "GetNamedSecurityInfoW {}", p.display());
+        let (mut s, mut n) = (std::ptr::null_mut::<u16>(), 0u32);
+        // SAFETY: `sd` is the descriptor just returned; `s` receives a LocalAlloc'd
+        // string of `n` units, freed below.
+        let ok = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1, DACL_SECURITY_INFORMATION, &mut s, &mut n)
+        };
+        assert_ne!(ok, 0, "ConvertSecurityDescriptorToStringSecurityDescriptorW");
+        // SAFETY: `s` points at `n` initialised units, the trailing NUL among them.
+        let out = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(s, n as usize) });
+        // SAFETY: both were allocated by the calls above and are not used again.
+        unsafe {
+            LocalFree(s.cast());
+            LocalFree(sd);
+        }
+        out.trim_end_matches('\0').to_string()
+    }
+
+    /// Set `p`'s DACL from SDDL the way an ACL editor does: a `D:P` string protects
+    /// it, anything else leaves it inheriting, and the directory's entries are merged
+    /// in by the call.
+    pub fn set_sddl(p: &Path, text: &str) {
+        let w: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: `w` is NUL-terminated; `sd` receives a LocalAlloc'd descriptor,
+        // freed below.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(w.as_ptr(), SDDL_REVISION_1, &mut sd, std::ptr::null_mut())
+        };
+        assert_ne!(ok, 0, "bad SDDL {text}");
+        let (mut present, mut dacl, mut defaulted) = (0, std::ptr::null_mut::<ACL>(), 0);
+        let (mut ctl, mut rev) = (0u16, 0u32);
+        let name = wide_nul(p);
+        // SAFETY: `sd` is valid until freed at the end; `dacl` points into it and is
+        // only passed to SetNamedSecurityInfoW, which copies it.
+        let rc = unsafe {
+            GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted);
+            GetSecurityDescriptorControl(sd, &mut ctl, &mut rev);
+            let how = if ctl & SE_DACL_PROTECTED != 0 {
+                PROTECTED_DACL_SECURITY_INFORMATION
+            } else {
+                UNPROTECTED_DACL_SECURITY_INFORMATION
+            };
+            let none = std::ptr::null_mut();
+            let rc = SetNamedSecurityInfoW(name.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | how, none, none, dacl, std::ptr::null());
+            LocalFree(sd);
+            rc
+        };
+        assert_eq!(rc, 0, "SetNamedSecurityInfoW {} {text}", p.display());
+    }
+
+    /// What someone hardening settings.json by hand does: inheritance off with the
+    /// inherited entries kept as explicit ones (`icacls /inheritance:d`),
+    /// Administrators removed, and an explicit deny of read to Guests (S-1-5-32-546).
+    pub fn harden(p: &Path) {
+        let now = sddl(p);
+        let aces = now.find('(').map_or("", |i| &now[i..]);
+        let mut out = String::from("D:P(D;;FR;;;BG)");
+        for ace in aces.trim_start_matches('(').trim_end_matches(')').split(")(").filter(|a| !a.is_empty()) {
+            let mut f: Vec<String> = ace.split(';').map(str::to_string).collect();
+            if f.last().map(String::as_str) == Some("BA") {
+                continue;
+            }
+            f[1] = f[1].replace("ID", "");
+            out.push_str(&format!("({})", f.join(";")));
+        }
+        set_sddl(p, &out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1578,6 +1870,65 @@ mod tests {
 
     fn abs(p: &Path) -> PathBuf {
         std::path::absolute(p).expect("absolute")
+    }
+
+    /// The temp file a rewrite makes is BORN private - a protected DACL granting its
+    /// owner alone, so between its creation and the DACL set no one else may open it,
+    /// not even for `READ_CONTROL` or `WRITE_DAC`, which share mode 0 does not bar -
+    /// and the creating handle writes it and sets its security. Then it has the
+    /// original's DACL before a byte is written, and nothing else can open it for its
+    /// data, before or after. Nothing there: `None`. A long path works as through std.
+    #[test]
+    fn a_secured_file_is_born_private_and_then_takes_the_dacl() {
+        let d = scratch("secured");
+        let orig = d.join("settings.json");
+        fs::write(&orig, b"{}").expect("write");
+        test_acl::harden(&orig);
+        let acl = test_acl::sddl(&orig);
+        assert!(acl.starts_with("D:P") && acl.contains("(D;;FR;;;BG)"), "{acl}");
+        let sec = security_of(&orig).expect("readable").expect("there");
+
+        let born = d.join(".born");
+        let f = create_private(&born).expect("made");
+        assert_eq!(test_acl::sddl(&born), "D:P(A;;FA;;;OW)", "its owner alone until the DACL is set");
+        let other = OpenOptions::new().read(true).open(&born).expect_err("not shared");
+        assert_eq!(other.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+        set_security(&f, DACL_SECURITY_INFORMATION, &sec).expect("the creator may set it");
+        let other = OpenOptions::new().read(true).open(&born).expect_err("still not shared");
+        assert_eq!(other.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+        let mut w = &f;
+        io::Write::write_all(&mut w, b"x").expect("the creator may write");
+        drop(f);
+        assert_eq!(test_acl::sddl(&born), acl);
+        assert_eq!(create_private(&born).expect_err("never replaces").kind(), io::ErrorKind::AlreadyExists);
+
+        let tmp = d.join(".settings.json.cctab-tmp.1");
+        let f = create_secured(&tmp, &sec).expect("made");
+        assert_eq!(test_acl::sddl(&tmp), acl, "before a byte is written");
+        let other = OpenOptions::new().read(true).open(&tmp).expect_err("not shared");
+        assert_eq!(other.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+        drop(f);
+        assert!(security_of(&d.join("absent")).expect("no error").is_none());
+
+        let deep = d.join("a".repeat(120)).join("b".repeat(120));
+        fs::create_dir_all(&deep).expect("mkdir long");
+        let long = deep.join("settings.json");
+        assert!(long.as_os_str().len() > 260, "past MAX_PATH");
+        drop(create_secured(&long, &sec).expect("a long path"));
+        assert_eq!(fs::metadata(&long).expect("there").len(), 0);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A file on a filesystem with no Windows ACL - the WSL 9P share - is told apart
+    /// from one whose ACL this user may not read. Needs such a file, so run by hand:
+    /// `CCTAB_TEST_NO_ACL_FILE=\\wsl.localhost\<distro>\tmp\<dir>\f cargo test -- --ignored`.
+    #[test]
+    #[ignore = "needs a file on a WSL share, named by CCTAB_TEST_NO_ACL_FILE"]
+    fn a_file_on_a_share_with_no_acl_is_unsupported_not_unreadable() {
+        let p = PathBuf::from(std::env::var_os("CCTAB_TEST_NO_ACL_FILE").expect("CCTAB_TEST_NO_ACL_FILE"));
+        fs::read(&p).expect("its data is readable");
+        let e = security_of(&p).err().expect("no ACL to read");
+        assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
     }
 
     /// The spelling a raw Win32 call gets for a long path.

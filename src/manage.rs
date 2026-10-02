@@ -678,16 +678,97 @@ fn mode_note(mode: u32, tail: &str) -> String {
     }
 }
 
+/// `" (mode 0600 kept)"` where the mode is the protection, and where it is not
+/// (Windows) the access control list `write_settings` and `copy_settings` carry over.
+fn kept_note(mode: u32) -> String {
+    if sys::HAS_MODES {
+        mode_note(mode, " kept")
+    } else {
+        " (its access control list kept)".to_string()
+    }
+}
+
 /// Write through a temp file in the same directory and rename, with an explicit
 /// mode: the settings.json we replace holds the user's `env` block, so a mode of
 /// 0600 has to stay 0600. The shell installer widened it to 0644 through a
 /// redirection, which is the bug this signature exists to make impossible.
 ///
 /// On Windows there is no mode to apply: the temp file takes its directory's
-/// inherited ACL and the rename carries that over the original, so an explicit
-/// ACL someone set on settings.json itself is NOT preserved. Keeping it needs
-/// `ReplaceFileW` or a security-descriptor copy, which this crate does not bind yet.
+/// inherited ACL and the rename carries that over the original. Right for what this
+/// tool owns (the record, the tree); settings.json goes through [`write_settings`],
+/// which keeps the ACL the file had.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+    write_atomic_as(path, bytes, mode, None).map_err(|e| could_not_write(path, &e))
+}
+
+fn could_not_write(path: &Path, e: &std::io::Error) -> String {
+    format!("could not write {}: {}", path.display(), e)
+}
+
+/// [`write_atomic`] for settings.json and its backups: the new file also keeps what
+/// `like` carries beyond its mode - on Windows, its DACL, so an ACL the user set on
+/// the file survives the rename that replaces it (`sys::security_of`). `like` is the
+/// file being replaced, or for a backup or a restore, the file being copied. Nothing
+/// there: the new file is made exactly as `write_atomic` makes it. An ACL this user
+/// cannot read refuses the write, before anything is written to `path` - the
+/// preflights ask the same question first ([`refuse_unreadable_acl`]), so this is
+/// reached only by a change made while the tool runs.
+fn write_settings(path: &Path, bytes: &[u8], mode: u32, like: &Path) -> Result<(), String> {
+    let keep = sys::security_of(like).map_err(|e| acl_unreadable(like, &e, &format!("{} was not changed", path.display())))?;
+    write_atomic_as(path, bytes, mode, keep.as_ref()).map_err(|e| could_not_write(path, &e))
+}
+
+/// A copy of settings.json at `to`, exactly as private as `from`: its mode on Unix,
+/// where `fs::copy` carries it, and on Windows its DACL, which `CopyFileExW` does not
+/// copy - so a backup, which holds the same secrets, was born with the directory's
+/// ACL. There the copy is written as `write_settings` writes, from `from`'s bytes
+/// (so it does not keep `from`'s timestamps, as `CopyFileExW` did). `what` names it
+/// in an error: `"the backup "`, or nothing.
+fn copy_settings(from: &Path, to: &Path, what: &str) -> Result<(), String> {
+    let fail = |e: &std::io::Error| format!("cannot write {}{}: {}", what, to.display(), e);
+    match sys::security_of(from) {
+        Ok(None) => fs::copy(from, to).map(drop).map_err(|e| fail(&e)),
+        Ok(Some(sec)) => {
+            let bytes = fs::read(from).map_err(|e| fail(&e))?;
+            write_atomic_as(to, &bytes, mode_of(from).unwrap_or(0o600), Some(&sec)).map_err(|e| fail(&e))
+        }
+        Err(e) => Err(acl_unreadable(from, &e, &format!("{} was not written", to.display()))),
+    }
+}
+
+/// Why `p`'s protection cannot be carried to the file written in its place, ending
+/// with `tail`. `Unsupported` is a filesystem with no Windows ACL at all (a WSL
+/// share): there is nothing to read, and the permissions it does keep - Unix ones -
+/// cannot be carried from here either.
+fn acl_unreadable(p: &Path, e: &std::io::Error, tail: &str) -> String {
+    if e.kind() == std::io::ErrorKind::Unsupported {
+        return format!(
+            "{} is on a filesystem that keeps no Windows access control list ({}): a copy \
+             or rewrite of it made from Windows would not keep its permissions (on a WSL \
+             share, 0600 comes back 0644). Edit it from the system that owns that \
+             filesystem. {}.",
+            p.display(),
+            e,
+            tail
+        );
+    }
+    format!(
+        "cannot read the access control list of {} ({}), and the file written in its \
+         place has to keep it. {}.",
+        p.display(),
+        e,
+        tail
+    )
+}
+
+/// Refuse, in a preflight, a settings file whose ACL this user cannot read: every
+/// rewrite of it, and every backup, has to carry that ACL over, so finding out after
+/// the first write would leave a half-done install. Never refuses on Unix.
+fn refuse_unreadable_acl(p: &Path) -> Result<(), String> {
+    sys::security_of(p).map(drop).map_err(|e| acl_unreadable(p, &e, "Nothing has been changed"))
+}
+
+fn write_atomic_as(path: &Path, bytes: &[u8], mode: u32, keep: Option<&sys::Security>) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let name = path.file_name().map(|n| n.as_encoded_bytes().to_vec()).unwrap_or_default();
     let mut tmp_name = b".".to_vec();
@@ -696,8 +777,10 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), S
     let tmp = dir.join(sys::os_string_from_vec(tmp_name));
     let _ = fs::remove_file(&tmp);
     let res = (|| -> std::io::Result<()> {
-        let mut f = sys::with_mode(fs::OpenOptions::new().write(true).create_new(true), mode)
-            .open(&tmp)?;
+        let mut f = match keep {
+            Some(sec) => sys::create_secured(&tmp, sec)?,
+            None => sys::with_mode(fs::OpenOptions::new().write(true).create_new(true), mode).open(&tmp)?,
+        };
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
@@ -707,13 +790,10 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), S
         sys::set_mode(&tmp, mode)?;
         fs::rename(&tmp, path)
     })();
-    match res {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(format!("could not write {}: {}", path.display(), e))
-        }
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
+    res
 }
 
 fn read_file(p: &Path) -> Result<Vec<u8>, String> {
@@ -1159,6 +1239,7 @@ fn install_preflight(c: &Ctx) -> Result<(Option<Vec<u8>>, Option<State>), String
     }
     let existing = if c.settings.exists() {
         let doc = read_file(&c.settings)?;
+        refuse_unreadable_acl(&c.settings)?;
         // A zero-byte or whitespace-only file is a real state - a truncated write,
         // or an editor that creates the file before it saves - and Claude Code
         // reads it as no settings at all. Treated as the `None` branch, i.e.
@@ -1352,7 +1433,7 @@ fn write_env_key(c: &Ctx, existing: Option<Vec<u8>>) -> Result<(), String> {
             // file that already existed keeps the mode it had.
             let mode = mode_of(&c.settings).unwrap_or(0o600);
             let text = format!("{{\n  \"env\": {{\n    {}: \"1\"\n  }}\n}}\n", json::quote(KEY.as_bytes()));
-            write_atomic(&c.settings, text.as_bytes(), mode)?;
+            write_settings(&c.settings, text.as_bytes(), mode, &c.settings)?;
             say(&format!("settings: created {}{}", c.settings.display(), mode_note(mode, "")));
             say(&format!("          env.{} = \"1\"", KEY));
         }
@@ -1363,8 +1444,7 @@ fn write_env_key(c: &Ctx, existing: Option<Vec<u8>>) -> Result<(), String> {
             }
             Outcome::Changed { text, before } => {
                 let mode = mode_of(&c.settings).unwrap_or(0o600);
-                fs::copy(&c.settings, &c.backup)
-                    .map_err(|e| format!("cannot write the backup {}: {}", c.backup.display(), e))?;
+                copy_settings(&c.settings, &c.backup, "the backup ")?;
                 say(&format!("settings: backed up to {}", c.backup.display()));
                 // Re-read and compare: another live Claude Code session writing
                 // this file between the read above and the rename here would
@@ -1379,8 +1459,8 @@ fn write_env_key(c: &Ctx, existing: Option<Vec<u8>>) -> Result<(), String> {
                         c.backup.display()
                     ));
                 }
-                write_atomic(&c.settings, &text, mode)?;
-                say(&format!("settings: set env.{} = \"1\"{}", KEY, mode_note(mode, " kept")));
+                write_settings(&c.settings, &text, mode, &c.settings)?;
+                say(&format!("settings: set env.{} = \"1\"{}", KEY, kept_note(mode)));
                 if before.had {
                     say(&format!(
                         "          the previous value {} is recorded in the state file",
@@ -2071,6 +2151,12 @@ fn uninstall_preflight(c: &Ctx, force: bool, restore_backup: bool, keep_tree: bo
         if !writable(&c.settings) {
             return Err(format!("{} is read-only. Refusing to overwrite it.", c.settings.display()));
         }
+        refuse_unreadable_acl(&c.settings)?;
+    }
+    // A restore with no live file gives the restored one the backup's ACL; over a
+    // live file it keeps the live one's, checked above, and the backup's is not read.
+    if restore_backup && !c.settings.exists() && c.backup.exists() {
+        refuse_unreadable_acl(&c.backup)?;
     }
     let state = read_state(c)?;
 
@@ -2144,13 +2230,26 @@ fn remove_env_key(c: &Ctx, prior: &Prior, force: bool, restore_backup: bool) -> 
             format!("{} is not valid JSON ({}). Refusing to restore it.", c.backup.display(), e)
         })?;
         let mode = mode_of(&c.backup).or_else(|| mode_of(&c.settings)).unwrap_or(0o600);
-        if c.settings.exists() {
-            fs::copy(&c.settings, &c.safety)
-                .map_err(|e| format!("cannot write {}: {}", c.safety.display(), e))?;
+        // The ACL (Windows): the LIVE file's, as every rewrite keeps it - it is the
+        // newest word on who may read this file, and may have been tightened since
+        // install. Only with no live file does the restored one take the backup's,
+        // which is the ACL the file had when it was backed up.
+        let like = if c.settings.exists() {
+            copy_settings(&c.settings, &c.safety, "")?;
             say(&format!("settings: current file saved to {}", c.safety.display()));
-        }
-        write_atomic(&c.settings, &raw, mode)?;
+            &c.settings
+        } else {
+            &c.backup
+        };
+        write_settings(&c.settings, &raw, mode, like)?;
         say(&format!("settings: restored from {}", c.backup.display()));
+        if !sys::HAS_MODES {
+            say(if like == &c.settings {
+                "          (the access control list of the file it replaced kept)"
+            } else {
+                "          (with the backup's access control list)"
+            });
+        }
     } else if !c.settings.exists() {
         say(&format!("settings: {} does not exist - nothing to do", c.settings.display()));
     } else if blank_settings {
@@ -2188,10 +2287,9 @@ fn remove_env_key(c: &Ctx, prior: &Prior, force: bool, restore_backup: bool) -> 
                 }
                 Outcome::Changed { text, .. } => {
                     let mode = mode_of(&c.settings).unwrap_or(0o600);
-                    fs::copy(&c.settings, &c.safety)
-                        .map_err(|e| format!("cannot write {}: {}", c.safety.display(), e))?;
+                    copy_settings(&c.settings, &c.safety, "")?;
                     say(&format!("settings: backed up to {}", c.safety.display()));
-                    write_atomic(&c.settings, &text, mode)?;
+                    write_settings(&c.settings, &text, mode, &c.settings)?;
                     match &want {
                         Some(raw) => {
                             say(&format!(
@@ -2217,9 +2315,7 @@ fn remove_env_key(c: &Ctx, prior: &Prior, force: bool, restore_backup: bool) -> 
                             });
                         }
                     }
-                    if sys::HAS_MODES {
-                        say(&format!("          (mode {:04o} kept)", mode));
-                    }
+                    say(&format!("         {}", kept_note(mode)));
                 }
             }
         }
@@ -3460,5 +3556,185 @@ mod tests {
         let t = target_triple();
         assert!(t.contains('-'), "{}", t);
         assert_ne!(t, "unknown-target", "this crate is built for a named target");
+    }
+
+    /// A Ctx whose config directory is a fresh scratch directory, for the tests that
+    /// drive the real settings steps.
+    #[cfg(windows)]
+    fn scratch_ctx(tag: &str) -> Ctx {
+        let config = std::env::temp_dir().join(format!("cctab-acl-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&config);
+        fs::create_dir_all(&config).expect("mkdir");
+        Ctx {
+            skills: config.join("skills"),
+            link: config.join("skills").join(PLUGIN),
+            settings: config.join("settings.json"),
+            state: config.join(format!("{}.state", PLUGIN)),
+            backup: config.join("settings.json.cctab-preinstall"),
+            safety: config.join("settings.json.cctab-preuninstall"),
+            config,
+            ..ctx()
+        }
+    }
+
+    #[cfg(windows)]
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Install's edit, uninstall's edit and `--restore-backup`, on a settings.json
+    /// with an ACL of its own - one hardened by hand (inheritance off, Administrators
+    /// removed, Guests denied), and one that still inherits but carries an explicit
+    /// deny. Every rewrite keeps the file's DACL exactly, flags and all, and every
+    /// backup is born with the same one: the backups hold the same secrets.
+    #[test]
+    #[cfg(windows)]
+    fn every_settings_write_and_backup_keeps_the_files_own_acl() {
+        use crate::sys::test_acl::{harden, sddl, set_sddl};
+        for kind in ["protected", "explicit"] {
+            let c = scratch_ctx(kind);
+            fs::write(&c.settings, b"{\"env\": {\"ANTHROPIC_API_KEY\": \"sk-x\"}}\n").expect("write");
+            if kind == "protected" {
+                harden(&c.settings);
+            } else {
+                set_sddl(&c.settings, "D:(D;;FR;;;BG)");
+            }
+            let acl = sddl(&c.settings);
+            assert!(acl.contains("(D;;FR;;;BG)"), "{kind}: {acl}");
+            assert_eq!(acl.starts_with("D:P"), kind == "protected", "{acl}");
+            assert_eq!(acl.contains(";ID;"), kind == "explicit", "{acl}");
+            refuse_unreadable_acl(&c.settings).expect("readable");
+
+            // install
+            let doc = fs::read(&c.settings).expect("read");
+            write_env_key(&c, Some(doc)).expect("install's edit");
+            let now = fs::read(&c.settings).expect("read");
+            assert!(settings::env_raw_text(&now, KEY).expect("parse").is_some());
+            assert_eq!(sddl(&c.settings), acl, "{kind}: settings.json after install");
+            assert_eq!(sddl(&c.backup), acl, "{kind}: the pre-install backup");
+
+            // uninstall, removing the key
+            let prior = Prior { blank_settings: false, state: None };
+            remove_env_key(&c, &prior, true, false).expect("uninstall's edit");
+            let now = fs::read(&c.settings).expect("read");
+            assert!(settings::env_raw_text(&now, KEY).expect("parse").is_none());
+            assert_eq!(sddl(&c.settings), acl, "{kind}: settings.json after uninstall");
+            assert_eq!(sddl(&c.safety), acl, "{kind}: the pre-uninstall backup");
+
+            // --restore-backup over a live file keeps the LIVE file's ACL, even where
+            // the backup's has since become a different one.
+            // (Another deny, on the entries this process already has: a DACL that drops
+            // them can leave a sandboxed test unable to rename the file it made.)
+            let other = match acl.find('(') {
+                Some(i) if kind == "protected" => format!("{}(D;;FW;;;AN){}", &acl[..i], &acl[i..]),
+                _ => "D:(D;;FW;;;AN)".to_string(),
+            };
+            set_sddl(&c.backup, &other);
+            remove_env_key(&c, &prior, false, true).expect("restore");
+            assert_eq!(fs::read(&c.settings).expect("read"), fs::read(&c.backup).expect("read"));
+            assert_eq!(sddl(&c.settings), acl, "{kind}: settings.json after a restore");
+            assert_eq!(sddl(&c.safety), acl, "{kind}: the copy a restore saves");
+
+            // ... and with no live file, the restored one takes the backup's.
+            let backup_acl = sddl(&c.backup);
+            assert_ne!(backup_acl, acl);
+            fs::remove_file(&c.settings).expect("rm");
+            remove_env_key(&c, &prior, false, true).expect("restore with no live file");
+            assert_eq!(sddl(&c.settings), backup_acl, "{kind}: restored with no live file");
+
+            let want = ["settings.json", "settings.json.cctab-preinstall", "settings.json.cctab-preuninstall"];
+            assert_eq!(names_in(&c.config), want, "no temp file left behind");
+            let _ = fs::remove_dir_all(&c.config);
+        }
+    }
+
+    /// No ACL of its own: the rewritten file still inherits, exactly as before - and a
+    /// settings.json created where there was none gets its directory's ACL, as it
+    /// always did.
+    #[test]
+    #[cfg(windows)]
+    fn a_settings_file_that_inherits_still_inherits_and_a_new_one_is_unchanged() {
+        use crate::sys::test_acl::sddl;
+        let c = scratch_ctx("inherits");
+        let plain = c.config.join("plain");
+        fs::write(&plain, b"x").expect("write");
+        let inherited = sddl(&plain);
+        fs::remove_file(&plain).expect("rm");
+        assert!(!inherited.starts_with("D:P") && inherited.contains(";ID;"), "{inherited}");
+        assert!(!inherited.contains("(A;;") && !inherited.contains("(D;;"), "nothing explicit: {inherited}");
+
+        write_env_key(&c, None).expect("created");
+        assert_eq!(sddl(&c.settings), inherited, "a new settings.json");
+        fs::write(&c.settings, b"{}").expect("write");
+        write_env_key(&c, Some(b"{}".to_vec())).expect("edited");
+        assert_eq!(sddl(&c.settings), inherited, "an edited one");
+        assert_eq!(sddl(&c.backup), inherited, "its backup");
+        let _ = fs::remove_dir_all(&c.config);
+    }
+
+    /// An ACL this user may not read is refused - by the preflight, saying nothing
+    /// was changed, and by the write and the backup themselves, which then write
+    /// nothing - rather than replaced with the directory's.
+    #[test]
+    #[cfg(windows)]
+    fn a_settings_acl_that_cannot_be_read_refuses_the_write() {
+        use crate::sys::test_acl::set_sddl;
+        let c = scratch_ctx("unreadable");
+        fs::write(&c.settings, b"{}").expect("write");
+        // OWNER RIGHTS replaces the owner's implicit READ_CONTROL and WRITE_DAC: this
+        // process may read the data and nothing else. The directory's delete-child
+        // right still lets the cleanup remove it.
+        set_sddl(&c.settings, "D:P(A;;0x1;;;OW)");
+        let e = refuse_unreadable_acl(&c.settings).expect_err("refused");
+        assert!(e.contains("access control list") && e.ends_with("Nothing has been changed."), "{e}");
+        let e = write_settings(&c.settings, b"{\"x\": 1}", 0o600, &c.settings).expect_err("refused");
+        assert!(e.contains("was not changed"), "{e}");
+        let e = copy_settings(&c.settings, &c.backup, "the backup ").expect_err("refused");
+        assert!(e.contains("was not written"), "{e}");
+        assert_eq!(fs::metadata(&c.settings).expect("stat").len(), 2, "untouched");
+        assert_eq!(names_in(&c.config), ["settings.json"], "nothing written, nothing left");
+        let _ = fs::remove_dir_all(&c.config);
+    }
+
+    /// A settings.json moved in from a directory that gave it a deny keeps that
+    /// INHERITED entry through a rewrite and in its backup: the DACL is carried as it
+    /// was, not recomputed from the directory it now sits in.
+    #[test]
+    #[cfg(windows)]
+    fn a_moved_in_settings_file_keeps_the_entries_it_inherited_elsewhere() {
+        use crate::sys::test_acl::{sddl, set_sddl};
+        let c = scratch_ctx("moved");
+        let elsewhere = c.config.join("elsewhere");
+        fs::create_dir(&elsewhere).expect("mkdir");
+        set_sddl(&elsewhere, "D:(D;OICI;FR;;;BG)");
+        let born = elsewhere.join("settings.json");
+        fs::write(&born, b"{}").expect("write");
+        fs::rename(&born, &c.settings).expect("move");
+        fs::remove_dir(&elsewhere).expect("rmdir");
+        let acl = sddl(&c.settings);
+        assert!(acl.starts_with("D:AI") && acl.contains("(D;ID;FR;;;BG)"), "{acl}");
+
+        write_env_key(&c, Some(b"{}".to_vec())).expect("install's edit");
+        assert_eq!(sddl(&c.settings), acl, "settings.json");
+        assert_eq!(sddl(&c.backup), acl, "its backup");
+        let _ = fs::remove_dir_all(&c.config);
+    }
+
+    /// A filesystem that keeps no Windows ACL (a WSL share: `security_of` answers
+    /// `Unsupported`) is refused for what it is, not as an ACL this user cannot read.
+    #[test]
+    fn a_filesystem_with_no_acl_is_refused_for_what_it_is() {
+        let e = std::io::Error::new(std::io::ErrorKind::Unsupported, std::io::Error::from_raw_os_error(1));
+        let m = acl_unreadable(Path::new("settings.json"), &e, "Nothing has been changed");
+        assert!(m.starts_with("settings.json is on a filesystem that keeps no Windows access control list"), "{m}");
+        assert!(m.ends_with("Nothing has been changed."), "{m}");
+        let e = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let m = acl_unreadable(Path::new("settings.json"), &e, "Nothing has been changed");
+        assert!(m.starts_with("cannot read the access control list of settings.json"), "{m}");
     }
 }

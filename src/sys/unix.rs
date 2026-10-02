@@ -129,6 +129,22 @@ pub fn with_mode(opts: &mut OpenOptions, mode: u32) -> &mut OpenOptions {
     opts.mode(mode)
 }
 
+/// What a rewrite carries over from the file it replaces BEYOND its mode - and on
+/// Unix that is nothing: the mode is the protection, and the caller already keeps
+/// it. Uninhabited, so [`security_of`] provably answers `None` and
+/// [`create_secured`] is never reached: no syscall is added to any Unix write.
+pub enum Security {}
+
+/// Always `None`, without a syscall; see [`Security`].
+pub fn security_of(_path: &Path) -> io::Result<Option<Security>> {
+    Ok(None)
+}
+
+/// Unreachable: there is no [`Security`] to apply.
+pub fn create_secured(_path: &Path, sec: &Security) -> io::Result<File> {
+    match *sec {}
+}
+
 /// Whether any execute bit is set. Always an answer on Unix.
 pub fn is_executable(m: &Metadata) -> Option<bool> {
     Some(m.permissions().mode() & 0o111 != 0)

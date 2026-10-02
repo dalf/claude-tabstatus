@@ -1254,7 +1254,17 @@ order, same values - or nothing is written. The file keeps its mode (a
 file is created with the original's mode rather than the umask's), a
 `settings.json` that is a symlink stays a symlink with its target updated, and a
 read-only one, an unparseable one, or one whose top level is not an object is
-refused rather than quietly overwritten.
+refused rather than quietly overwritten. On Windows, where there is no mode, it
+keeps its **ACL**: the temp file is created open to its owner alone and gets the
+original's DACL - its entries, and whether it inherits - before a byte is written;
+its owner and group are carried where no privilege is needed. The backups get the
+same DACL, since they hold the same secrets. `--restore-backup` keeps the live
+file's ACL, or takes the backup's if there is no live file. An ACL `install` or
+`uninstall` cannot read is refused up front, with nothing changed, and so is a
+`settings.json` on a filesystem that keeps no Windows ACL (a symlink into a WSL
+share, where a rewrite from Windows would turn 0600 into 0644): edit that one
+from the system it lives on. Integrity labels and auditing entries (the SACL) are
+not carried. A new `settings.json` inherits from its directory, as before.
 
 `settings.json` is written first and the symlink last, so a failure while
 editing settings cannot leave the plugin loaded with the built-in title still

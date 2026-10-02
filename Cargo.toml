@@ -30,14 +30,18 @@ serde_json = "1"
 # Code runs in: System_Console to attach to it and set its title, and - for the
 # headless guard - Wdk_System_Threading (a process's parent and its PEB) and
 # System_Diagnostics_Debug (reading its standard output handle out of that PEB).
+# Security, so a rewritten settings.json and its backups keep the file's own DACL:
+# read from the old file and set on the new one, by handle.
 # Declarations only; no Unix build sees this crate.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Wdk_System_Threading", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Wdk_System_Threading", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Threading"] }
 
 # Tests only (tests/conpty.rs): CreateProcessW takes SECURITY_ATTRIBUTES, and an
-# optional ConPTY package's conpty.dll is loaded by name.
+# optional ConPTY package's conpty.dll is loaded by name. Security_Authorization
+# for the unit tests that set and read a DACL as SDDL, independently of the code
+# they test.
 [target.'cfg(windows)'.dev-dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_System_LibraryLoader"] }
+windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_Security_Authorization", "Win32_System_LibraryLoader"] }
 
 [[bin]]
 name = "tabstatus"
