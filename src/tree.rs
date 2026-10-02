@@ -768,9 +768,9 @@ pub struct Removal {
     /// Named by the report rather than swallowed: they are still on disk.
     pub blocked: Vec<String>,
     /// Marker-listed files that are inside the tree and still there because removing
-    /// them FAILED, each with the error - on Windows, the binary a hook is running
-    /// right now. While any is left the marker stays too.
-    pub failed: Vec<String>,
+    /// them FAILED, each as its full path and the error - on Windows, the binary a hook
+    /// is running right now. While any is left the marker stays too.
+    pub failed: Vec<(PathBuf, String)>,
     pub dir_gone: bool,
 }
 
@@ -800,7 +800,7 @@ pub fn remove(tree: &Path) -> Result<Removal, String> {
     let left = extra_files(tree, &known);
     let mut removed = 0usize;
     let mut blocked: Vec<String> = Vec::new();
-    let mut failed: Vec<String> = Vec::new();
+    let mut failed: Vec<(PathBuf, String)> = Vec::new();
     let mut dirs: Vec<PathBuf> = Vec::new();
     for f in &known {
         // The ONE way a path to unlink is built here. A textual check is not enough:
@@ -816,7 +816,7 @@ pub fn remove(tree: &Path) -> Result<Removal, String> {
         if fs::symlink_metadata(&p).is_ok() {
             match fs::remove_file(&p) {
                 Ok(()) => removed += 1,
-                Err(e) => failed.push(format!("{} ({})", shown(&String::from_utf8_lossy(f)), e)),
+                Err(e) => failed.push((p.clone(), e.to_string())),
             }
         }
         if let Some(d) = p.parent() {
@@ -1350,7 +1350,7 @@ mod tests {
         let r = remove(&tree).expect("removed");
         assert_eq!(r.removed, 2);
         assert_eq!(r.failed.len(), 1, "{:?}", r.failed);
-        assert!(r.failed[0].starts_with(&shown(BIN)), "{:?}", r.failed);
+        assert_eq!(r.failed[0].0, bin_path(&tree), "{:?}", r.failed);
         assert!(!r.dir_gone);
         assert!(is_generated(&tree), "the marker stays while a file it lists does");
         assert!(refuse_target(&tree, &skills).is_none(), "so install still reuses it");
