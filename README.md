@@ -2028,7 +2028,10 @@ because a symlink needs Developer Mode or elevation; Git Bash runs
 the C runtime statically for that target (`+crt-static`), so a local build is the
 same binary CI tests and needs no Visual C++ Redistributable. A `RUSTFLAGS`
 environment variable replaces that setting, so leave it unset when building one
-to hand out.
+to hand out. cargo also merges the `.cargo/config.toml` of every directory above
+the checkout - on Windows any local account may create `C:\.cargo` - so the "same
+binary" holds only when none of those overrides it; `scripts/build.sh` warns about
+each one it finds, and builds anyway.
 
 **Serde and serde_json parse hook metadata**, without enabling `serde_derive`.
 `Cargo.lock` pins their dependency graph and release builds use `--locked`.
