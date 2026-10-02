@@ -39,6 +39,14 @@
 //! replace is a POSIX-semantics rename, the only kind that replaces a file its writer
 //! holds open. [`replaces_open_files`] says where that kind exists.
 //!
+//! And A REWRITE'S PROTECTION beyond its mode: [`security_of`] reads what the file
+//! being replaced carries besides its mode bits, and [`create_secured`] creates the
+//! replacement with it before a byte is written. On Unix that is nothing - the mode
+//! is the protection, the caller keeps it, and [`Security`] is uninhabited, so no
+//! Unix write makes one more syscall. On Windows it is the file's DACL (and its owner
+//! and group where they can be set), which the rename over it would otherwise
+//! replace with the directory's inherited ACL.
+//!
 //! And THE SESSION'S TAB, for the two edges `terminalSequence` cannot carry. On Unix
 //! it is a pty, resolved by [`session_tty`] and written as bytes. On Windows it is
 //! the console Claude Code runs in, and [`set_session_title`] sets that console's
@@ -59,12 +67,12 @@ mod windows;
 use windows as imp;
 
 pub use imp::{
-    create_private_dir, file_id, file_id_at, file_id_of, gitpath_allowed, home_fallback,
+    create_private_dir, create_secured, file_id, file_id_at, file_id_of, gitpath_allowed, home_fallback,
     is_executable, is_line_end, is_set_aside, is_within, kernel_hostname_file, link_dir, lock_exclusive, mode,
     normalize, os_str_from_bytes, os_string_from_vec, probe_dir_link, process_alive,
     process_start_time, remove_dir_command, remove_dir_link, replace_dir_link, replace_file,
-    replace_running, replaces_open_files, reserved_name, same_path, same_process, session_tty,
-    set_mode, set_session_title, sweep_replaced, with_mode, write_tty, DIR_LINK, HAS_MODES,
+    replace_running, replaces_open_files, reserved_name, same_path, same_process, security_of,
+    session_tty, set_mode, set_session_title, sweep_replaced, with_mode, write_tty, Security, DIR_LINK, HAS_MODES,
     HAS_RECORD_LOCK, HAS_SESSION_CONSOLE, HAS_SESSION_TTY, HAS_UNLINK_RUNNING, NO_STATE_DIR,
     ORIGIN_KEY, RUNTIME_DIR_VAR,
 };
@@ -74,6 +82,11 @@ pub use imp::{
 /// functions answer `None` where there is no such identity to offer, which callers
 /// read as "cannot prove same file".
 pub type FileId = (u64, u128);
+
+/// Test helpers that set and read a file's DACL through Win32 directly, so a test of
+/// [`security_of`] and [`create_secured`] does not grade them with themselves.
+#[cfg(all(test, windows))]
+pub(crate) use imp::test_acl;
 
 #[cfg(test)]
 mod tests {
@@ -116,6 +129,9 @@ mod tests {
         assert_eq!(HAS_RECORD_LOCK, proven);
         assert_eq!(HAS_MODES, mode(&m).is_some());
         assert_eq!(HAS_MODES, is_executable(&m).is_some());
+        // Where the mode is the protection there is nothing more to carry; where there
+        // is no mode, an existing file's ACL is.
+        assert_eq!(HAS_MODES, security_of(&exe).expect("readable").is_none());
         // Without a console route the function answers "not painted" for anything,
         // our own pid included - so a caller branching on the constant and one calling
         // the function agree.
