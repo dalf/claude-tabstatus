@@ -200,9 +200,24 @@ pub fn is_within(p: &Path, base: &Path) -> bool {
     p == base || p.starts_with(base)
 }
 
-/// The command a report hands an operator to remove the directory `p` outright.
+/// The command a report hands an operator to remove the directory `p` outright,
+/// pasteable into any POSIX shell: the path as it is when every byte is one no shell
+/// treats specially, single-quoted otherwise. Unquoted, a tree under `~/my tree`
+/// printed `rm -rf /home/me/my tree/claude-tabstatus`, which removes `/home/me/my`.
 pub fn remove_dir_command(p: &Path) -> String {
-    format!("rm -rf {}", p.display())
+    let s = p.display().to_string();
+    let plain = !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"/._-+,:@%".contains(&b));
+    if plain {
+        format!("rm -rf {}", s)
+    } else {
+        format!("rm -rf '{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// Whether `name` is one [`replace_running`] or [`replace_dir_link`] set aside.
+/// Neither sets anything aside here, so nothing is.
+pub fn is_set_aside(_name: &str) -> bool {
+    false
 }
 
 /// Field 22 of `/proc/<pid>/stat`: the process start time, in clock ticks since

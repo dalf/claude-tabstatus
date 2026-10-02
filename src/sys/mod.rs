@@ -60,7 +60,7 @@ use windows as imp;
 
 pub use imp::{
     create_private_dir, file_id, file_id_at, file_id_of, gitpath_allowed, home_fallback,
-    is_executable, is_line_end, is_within, kernel_hostname_file, link_dir, lock_exclusive, mode,
+    is_executable, is_line_end, is_set_aside, is_within, kernel_hostname_file, link_dir, lock_exclusive, mode,
     normalize, os_str_from_bytes, os_string_from_vec, probe_dir_link, process_alive,
     process_start_time, remove_dir_command, remove_dir_link, replace_dir_link, replace_file,
     replace_running, replaces_open_files, reserved_name, same_path, same_process, session_tty,
@@ -79,6 +79,21 @@ pub type FileId = (u64, u128);
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+
+    /// The directory command is pasted into a shell as it stands, so a path any shell
+    /// would split or expand is quoted - and an ordinary one reads exactly as before.
+    #[test]
+    #[cfg(unix)]
+    fn the_removal_hint_quotes_a_path_a_shell_would_split() {
+        use std::path::Path;
+        assert_eq!(
+            remove_dir_command(Path::new("/home/me/.local/share/claude-tabstatus")),
+            "rm -rf /home/me/.local/share/claude-tabstatus"
+        );
+        assert_eq!(remove_dir_command(Path::new("/home/me/my tree/t")), "rm -rf '/home/me/my tree/t'");
+        assert_eq!(remove_dir_command(Path::new("/tmp/it's;$(x)*")), r"rm -rf '/tmp/it'\''s;$(x)*'");
+        assert_eq!(remove_dir_command(Path::new("/tmp/~x")), "rm -rf '/tmp/~x'");
+    }
 
     #[test]
     fn utf8_bytes_round_trip_on_every_platform() {

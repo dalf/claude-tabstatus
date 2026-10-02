@@ -449,7 +449,7 @@ fn make_junction(at: &Path, buf: &MountPointReparseBuffer, len: usize) -> io::Re
 /// `MoveFileExW` with no flags: renames `from` to `to` on the same volume and fails
 /// if `to` exists, where std's `rename` would replace it.
 fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
-    let (f, t) = (wide_nul(from), wide_nul(to));
+    let (f, t) = (wide_nul_long(from), wide_nul_long(to));
     // SAFETY: both pointers are NUL-terminated UTF-16 buffers that outlive the call,
     // which reads them and keeps neither.
     if unsafe { MoveFileExW(f.as_ptr(), t.as_ptr(), 0) } == 0 {
@@ -467,6 +467,62 @@ fn wide_nul(p: &Path) -> Vec<u16> {
     let mut v = wide(p);
     v.push(0);
     v
+}
+
+/// [`wide_nul`] for a raw Win32 call that has to reach a LONG path. std adds the
+/// `\\?\` prefix itself to every path of 248 units or more; a raw call gets nothing,
+/// so past MAX_PATH it answers os error 3 - measured: `install --tree` under a long
+/// config directory made its scratch junction through std and then could not rename
+/// it into place, after settings.json had already been written. The same threshold
+/// as std, so a path short enough for Win32 is passed exactly as it always was.
+fn wide_nul_long(p: &Path) -> Vec<u16> {
+    if wide(p).len() < 248 {
+        return wide_nul(p);
+    }
+    match verbatim(p) {
+        Some(v) => wide_nul(Path::new(&v)),
+        None => wide_nul(p),
+    }
+}
+
+/// `p` spelled `\\?\C:\...` or `\\?\UNC\server\share\...`: every separator a backslash
+/// and `.` and `..` folded, which is the normalisation a verbatim path no longer gets
+/// from Win32. `None` for anything else - relative, or verbatim or a device already.
+fn verbatim(p: &Path) -> Option<OsString> {
+    let mut comps = p.components();
+    let mut out = match comps.next()? {
+        Component::Prefix(pre) => match pre.kind() {
+            Prefix::Disk(d) => OsString::from(format!(r"\\?\{}:", char::from(d))),
+            Prefix::UNC(server, share) => {
+                let mut s = OsString::from(r"\\?\UNC\");
+                s.push(server);
+                s.push(r"\");
+                s.push(share);
+                s
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    if comps.next() != Some(Component::RootDir) {
+        return None;
+    }
+    let mut parts: Vec<&OsStr> = Vec::new();
+    for c in comps {
+        match c {
+            Component::Normal(n) => parts.push(n),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop();
+            }
+            _ => return None,
+        }
+    }
+    for n in parts {
+        out.push(r"\");
+        out.push(n);
+    }
+    Some(out)
 }
 
 /// `\\?\C:\x` as `C:\x`, and `\\?\UNC\srv\share\x` as `\\srv\share\x`; any other
@@ -802,6 +858,12 @@ fn beside(p: &Path, tag: &str) -> PathBuf {
     p.with_file_name(name)
 }
 
+/// Whether `name` is one [`replace_running`], [`replace_dir_link`] or [`link_dir`] set
+/// aside or left half made: the names [`sweep_replaced`] removes.
+pub fn is_set_aside(name: &str) -> bool {
+    is_retired(name)
+}
+
 /// A name [`beside`] made - a dotfile ending `.cctab-old.<digits>` or
 /// `.cctab-new.<digits>` - or the probe junction of a [`probe_dir_link`] that was
 /// killed before it removed it.
@@ -1080,11 +1142,21 @@ fn base_on_remote_disk(base: &Path) -> bool {
 /// The command a report hands an operator to remove the directory `p` outright: a
 /// PowerShell one, the path single-quoted - a profile path with a space in it is the
 /// ordinary case here, and `rm -rf` is a parameter error in PowerShell.
+///
+/// Every character PowerShell reads as a single quote is doubled, not only `'`: its
+/// tokenizer also ends a single-quoted string at U+2018, U+2019, U+201A and U+201B.
+/// A directory named `it’s` - the apostrophe a phone or a word processor types -
+/// otherwise closed the string early, and `a’,’C:\Users\me’,’b` turned one path into
+/// an array of three, the middle one somebody's whole profile.
 pub fn remove_dir_command(p: &Path) -> String {
-    format!(
-        "Remove-Item -Recurse -Force -LiteralPath '{}'",
-        p.display().to_string().replace('\'', "''")
-    )
+    let mut quoted = String::new();
+    for c in p.display().to_string().chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            quoted.push(c);
+        }
+        quoted.push(c);
+    }
+    format!("Remove-Item -Recurse -Force -LiteralPath '{}'", quoted)
 }
 
 /// The creation time of the RUNNING process `pid`, in 100ns units since 1601, or
@@ -1508,6 +1580,41 @@ mod tests {
         std::path::absolute(p).expect("absolute")
     }
 
+    /// The spelling a raw Win32 call gets for a long path.
+    #[test]
+    fn a_long_path_is_spelled_verbatim_for_win32() {
+        let v = |s: &str| verbatim(Path::new(s)).map(|o| o.to_string_lossy().into_owned());
+        assert_eq!(v(r"C:\a/b\.\c\..\d").as_deref(), Some(r"\\?\C:\a\b\d"));
+        assert_eq!(v(r"\\srv\share\x\y").as_deref(), Some(r"\\?\UNC\srv\share\x\y"));
+        assert_eq!(v(r"a\b"), None);
+        assert_eq!(v(r"C:a"), None);
+        assert_eq!(v(r"\\?\C:\a"), None);
+        // Short: exactly what it always was.
+        assert_eq!(wide_nul_long(Path::new(r"C:\a")), wide_nul(Path::new(r"C:\a")));
+    }
+
+    /// A junction made where the path to it is past MAX_PATH: std makes the scratch
+    /// directory, and the no-replace rename into place has to reach it as well.
+    #[test]
+    fn a_junction_lands_at_a_path_past_max_path() {
+        let d = scratch("longjunction");
+        let target = d.join("target");
+        fs::create_dir_all(&target).expect("mkdir");
+        let mut deep = d.clone();
+        while deep.as_os_str().len() < 300 {
+            deep.push("a-directory-name-of-some-length");
+        }
+        fs::create_dir_all(&deep).expect("mkdir");
+        let link = deep.join("claude-tabstatus");
+        link_dir(&target, &link).expect("junction past MAX_PATH");
+        assert!(fs::symlink_metadata(&link).expect("lstat").file_type().is_symlink());
+        fs::write(target.join("probe"), b"x").expect("write");
+        assert_eq!(fs::read(link.join("probe")).expect("through the junction"), b"x");
+        remove_dir_link(&link).expect("unlink");
+        assert!(target.is_dir(), "the target is untouched");
+        let _ = fs::remove_dir_all(&d);
+    }
+
     fn names(dir: &Path) -> Vec<String> {
         let mut v: Vec<String> = fs::read_dir(dir)
             .expect("read_dir")
@@ -1900,6 +2007,12 @@ mod tests {
         assert_eq!(
             remove_dir_command(Path::new(r"C:\Users\A B\it's")),
             r"Remove-Item -Recurse -Force -LiteralPath 'C:\Users\A B\it''s'"
+        );
+        // ...and so is every typographic quote PowerShell also ends that string at.
+        assert_eq!(
+            remove_dir_command(Path::new("C:\\x\\a\u{2019},\u{2018}C:\\Users\\me\u{201A},\u{201B}b")),
+            "Remove-Item -Recurse -Force -LiteralPath \
+             'C:\\x\\a\u{2019}\u{2019},\u{2018}\u{2018}C:\\Users\\me\u{201A}\u{201A},\u{201B}\u{201B}b'"
         );
     }
 

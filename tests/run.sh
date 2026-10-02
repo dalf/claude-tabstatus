@@ -1746,16 +1746,20 @@ check 'install --tree: refuses a non-empty directory with no marker' 'yes' \
 check 'install --tree: and writes nothing into it' 'README' "$(ls "$_sanot")"
 check 'install --tree: exits 1 on that refusal' '1' \
     "$(_sa install --tree "$_sanot" >/dev/null 2>&1; printf %s $?)"
-# The `rm -rf` hint is BOUNDED. It is the one message here a hurried operator copies,
-# and its subject is whatever they typed: `--tree /` printed `rm -rf /` and `--tree ~`
-# printed `rm -rf` on the home directory. So it is offered only for something that looks
-# like a stale tree of ours, and every other refusal stops at "pass a different
-# directory". All three are refused either way; only the remedy differs.
+# There is no `rm -rf` hint at all any more. It is the one message here a hurried
+# operator copies, and its subject is whatever they typed: `--tree /` printed `rm -rf /`
+# and `--tree ~` printed `rm -rf` on the home directory - and even bounded to "looks like
+# ours", it named a directory that carries no marker, so nothing could tell its files
+# from the operator's. One named like a stale tree of ours is told to look and empty it
+# by hand; every other refusal stops at "pass a different directory". All are refused.
 _sanotours=$tmp/sa-notours-dir/claude-tabstatus
 mkdir -p "$_sanotours"
 printf 'mine\n' >"$_sanotours/README"
-check 'install --tree: a stale tree of ours by name does get the rm -rf hint' 'yes' \
-    "$(_sa install --tree "$_sanotours" | grep -q "rm -rf $_sanotours" && printf yes)"
+check 'install --tree: a stale tree of ours by name gets no rm -rf either' '' \
+    "$(_sa install --tree "$_sanotours" | grep -o 'rm -rf')"
+check 'install --tree: it is told to look at what it holds instead' 'yes' \
+    "$(_sa install --tree "$_sanotours" | grep -q 'look at what it holds, and empty it yourself' && printf yes)"
+check 'install --tree: and its README is untouched' 'mine' "$(cat "$_sanotours/README")"
 check 'install --tree: a directory that is not plausibly ours gets no rm -rf' '' \
     "$(_sa install --tree "$_sanot" | grep -o 'rm -rf')"
 check 'install --tree: and still refuses it, and still says nothing changed' 'yes' \

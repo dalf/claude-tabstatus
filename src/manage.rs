@@ -932,7 +932,7 @@ fn sweep_litter(dir: &Path) {
 /// `.cctab-wtest.<pid>` and `.<file>.cctab-tmp.<pid>` are the only two shapes, and
 /// the pid must be all digits: nothing else in either directory ends in
 /// `.<digits>` after one of those markers.
-fn scratch_pid(name: &str) -> Option<&str> {
+pub(crate) fn scratch_pid(name: &str) -> Option<&str> {
     let pid = name
         .strip_prefix(".cctab-wtest.")
         .or_else(|| name.rsplit_once(".cctab-tmp.").map(|(_, p)| p))?;
@@ -1489,11 +1489,9 @@ fn link_the_plugin(c: &Ctx, promise: &RecordedPrior) -> Result<(), String> {
             if was_checkout {
                 say("          that checkout is source now, and is not modified.");
             } else if was_ours {
-                say(&format!(
-                    "          {} is left behind and is now an orphan - remove it with",
-                    t.display()
-                ));
-                say(&format!("          `{}`", sys::remove_dir_command(&t)));
+                for line in moved_from_lines(&t) {
+                    say(&line);
+                }
             } else {
                 match promise {
                     RecordedPrior::ThisRun => say("          uninstall puts the old target back."),
@@ -1679,6 +1677,10 @@ fn uninstall(c: &Ctx, force: bool, restore_backup: bool, keep_tree: bool) -> Res
     };
     uninstall_header(c, &prior);
     sweep_all(c);
+    // Asked NOW, while the state record still exists: `remove_state` below deletes the
+    // record that names one of the two places an orphan can be found, and asking after
+    // it found only the default path.
+    let orphans = orphan_trees(c);
 
     remove_env_key(c, &prior, force, restore_backup)?;
     unlink_the_plugin(c, &prior)?;
@@ -1694,7 +1696,7 @@ fn uninstall(c: &Ctx, force: bool, restore_backup: bool, keep_tree: bool) -> Res
     // LAST, because it holds the binary this process is running. Unlinking a
     // running executable is fine on Linux; unlinking it before the writes above
     // would leave the hooks pointing at nothing if one of them failed.
-    remove_tree(c, keep_tree)?;
+    remove_tree(c, keep_tree, &orphans)?;
 
     say("");
     say("Done. Start a NEW Claude Code session for the change to take effect.");
@@ -1720,7 +1722,7 @@ fn uninstall(c: &Ctx, force: bool, restore_backup: bool, keep_tree: bool) -> Res
 /// somebody's source. And within a tree we do own, only the files the marker lists,
 /// plus the directories those leave empty. Anything else is NAMED and left; there is
 /// no `remove_dir_all` here on a path derived from a symlink.
-fn remove_tree(c: &Ctx, keep: bool) -> Result<(), String> {
+fn remove_tree(c: &Ctx, keep: bool, orphans: &[PathBuf]) -> Result<(), String> {
     if !tree::is_generated(&c.tree) {
         if c.tree.is_dir() {
             say(&format!(
@@ -1737,27 +1739,20 @@ fn remove_tree(c: &Ctx, keep: bool) -> Result<(), String> {
         return Ok(());
     }
     if keep {
-        say(&format!(
-            "tree:     {} was kept (--keep-tree). Remove it with `{}`.",
-            c.tree.display(),
-            sys::remove_dir_command(&c.tree)
-        ));
+        for line in kept_tree_lines(&c.tree) {
+            say(&line);
+        }
         return Ok(());
     }
-    // Collected BEFORE the removal: once the live tree is gone it is itself a
-    // candidate, and naming the directory we just emptied as an orphan would be a lie.
-    let orphans = orphan_trees(c);
+    // `orphans` was collected BEFORE the removal, by the caller: once the live tree is
+    // gone it is itself a candidate, and naming the directory we just emptied as an
+    // orphan would be a lie.
     let r = tree::remove(&c.tree)?;
     for line in removal_report(&c.tree, &r) {
         say(&line);
     }
-    for o in orphans {
-        say(&format!(
-            "tree:     {} is another generated tree and was NOT the live one, so it is \
-             left behind. Remove it with `{}`.",
-            o.display(),
-            sys::remove_dir_command(&o)
-        ));
+    for line in orphans.iter().flat_map(|o| orphan_lines(o)) {
+        say(&line);
     }
     Ok(())
 }
@@ -1798,13 +1793,29 @@ fn removal_report(tree: &Path, r: &tree::Removal) -> Vec<String> {
         //
         // `blocked` is not checked here, deliberately: with nothing LEFT and nothing
         // FAILED, every path the tree still holds is a real directory. A link inside
-        // it is a non-directory entry `extra_files` names as left unless the marker
+        // it is a non-directory entry the removal names as left unless the marker
         // lists it, and a listed one was removed, so a refused path (`../outside`, a
         // component that was a link) points at nothing in here for the command to
         // follow.
+        //
+        // Nor is an empty `left` proof of anything when the walk behind it did not see
+        // the whole tree - it stopped at its bound, or could not read a directory - so
+        // then there is no command at all.
         if r.left.is_empty() && r.failed.is_empty() {
-            out.push("          the directory itself survived - it holds no file this report can".into());
-            out.push(format!("          name, only empty directories. Remove it with `{}`", sys::remove_dir_command(tree)));
+            match r.unread {
+                None => {
+                    out.push("          the directory itself survived - it holds no file this report can".into());
+                    out.push(format!(
+                        "          name, only empty directories. Remove it with `{}`",
+                        sys::remove_dir_command(tree)
+                    ));
+                }
+                Some(u) => {
+                    out.push(format!("          the directory itself survived. {}, so nothing here", u.why()));
+                    out.push("          can say what is left in it - do NOT delete the directory without".into());
+                    out.push("          looking at what it holds.".into());
+                }
+            }
         }
     }
     // Paths the marker listed that were NOT taken, because they could not be proved to
@@ -1826,7 +1837,7 @@ fn removal_report(tree: &Path, r: &tree::Removal) -> Vec<String> {
         tree.display(),
         tree::MARKER
     ));
-    if r.left.is_empty() && r.blocked.is_empty() {
+    if r.left.is_empty() && r.blocked.is_empty() && r.unread.is_none() {
         out.push(if sys::HAS_UNLINK_RUNNING {
             "          wrote and will reuse. Nothing else is in it, so to finish, remove".into()
         } else {
@@ -1838,31 +1849,144 @@ fn removal_report(tree: &Path, r: &tree::Removal) -> Vec<String> {
     // Something of somebody else's is in there: the files, never the directory. The
     // marker goes LAST, because a tree with one of ours and no marker is one `install`
     // refuses forever.
-    out.push(if r.left.is_empty() {
+    out.push(if !r.left.is_empty() {
+        "          wrote and will reuse. It also holds files nothing here generated, so".into()
+    } else if !r.blocked.is_empty() {
         "          wrote and will reuse. Its marker lists paths refused above, so".into()
     } else {
-        "          wrote and will reuse. It also holds files nothing here generated, so".into()
+        format!("          wrote and will reuse. {}, so", r.unread.map_or("", tree::Unread::why))
     });
-    if sys::HAS_UNLINK_RUNNING {
-        out.push("          do NOT delete the directory - delete only these, the marker last:".into());
+    out.extend(delete_only_these(
+        tree,
+        r.failed.iter().map(|(p, _)| {
+            // A marker-listed path that is a directory fails `remove_file` too, and
+            // the removal's walk goes into it, so anything inside it is somebody's and is
+            // named above as left. "Delete only these" must not take that with it.
+            let holds_something = fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
+                && fs::read_dir(p).map_or(true, |mut rd| rd.next().is_some());
+            if holds_something {
+                format!("{} (a directory - only once it is empty)", p.display())
+            } else {
+                p.display().to_string()
+            }
+        }),
+    ));
+    out
+}
+
+/// The instruction for a tree of ours that holds something else too: not the
+/// directory, the files - the marker LAST, because a tree with one of ours and no
+/// marker is one `install` refuses forever. It follows a line ending in "so" that
+/// said why.
+fn delete_only_these(tree: &Path, files: impl Iterator<Item = String>) -> Vec<String> {
+    let mut out: Vec<String> = if sys::HAS_UNLINK_RUNNING {
+        vec!["          do NOT delete the directory - delete only these, the marker last:".into()]
     } else {
-        out.push("          do NOT delete the directory - once nothing is running from the tree,".into());
-        out.push("          delete only these, the marker last:".into());
-    }
-    for (p, _) in &r.failed {
-        // A marker-listed path that is a directory fails `remove_file` too, and
-        // `extra_files` walks into it, so anything inside it is somebody's and is
-        // named above as left. "Delete only these" must not take that with it.
-        let holds_something = fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
-            && fs::read_dir(p).map_or(true, |mut rd| rd.next().is_some());
-        out.push(if holds_something {
-            format!("            {} (a directory - only once it is empty)", p.display())
-        } else {
-            format!("            {}", p.display())
-        });
-    }
+        vec![
+            "          do NOT delete the directory - once nothing is running from the tree,".into(),
+            "          delete only these, the marker last:".into(),
+        ]
+    };
+    out.extend(files.map(|f| format!("            {}", f)));
     out.push(format!("            {}", tree::marker_path(tree).display()));
     out
+}
+
+/// What to do about a generated tree this run LEAVES in place - the one an
+/// `install --tree` moved away from, a `--keep-tree`, an orphan - as lines under the
+/// one that introduced it; `None` is the go-ahead for the caller to offer the
+/// delete-the-directory command in its own words.
+///
+/// The same rule as `removal_report`: that command is the line a hurried operator
+/// copies, so it is offered only for a tree holding nothing but what its marker lists
+/// (`tree::survey`). Anything else in there - a file tabstatus did not write, a link, a
+/// marker entry not provably inside, or no readable marker at all - and the directory
+/// is NOT to be deleted; our files are named instead.
+fn keep_the_directory(tree: &Path) -> Option<Vec<String>> {
+    let s = match tree::survey(tree) {
+        Ok(s) if s.only_ours() => return None,
+        Ok(s) => s,
+        Err(why) => {
+            return Some(vec![
+                format!("          {}, so nothing here can tell which of its files tabstatus", why),
+                "          wrote - do NOT delete the directory without looking at what it holds.".into(),
+            ])
+        }
+    };
+    let mut out: Vec<String> =
+        s.blocked.iter().map(|why| format!("          its marker lists a path this does not follow - {}", why)).collect();
+    out.push(if !s.foreign.is_empty() {
+        format!("          It also holds {}, so", foreign_files(&s.foreign))
+    } else if !s.blocked.is_empty() {
+        "          Its marker lists paths refused above, so".into()
+    } else {
+        format!("          {}, so", s.unread.map_or("", tree::Unread::why))
+    });
+    out.extend(delete_only_these(tree, s.ours.iter().map(|p| p.display().to_string())));
+    Some(out)
+}
+
+/// How the delete-the-directory command is introduced where it IS offered. On Windows,
+/// only once nothing runs from the tree - removal_report's caveat - because
+/// `Remove-Item -Recurse` can take `.tabstatus-generated` before reaching
+/// `bin\tabstatus.exe`, and stopping at a running binary then leaves one of ours with
+/// no marker: the shape `install` refuses forever.
+fn remove_it_with(starts_sentence: bool) -> &'static str {
+    match (sys::HAS_UNLINK_RUNNING, starts_sentence) {
+        (true, true) => "Remove it with",
+        (true, false) => "remove it with",
+        (false, true) => "Once nothing is running from it, remove it with",
+        (false, false) => "once nothing is running from it, remove it with",
+    }
+}
+
+/// install's lines about the generated tree the link was just MOVED away from.
+fn moved_from_lines(old: &Path) -> Vec<String> {
+    match keep_the_directory(old) {
+        None => vec![
+            format!("          {} is left behind and is now an orphan - {}", old.display(), remove_it_with(false)),
+            format!("          `{}`", sys::remove_dir_command(old)),
+        ],
+        Some(rest) => {
+            let mut out = vec![format!("          {} is left behind and is now an orphan.", old.display())];
+            out.extend(rest);
+            out
+        }
+    }
+}
+
+/// uninstall --keep-tree's line about the tree it kept.
+fn kept_tree_lines(tree: &Path) -> Vec<String> {
+    match keep_the_directory(tree) {
+        None => vec![format!(
+            "tree:     {} was kept (--keep-tree). {} `{}`.",
+            tree.display(),
+            remove_it_with(true),
+            sys::remove_dir_command(tree)
+        )],
+        Some(rest) => {
+            let mut out = vec![format!("tree:     {} was kept (--keep-tree).", tree.display())];
+            out.extend(rest);
+            out
+        }
+    }
+}
+
+/// uninstall's lines about a generated tree that is not the live one.
+fn orphan_lines(o: &Path) -> Vec<String> {
+    let lead = format!(
+        "tree:     {} is another generated tree and was NOT the live one, so it is \
+         left behind.",
+        o.display()
+    );
+    match keep_the_directory(o) {
+        None => vec![format!("{} {} `{}`.", lead, remove_it_with(true), sys::remove_dir_command(o))],
+        Some(rest) => {
+            let mut out = vec![lead];
+            out.extend(rest);
+            out
+        }
+    }
 }
 
 /// The parenthesis naming what removal LEFT BEHIND. A few names, then a count: the
@@ -1872,11 +1996,17 @@ fn describe_extra(extra: &[String]) -> String {
     if extra.is_empty() {
         return String::new();
     }
+    format!(", which was left in place because it holds {}", foreign_files(extra))
+}
+
+/// `N file(s) nothing here generated: a, b, and K more` - the same few names, then a
+/// count, wherever a tree's foreign files are named.
+fn foreign_files(extra: &[String]) -> String {
     const SHOW: usize = 5;
     let named: Vec<&str> = extra.iter().take(SHOW).map(String::as_str).collect();
     let more = extra.len() - named.len();
     format!(
-        ", which was left in place because it holds {} file{} nothing here generated: {}{}",
+        "{} file{} nothing here generated: {}{}",
         extra.len(),
         if extra.len() == 1 { "" } else { "s" },
         named.join(", "),
@@ -3174,6 +3304,155 @@ mod tests {
         assert!(text.contains("once nothing is running from the tree"), "{}", text);
         assert!(text.contains(&format!("            {}", bin.display())), "{}", text);
         let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A generated tree of plain files its marker lists, and `extra` beside them - a
+    /// file the tool did not write. Returns the tree and its generated files in the
+    /// marker's order.
+    fn left_tree(d: &Path, extra: Option<&str>) -> (PathBuf, Vec<PathBuf>) {
+        let tree = d.join("claude-tabstatus");
+        let ours = vec![tree::bin_path(&tree), tree.join("hooks").join("hooks.json")];
+        for p in &ours {
+            fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            fs::write(p, b"x").expect("write");
+        }
+        if let Some(name) = extra {
+            fs::write(tree.join(name), b"mine").expect("write");
+        }
+        fs::write(tree::marker_path(&tree), tree::marker_text("0.1.0", "t", &[tree::BIN, "hooks/hooks.json"]))
+            .expect("write");
+        (tree, ours)
+    }
+
+    /// One site that names a generated tree it LEAVES in place: the delete-the-directory
+    /// command only for a tree holding nothing but what its marker lists, and otherwise
+    /// our files by name, the marker last. Nothing is touched either way.
+    fn a_tree_left_in_place_gets_the_command_only_when_it_holds_only_ours(
+        tag: &str,
+        lines_for: fn(&Path) -> Vec<String>,
+    ) {
+        let d = report_scratch(&format!("{}-ours", tag));
+        let (tree, _) = left_tree(&d, None);
+        let text = lines_for(&tree).join("\n");
+        assert!(text.contains(&format!("`{}`", sys::remove_dir_command(&tree))), "{}", text);
+        assert!(!text.contains("do NOT delete"), "{}", text);
+        // removal_report's caveat: on Windows the binary may still be running from it.
+        assert_eq!(text.contains("nothing is running from it, remove it with"), !sys::HAS_UNLINK_RUNNING, "{}", text);
+        let _ = fs::remove_dir_all(&d);
+
+        let d = report_scratch(&format!("{}-foreign", tag));
+        let (tree, ours) = left_tree(&d, Some("NOTES.txt"));
+        let lines = lines_for(&tree);
+        let text = lines.join("\n");
+        assert!(!text.contains(&sys::remove_dir_command(&tree)), "{}", text);
+        assert!(!text.contains("rm -rf") && !text.contains("Remove-Item"), "{}", text);
+        assert!(text.contains("It also holds 1 file nothing here generated: NOTES.txt, so"), "{}", text);
+        assert!(text.contains("do NOT delete the directory"), "{}", text);
+        assert_eq!(text.contains("nothing is running"), !sys::HAS_UNLINK_RUNNING, "{}", text);
+        let listed: Vec<String> = ours
+            .iter()
+            .chain([tree::marker_path(&tree)].iter())
+            .map(|p| format!("            {}", p.display()))
+            .collect();
+        assert_eq!(lines[lines.len() - listed.len()..], listed[..], "{}", text);
+        assert_eq!(fs::read(tree.join("NOTES.txt")).expect("kept"), b"mine");
+        assert!(ours.iter().all(|p| p.is_file()) && tree::is_generated(&tree), "{}", text);
+        let _ = fs::remove_dir_all(&d);
+
+        // A tree that no longer has a marker never gets the command.
+        let d = report_scratch(&format!("{}-unmarked", tag));
+        let (tree, _) = left_tree(&d, None);
+        fs::remove_file(tree::marker_path(&tree)).expect("rm");
+        let text = lines_for(&tree).join("\n");
+        assert!(!text.contains(&sys::remove_dir_command(&tree)), "{}", text);
+        assert!(text.contains("do NOT delete the directory"), "{}", text);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A tree the walk could not see all of gets no command either - here because it
+    /// stopped at its bound, with nothing foreign among what it did see.
+    #[test]
+    fn a_tree_left_in_place_that_was_not_read_whole_gets_no_command() {
+        let d = report_scratch("toomany");
+        let (tree, ours) = left_tree(&d, None);
+        for i in 0..4100 {
+            fs::create_dir_all(tree.join("bulk").join(i.to_string())).expect("mkdir");
+        }
+        for lines_for in [moved_from_lines as fn(&Path) -> Vec<String>, kept_tree_lines, orphan_lines] {
+            let lines = lines_for(&tree);
+            let text = lines.join("\n");
+            assert!(!text.contains(&sys::remove_dir_command(&tree)), "{}", text);
+            assert!(text.contains("It holds more entries than a generated tree ever does, so"), "{}", text);
+            assert!(text.contains("do NOT delete the directory"), "{}", text);
+            assert_eq!(lines.last(), Some(&format!("            {}", tree::marker_path(&tree).display())), "{}", text);
+            assert!(ours.iter().all(|p| lines.contains(&format!("            {}", p.display()))), "{}", text);
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A removal whose walk did not see the whole tree proves nothing by leaving
+    /// `left` empty: no "only empty directories", no command - in the survival arm and
+    /// after a failure alike.
+    #[test]
+    fn a_removal_that_did_not_read_the_whole_tree_never_offers_the_command() {
+        let tree = PathBuf::from("/nowhere/claude-tabstatus");
+        for unread in [tree::Unread::TooMany, tree::Unread::Unreadable] {
+            let survived = tree::Removal {
+                removed: 3,
+                left: Vec::new(),
+                blocked: Vec::new(),
+                failed: Vec::new(),
+                unread: Some(unread),
+                dir_gone: false,
+            };
+            let text = removal_report(&tree, &survived).join("\n");
+            assert!(!text.contains(&sys::remove_dir_command(&tree)), "{}", text);
+            assert!(!text.contains("only empty directories"), "{}", text);
+            assert!(text.contains(unread.why()), "{}", text);
+            assert!(text.contains("do NOT delete the directory"), "{}", text);
+
+            let stuck = tree::bin_path(&tree);
+            let failed = tree::Removal {
+                removed: 2,
+                left: Vec::new(),
+                blocked: Vec::new(),
+                failed: vec![(stuck.clone(), "in use".into())],
+                unread: Some(unread),
+                dir_gone: false,
+            };
+            let lines = removal_report(&tree, &failed);
+            let text = lines.join("\n");
+            assert!(!text.contains(&sys::remove_dir_command(&tree)), "{}", text);
+            assert!(text.contains(&format!("wrote and will reuse. {}, so", unread.why())), "{}", text);
+            assert!(text.contains("do NOT delete the directory"), "{}", text);
+            assert_eq!(
+                lines[lines.len() - 2..],
+                [
+                    format!("            {}", stuck.display()),
+                    format!("            {}", tree::marker_path(&tree).display())
+                ],
+                "{}",
+                text
+            );
+        }
+    }
+
+    /// install, moving the plugin to another tree: the hint about the OLD one.
+    #[test]
+    fn the_tree_install_moved_away_from_gets_the_command_only_when_it_holds_only_ours() {
+        a_tree_left_in_place_gets_the_command_only_when_it_holds_only_ours("moved", moved_from_lines);
+    }
+
+    /// uninstall --keep-tree: the "remove it later" hint.
+    #[test]
+    fn a_kept_tree_gets_the_command_only_when_it_holds_only_ours() {
+        a_tree_left_in_place_gets_the_command_only_when_it_holds_only_ours("kept", kept_tree_lines);
+    }
+
+    /// uninstall naming a generated tree that is not the live one.
+    #[test]
+    fn an_orphan_tree_gets_the_command_only_when_it_holds_only_ours() {
+        a_tree_left_in_place_gets_the_command_only_when_it_holds_only_ours("orphan", orphan_lines);
     }
 
     #[test]
