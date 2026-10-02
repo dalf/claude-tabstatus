@@ -1604,20 +1604,31 @@ pub struct Survey {
 /// healthy in that state, including "nothing recorded, which is also what a
 /// session that has raised no dialog leaves behind".
 ///
-/// A create-then-unlink of a file named for this process destroys no evidence, so
-/// it does not breach the read-only contract above - it is the one write `doctor`
-/// makes, and it removes what it made. The name begins with a dot, so
-/// [`Named::of`] reads it as `Foreign` and the reaper would not touch it even if
-/// the unlink failed.
+/// A create-then-unlink of a fresh file destroys no evidence, so it does not
+/// breach the read-only contract above - it is the one write `doctor` makes, and
+/// it removes only what it made. The name carries a random part, like a temp
+/// record's, and is created with `create_new`: a name somebody else already holds
+/// is neither opened nor unlinked, only skipped for another, and is not read as
+/// "not writable" either. The name begins with a dot, so [`Named::of`] reads it as
+/// `Foreign` and the reaper would not touch it even if the unlink failed.
 fn writable(d: &Path) -> bool {
-    let probe = d.join(format!(".cctab-probe.{}", itoa(u64::from(std::process::id()))));
-    let ok = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&probe)
-        .is_ok();
-    let _ = fs::remove_file(&probe);
-    ok
+    for _ in 0..TMP_TRIES {
+        let probe = d.join(format!(
+            ".cctab-probe.{}.{:016x}",
+            itoa(u64::from(std::process::id())),
+            tmp_nonce()
+        ));
+        match fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
+            Ok(f) => {
+                drop(f);
+                let _ = fs::remove_file(&probe);
+                return true;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return false,
+        }
+    }
+    false
 }
 
 pub fn survey() -> Survey {
@@ -2658,6 +2669,29 @@ mod tests {
     /// links a file of the user's at the temp name the next write uses. The write
     /// must not open it - the target keeps its bytes - and must still land, under
     /// the next name. The planted links are not ours, so they stay.
+    #[test]
+    fn the_writability_probe_removes_only_what_it_created() {
+        let f = Fixture::new("probe-own-only");
+        fs::create_dir_all(&f.dir).expect("a writable state dir");
+        // Somebody else's file at the name the probe used to take, hard-linked to
+        // something precious: the probe must neither open nor unlink it.
+        let victim = f.dir.join("victim.txt");
+        fs::write(&victim, b"precious").expect("a writable state dir");
+        let old_name = f.dir.join(format!(".cctab-probe.{}", itoa(u64::from(std::process::id()))));
+        fs::hard_link(&victim, &old_name).expect("hard links need no privilege");
+        let before = names_in(&f.dir);
+        assert!(writable(&f.dir), "a writable directory reads as writable");
+        assert_eq!(names_in(&f.dir), before, "the probe leaves nothing behind and removes nothing");
+        assert_eq!(fs::read(&victim).expect("still there"), b"precious");
+        assert!(!writable(&f.dir.join("missing")), "a missing directory is not writable");
+    }
+
+    fn names_in(d: &Path) -> Vec<std::ffi::OsString> {
+        let mut v: Vec<_> = fs::read_dir(d).expect("readable").map(|e| e.expect("entry").file_name()).collect();
+        v.sort();
+        v
+    }
+
     #[test]
     fn a_planted_hard_link_at_a_temp_name_is_never_written_through() {
         let f = Fixture::new("plant-hardlink");
