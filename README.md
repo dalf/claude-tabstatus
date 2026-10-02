@@ -860,16 +860,19 @@ the subject of that sentence is an argument - so `--tree /` printed `rm -rf /`,
 `--tree ~` printed it on the home directory, and a slipped `--tree ..` printed it
 on a parent full of somebody's work. The refusal itself was right and wrote
 nothing; the defect was that the suggested remedy for a typo was unrecoverable, in
-the one message a hurried operator copies. The hint is now offered **only** for a
-directory that looks like a stale tree of ours - named `claude-tabstatus`, or
-sitting exactly where the default one would - and never for `$HOME` or for anything
-fewer than three levels down, whatever it is called:
+the one message a hurried operator copies. Bounding it to directories that looked
+like ours was not enough either: by definition the directory carries no marker, so
+nothing can tell its files from yours, and "sits beside the default tree" took in
+`~/.local/share/claude` and every other sibling there. So no refusal carries a
+command now. A directory named `claude-tabstatus` - never `$HOME`, never anything
+fewer than three levels down - gets a sentence instead:
 
 ```text
 error: /home/me/.local/share/claude-tabstatus already exists, is not empty, and
-       carries no .tabstatus-generated - ... If it is nothing you need, remove it -
-       `rm -rf /home/me/.local/share/claude-tabstatus` - and re-run. Pass a
-       different directory with `--tree`. Nothing has been changed.
+       carries no .tabstatus-generated - ... If it is an old plugin tree that lost
+       its marker, nothing here can tell its files from yours: look at what it
+       holds, and empty it yourself before re-running. Pass a different directory
+       with `--tree`. Nothing has been changed.
 ```
 
 A directory with a `.git` in it is refused a second time even if a marker appears
@@ -1104,6 +1107,23 @@ tree:     /home/me/.local/share/claude-tabstatus is another generated tree and w
 previous *custom* path is not discoverable afterwards and this does not pretend
 otherwise: the record names the tree an install owns, not a history of them.
 
+That command - for an orphan, after `--keep-tree`, and for the tree `install` just
+moved away from - is offered only for a tree holding nothing but what its marker
+lists, read without following a link and read whole. Anything else in there, and the
+report names it, says not to delete the directory, and lists the generated files to
+delete instead, the marker last so an interrupted clean-up is still a tree `install`
+recognises:
+
+```text
+tree:     /home/me/.local/share/claude-tabstatus was kept (--keep-tree).
+          It also holds 1 file nothing here generated: NOTES.txt, so
+          do NOT delete the directory - delete only these, the marker last:
+            /home/me/.local/share/claude-tabstatus/.claude-plugin/plugin.json
+            /home/me/.local/share/claude-tabstatus/bin/tabstatus
+            /home/me/.local/share/claude-tabstatus/hooks/hooks.json
+            /home/me/.local/share/claude-tabstatus/.tabstatus-generated
+```
+
 There is no `remove_dir_all` anywhere on a path this program derived from a
 symlink. Prune only ever removes what the marker lists, so a few refresh runs
 teach you by behaviour that your own files are safe in that directory, and
@@ -1111,7 +1131,9 @@ teach you by behaviour that your own files are safe in that directory, and
 want the whole directory gone including your own files, `rm -rf <the path it just
 named>` is the honest instruction - and when the directory survives with nothing
 this report can name in it, only empty subdirectories, it says exactly that rather
-than claiming the tree "is now empty" over a directory still on disk.
+than claiming the tree "is now empty" over a directory still on disk. A tree it could
+not read whole - one past its bound on entries, or with a directory it may not list -
+gets no command at all.
 
 **A marker-listed path is checked on disk, not just as a string.** The marker is
 plain text in a directory anything able to write the tree can edit, so "we wrote it"

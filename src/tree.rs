@@ -300,9 +300,11 @@ pub fn refuse_target(tree: &Path, skills: &Path) -> Option<String> {
                         tree.display(),
                         MARKER,
                         if safe_to_suggest_removing(tree) {
-                            format!(" If it is nothing you need, remove it - `{}` - and re-run.", sys::remove_dir_command(tree))
+                            " If it is an old plugin tree that lost its marker, nothing here can \
+                             tell its files from yours: look at what it holds, and empty it \
+                             yourself before re-running."
                         } else {
-                            String::new()
+                            ""
                         }
                     ))
                 }
@@ -311,18 +313,19 @@ pub fn refuse_target(tree: &Path, skills: &Path) -> Option<String> {
     }
 }
 
-/// Is `rm -rf <this>` a thing to put in front of somebody?
+/// Is emptying this directory by hand a thing to suggest at all?
 ///
 /// The refusal above is correct and writes nothing, but it is the one message in this
-/// program a hurried operator copies, and its subject is whatever they typed after
-/// `--tree`. `--tree /` printed `rm -rf /`; `--tree ~` printed `rm -rf` on the home
-/// directory; a slipped `--tree ..` prints a parent full of somebody's work. A mistyped
-/// argument must not be answered with an unrecoverable command.
+/// program a hurried operator acts on, and its subject is whatever they typed after
+/// `--tree`. It used to end with `rm -rf <that>`: `--tree /` printed `rm -rf /`,
+/// `--tree ~` printed it on the home directory, and once bounded to "looks like ours"
+/// it still printed it for a directory that by definition carries no marker - nothing
+/// here can tell its files from the operator's - and, through a "sits beside the
+/// default tree" clause, for `~/.local/share/claude` and every other sibling in there.
 ///
-/// So the hint is offered only for a directory that looks like a plugin tree of ours
-/// gone stale - named `claude-tabstatus`, or sitting exactly where the default one
-/// would - and never for `$HOME` or for anything less than three levels down whatever
-/// it is called. Every other refusal stops at "pass a different directory".
+/// So no refusal carries a command any more. This decides only whether the refusal
+/// adds "if it is an old plugin tree, look and empty it yourself": a directory named
+/// `claude-tabstatus`, never `$HOME`, never anything less than three levels down.
 fn safe_to_suggest_removing(tree: &Path) -> bool {
     if tree.components().filter(|c| matches!(c, Component::Normal(_))).count() < 3 {
         return false;
@@ -330,10 +333,7 @@ fn safe_to_suggest_removing(tree: &Path) -> bool {
     if crate::config::home_var().map(|h| Path::new(&h) == tree).unwrap_or(false) {
         return false;
     }
-    if tree.file_name() == Some(OsStr::new("claude-tabstatus")) {
-        return true;
-    }
-    default_tree().ok().as_deref().and_then(Path::parent) == tree.parent()
+    tree.file_name() == Some(OsStr::new("claude-tabstatus"))
 }
 
 /// A claude-tabstatus checkout at or above `from`: a `.git` beside a
@@ -602,7 +602,7 @@ fn safe_relative(p: &[u8]) -> bool {
 /// THAT directory - and both operations this module performs would reach it:
 /// `remove_file` unlinks it, and `write_atomic`, whose temp file is created in
 /// `path.parent()`, creates and renames inside it. Outside the tree, silently, and
-/// reported as inside it. `extra_files` already refuses to wander through such a link
+/// reported as inside it. [`walk`] already refuses to wander through such a link
 /// (`symlink_metadata`, so `bin` is one entry rather than a directory); this is the
 /// same rule applied where it matters.
 ///
@@ -662,44 +662,243 @@ fn in_tree(tree: &Path, rel: &[u8], create: bool) -> Result<PathBuf, String> {
     Ok(at)
 }
 
-/// Files inside a tree we own that the marker does NOT list, as tree-relative
-/// paths, so `uninstall` can name what it is LEAVING BEHIND.
-///
-/// `install` is scrupulous - prune only ever touches the marker's list, so a few
-/// refresh runs teach the operator by behaviour that their own files are safe in
-/// that directory. `uninstall` keeps that promise rather than breaking it at the
-/// last moment: these paths stay, and the report names them so a directory left in
-/// `~/.local/share` is not something to find by accident.
-pub fn extra_files(tree: &Path, known: &[Vec<u8>]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+/// What `remove` leaves behind in `tree` given the marker's list `known`.
+#[cfg(test)]
+fn extra_files(tree: &Path, known: &[Vec<u8>]) -> Vec<String> {
+    walk(tree, known).left()
+}
+
+/// Why a walk of a tree did not see all of it - and so cannot vouch for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unread {
+    /// It stopped at its bound.
+    TooMany,
+    /// A directory, or an entry in one, could not be read.
+    Unreadable,
+}
+
+impl Unread {
+    /// The reason, as the start of a sentence the caller ends.
+    pub fn why(self) -> &'static str {
+        match self {
+            Unread::TooMany => "It holds more entries than a generated tree ever does",
+            Unread::Unreadable => "Some of what it holds could not be read",
+        }
+    }
+}
+
+/// What a non-directory entry is, as far as anything here cares.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    File,
+    Link,
+    Other,
+}
+
+/// What one bounded, link-blind walk of a tree saw: the single reading behind
+/// [`remove`]'s `left` and [`survey`] (whether the directory command may be offered),
+/// so the two cannot disagree about what is in there.
+struct Walk {
+    /// Non-directory entries the marker does not list and this tool did not leave, as
+    /// tree-relative `/`-joined paths, a link marked as one.
+    foreign: Vec<String>,
+    /// Plain files bearing one of this tool's own scratch names - a killed run's temp
+    /// copy, or on Windows a binary set aside while it ran - tree-relative.
+    litter: Vec<PathBuf>,
+    /// Marker-listed non-directory entries, in the exact spelling read from disk.
+    listed: Vec<(Vec<u8>, Kind)>,
+    unread: Option<Unread>,
+}
+
+impl Walk {
+    /// Files inside a tree we own that the marker does NOT list, as tree-relative
+    /// paths, so `uninstall` can name what it is LEAVING BEHIND: the foreign entries
+    /// and this tool's litter, which `remove` does not take either - `install`'s sweep
+    /// does.
+    ///
+    /// `install` is scrupulous - prune only ever touches the marker's list, so a few
+    /// refresh runs teach the operator by behaviour that their own files are safe in
+    /// that directory. `uninstall` keeps that promise rather than breaking it at the
+    /// last moment: these paths stay, and the report names them so a directory left in
+    /// `~/.local/share` is not something to find by accident.
+    fn left(&self) -> Vec<String> {
+        let mut out = self.foreign.clone();
+        out.extend(self.litter.iter().map(|p| String::from_utf8_lossy(&slash_joined(p)).into_owned()));
+        out.sort();
+        out
+    }
+}
+
+/// `name (a link)` for a link, so a report never calls one a file somebody wrote.
+fn entry_name(rel: &[u8], kind: Kind) -> String {
+    let name = String::from_utf8_lossy(rel);
+    if kind == Kind::Link {
+        format!("{} (a link)", name)
+    } else {
+        name.into_owned()
+    }
+}
+
+/// A name only this tool gives a file: `manage::scratch_pid`'s two shapes, which every
+/// `install` sweeps, and `sys::is_set_aside`'s, which it sweeps on Windows.
+fn is_litter(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|n| crate::manage::scratch_pid(n).is_some() || sys::is_set_aside(n))
+}
+
+fn walk(tree: &Path, known: &[Vec<u8>]) -> Walk {
+    let mut w = Walk { foreign: Vec::new(), litter: Vec::new(), listed: Vec::new(), unread: None };
     let mut stack = vec![PathBuf::new()];
-    // A report, not a traversal anybody depends on: bounded so a pathological tree
-    // cannot make `uninstall` hang, and symlink_metadata so a link out of the tree
-    // is one entry rather than a directory to wander into.
+    // Bounded so a pathological tree cannot make `uninstall` hang, and symlink_metadata
+    // so a link out of the tree is one entry rather than a directory to wander into.
+    // What it could not read, and what lies past the bound, is recorded as such: a walk
+    // that did not see everything must never read as "nothing else is in there".
     let mut budget = 4096usize;
     'walk: while let Some(rel) = stack.pop() {
-        let Ok(rd) = fs::read_dir(tree.join(&rel)) else { continue };
-        for e in rd.flatten() {
+        let rd = match fs::read_dir(tree.join(&rel)) {
+            Ok(rd) => rd,
+            Err(_) => {
+                w.unread.get_or_insert(Unread::Unreadable);
+                continue;
+            }
+        };
+        for e in rd {
             if budget == 0 {
+                w.unread = Some(Unread::TooMany);
                 break 'walk;
             }
             budget -= 1;
+            let Ok(e) = e else {
+                w.unread.get_or_insert(Unread::Unreadable);
+                continue;
+            };
             let child = rel.join(e.file_name());
-            let Ok(md) = fs::symlink_metadata(tree.join(&child)) else { continue };
+            let Ok(md) = fs::symlink_metadata(tree.join(&child)) else {
+                w.unread.get_or_insert(Unread::Unreadable);
+                continue;
+            };
             if md.is_dir() {
                 stack.push(child);
                 continue;
             }
+            let kind = if md.file_type().is_symlink() {
+                Kind::Link
+            } else if md.is_file() {
+                Kind::File
+            } else {
+                Kind::Other
+            };
             let bytes = slash_joined(&child);
             // The marker is ours whether or not it lists itself.
-            if bytes == MARKER.as_bytes() || known.contains(&bytes) {
+            if bytes == MARKER.as_bytes() {
                 continue;
             }
-            out.push(String::from_utf8_lossy(&bytes).into_owned());
+            if known.contains(&bytes) {
+                w.listed.push((bytes, kind));
+            } else if kind == Kind::File && is_litter(&e.file_name()) {
+                w.litter.push(child);
+            } else {
+                w.foreign.push(entry_name(&bytes, kind));
+            }
         }
     }
-    out.sort();
-    out
+    w.foreign.sort();
+    w.litter.sort();
+    w
+}
+
+/// What a generated tree holds, read and never changed, for the one question asked
+/// before printing the delete-the-directory command about a tree this run LEAVES in
+/// place: does it hold only what its marker lists?
+///
+/// The notion of "ours" is [`remove`]'s, built from the same pieces - the marker's list,
+/// [`walk`] for everything else, [`in_tree`] for whether a
+/// listed path is provably inside - plus two rules `remove` does not need. A
+/// marker-listed path that is a LINK is not ours, because install writes only plain
+/// files and the directory command must never be handed a link to follow. And a plain
+/// file with one of this tool's scratch names IS ours: `install` sweeps those.
+pub struct Survey {
+    /// What "delete only these" may name: the marker-listed paths that are provably
+    /// inside the tree and plain files at exactly that spelling, in the marker's order,
+    /// then this tool's litter. Never the marker, which goes last and is the caller's.
+    pub ours: Vec<PathBuf>,
+    /// Every other non-directory entry, tree-relative, a link marked as one.
+    pub foreign: Vec<String>,
+    /// Marker-listed paths not provably inside the tree, each as [`in_tree`] says why.
+    pub blocked: Vec<String>,
+    /// Why the walk did not see everything, when it did not.
+    pub unread: Option<Unread>,
+}
+
+impl Survey {
+    /// The go-ahead for the delete-the-directory command.
+    pub fn only_ours(&self) -> bool {
+        self.unread.is_none() && self.foreign.is_empty() && self.blocked.is_empty()
+    }
+}
+
+/// [`Survey`] a tree, or say why it cannot be: no marker, a marker that is not a plain
+/// file or cannot be read, or a tree that is itself a link. Each is a tree whose files
+/// nothing here can tell from anybody else's.
+///
+/// Cheap and bounded: [`walk`]'s capped walk, which never follows a link, and a
+/// few `stat`s per marker entry. Install, uninstall and doctor run it; no hook does.
+pub fn survey(tree: &Path) -> Result<Survey, String> {
+    if fs::symlink_metadata(tree).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("It is a link, not a directory".to_string());
+    }
+    match fs::symlink_metadata(marker_path(tree)) {
+        Ok(m) if m.is_file() => {}
+        Ok(m) if m.file_type().is_symlink() => return Err(format!("Its {} is a link, not a file", MARKER)),
+        Ok(_) => return Err(format!("Its {} is not a file", MARKER)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("It carries no {} any more", MARKER))
+        }
+        Err(_) => return Err(format!("Its {} cannot be read", MARKER)),
+    }
+    let known = match read_marker(tree) {
+        Some(Ok(m)) => m.files,
+        _ => return Err(format!("Its {} cannot be read", MARKER)),
+    };
+    let w = walk(tree, &known);
+    let mut foreign = w.foreign.clone();
+    let mut ours: Vec<PathBuf> = Vec::new();
+    let mut blocked: Vec<String> = Vec::new();
+    for f in &known {
+        let p = match in_tree(tree, f, false) {
+            Ok(p) => p,
+            Err(why) => {
+                blocked.push(why);
+                continue;
+            }
+        };
+        // What the walk saw at exactly this spelling. Not a `stat` of `p`: on Windows
+        // that answers for `NOTES.txt` when the marker says `notes.txt`, and the
+        // operator's own file would be listed as ours to delete while being named as
+        // theirs one line up.
+        let kind = match w.listed.iter().find(|(b, _)| b == f) {
+            Some((_, k)) => Some(*k),
+            // Absent, a directory (whatever it holds was walked), or another spelling
+            // of an entry the walk already named under its own.
+            None if w.unread.is_none() => None,
+            // The walk did not get there: ask the disk, so the list of ours is whole.
+            None => match fs::symlink_metadata(&p) {
+                Ok(m) if m.is_dir() => None,
+                Ok(m) if m.is_file() => Some(Kind::File),
+                Ok(m) if m.file_type().is_symlink() => Some(Kind::Link),
+                Ok(_) => Some(Kind::Other),
+                Err(_) => None,
+            },
+        };
+        match kind {
+            Some(Kind::File) => ours.push(p),
+            // A link, or anything else install never writes.
+            Some(k) => foreign.push(entry_name(f, k)),
+            None => {}
+        }
+    }
+    ours.extend(w.litter.iter().map(|rel| tree.join(rel)));
+    foreign.sort();
+    Ok(Survey { ours, foreign, blocked, unread: w.unread })
 }
 
 /// A tree-relative path in the marker's spelling: components joined by `/`, which
@@ -771,6 +970,9 @@ pub struct Removal {
     /// them FAILED, each as its full path and the error - on Windows, the binary a hook
     /// is running right now. While any is left the marker stays too.
     pub failed: Vec<(PathBuf, String)>,
+    /// Why `left` may not be everything, when the walk behind it did not see the whole
+    /// tree: an empty `left` then proves nothing, and the report must not say it does.
+    pub unread: Option<Unread>,
     pub dir_gone: bool,
 }
 
@@ -797,7 +999,8 @@ pub fn remove(tree: &Path) -> Result<Removal, String> {
         // ours whatever it says.
         _ => Vec::new(),
     };
-    let left = extra_files(tree, &known);
+    let w = walk(tree, &known);
+    let (left, unread) = (w.left(), w.unread);
     let mut removed = 0usize;
     let mut blocked: Vec<String> = Vec::new();
     let mut failed: Vec<(PathBuf, String)> = Vec::new();
@@ -835,7 +1038,7 @@ pub fn remove(tree: &Path) -> Result<Removal, String> {
         let _ = fs::remove_dir(d);
     }
     let dir_gone = fs::remove_dir(tree).is_ok();
-    Ok(Removal { removed, left, blocked, failed, dir_gone })
+    Ok(Removal { removed, left, blocked, failed, unread, dir_gone })
 }
 
 #[cfg(test)]
@@ -1320,7 +1523,7 @@ mod tests {
         assert!(r.blocked.iter().any(|w| w.contains("bin")), "{:?}", r.blocked);
         // One file was genuinely ours and went; the link is named as left behind.
         assert_eq!(r.removed, 1);
-        assert!(r.left.contains(&"bin".to_string()), "{:?}", r.left);
+        assert!(r.left.contains(&"bin (a link)".to_string()), "{:?}", r.left);
         assert!(!r.dir_gone);
         // The link itself is not removed either - it is not a file this tool wrote.
         assert!(fs::symlink_metadata(tree.join("bin")).is_ok());
@@ -1385,7 +1588,9 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
-    /// The `rm -rf` in a refusal is the one line here a hurried operator copies.
+    /// A refusal is the one message here a hurried operator acts on. It carries no
+    /// command at all any more (next test); this bounds even the advice to empty a
+    /// directory by hand to one that looks like a stale tree of ours.
     #[test]
     fn rm_rf_is_only_ever_offered_for_something_that_looks_like_ours() {
         for no in ["/", "/usr", "/home/someone", "/a/b"] {
@@ -1395,6 +1600,191 @@ mod tests {
         assert!(safe_to_suggest_removing(Path::new("/srv/state/claude-tabstatus")));
         // Deep enough and named something else: no hint.
         assert!(!safe_to_suggest_removing(Path::new("/home/someone/code/work")));
+    }
+
+    /// No refusal hands over a command, whatever the directory is called: it carries no
+    /// marker, so nothing here can tell its files from the operator's. One named like
+    /// ours is told to look and empty it by hand; a sibling of the default tree - the
+    /// slip that once printed `rm -rf ~/.local/share/claude` - gets nothing extra.
+    #[test]
+    fn a_refusal_never_hands_over_a_command_for_a_directory_without_a_marker() {
+        let d = scratch("nocmd");
+        let skills = d.join("cfg/skills");
+        fs::create_dir_all(&skills).expect("mkdir");
+        for (name, advice) in [("claude-tabstatus", true), ("claude", false), ("nvim", false)] {
+            let p = d.join("share").join(name);
+            fs::create_dir_all(&p).expect("mkdir");
+            fs::write(p.join("theirs"), b"x").expect("write");
+            let why = refuse_target(&p, &skills).expect("refused");
+            assert!(!why.contains(&sys::remove_dir_command(&p)), "{}", why);
+            assert!(!why.contains("rm -rf") && !why.contains("Remove-Item"), "{}", why);
+            assert_eq!(why.contains("look at what it holds, and empty it yourself before re-running."), advice, "{}", why);
+            assert!(why.ends_with("Nothing has been changed."), "{}", why);
+            assert_eq!(fs::read(p.join("theirs")).expect("untouched"), b"x");
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// The check behind every delete-the-directory hint about a tree left in place:
+    /// only the marker's plain files, and never a link - followed or not.
+    #[test]
+    fn a_survey_vouches_only_for_a_tree_holding_nothing_but_its_marker_list() {
+        let d = scratch("survey");
+        let tree = d.join("tree");
+        let victim = d.join("victim");
+        fs::create_dir_all(&victim).expect("mkdir");
+        fs::write(victim.join("precious"), b"theirs").expect("write");
+        let hooks = tree.join("hooks").join("hooks.json");
+        for p in [bin_path(&tree), hooks.clone()] {
+            fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            fs::write(&p, b"x").expect("write");
+        }
+        fs::write(marker_path(&tree), marker_text("0.1.0", "t", &[BIN, "hooks/hooks.json"])).expect("write");
+
+        let s = survey(&tree).expect("marked");
+        assert!(s.only_ours());
+        assert_eq!(s.ours, vec![bin_path(&tree), hooks.clone()]);
+
+        // A link inside the tree is somebody's, and the walk does not go through it.
+        sys::link_dir(&victim, &tree.join("linked")).expect("link");
+        let s = survey(&tree).expect("marked");
+        assert!(!s.only_ours());
+        assert_eq!(s.foreign, vec!["linked (a link)"]);
+        sys::remove_dir_link(&tree.join("linked")).expect("unlink");
+
+        // ...and so is one at a path the marker lists: install writes only plain files.
+        fs::remove_file(&hooks).expect("rm");
+        sys::link_dir(&victim, &hooks).expect("link");
+        let s = survey(&tree).expect("marked");
+        assert!(!s.only_ours());
+        assert_eq!(s.foreign, vec!["hooks/hooks.json (a link)"]);
+        assert_eq!(s.ours, vec![bin_path(&tree)]);
+        sys::remove_dir_link(&hooks).expect("unlink");
+
+        // A file the marker lists under another spelling is not ours by that spelling:
+        // on Windows `notes.txt` opens `NOTES.txt`, and the operator's file must not be
+        // listed for deletion while being named as theirs.
+        fs::write(tree.join("NOTES.txt"), b"mine").expect("write");
+        fs::write(marker_path(&tree), marker_text("0.1.0", "t", &[BIN, "hooks/hooks.json", "notes.txt"])).expect("write");
+        let s = survey(&tree).expect("marked");
+        assert!(!s.only_ours());
+        assert_eq!(s.foreign, vec!["NOTES.txt"]);
+        assert_eq!(s.ours, vec![bin_path(&tree)]);
+        fs::remove_file(tree.join("NOTES.txt")).expect("rm");
+        fs::write(marker_path(&tree), marker_text("0.1.0", "t", &[BIN, "hooks/hooks.json"])).expect("write");
+
+        // A tree that is itself a link, and one with no marker or an unreadable one,
+        // are not surveyed at all - each with its own reason.
+        let linked = d.join("linked-tree");
+        sys::link_dir(&tree, &linked).expect("link");
+        assert_eq!(survey(&linked).err().as_deref(), Some("It is a link, not a directory"));
+        sys::remove_dir_link(&linked).expect("unlink");
+        fs::write(marker_path(&tree), b"not json").expect("write");
+        assert_eq!(survey(&tree).err(), Some(format!("Its {} cannot be read", MARKER)));
+        fs::remove_file(marker_path(&tree)).expect("rm");
+        assert_eq!(survey(&tree).err(), Some(format!("It carries no {} any more", MARKER)));
+        sys::link_dir(&victim, &marker_path(&tree)).expect("link");
+        assert_eq!(survey(&tree).err(), Some(format!("Its {} is a link, not a file", MARKER)));
+        sys::remove_dir_link(&marker_path(&tree)).expect("unlink");
+
+        assert_eq!(fs::read(victim.join("precious")).expect("untouched"), b"theirs");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// This tool's own scratch files are ours to name for deletion and do not stand in
+    /// the way of the directory command - every `install` sweeps them - but only as
+    /// plain files: a link wearing that name is somebody's like any other link.
+    #[test]
+    fn a_survey_counts_this_tools_own_litter_as_ours_and_a_link_as_nobodys() {
+        let d = scratch("litter");
+        let tree = d.join("tree");
+        fs::create_dir_all(bin_path(&tree).parent().expect("parent")).expect("mkdir");
+        fs::write(bin_path(&tree), b"x").expect("write");
+        fs::write(marker_path(&tree), marker_text("0.1.0", "t", &[BIN])).expect("write");
+        let tmp = tree.join("bin").join(".tabstatus.cctab-tmp.4242");
+        fs::write(&tmp, b"half a copy").expect("write");
+        let s = survey(&tree).expect("marked");
+        assert!(s.only_ours(), "{:?}", s.foreign);
+        assert_eq!(s.ours, vec![bin_path(&tree), tmp.clone()]);
+        // `remove` does not take it, so it is still named as left there.
+        assert_eq!(extra_files(&tree, &[BIN.as_bytes().to_vec()]), vec!["bin/.tabstatus.cctab-tmp.4242"]);
+        if !sys::HAS_UNLINK_RUNNING {
+            // The binary a running hook held, set aside by an install on Windows.
+            let aside = tree.join("bin").join(".tabstatus.exe.cctab-old.4242");
+            fs::write(&aside, b"old").expect("write");
+            let s = survey(&tree).expect("marked");
+            assert!(s.only_ours(), "{:?}", s.foreign);
+            assert!(s.ours.contains(&aside), "{:?}", s.ours);
+            fs::remove_file(&aside).expect("rm");
+        }
+        fs::remove_file(&tmp).expect("rm");
+        let other = d.join("other");
+        fs::create_dir_all(&other).expect("mkdir");
+        sys::link_dir(&other, &tmp).expect("link");
+        let s = survey(&tree).expect("marked");
+        assert!(!s.only_ours());
+        assert_eq!(s.foreign, vec!["bin/.tabstatus.cctab-tmp.4242 (a link)"]);
+        assert_eq!(s.ours, vec![bin_path(&tree)]);
+        sys::remove_dir_link(&tmp).expect("unlink");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A walk that stopped at its bound has not seen the tree, so neither the survey
+    /// nor the removal may read its silence as "nothing else is in there". Empty
+    /// directories, so that nothing it did see is foreign: the bound alone decides.
+    #[test]
+    fn a_walk_cut_short_vouches_for_nothing() {
+        let d = scratch("toomany");
+        let tree = d.join("tree");
+        fs::create_dir_all(bin_path(&tree).parent().expect("parent")).expect("mkdir");
+        fs::write(bin_path(&tree), b"x").expect("write");
+        fs::write(marker_path(&tree), marker_text("0.1.0", "t", &[BIN])).expect("write");
+        let bulk = tree.join("bulk");
+        fs::create_dir_all(&bulk).expect("mkdir");
+        for i in 0..4100 {
+            fs::create_dir(bulk.join(i.to_string())).expect("mkdir");
+        }
+        let s = survey(&tree).expect("marked");
+        assert_eq!(s.unread, Some(Unread::TooMany));
+        assert!(s.foreign.is_empty() && s.blocked.is_empty(), "{:?} {:?}", s.foreign, s.blocked);
+        assert!(!s.only_ours());
+        // ...and what is ours is still listed, from the disk, wherever the walk stopped.
+        assert_eq!(s.ours, vec![bin_path(&tree)]);
+        let r = remove(&tree).expect("removed");
+        assert_eq!(r.unread, Some(Unread::TooMany));
+        assert!(r.left.is_empty() && !r.dir_gone, "{:?}", r.left);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// A directory the walk cannot read is one it has not seen. Not on Windows, whose
+    /// ACLs this test does not edit, and not as root, who reads it anyway.
+    #[test]
+    #[cfg(unix)]
+    fn an_unreadable_directory_vouches_for_nothing() {
+        let d = scratch("unreadable");
+        let tree = d.join("tree");
+        fs::create_dir_all(bin_path(&tree).parent().expect("parent")).expect("mkdir");
+        fs::write(bin_path(&tree), b"x").expect("write");
+        fs::write(marker_path(&tree), marker_text("0.1.0", "t", &[BIN])).expect("write");
+        let shut = tree.join("shut");
+        fs::create_dir_all(&shut).expect("mkdir");
+        fs::write(shut.join("theirs"), b"x").expect("write");
+        sys::set_mode(&shut, 0o000).expect("chmod");
+        if fs::read_dir(&shut).is_ok() {
+            sys::set_mode(&shut, 0o755).expect("chmod");
+            let _ = fs::remove_dir_all(&d);
+            return;
+        }
+        let s = survey(&tree).expect("marked");
+        assert_eq!(s.unread, Some(Unread::Unreadable));
+        assert!(s.foreign.is_empty(), "{:?}", s.foreign);
+        assert!(!s.only_ours());
+        let r = remove(&tree).expect("removed");
+        assert_eq!(r.unread, Some(Unread::Unreadable));
+        assert!(r.left.is_empty() && !r.dir_gone, "{:?}", r.left);
+        sys::set_mode(&shut, 0o755).expect("chmod");
+        assert_eq!(fs::read(shut.join("theirs")).expect("untouched"), b"x");
+        let _ = fs::remove_dir_all(&d);
     }
 
     /// An emptied directory is invisible to everything downstream - no later marker
