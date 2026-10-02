@@ -39,6 +39,27 @@ set -eu
 here=$(cd -- "$(dirname -- "$0")/.." && pwd) || exit 1
 cd -- "$here"
 
+# cargo merges the .cargo/config.toml (or legacy .cargo/config) of EVERY directory
+# above the checkout, up to the root, into this build - and on a default Windows
+# install any local account may create C:\.cargo. Such a file can add rustflags
+# or name a linker or rustc-wrapper that runs as you, so the binary in bin/ would
+# no longer be the one CI tests. A warning, not a refusal: a config of your own up
+# there (sccache, a linker) is legitimate, and nothing here can tell the two apart.
+_dir=$(dirname -- "$here")
+while :; do
+    for _c in "$_dir/.cargo/config.toml" "$_dir/.cargo/config"; do
+        if [ -f "$_c" ]; then
+            printf 'warning: %s also applies to this build: cargo reads every\n' "$_c" >&2
+            printf '         .cargo/config above the checkout. If you did not put it there,\n' >&2
+            printf '         look at it before trusting bin/ - it can change the binary or run\n' >&2
+            printf '         a program as you.\n' >&2
+        fi
+    done
+    _up=$(dirname -- "$_dir")
+    [ "$_up" = "$_dir" ] && break
+    _dir=$_up
+done
+
 CARGO=${CARGO:-}
 if [ -z "$CARGO" ]; then
     if command -v cargo >/dev/null 2>&1; then
