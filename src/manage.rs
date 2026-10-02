@@ -92,6 +92,8 @@ pub enum Subcommand {
     /// checkout and on a bare VM alike.
     Install {
         tree: Option<OsString>,
+        /// Write settings.json even on a filesystem with no Windows ACL to keep.
+        force: bool,
     },
     Uninstall {
         force: bool,
@@ -169,7 +171,7 @@ impl Subcommand {
         match self {
             // NOT `with_ctx`: install resolves its OWN tree - it is the command that
             // decides where the plugin directory is, rather than discovering one.
-            Subcommand::Install { tree } => match install(tree) {
+            Subcommand::Install { tree, force } => match install(tree, force) {
                 Ok(()) => 0,
                 Err(e) => {
                     fail(&e);
@@ -229,16 +231,22 @@ impl Subcommand {
     }
 }
 
-/// `install [--tree <dir>]`.
+/// `install [--tree <dir>] [--force]`.
 ///
-/// `--force` is gone with the check it forced. It existed for "install anyway, I am
-/// about to build `bin/tabstatus`", and install now SUPPLIES the binary it needs - it
-/// copies the running one into the tree - so there is nothing left to force. Refused
-/// by name rather than ignored, the same way `--restore-backup` always was.
+/// `--force` once meant "install anyway, I am about to build `bin/tabstatus`"; install
+/// now SUPPLIES the binary it needs, so that meaning is gone for good. It now lifts
+/// exactly one refusal: a settings.json on a filesystem that keeps no Windows ACL (a
+/// WSL share), whose permissions a rewrite from Windows cannot keep - written anyway,
+/// with a warning. `--restore-backup` and `--keep-tree` are uninstall's and refused.
 fn install_options(rest: &[OsString]) -> Subcommand {
     let mut tree = None;
+    let mut force = false;
     let mut it = rest.iter();
     while let Some(arg) = it.next() {
+        if matches!(Flag::parse(arg), Some(Flag::Force)) {
+            force = true;
+            continue;
+        }
         if matches!(Flag::parse(arg), Some(Flag::Tree)) {
             match it.next() {
                 Some(d) if !d.is_empty() && !d.as_encoded_bytes().starts_with(b"-") => {
@@ -275,7 +283,7 @@ fn install_options(rest: &[OsString]) -> Subcommand {
             String::from_utf8_lossy(arg.as_encoded_bytes())
         ));
     }
-    Subcommand::Install { tree }
+    Subcommand::Install { tree, force }
 }
 
 fn uninstall_options(rest: &[OsString]) -> Subcommand {
@@ -342,8 +350,12 @@ fn usage() {
         "                               OUTPUT, like bin/ - never your checkout\n",
         "      --tree <dir>             put it somewhere other than\n",
         "                               $XDG_DATA_HOME/claude-tabstatus\n",
+        "      --force                  write settings.json even where its permissions\n",
+        "                               cannot be kept (Windows, on a WSL share)\n",
         "  tabstatus uninstall          undo exactly that, tree included\n",
-        "      --force                  remove the env key even with no state record\n",
+        "      --force                  remove the env key even with no state record, and\n",
+        "                               write settings.json where its permissions cannot\n",
+        "                               be kept (Windows, on a WSL share)\n",
         "      --restore-backup         roll settings.json back to the pre-install copy\n",
         "      --keep-tree              leave the generated plugin tree on disk\n",
         "  tabstatus doctor             report what is installed and what would paint\n",
@@ -713,9 +725,23 @@ fn could_not_write(path: &Path, e: &std::io::Error) -> String {
 /// cannot read refuses the write, before anything is written to `path` - the
 /// preflights ask the same question first ([`refuse_unreadable_acl`]), so this is
 /// reached only by a change made while the tool runs.
-fn write_settings(path: &Path, bytes: &[u8], mode: u32, like: &Path) -> Result<(), String> {
-    let keep = sys::security_of(like).map_err(|e| acl_unreadable(like, &e, &format!("{} was not changed", path.display())))?;
+///
+/// `allow_no_acl` is `--force`: a filesystem that keeps no Windows ACL at all is then
+/// written as `write_atomic` writes, having been warned about in the preflight
+/// ([`refuse_unreadable_acl`]). An ACL that exists but cannot be read is refused
+/// whatever the flag says.
+fn write_settings(path: &Path, bytes: &[u8], mode: u32, like: &Path, allow_no_acl: bool) -> Result<(), String> {
+    let keep = match sys::security_of(like) {
+        Ok(keep) => keep,
+        Err(e) if allow_no_acl && no_acl_here(&e) => None,
+        Err(e) => return Err(acl_unreadable(like, &e, &format!("{} was not changed", path.display()))),
+    };
     write_atomic_as(path, bytes, mode, keep.as_ref()).map_err(|e| could_not_write(path, &e))
+}
+
+/// The one refusal `--force` lifts: a filesystem with no Windows ACL to carry.
+fn no_acl_here(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::Unsupported
 }
 
 /// A copy of settings.json at `to`, exactly as private as `from`: its mode on Unix,
@@ -724,10 +750,11 @@ fn write_settings(path: &Path, bytes: &[u8], mode: u32, like: &Path) -> Result<(
 /// ACL. There the copy is written as `write_settings` writes, from `from`'s bytes
 /// (so it does not keep `from`'s timestamps, as `CopyFileExW` did). `what` names it
 /// in an error: `"the backup "`, or nothing.
-fn copy_settings(from: &Path, to: &Path, what: &str) -> Result<(), String> {
+fn copy_settings(from: &Path, to: &Path, what: &str, allow_no_acl: bool) -> Result<(), String> {
     let fail = |e: &std::io::Error| format!("cannot write {}{}: {}", what, to.display(), e);
     match sys::security_of(from) {
         Ok(None) => fs::copy(from, to).map(drop).map_err(|e| fail(&e)),
+        Err(e) if allow_no_acl && no_acl_here(&e) => fs::copy(from, to).map(drop).map_err(|e| fail(&e)),
         Ok(Some(sec)) => {
             let bytes = fs::read(from).map_err(|e| fail(&e))?;
             write_atomic_as(to, &bytes, mode_of(from).unwrap_or(0o600), Some(&sec)).map_err(|e| fail(&e))
@@ -746,7 +773,7 @@ fn acl_unreadable(p: &Path, e: &std::io::Error, tail: &str) -> String {
             "{} is on a filesystem that keeps no Windows access control list ({}): a copy \
              or rewrite of it made from Windows would not keep its permissions (on a WSL \
              share, 0600 comes back 0644). Edit it from the system that owns that \
-             filesystem. {}.",
+             filesystem, or re-run with --force to write it anyway. {}.",
             p.display(),
             e,
             tail
@@ -764,8 +791,21 @@ fn acl_unreadable(p: &Path, e: &std::io::Error, tail: &str) -> String {
 /// Refuse, in a preflight, a settings file whose ACL this user cannot read: every
 /// rewrite of it, and every backup, has to carry that ACL over, so finding out after
 /// the first write would leave a half-done install. Never refuses on Unix.
-fn refuse_unreadable_acl(p: &Path) -> Result<(), String> {
-    sys::security_of(p).map(drop).map_err(|e| acl_unreadable(p, &e, "Nothing has been changed"))
+///
+/// With `allow_no_acl` (`--force`), a filesystem that keeps no Windows ACL is let
+/// through with a warning instead, said here once so the writes that follow need
+/// not repeat it.
+fn refuse_unreadable_acl(p: &Path, allow_no_acl: bool) -> Result<(), String> {
+    match sys::security_of(p) {
+        Ok(_) => Ok(()),
+        Err(e) if allow_no_acl && no_acl_here(&e) => {
+            say(&format!("settings: WARNING {} is on a filesystem that keeps no Windows", p.display()));
+            say("          access control list: its permissions will not be kept (on a WSL");
+            say("          share, 0600 comes back 0644). Going ahead because of --force.");
+            Ok(())
+        }
+        Err(e) => Err(acl_unreadable(p, &e, "Nothing has been changed")),
+    }
 }
 
 fn write_atomic_as(path: &Path, bytes: &[u8], mode: u32, keep: Option<&sys::Security>) -> std::io::Result<()> {
@@ -1105,14 +1145,14 @@ fn resolve_tree(dir: Option<OsString>, config: &Path) -> Result<(PathBuf, TreeFr
 /// It resolves its own tree rather than being handed one by `with_ctx`, because
 /// install is the command that DECIDES where the plugin directory is. Everything else
 /// discovers it.
-fn install(dir: Option<OsString>) -> Result<(), String> {
+fn install(dir: Option<OsString>, force: bool) -> Result<(), String> {
     let config = config_dir()?;
     let (tree, from) = resolve_tree(dir, &config)?;
     let c = Ctx::at(tree, from)?;
     let exe = std::env::current_exe()
         .map_err(|e| format!("cannot find my own path ({}), so there is nothing to copy", e))?;
 
-    let (existing, prior) = install_preflight(&c)?;
+    let (existing, prior) = install_preflight(&c, force)?;
     install_header(&c, &exe);
     // Clear this tool's own scratch files left by a killed run, in the directories it
     // is about to write.
@@ -1130,7 +1170,7 @@ fn install(dir: Option<OsString>) -> Result<(), String> {
         say(&line);
     }
     record_state(&c, prior, existing.as_deref())?;
-    write_env_key(&c, existing)?;
+    write_env_key(&c, existing, force)?;
     link_the_plugin(&c, &promise)?;
 
     say("");
@@ -1162,7 +1202,7 @@ fn install(dir: Option<OsString>) -> Result<(), String> {
 /// FAIL - a record that will not parse - and that refusal belongs in front of the first
 /// write like every other one, not between the tree and settings.json.
 #[allow(clippy::type_complexity)]
-fn install_preflight(c: &Ctx) -> Result<(Option<Vec<u8>>, Option<State>), String> {
+fn install_preflight(c: &Ctx, force: bool) -> Result<(Option<Vec<u8>>, Option<State>), String> {
     if let Some(e) = refuse_unresolved(c) {
         return Err(e);
     }
@@ -1239,7 +1279,7 @@ fn install_preflight(c: &Ctx) -> Result<(Option<Vec<u8>>, Option<State>), String
     }
     let existing = if c.settings.exists() {
         let doc = read_file(&c.settings)?;
-        refuse_unreadable_acl(&c.settings)?;
+        refuse_unreadable_acl(&c.settings, force)?;
         // A zero-byte or whitespace-only file is a real state - a truncated write,
         // or an editor that creates the file before it saves - and Claude Code
         // reads it as no settings at all. Treated as the `None` branch, i.e.
@@ -1426,14 +1466,14 @@ fn state_version_on_disk(c: &Ctx) -> Option<Vec<u8>> {
 }
 
 /// The one key, spliced into the document we parsed in the preflight.
-fn write_env_key(c: &Ctx, existing: Option<Vec<u8>>) -> Result<(), String> {
+fn write_env_key(c: &Ctx, existing: Option<Vec<u8>>, force: bool) -> Result<(), String> {
     match existing {
         None => {
             // 0600 from birth: this file is where people keep API keys. A blank
             // file that already existed keeps the mode it had.
             let mode = mode_of(&c.settings).unwrap_or(0o600);
             let text = format!("{{\n  \"env\": {{\n    {}: \"1\"\n  }}\n}}\n", json::quote(KEY.as_bytes()));
-            write_settings(&c.settings, text.as_bytes(), mode, &c.settings)?;
+            write_settings(&c.settings, text.as_bytes(), mode, &c.settings, force)?;
             say(&format!("settings: created {}{}", c.settings.display(), mode_note(mode, "")));
             say(&format!("          env.{} = \"1\"", KEY));
         }
@@ -1444,7 +1484,7 @@ fn write_env_key(c: &Ctx, existing: Option<Vec<u8>>) -> Result<(), String> {
             }
             Outcome::Changed { text, before } => {
                 let mode = mode_of(&c.settings).unwrap_or(0o600);
-                copy_settings(&c.settings, &c.backup, "the backup ")?;
+                copy_settings(&c.settings, &c.backup, "the backup ", force)?;
                 say(&format!("settings: backed up to {}", c.backup.display()));
                 // Re-read and compare: another live Claude Code session writing
                 // this file between the read above and the rename here would
@@ -1459,7 +1499,7 @@ fn write_env_key(c: &Ctx, existing: Option<Vec<u8>>) -> Result<(), String> {
                         c.backup.display()
                     ));
                 }
-                write_settings(&c.settings, &text, mode, &c.settings)?;
+                write_settings(&c.settings, &text, mode, &c.settings, force)?;
                 say(&format!("settings: set env.{} = \"1\"{}", KEY, kept_note(mode)));
                 if before.had {
                     say(&format!(
@@ -2151,12 +2191,12 @@ fn uninstall_preflight(c: &Ctx, force: bool, restore_backup: bool, keep_tree: bo
         if !writable(&c.settings) {
             return Err(format!("{} is read-only. Refusing to overwrite it.", c.settings.display()));
         }
-        refuse_unreadable_acl(&c.settings)?;
+        refuse_unreadable_acl(&c.settings, force)?;
     }
     // A restore with no live file gives the restored one the backup's ACL; over a
     // live file it keeps the live one's, checked above, and the backup's is not read.
     if restore_backup && !c.settings.exists() && c.backup.exists() {
-        refuse_unreadable_acl(&c.backup)?;
+        refuse_unreadable_acl(&c.backup, force)?;
     }
     let state = read_state(c)?;
 
@@ -2235,13 +2275,13 @@ fn remove_env_key(c: &Ctx, prior: &Prior, force: bool, restore_backup: bool) -> 
         // install. Only with no live file does the restored one take the backup's,
         // which is the ACL the file had when it was backed up.
         let like = if c.settings.exists() {
-            copy_settings(&c.settings, &c.safety, "")?;
+            copy_settings(&c.settings, &c.safety, "", force)?;
             say(&format!("settings: current file saved to {}", c.safety.display()));
             &c.settings
         } else {
             &c.backup
         };
-        write_settings(&c.settings, &raw, mode, like)?;
+        write_settings(&c.settings, &raw, mode, like, force)?;
         say(&format!("settings: restored from {}", c.backup.display()));
         if !sys::HAS_MODES {
             say(if like == &c.settings {
@@ -2287,9 +2327,9 @@ fn remove_env_key(c: &Ctx, prior: &Prior, force: bool, restore_backup: bool) -> 
                 }
                 Outcome::Changed { text, .. } => {
                     let mode = mode_of(&c.settings).unwrap_or(0o600);
-                    copy_settings(&c.settings, &c.safety, "")?;
+                    copy_settings(&c.settings, &c.safety, "", force)?;
                     say(&format!("settings: backed up to {}", c.safety.display()));
-                    write_settings(&c.settings, &text, mode, &c.settings)?;
+                    write_settings(&c.settings, &text, mode, &c.settings, force)?;
                     match &want {
                         Some(raw) => {
                             say(&format!(
@@ -2975,7 +3015,7 @@ mod tests {
 
     #[test]
     fn every_verb_and_every_spelling_of_one_parses() {
-        assert!(matches!(parse(&["install"]), Subcommand::Install { tree: None }));
+        assert!(matches!(parse(&["install"]), Subcommand::Install { tree: None, force: false }));
         assert!(matches!(
             parse(&["uninstall"]),
             Subcommand::Uninstall { force: false, restore_backup: false, keep_tree: false }
@@ -3011,8 +3051,13 @@ mod tests {
     #[test]
     fn a_flag_attaches_only_to_the_verb_that_accepts_it() {
         match parse(&["install", "--tree", "/tmp/somewhere"]) {
-            Subcommand::Install { tree: Some(d) } => assert_eq!(d, OsString::from("/tmp/somewhere")),
+            Subcommand::Install { tree: Some(d), force: false } => assert_eq!(d, OsString::from("/tmp/somewhere")),
             _ => panic!("install --tree must carry the directory"),
+        }
+        // install's --force lifts only the no-ACL refusal; it combines with --tree in
+        // either order.
+        for words in [&["install", "--force"][..], &["install", "--force", "--tree", "/t"][..], &["install", "--tree", "/t", "--force"][..]] {
+            assert!(matches!(parse(words), Subcommand::Install { force: true, .. }), "{:?}", words);
         }
         assert!(matches!(
             parse(&["uninstall", "--force"]),
@@ -3032,7 +3077,7 @@ mod tests {
         ));
         // Repeats are idempotent, as they were: the last one wins.
         match parse(&["install", "--tree", "/a", "--tree", "/b"]) {
-            Subcommand::Install { tree: Some(d) } => assert_eq!(d, OsString::from("/b")),
+            Subcommand::Install { tree: Some(d), .. } => assert_eq!(d, OsString::from("/b")),
             _ => panic!("the last --tree wins"),
         }
     }
@@ -3069,9 +3114,6 @@ mod tests {
             &["uninstall", "--bogus"][..],
             // `--keep-tree` is a real flag, but only uninstall takes it.
             &["install", "--keep-tree"][..],
-            // `--force` went with the check it forced: install supplies the binary it
-            // needs, so there is nothing left to force.
-            &["install", "--force"][..],
             // `--tree` is a real flag, but only install takes it.
             &["uninstall", "--tree"][..],
         ] {
@@ -3608,11 +3650,11 @@ mod tests {
             assert!(acl.contains("(D;;FR;;;BG)"), "{kind}: {acl}");
             assert_eq!(acl.starts_with("D:P"), kind == "protected", "{acl}");
             assert_eq!(acl.contains(";ID;"), kind == "explicit", "{acl}");
-            refuse_unreadable_acl(&c.settings).expect("readable");
+            refuse_unreadable_acl(&c.settings, false).expect("readable");
 
             // install
             let doc = fs::read(&c.settings).expect("read");
-            write_env_key(&c, Some(doc)).expect("install's edit");
+            write_env_key(&c, Some(doc), false).expect("install's edit");
             let now = fs::read(&c.settings).expect("read");
             assert!(settings::env_raw_text(&now, KEY).expect("parse").is_some());
             assert_eq!(sddl(&c.settings), acl, "{kind}: settings.json after install");
@@ -3668,10 +3710,10 @@ mod tests {
         assert!(!inherited.starts_with("D:P") && inherited.contains(";ID;"), "{inherited}");
         assert!(!inherited.contains("(A;;") && !inherited.contains("(D;;"), "nothing explicit: {inherited}");
 
-        write_env_key(&c, None).expect("created");
+        write_env_key(&c, None, false).expect("created");
         assert_eq!(sddl(&c.settings), inherited, "a new settings.json");
         fs::write(&c.settings, b"{}").expect("write");
-        write_env_key(&c, Some(b"{}".to_vec())).expect("edited");
+        write_env_key(&c, Some(b"{}".to_vec()), false).expect("edited");
         assert_eq!(sddl(&c.settings), inherited, "an edited one");
         assert_eq!(sddl(&c.backup), inherited, "its backup");
         let _ = fs::remove_dir_all(&c.config);
@@ -3690,11 +3732,11 @@ mod tests {
         // process may read the data and nothing else. The directory's delete-child
         // right still lets the cleanup remove it.
         set_sddl(&c.settings, "D:P(A;;0x1;;;OW)");
-        let e = refuse_unreadable_acl(&c.settings).expect_err("refused");
+        let e = refuse_unreadable_acl(&c.settings, false).expect_err("refused");
         assert!(e.contains("access control list") && e.ends_with("Nothing has been changed."), "{e}");
-        let e = write_settings(&c.settings, b"{\"x\": 1}", 0o600, &c.settings).expect_err("refused");
+        let e = write_settings(&c.settings, b"{\"x\": 1}", 0o600, &c.settings, false).expect_err("refused");
         assert!(e.contains("was not changed"), "{e}");
-        let e = copy_settings(&c.settings, &c.backup, "the backup ").expect_err("refused");
+        let e = copy_settings(&c.settings, &c.backup, "the backup ", false).expect_err("refused");
         assert!(e.contains("was not written"), "{e}");
         assert_eq!(fs::metadata(&c.settings).expect("stat").len(), 2, "untouched");
         assert_eq!(names_in(&c.config), ["settings.json"], "nothing written, nothing left");
@@ -3719,7 +3761,7 @@ mod tests {
         let acl = sddl(&c.settings);
         assert!(acl.starts_with("D:AI") && acl.contains("(D;ID;FR;;;BG)"), "{acl}");
 
-        write_env_key(&c, Some(b"{}".to_vec())).expect("install's edit");
+        write_env_key(&c, Some(b"{}".to_vec()), false).expect("install's edit");
         assert_eq!(sddl(&c.settings), acl, "settings.json");
         assert_eq!(sddl(&c.backup), acl, "its backup");
         let _ = fs::remove_dir_all(&c.config);
@@ -3733,8 +3775,35 @@ mod tests {
         let m = acl_unreadable(Path::new("settings.json"), &e, "Nothing has been changed");
         assert!(m.starts_with("settings.json is on a filesystem that keeps no Windows access control list"), "{m}");
         assert!(m.ends_with("Nothing has been changed."), "{m}");
+        assert!(m.contains("re-run with --force"), "the way through is named: {m}");
         let e = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         let m = acl_unreadable(Path::new("settings.json"), &e, "Nothing has been changed");
         assert!(m.starts_with("cannot read the access control list of settings.json"), "{m}");
+        assert!(!m.contains("--force"), "an unreadable ACL is not something --force lifts: {m}");
+        assert!(!no_acl_here(&e) && no_acl_here(&std::io::Error::from(std::io::ErrorKind::Unsupported)));
+    }
+
+    /// `--force` lifts the no-ACL refusal, and only it. Needs a settings.json on a
+    /// filesystem with no Windows ACL, so run by hand:
+    /// `CCTAB_TEST_NO_ACL_DIR=\\wsl.localhost\<distro>\tmp\<dir> cargo test -- --ignored`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a directory on a WSL share, named by CCTAB_TEST_NO_ACL_DIR"]
+    fn force_writes_settings_on_a_filesystem_with_no_acl() {
+        let d = PathBuf::from(std::env::var_os("CCTAB_TEST_NO_ACL_DIR").expect("CCTAB_TEST_NO_ACL_DIR"));
+        let settings = d.join("settings.json");
+        let backup = d.join("settings.json.cctab-preinstall");
+        fs::write(&settings, b"{}").expect("writable share");
+        let _ = fs::remove_file(&backup);
+        assert!(refuse_unreadable_acl(&settings, false).is_err(), "refused without --force");
+        assert!(write_settings(&settings, b"{\"a\":1}", 0o600, &settings, false).is_err());
+        assert_eq!(fs::read(&settings).expect("still there"), b"{}", "nothing changed when refused");
+        refuse_unreadable_acl(&settings, true).expect("--force lets it through");
+        copy_settings(&settings, &backup, "the backup ", true).expect("backup written");
+        write_settings(&settings, b"{\"a\":1}", 0o600, &settings, true).expect("written");
+        assert_eq!(fs::read(&settings).expect("read"), b"{\"a\":1}");
+        assert_eq!(fs::read(&backup).expect("read"), b"{}");
+        let _ = fs::remove_file(&backup);
+        let _ = fs::remove_file(&settings);
     }
 }
