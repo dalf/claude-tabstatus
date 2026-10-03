@@ -10,7 +10,7 @@
 //!
 //! THE DEVELOPER'S OWN TAB IS NEVER A TARGET. The stand-in starts from an environment
 //! block built here, without the ambient `CLAUDE_PID`, and every hook is handed a pid
-//! explicitly - the stand-in's, or a decoy's. Nothing names an ancestor of this
+//! explicitly - the stand-in's, a decoy's, or a relay's. Nothing names an ancestor of this
 //! process, and those include the terminal the tests were started from.
 //!
 //! The pseudo console is kernel32's: the inbox conhost. `CCTAB_TEST_CONPTY_DLL` names
@@ -37,10 +37,10 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
+    InitializeProcThreadAttributeList, OpenProcess, TerminateProcess, UpdateProcThreadAttribute,
     WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-    PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW,
+    PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
 /// The binary under test: the one `hooks.json` runs.
@@ -97,6 +97,34 @@ fn a_claude_writing_to_nul_is_not_painted() {
 #[test]
 fn a_pid_that_is_not_an_ancestor_is_not_painted_even_on_the_same_console() {
     let run = Scenario::new("decoy").target("decoy").run();
+    assert!(run.titles().is_empty(), "{run}");
+    run.assert_hooks_clean();
+}
+
+/// The control for the next test: the hook is spawned by a RELAY, a second claude on
+/// the stand-in's console that names itself in `CLAUDE_PID` and lives until the hook
+/// is done, as Claude does. It is painted.
+#[test]
+fn a_hook_spawned_by_a_relay_claude_paints_its_console() {
+    let run = Scenario::new("relay").target("relay").run();
+    assert_eq!(run.titles(), vec![run.expected_title(), String::new()], "{run}");
+    run.assert_hooks_clean();
+}
+
+/// The same relay, but it exits - and nothing here holds it open any more - before its
+/// hook reads the payload, so before the hook can look at its `CLAUDE_PID`: Claude
+/// quitting as a hook starts. Nothing is painted: the walk finds that pid exited -
+/// something else may still hold its process open - or no longer there.
+///
+/// What this does NOT cover is the race the hook guards against by opening that pid
+/// once the walk has matched it, checking its creation time is the walk's, and
+/// holding it to the attach: Claude exiting in the middle AND its pid going to
+/// another process on a console in between. Pid reuse cannot be forced; that case is
+/// closed by construction - no reuse while a handle is open - and the comparison of
+/// creation times is unit-tested in sys::windows.
+#[test]
+fn a_claude_that_exited_before_its_hook_looked_is_not_painted() {
+    let run = Scenario::new("exited").target("exited").run();
     assert!(run.titles().is_empty(), "{run}");
     run.assert_hooks_clean();
 }
@@ -442,6 +470,12 @@ fn stand_in_claude() {
     });
     let target = decoy.as_ref().map_or(std::process::id(), |d| d.id());
     let inherit = var("CCTAB_TEST_CONPTY_SPAWN") == "inherit";
+    // Some(exits): each edge's hook is spawned by a relay claude, see `relayed_hook`.
+    let relay = match var("CCTAB_TEST_CONPTY_TARGET").as_str() {
+        "relay" => Some(false),
+        "exited" => Some(true),
+        _ => None,
+    };
     // What session-start WOULD paint, from a dry run through the same spawn path; and
     // what the `terminalSequence` path paints for an idle edge in the same directory,
     // from a real run with a state of its own. Neither titles anything.
@@ -455,7 +489,11 @@ fn stand_in_claude() {
     let _ = write!(con, "{BEFORE}\r\n");
     std::thread::sleep(Duration::from_millis(150));
     for edge in var("CCTAB_TEST_CONPTY_EDGES").split(',') {
-        results.push_str(&hook(&dir, "state", edge, target, inherit, false).line);
+        let line = match relay {
+            Some(exits) => relayed_hook(&dir, edge, exits),
+            None => hook(&dir, "state", edge, target, inherit, false).line,
+        };
+        results.push_str(&line);
         results.push('\n');
         // Two titles inside one frame of the inbox conhost would be coalesced.
         std::thread::sleep(Duration::from_millis(150));
@@ -477,21 +515,129 @@ fn decoy() {
     }
 }
 
+/// Not a test: a relay claude on the stand-in's console. It spawns one hook as Claude
+/// Code does, naming ITSELF in `CLAUDE_PID`, with its own stdin - the stand-in's
+/// payload pipe - and files for the hook's output; writes the hook's pid to
+/// `hook.pid`; and then either exits at once or waits for the hook.
+#[test]
+#[ignore = "a child process for the tests in this file"]
+fn relay() {
+    if std::env::var_os(ROLE).as_deref() != Some(OsStr::new("relay")) {
+        return;
+    }
+    let var = |k: &str| std::env::var(k).unwrap_or_default();
+    let dir = PathBuf::from(var("CCTAB_TEST_CONPTY_DIR"));
+    let mut c = hook_command(&dir, "state", &var("CCTAB_TEST_CONPTY_EDGE"), std::process::id(), false, false);
+    c.stdin(Stdio::inherit())
+        .stdout(std::fs::File::create(dir.join("hook.out")).expect("hook.out"))
+        .stderr(std::fs::File::create(dir.join("hook.err")).expect("hook.err"));
+    let mut child = c.spawn().expect("hook");
+    std::fs::write(dir.join("hook.pid.tmp"), child.id().to_string()).expect("pid");
+    std::fs::rename(dir.join("hook.pid.tmp"), dir.join("hook.pid")).expect("pid");
+    if var("CCTAB_TEST_CONPTY_RELAY_EXITS").is_empty() {
+        let _ = child.wait();
+    }
+}
+
+/// Run `tabstatus <edge>` through a [`relay`] on this console, and report it as
+/// [`hook`] does. With `exits`, the relay has exited and its handle here is closed
+/// before the hook is given its payload - which it reads before anything else - so
+/// its `CLAUDE_PID` is gone by the time it looks. The hook is opened by pid while it
+/// waits on that payload, alive, so the pid is its own.
+fn relayed_hook(dir: &Path, edge: &str, exits: bool) -> String {
+    let (payload_r, mut payload_w) = std::io::pipe().expect("pipe");
+    let pid_file = dir.join("hook.pid");
+    let _ = std::fs::remove_file(&pid_file);
+    let mut relay = Command::new(std::env::current_exe().expect("exe"))
+        .args(["--exact", "relay", "--ignored"])
+        .env(ROLE, "relay")
+        .env("CCTAB_TEST_CONPTY_EDGE", edge)
+        .env("CCTAB_TEST_CONPTY_RELAY_EXITS", if exits { "1" } else { "" })
+        .stdin(payload_r)
+        .spawn()
+        .expect("relay");
+    let t = Instant::now();
+    let pid: u32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file).ok().and_then(|s| s.parse().ok()) {
+            break pid;
+        }
+        assert!(t.elapsed() < Duration::from_secs(30), "the relay wrote no hook.pid");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    // SAFETY: no pointers; a null handle is the failure, checked at once.
+    let h = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    assert!(!h.is_null(), "open hook {pid}: {}", std::io::Error::last_os_error());
+    // With `exits`, waited for and then its handle closed: nothing here keeps its pid.
+    let live_relay = if exits {
+        let _ = relay.wait();
+        drop(relay);
+        None
+    } else {
+        Some(relay)
+    };
+    let t = Instant::now();
+    let _ = payload_w.write_all(payload(edge).as_bytes());
+    let _ = payload_w.write_all(b"\n");
+    drop(payload_w);
+    // SAFETY: the live process handle opened above, closed once here.
+    let code = unsafe {
+        let code = (WaitForSingleObject(h, 30_000) == 0).then(|| {
+            let mut code = 0u32;
+            GetExitCodeProcess(h, &mut code);
+            code as i32
+        });
+        CloseHandle(h);
+        code
+    };
+    let ms = t.elapsed().as_millis();
+    if let Some(mut relay) = live_relay {
+        let _ = relay.wait();
+    }
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+    format!("{edge} exit={code:?} ms={ms} stdout={:?} stderr={:?}", read("hook.out"), read("hook.err"))
+}
+
 struct Hook {
     stdout: String,
     line: String,
+}
+
+/// What Claude Code writes to the hook for `edge`.
+fn payload(edge: &str) -> &'static str {
+    match edge {
+        "session-start" => r#"{"session_id":"conpty","hook_event_name":"SessionStart","source":"startup"}"#,
+        "session-end" => r#"{"session_id":"conpty","hook_event_name":"SessionEnd","reason":"exit"}"#,
+        "idle" => r#"{"session_id":"conpty","hook_event_name":"Stop"}"#,
+        _ => r#"{"session_id":"conpty","hook_event_name":"UserPromptSubmit"}"#,
+    }
 }
 
 /// Run `tabstatus <edge>` as Claude Code runs a hook: `bash -c` through Git Bash
 /// when there is one, CREATE_NO_WINDOW unless `inherit`, stdio on pipes, the payload
 /// on stdin, and `CLAUDE_PID` = `target`; in `dir`, with `dir\<state>` as its state.
 fn hook(dir: &Path, state: &str, edge: &str, target: u32, inherit: bool, dry: bool) -> Hook {
-    let payload = match edge {
-        "session-start" => r#"{"session_id":"conpty","hook_event_name":"SessionStart","source":"startup"}"#,
-        "session-end" => r#"{"session_id":"conpty","hook_event_name":"SessionEnd","reason":"exit"}"#,
-        "idle" => r#"{"session_id":"conpty","hook_event_name":"Stop"}"#,
-        _ => r#"{"session_id":"conpty","hook_event_name":"UserPromptSubmit"}"#,
-    };
+    let mut c = hook_command(dir, state, edge, target, inherit, dry);
+    c.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let t = Instant::now();
+    let mut child = c.spawn().expect("hook");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let _ = stdin.write_all(payload(edge).as_bytes());
+    let _ = stdin.write_all(b"\n");
+    drop(stdin);
+    let out = child.wait_with_output().expect("hook");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let line = format!(
+        "{edge} exit={:?} ms={} stdout={:?} stderr={:?}",
+        out.status.code(),
+        t.elapsed().as_millis(),
+        stdout,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Hook { stdout, line }
+}
+
+/// The hook's command, all but its stdio: see [`hook`].
+fn hook_command(dir: &Path, state: &str, edge: &str, target: u32, inherit: bool, dry: bool) -> Command {
     let bash = std::env::var_os("CCTAB_TEST_GIT_BASH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Program Files\Git\bin\bash.exe"));
@@ -513,26 +659,6 @@ fn hook(dir: &Path, state: &str, edge: &str, target: u32, inherit: bool, dry: bo
     if dry {
         c.env("CCTAB_DRY_RUN", "1");
     }
-    c.current_dir(dir)
-        .env("CLAUDE_PID", target.to_string())
-        .env("CCTAB_STATE_DIR", dir.join(state))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let t = Instant::now();
-    let mut child = c.spawn().expect("hook");
-    let mut stdin = child.stdin.take().expect("stdin");
-    let _ = stdin.write_all(payload.as_bytes());
-    let _ = stdin.write_all(b"\n");
-    drop(stdin);
-    let out = child.wait_with_output().expect("hook");
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let line = format!(
-        "{edge} exit={:?} ms={} stdout={:?} stderr={:?}",
-        out.status.code(),
-        t.elapsed().as_millis(),
-        stdout,
-        String::from_utf8_lossy(&out.stderr)
-    );
-    Hook { stdout, line }
+    c.current_dir(dir).env("CLAUDE_PID", target.to_string()).env("CCTAB_STATE_DIR", dir.join(state));
+    c
 }

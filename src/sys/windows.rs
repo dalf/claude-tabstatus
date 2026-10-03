@@ -1595,6 +1595,12 @@ fn probe_open(process: &Process) -> Probe {
 /// An open process handle, closed on drop.
 struct Process(HANDLE);
 
+// SAFETY: a process handle names a kernel object, not thread-local state: any thread
+// of this process may use it, and `Process` owns it and closes it exactly once, as
+// `OwnedHandle` (which is `Send`) does. It moves to the console worker inside a
+// [`Claude`].
+unsafe impl Send for Process {}
+
 impl Drop for Process {
     fn drop(&mut self) {
         // SAFETY: the handle came from OpenProcess and is closed exactly once.
@@ -1646,10 +1652,15 @@ const CANCEL_BUDGET: Duration = Duration::from_millis(50);
 /// that has none.
 ///
 /// THE HEADLESS GUARD, the Windows form of Unix's "fd 1 is a tty", is three proofs,
-/// and any "no" paints nothing:
+/// and any "no" paints nothing. All three, and the attach, are about ONE process:
+/// once the walk has proven `claude_pid` an ancestor, it is opened as a [`Claude`],
+/// and that handle - kept only if its process was created when the walk's was - is
+/// what the PEB is read through and is held until the attach is over, so the pid
+/// cannot be reissued in between, however soon Claude exits.
 ///   1. `claude_pid` is a LIVE ANCESTOR of this process: the parent chain is walked
 ///      up from here, each hop running and created no later than its child, so a
 ///      stale or recycled pid, a sibling, and every unrelated process are refused.
+///      Only then is it opened for more than a query, as before.
 ///   2. That process's standard output - read out of its PEB, the one place Windows
 ///      records it, current as of any `SetStdHandle` - is a character device. That
 ///      refuses `claude -p > file` and `claude -p | jq` before any console is touched.
@@ -1668,13 +1679,41 @@ const CANCEL_BUDGET: Duration = Duration::from_millis(50);
 /// changes but its title, and this process's standard handles - the pipes the hook
 /// protocol runs over - are untouched.
 pub fn set_session_title(claude_pid: &OsStr, title: &str) -> io::Result<bool> {
-    let Some(pid) = parse_pid(claude_pid) else { return Ok(false) };
-    if !is_live_ancestor(pid) {
-        return Ok(false);
-    }
-    let Some(stdout) = char_stdout_of(pid) else { return Ok(false) };
+    let Some(claude) = parse_pid(claude_pid).and_then(live_ancestor) else { return Ok(false) };
+    let Some(stdout) = char_stdout_of(&claude.process) else { return Ok(false) };
     let title: Vec<u16> = title.encode_utf16().chain(Some(0)).collect();
-    on_console_worker(move |abandoned| title_console(pid, &stdout, &title, abandoned))
+    // `claude` moves into the worker and is dropped there, after `title_console` has
+    // returned: past AttachConsole, the screen-buffer check and the detach, abandoned
+    // or not. An abandoned worker still owns it, so nothing closes it under a call in
+    // flight, and the handle lives no longer than that call or this process.
+    on_console_worker(move |abandoned| title_console(&claude, &stdout, &title, abandoned))
+}
+
+/// `$CLAUDE_PID`, opened ONCE with every right [`set_session_title`] needs of it, after
+/// the ancestor walk and only if its process is the one the walk proved. Windows does
+/// not reissue a pid while a handle to its process is open, so for as long as this
+/// lives the one step that can only name the process by number - AttachConsole -
+/// names this one, even if Claude has exited since: a pid freed between the checks and
+/// the attach, and handed to another process's console, is what holding it rules out.
+struct Claude {
+    pid: u32,
+    process: Process,
+}
+
+impl Claude {
+    /// The process `pid`, still RUNNING and created at `created` - the creation time
+    /// the walk read for that pid from a handle since closed - or nothing. A pid
+    /// reissued in between names a process created later, and is refused; so is one
+    /// that refuses the rights to read its PEB and duplicate its stdout, which guard 2
+    /// needs anyway.
+    fn open(pid: u32, created: u64) -> Option<Claude> {
+        let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ | PROCESS_DUP_HANDLE;
+        let process = open_process(pid, access)?;
+        match probe_open(&process) {
+            Probe::Running(born) if born == created => Some(Claude { pid, process }),
+            _ => None,
+        }
+    }
 }
 
 /// Run `work` on a worker thread for at most [`CONSOLE_BUDGET`], then [`abandon`] it:
@@ -1721,8 +1760,9 @@ fn abandon(worker: &JoinHandle<()>, abandoned: &AtomicBool) {
 
 /// The part of [`set_session_title`] that runs attached to Claude's console, on the
 /// worker [`on_console_worker`] runs. Once `abandoned`, it makes no further call.
+/// AttachConsole takes a pid; `claude`, open for the whole call, keeps it Claude's.
 fn title_console(
-    pid: u32,
+    claude: &Claude,
     stdout: &OwnedHandle,
     title: &[u16],
     abandoned: &AtomicBool,
@@ -1738,7 +1778,7 @@ fn title_console(
         // AttachConsole refuses a process that has a console (error 5), and a hook
         // has one. Our standard handles are pipes, which this leaves as they are.
         FreeConsole();
-        if !live() || AttachConsole(pid) == 0 {
+        if !live() || AttachConsole(claude.pid) == 0 {
             // Abandoned already, or no console at all - a detached or GUI parent -
             // so no tab.
             return Ok(false);
@@ -1797,22 +1837,27 @@ fn parse_pid(raw: &OsStr) -> Option<u32> {
     std::str::from_utf8(b).ok()?.parse().ok().filter(|&p| p != 0)
 }
 
-/// Whether `pid` is a live ancestor of this process within [`ANCESTOR_HOPS`]. A hop
-/// whose recorded parent is YOUNGER than it has outlived that parent, whose pid went
-/// to a newer process: nothing above it is ours, and the walk stops there.
-fn is_live_ancestor(pid: u32) -> bool {
-    let Some((mut born, mut parent)) = hop(std::process::id()) else { return false };
+/// `pid` opened as [`Claude`], when it is a live ancestor of this process within
+/// [`ANCESTOR_HOPS`]. A hop whose recorded parent is YOUNGER than it has outlived that
+/// parent, whose pid went to a newer process: nothing above it is ours, and the walk
+/// stops there.
+///
+/// The hops are opened by pid for a query alone, so nothing but a proven ancestor is
+/// opened for more. The handle that is kept must name the process the walk matched,
+/// created at the same time: the same process, not merely the same number.
+fn live_ancestor(pid: u32) -> Option<Claude> {
+    let (mut born, mut parent) = hop(std::process::id())?;
     for _ in 0..ANCESTOR_HOPS {
-        let Some((parent_born, grandparent)) = hop(parent) else { return false };
+        let (parent_born, grandparent) = hop(parent)?;
         if parent_born > born {
-            return false;
+            return None;
         }
         if parent == pid {
-            return true;
+            return Claude::open(pid, parent_born);
         }
         (born, parent) = (parent_born, grandparent);
     }
-    false
+    None
 }
 
 /// A RUNNING process's creation time and the pid that created it, from one handle,
@@ -1823,24 +1868,24 @@ fn hop(pid: u32) -> Option<(u64, u32)> {
     Some((created, u32::try_from(basic_info(&p)?.parent).ok()?))
 }
 
-/// The standard output of `pid`, duplicated into this process, when it is a character
-/// device - the Windows `/proc/<pid>/fd/1`. The PEB offsets are the 64-bit layout
+/// The standard output of process `p`, duplicated into this process, when it is a
+/// character device - the Windows `/proc/<pid>/fd/1`. `p` is open for
+/// `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ | PROCESS_DUP_HANDLE`, as a
+/// [`Claude`] is. The PEB offsets are the 64-bit layout
 /// (`PEB.ProcessParameters` at 0x20, and `StandardOutput` at 0x28 in that), stable
 /// since NT; a WOW64 process keeps its current handles in its 32-bit copy, and a
 /// 32-bit build cannot use these offsets, so both are refused.
-fn char_stdout_of(pid: u32) -> Option<OwnedHandle> {
+fn char_stdout_of(p: &Process) -> Option<OwnedHandle> {
     if !cfg!(target_pointer_width = "64") {
         return None;
     }
-    let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ | PROCESS_DUP_HANDLE;
-    let p = open_process(pid, access)?;
     let mut wow = 0;
     // SAFETY: an open process handle and a live BOOL.
     if unsafe { IsWow64Process(p.0, &mut wow) } == 0 || wow != 0 {
         return None;
     }
-    let params = read_word(&p, basic_info(&p)?.peb.checked_add(0x20)?)?;
-    let handle = read_word(&p, params.checked_add(0x28)?)?;
+    let params = read_word(p, basic_info(p)?.peb.checked_add(0x20)?)?;
+    let handle = read_word(p, params.checked_add(0x28)?)?;
     if handle == 0 {
         return None;
     }
@@ -2219,22 +2264,43 @@ mod tests {
             .expect("spawn")
     }
 
-    /// Guard 1. The process that started this test is an ancestor; this process, a
-    /// child it spawned - running, then exited - and a pid nothing has are not.
-    /// Nothing here touches a console.
+    /// Guard 1. The process that started this test is an ancestor, and is what is
+    /// held; this process, a child it spawned - running, then exited - and a pid
+    /// nothing has are not. Nothing here touches a console.
     #[test]
     fn only_a_running_ancestor_passes_the_walk() {
         let me = std::process::id();
         let (_, parent) = hop(me).expect("this process");
-        assert!(is_live_ancestor(parent), "the process that started this test");
-        assert!(!is_live_ancestor(me), "not its own ancestor");
-        assert!(!is_live_ancestor(u32::MAX), "no such pid");
+        let held = live_ancestor(parent).map(|c| c.pid);
+        assert_eq!(held, Some(parent), "the process that started this test");
+        assert!(live_ancestor(me).is_none(), "not its own ancestor");
+        assert!(live_ancestor(u32::MAX).is_none(), "no such pid");
         let mut child = held_child(Stdio::null());
         let pid = child.id();
-        assert!(!is_live_ancestor(pid), "a child is not an ancestor");
+        let (created, _) = hop(pid).expect("the child, running");
+        assert!(live_ancestor(pid).is_none(), "a child is not an ancestor");
+        assert!(Claude::open(pid, created).is_some(), "the child can be opened while it runs");
         drop(child.stdin.take());
         child.wait().expect("wait");
-        assert!(!is_live_ancestor(pid), "nor once it has exited");
+        // `child` still holds its handle, so the pid is not reissued: it is the exited
+        // process itself that the open refuses, at its own creation time.
+        assert!(Claude::open(pid, created).is_none(), "an exited process is not held");
+        assert!(live_ancestor(pid).is_none(), "nor once it has exited");
+    }
+
+    /// The handle kept is the process the walk matched, not merely its pid: opened
+    /// with another creation time than the walk read - what a pid reissued between the
+    /// walk and the open would show - it is refused, and with that one accepted. The
+    /// ancestor is only opened and queried; no console is touched.
+    #[test]
+    fn a_pid_created_at_another_time_than_the_walk_read_is_not_held() {
+        let (_, parent) = hop(std::process::id()).expect("this process");
+        let (created, _) = hop(parent).expect("the process that started this test");
+        assert!(Claude::open(parent, created).is_some(), "the process the walk read");
+        // `hop` never reads a creation time of 0, so neither neighbour wraps.
+        for forged in [created - 1, created + 1] {
+            assert!(Claude::open(parent, forged).is_none(), "created {forged}, the walk {created}");
+        }
     }
 
     /// Guard 2 reads another process's CURRENT standard output out of its PEB: a file
@@ -2251,7 +2317,9 @@ mod tests {
             (Stdio::from(nul), "NUL", true),
         ] {
             let mut child = held_child(stdout);
-            assert_eq!(char_stdout_of(child.id()).is_some(), char_device, "{what}");
+            let pid = child.id();
+            let held = hop(pid).and_then(|(created, _)| Claude::open(pid, created));
+            assert_eq!(held.and_then(|c| char_stdout_of(&c.process)).is_some(), char_device, "{what}");
             drop(child.stdin.take());
             child.wait().expect("wait");
         }
