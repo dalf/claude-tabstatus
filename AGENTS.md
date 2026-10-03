@@ -37,7 +37,8 @@ carries the management verbs (`install`, `uninstall`, `doctor`, `version`,
 | `.claude-plugin/plugin.json` | the plugin manifest. **Source**, compiled in like `hooks.json` |
 | `scripts/build.sh` | builds `bin/` and its source digests |
 | `scripts/bench-state.sh` | measures what the state layer costs per edge |
-| `scripts/bench-hot.sh` | the hot-path gate: times the four hot edges against a baseline binary inside a 50 µs band, and requires zero forks under a tracer; `CCTAB_BENCH=1 sh tests/run.sh` runs it |
+| `scripts/bench-hot.sh` | optional stateless dry-run timing against an explicit baseline, or `--calibrate` for self-comparison |
+| `tests/check_hot_subprocesses.py` | required Linux subprocess gate: traces actual protocol and private tmux delivery with syscall controls |
 | `tests/` | integration suites, fixtures, the golden corpus and the shell oracle (see [Tests](#tests)) |
 | `examples/tmux.conf` | an optional tmux configuration users can copy |
 | `docs/` | design and contract documents (see [Documentation map](#documentation-map)) |
@@ -362,9 +363,10 @@ limitation it closes; the pre-fix freeze is kept as `cases.jsonl.before-fixes`.
 sh scripts/bench-state.sh                      # bin/tabstatus, state layer against itself switched off
 sh scripts/bench-state.sh <baseline-binary>    # ...and against another build
 CCTAB_BENCH_EXECS=200 CCTAB_BENCH_ROUNDS=21 sh scripts/bench-state.sh
-sh scripts/bench-hot.sh                        # the hot-path GATE, self against self
-sh scripts/bench-hot.sh <baseline-binary>      # ...against a pre-refactor build
-CCTAB_BENCH=1 sh tests/run.sh                  # the suite runs the gate too
+python3 tests/check_hot_subprocesses.py        # required by Linux CI; needs strace, tmux, cc
+sh scripts/bench-hot.sh --calibrate           # self-comparison, no regression verdict
+sh scripts/bench-hot.sh <baseline-binary>      # optional stateless dry-run comparison
+CCTAB_BENCH=1 sh tests/run.sh                  # optional calibration; set CCTAB_BENCH_BASELINE for comparison
 ```
 
 `CCTAB_BENCH_BIN` picks the binary under test (default `bin/tabstatus`). Arms are
@@ -372,7 +374,8 @@ interleaved within each round; the report gives each arm's minimum, its spread,
 and the **median of per-round paired deltas** against the baseline arm. Read the
 deltas, not the absolutes: every arm pays one fork, not Claude Code's own launch
 cost. Do not quote remembered numbers in code or docs; re-run the script. The last
-recorded results and how to read the negative arms are in
+recorded results, comparable baseline-build procedure, enforced subprocess scope
+and how to read the negative arms are in
 [docs/architecture.md](docs/architecture.md).
 
 ## CI and releases
@@ -380,9 +383,10 @@ recorded results and how to read the negative arms are in
 **Test** ([`.github/workflows/test.yml`](.github/workflows/test.yml)) runs on every
 branch push, pull request, manual dispatch, and as a reusable workflow.
 
-- *Linux* (`ubuntu-24.04`): installs `musl-tools` and `tmux`; `cargo test --locked`
+- *Linux* (`ubuntu-24.04`): installs `musl-tools`, `tmux` and `strace`; `cargo test --locked`
   for both Linux targets; `sh scripts/build.sh --all`; the corpus fixture unit
-  tests; then, for **each** Linux binary, all six Python suites, `tests/run.sh`
+  tests and subprocess-checker tests; then, for **each** Linux binary, the required
+  subprocess/delivery gate, all six Python suites, `tests/run.sh`
   and the golden corpus. Uploads both binaries and their `SHA256SUMS` as the
   `linux-binaries` artifact.
 - *Windows* (`windows-2025`, steps under Git Bash): `cargo test --locked

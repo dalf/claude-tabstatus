@@ -484,12 +484,11 @@ vtables, registries, probes and a D-Bus dependency. The real figures are larger,
 those rejections rest on the *shape* of the cost — a fork, a round trip, a blocking
 read — rather than on a tight absolute budget. They still hold, for that reason.
 A measurement gate, not an argument, is what should defend the budget from here on.
-**That gate now exists**, as `scripts/bench-hot.sh`: it uses `bench-state.sh`'s
-method - interleaved rounds, minimum per arm, median of per-round paired deltas -
-adds a noise band measured by twelve null runs rather than guessed, and adds the
-half that is not a timing at all, running every hot edge under a tracer and
-requiring zero forks with a positive control first. `CCTAB_BENCH=1 sh tests/run.sh`
-runs it.
+**Superseded performance check.** The original `scripts/bench-hot.sh` combined
+optional dry-run timing with tracing that could skip and did not exercise native
+session-terminal discovery. It did not enforce the full claims above. The
+[current performance checks](architecture.md#performance) require Linux subprocess
+and delivery assertions in CI, with separate opt-in dry-run baseline measurements.
 
 ## 9. Static or runtime?
 

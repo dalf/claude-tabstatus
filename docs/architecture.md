@@ -1653,29 +1653,103 @@ build's 556us, below even `/bin/true`'s 312us, because it never enters `ld.so`.
 24-42ms. Konsole repaints its tab on a ~2s tick, not when the title arrives, so in
 Konsole that tick, not the hook, is the responsiveness ceiling.
 
-**The state layer.** Remembered numbers did not reproduce: a per-edge cost of tens of
-microseconds against a fork-and-exec floor of several hundred is below the noise of a
-desktop that is also doing something else, and an earlier harness that forked three
-times per invocation put an 1100us floor under a 500us measurement. So the numbers
-live in a script:
+**Required subprocess check.** Linux CI runs
+`python3 tests/check_hot_subprocesses.py` for both release targets, independently
+of timing and of `CCTAB_BENCH`. It requires working `strace`, `tmux` and `cc`;
+missing tools, tracer errors, incomplete traces and missing output fail the job.
+Only the hook process and its descendants are traced. The harness's launches and
+private tmux server are outside that trace.
+
+The check permits the initial successful `execve`, then rejects every attempt at
+`fork`, `vfork`, `clone`, `clone3`, `execve` or `execveat`, including failed calls.
+It requires normal tracee completion. A compiled clean control must pass; seven
+violation controls must fail, covering all six names plus a failed `execve`.
+Raw syscalls stop libc substituting `clone` for `fork`; a refused or unsupported
+syscall still tests detection of an attempt. Checker tests also reject empty,
+truncated and failed traces, missing tracers and tracers that exit without tracing.
+
+The exercised scope is `working`, `waiting`, `idle` and permission-prompt `notify`
+on x86_64 Linux, with a local repository, the `other` terminal row, and state both
+disabled and enabled. Each case paints twice, including record writes and reuse;
+idle starts from a seeded working record so the first Stop changes state.
+Ordinary delivery must produce the expected `terminalSequence`
+JSON. Tmux delivery must change a private server's disposable pane title to the
+expected carrier, with no protocol output. Every `CLAUDE_PID` names an owned PTY
+stand-in, so tmux delivery exercises native `/proc` session-terminal discovery,
+carrier construction and the PTY write. No dry-run shortcut is used.
+
+This enforces zero subprocess attempts for those configurations, not every possible
+hook input or backend. Other terminal rows, SSH host discovery, background and
+no-op transitions, nested multiplexers, macOS and Windows are outside this tracer
+check. Session start/end and management commands intentionally may launch tools.
+The existing semantic, corpus and tmux suites cover additional behaviour; they do
+not expand the measured zero-subprocess scope or prove an end-to-end latency bound.
+
+**Optional timing.** Timing remains a local opt-in measurement because shared CI
+noise makes a per-PR microsecond threshold unreliable. No latency regression has
+been demonstrated by this review. `bench-hot.sh` measures four **stateless dry-run**
+edges: payload handling, location, title composition and dry-run stdout, including
+the harness's process launch. It returns before routing, tmux carrier construction,
+native terminal discovery and delivery. `bench-state.sh` measures dry-run state
+arms; neither script measures Claude Code's complete hook pipeline or terminal
+repainting.
 
 ```sh
-sh scripts/bench-state.sh                      # the layer against itself, switched off
-sh scripts/bench-state.sh <baseline-binary>    # ...and against another build
-sh scripts/bench-hot.sh                        # the hot-path GATE, self against self
-sh scripts/bench-hot.sh <baseline-binary>      # ...against a pre-refactor build
-CCTAB_BENCH=1 sh tests/run.sh                  # the suite runs the gate too
+python3 tests/check_hot_subprocesses.py        # required by Linux CI, no timing
+sh scripts/bench-hot.sh --calibrate           # identical arms, no regression verdict
+sh scripts/bench-hot.sh /absolute/baseline    # candidate defaults to bin/tabstatus
+sh scripts/bench-state.sh                     # dry-run state arms against layer-off
+CCTAB_BENCH=1 sh tests/run.sh                  # optional calibration
+CCTAB_BENCH=1 CCTAB_BENCH_BASELINE=/absolute/baseline sh tests/run.sh
 ```
 
-`bench-hot.sh` is the same method turned into a **gate**. It times the four hot edges
-against a baseline binary inside a 50 µs band - measured, not guessed: twelve null
-runs where both arms are the same binary put the worst delta at ±23 µs, so the band
-is twice that. And it does the half that is not a timing at all: it runs every hot
-edge under a tracer and requires **zero** `clone`/`vfork`/`execve` beyond the
-binary's own exec, bare and tmux-shaped, with a positive control first so that a
-tracer seeing nothing cannot pass a binary that forks. The backend design rejected a
-vtable, a capability registry, a per-paint probe and a D-Bus dependency on the hot
-path's budget; this is what keeps those rejections true.
+`bench-hot.sh` requires an explicit baseline or `--calibrate`; identical binary
+contents always mean calibration, including copies at different paths. The
+candidate is selected with `CCTAB_BENCH_BIN`. Both arms use the same isolated
+stateless environment. With a distinct baseline the script fails when any edge's
+candidate minimum minus baseline minimum exceeds `CCTAB_BENCH_BAND` (default
+50 µs). It also reports the median of paired per-round deltas and the candidate's
+spread. The band is a local heuristic inherited from historical calibration,
+not a portable guarantee: calibrate on the measurement host and report noisy runs
+as inconclusive. Calibration reports band crossings but gives no regression verdict.
+
+For an explicit baseline comparison, build two pinned revisions with **one installed
+Rust toolchain, one target and the same release profile and flags**. For example,
+from the checkout with `cargo`, `rustc` and `rustup` on PATH:
+
+```sh
+baseline=$(git rev-parse be497b0)       # replace with the intended baseline
+candidate=$(git rev-parse HEAD)        # commit the candidate before measuring
+toolchain=$(rustup show active-toolchain | cut -d ' ' -f 1)
+measure_dir=$(mktemp -d)
+mkdir "$measure_dir/base" "$measure_dir/new"
+git archive "$baseline" | tar -x -C "$measure_dir/base"
+git archive "$candidate" | tar -x -C "$measure_dir/new"
+rustup run "$toolchain" rustc -Vv      # retain this alongside both commit IDs
+# Before building, compare [profile.*] in both Cargo.toml files and .cargo configs.
+# Resolve any differences explicitly; do not compare musl with gnu or debug with release.
+for arm in base new; do
+    (cd "$measure_dir/$arm" &&
+     env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+         CARGO_TARGET_DIR="$measure_dir/$arm/target" \
+         cargo +"$toolchain" build --locked --release --target x86_64-unknown-linux-musl)
+done
+CCTAB_BENCH_BIN="$measure_dir/new/target/x86_64-unknown-linux-musl/release/tabstatus" \
+    sh scripts/bench-hot.sh "$measure_dir/base/target/x86_64-unknown-linux-musl/release/tabstatus"
+```
+
+The explicit toolchain prevents directory-specific rustup selection. With another
+toolchain manager, pin its compiler in the same way. Review inherited Cargo configuration and build
+environment overrides; save `cargo build -vv` output when comparing changed build
+settings. The extracted source trees and separate target directories avoid stale
+artefacts from another revision. Repeat for gnu if that target matters. Preserve
+the revisions, toolchain, target, flags, sample counts and calibration output with
+any reported comparison. The subprocess gate needs no baseline build.
+
+**The state layer: historical measurements.** Remembered numbers did not reproduce:
+a per-edge cost of tens of microseconds against a fork-and-exec floor of several
+hundred is below the noise of a busy desktop. `bench-state.sh` makes that cost
+re-measurable.
 
 It interleaves every arm within each round, reports the spread as well as the
 minimum, and gives the **median of the per-round paired deltas** rather than a

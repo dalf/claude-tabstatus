@@ -228,8 +228,9 @@ anything derived from the leaf exists, so a late verdict cannot leave the glyph
 position stale. Step 2 costs nothing on the hot path because the hot path passes a
 zero-sized `NoOracle` whose answer is a constant — **the zero-fork property that
 `tests/run.sh`'s "the hot edges exec no tmux at all" pins becomes a type fact
-rather than a convention** — and `scripts/bench-hot.sh` widens that from tmux to
-*every* fork, under a tracer, with a positive control.
+rather than a convention**. The [required Linux subprocess check](architecture.md#performance)
+also rejects process creation and execution attempts in the documented Linux
+configurations, with controls for each syscall name.
 
 **I6 — Environment evidence is per-signal, and a multiplexer vetoes the signals that
 leak.** Each probe carries `survives_mux` and `survives_ssh`. `KONSOLE_VERSION`,
@@ -396,15 +397,17 @@ passed 0 failed; `sh tests/corpus/replay.sh` 312 passed 0 failed 0 diverged, wit
 all six Python suites OK. `cargo check --locked --offline --target
 x86_64-pc-windows-gnu` **0 errors, 0 warnings**; `--target aarch64-apple-darwin` 0
 errors, 0 warnings; host `--all-targets` warning-free.
-`sh scripts/bench-hot.sh <the windows-port baseline>`: every hot edge inside the
-50 µs band, and every hot edge forks nothing, bare and tmux-shaped.
+The original check was `sh scripts/bench-hot.sh <the windows-port baseline>`.
+Its dry-run timing and tmux-shaped tracing did not cover delivery, and its default
+self-comparison could not detect a baseline regression. The [current checks](architecture.md#performance)
+separate required Linux subprocess/delivery assertions from optional baseline timing.
 
-**The band is the claim; the individual microsecond figures are not.** One run here
+**Historical dry-run timings, not an enforced CI latency bound.** One run here
 measured working +14 µs, waiting −1 µs, idle −6 µs, notify +4 µs; an independent run
 against the same baseline binary measured +1, +17, −4, −5. Both pass, and the
 disagreement between them is the point: each is one machine-moment on a desktop that
 is also doing something else, which is why `bench-state.sh`'s method reports a spread
-and why the gate is a band rather than a number. Re-run the script; do not read any
+and why the optional comparison uses a band. Re-run the script; do not read any
 single figure here as a spec.
 
 ### Windows: what the counts mean now
