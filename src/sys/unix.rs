@@ -270,6 +270,13 @@ pub const CAN_FORCE_ACL: bool = false;
 #[cfg(not(target_os = "macos"))]
 pub enum Security {}
 
+#[cfg(not(target_os = "macos"))]
+impl Security {
+    pub fn preflight(&self, _path: &Path) -> io::Result<()> {
+        match *self {}
+    }
+}
+
 /// Always `None`, without a syscall; see [`Security`].
 #[cfg(not(target_os = "macos"))]
 pub fn security_of(_path: &Path) -> io::Result<Option<Security>> {
@@ -404,10 +411,30 @@ mod darwin_acl {
         }
     }
 
-    /// Some(Security { acl: None }) is an EXISTING file with no ACL. Outer None
-    /// alone means missing source and permits normal directory inheritance.
+    /// An existing file with no ACL still has an ownership/security snapshot.
+    /// Outer None alone means missing source and permits directory inheritance.
     pub struct Security {
         acl: Option<Acl>,
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+    }
+
+    impl Security {
+        /// Ask the filesystem with an empty private file, rather than guessing
+        /// whether these credentials can retain the source's ownership. This
+        /// catches privilege failures before installation/uninstallation writes.
+        pub fn preflight(&self, path: &Path) -> io::Result<()> {
+            let mut name = OsString::from(".");
+            name.push(path.file_name().unwrap_or(OsStr::new("settings")));
+            name.push(format!(".cctab-owner-probe.{}", std::process::id()));
+            let probe = path.parent().unwrap_or(Path::new(".")).join(name);
+            // EXCL: a colliding file belongs to somebody else and is never removed.
+            let f = create_private(&probe)?;
+            let result = apply_ownership(&f, self);
+            drop(f);
+            let cleanup = fs::remove_file(&probe);
+            result.and(cleanup)
+        }
     }
 
     fn read(f: &File) -> io::Result<Security> {
@@ -442,7 +469,11 @@ mod darwin_acl {
             })?;
             Some(Acl::own(p)?)
         };
-        Ok(Security { acl })
+        Ok(Security {
+            acl,
+            uid: stat.st_uid,
+            gid: stat.st_gid,
+        })
     }
 
     pub fn security_of(path: &Path) -> io::Result<Option<Security>> {
@@ -471,7 +502,33 @@ mod darwin_acl {
         }
     }
 
-    pub fn create_secured(path: &Path, sec: &Security) -> io::Result<File> {
+    fn verify_ownership(f: &File, sec: &Security) -> io::Result<()> {
+        let got = f.metadata()?;
+        if got.uid() != sec.uid || got.gid() != sec.gid {
+            return Err(io::Error::other("Darwin owner/group was not preserved"));
+        }
+        Ok(())
+    }
+
+    fn apply_ownership(f: &File, sec: &Security) -> io::Result<()> {
+        let got = f.metadata()?;
+        if got.uid() != sec.uid || got.gid() != sec.gid {
+            // Change only the differing IDs. Darwin requires privileges to change
+            // owner, and group membership to change group. Never accept best effort.
+            // SAFETY: live fd; (uid_t/gid_t)-1 leaves that ID unchanged.
+            check(unsafe {
+                libc::fchown(
+                    f.as_raw_fd(),
+                    if got.uid() == sec.uid { libc::uid_t::MAX } else { sec.uid },
+                    if got.gid() == sec.gid { libc::gid_t::MAX } else { sec.gid },
+                )
+            })
+            .map_err(|e| io::Error::new(e.kind(), format!("cannot preserve Darwin owner/group: {e}")))?;
+        }
+        verify_ownership(f, sec)
+    }
+
+    fn create_private(path: &Path) -> io::Result<File> {
         let name = CString::new(path.as_os_str().as_bytes())
             .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
         // Birth ACL: empty with NO_INHERIT. open(0600) alone would still inherit
@@ -498,8 +555,17 @@ mod darwin_acl {
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }
-        let f = unsafe { File::from_raw_fd(fd) };
-        if let Err(e) = apply(&f, sec).and_then(|()| verify_acl(&f, sec)) {
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    pub fn create_secured(path: &Path, sec: &Security) -> io::Result<File> {
+        let f = create_private(path)?;
+        // chown can clear set-ID bits: ownership precedes ACL application and the
+        // caller's final chmod. All of this happens before configuration bytes.
+        if let Err(e) = apply_ownership(&f, sec)
+            .and_then(|()| apply(&f, sec))
+            .and_then(|()| verify_protection(&f, sec))
+        {
             drop(f);
             let _ = fs::remove_file(path);
             return Err(e);
@@ -510,7 +576,8 @@ mod darwin_acl {
     /// Retain the STAT/XATTR/DATA metadata work of std's Darwin fs::copy. Do not
     /// ask copyfile to copy ACLs: it merges explicit source and inherited TARGET
     /// entries rather than preserving all source ACEs. The target is secured
-    /// already; verify its ACL again after copyfile and the final chmod.
+    /// already; verify its ownership and ACL again after copyfile and final chmod,
+    /// including copyfile's otherwise best-effort fchown.
     pub fn copy_secured(from: &Path, to: &mut File, _sec: &Security) -> io::Result<()> {
         let source = File::open(from)?;
         // std's successful clone path also retains birth time; COPYFILE_STAT
@@ -544,8 +611,11 @@ mod darwin_acl {
         })
     }
 
-    fn verify_acl(f: &File, sec: &Security) -> io::Result<()> {
+    fn verify_protection(f: &File, sec: &Security) -> io::Result<()> {
         let got = read(f)?;
+        if got.uid != sec.uid || got.gid != sec.gid {
+            return Err(io::Error::other("Darwin owner/group was not preserved"));
+        }
         let bytes = |s: &Security| s.acl.as_ref().map(Acl::bytes).transpose();
         if bytes(&got)? != bytes(sec)? {
             return Err(io::Error::other("Darwin ACL was not preserved"));
@@ -553,7 +623,7 @@ mod darwin_acl {
         Ok(())
     }
     pub fn verify_security(f: &File, sec: &Security, wanted: u32) -> io::Result<()> {
-        verify_acl(f, sec)?;
+        verify_protection(f, sec)?;
         if mode(&f.metadata()?) != Some(wanted) {
             return Err(io::Error::other("Darwin mode was not preserved"));
         }
@@ -585,15 +655,41 @@ mod darwin_acl {
                 .collect()
         }
 
-        /// chmod sets fixtures and ls observes them independently of our helpers.
-        /// Check the returned staging fd while it still contains ZERO bytes.
         #[test]
-        fn staging_has_the_source_acl_before_any_configuration_bytes() {
+        fn ownership_preflight_removes_its_probe_but_keeps_collisions() {
+            let dir = std::env::temp_dir()
+                .join(format!("cctab-darwin-owner-probe-{}", std::process::id()));
+            fs::create_dir(&dir).expect("mkdir");
+            let source = dir.join("source");
+            fs::write(&source, b"secret").expect("fixture");
+            let sec = security_of(&source).expect("readable").expect("existing");
+            let probe = dir.join(format!(".source.cctab-owner-probe.{}", std::process::id()));
+            sec.preflight(&source).expect("ownership possible");
+            assert!(!probe.exists());
+            fs::write(&probe, b"somebody else's file").expect("collision");
+            assert_eq!(sec.preflight(&source).expect_err("EXCL").kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read(&probe).expect("kept"), b"somebody else's file");
+            assert_eq!(fs::read(&source).expect("untouched"), b"secret");
+            fs::remove_dir_all(dir).expect("cleanup");
+        }
+
+        /// chmod sets fixtures and ls observes them independently of our helpers.
+        /// Check the returned staging fd, including ownership, with ZERO bytes.
+        #[test]
+        fn staging_has_the_source_protection_before_any_configuration_bytes() {
             let dir =
                 std::env::temp_dir().join(format!("cctab-darwin-staging-{}", std::process::id()));
             fs::create_dir(&dir).expect("mkdir");
             let source = dir.join("source");
             fs::write(&source, b"secret").expect("fixture");
+            let parent_group = dir.metadata().expect("stat dir").gid();
+            let groups = run("/usr/bin/id", &[OsStr::new("-G")]);
+            if let Some(group) = groups.split_whitespace()
+                .find(|g| g.parse::<u32>().expect("group ID") != parent_group) {
+                run("/usr/bin/chgrp", &[OsStr::new(group), source.as_os_str()]);
+            }
+            set_mode(&source, 0o2640).expect("fixture mode");
+            let owner = source.metadata().expect("stat source");
             run(
                 "/bin/chmod",
                 &[
@@ -621,11 +717,14 @@ mod darwin_acl {
                 let target = dir.join("staging");
                 let mut f = create_secured(&target, &sec).expect("secured");
                 assert_eq!(f.metadata().expect("stat").len(), 0);
+                let staging = f.metadata().expect("stat");
+                assert_eq!((staging.uid(), staging.gid()), (owner.uid(), owner.gid()));
                 assert_eq!(acl(&target), wanted, "staging before write");
-                set_mode(&target, 0o640).expect("chmod");
+                set_mode(&target, 0o2640).expect("chmod");
+                verify_security(&f, &sec, 0o2640).expect("protection before bytes");
                 f.write_all(b"secret").expect("write");
-                set_mode(&target, 0o640).expect("final chmod");
-                verify_security(&f, &sec, 0o640).expect("final protection");
+                set_mode(&target, 0o2640).expect("final chmod");
+                verify_security(&f, &sec, 0o2640).expect("final protection");
                 assert_eq!(acl(&target), wanted, "after chmod and write");
                 drop(f);
                 fs::remove_file(target).expect("cleanup");

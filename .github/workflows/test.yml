@@ -120,9 +120,10 @@ jobs:
       - name: Build native validation binary
         run: sh scripts/build.sh
 
-      - name: Require native settings ACL preservation and failure tests
+      - name: Require native settings ACL and ownership preservation and failure tests
         env:
           CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
+          CCTAB_TEST_REQUIRE_SUDO: '1'
         run: python3 tests/test_macos_acl.py
 
       - name: Run native state and disposable PTY tests

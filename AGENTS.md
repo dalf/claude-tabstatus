@@ -157,7 +157,7 @@ when they agree.
 | direct MCP elicitation | `python3 tests/test_elicitation.py` | Linux, Windows, macOS |
 | persistence and concurrency | `python3 tests/test_state_guarantees.py` | Linux, macOS (`fcntl`; strace fault injection Linux-only) |
 | direct Unix delivery | `python3 tests/test_unix_delivery.py -v` | Linux, macOS (disposable PTYs) |
-| settings ACLs and backup metadata | `python3 tests/test_macos_acl.py` | native macOS (chmod/ls, SDK fault interposition) |
+| settings ACLs, ownership and backup metadata | `python3 tests/test_macos_acl.py` | native macOS (chmod/ls/stat, SDK fault interposition) |
 | tmux window status | `python3 tests/test_tmux_status.py` | Linux (tmux) |
 | corpus fixture helpers | `python3 -m unittest discover -s tests/corpus -p 'test_*.py' -v` | Linux |
 | golden corpus | `sh tests/corpus/replay.sh bin/tabstatus` | Linux |
@@ -364,11 +364,16 @@ limitation it closes; the pre-fix freeze is kept as `cases.jsonl.before-fixes`.
   client, not the outer title.
 - `test_macos_acl.py`: isolated installer lifecycles, explicit and inherited ACLs,
   no ACL in an inheriting directory, symlink targets, restrictive umasks, backup
-  metadata and native inspection/application/verification faults. Uses `chmod`
-  and `ls` plus a separate native text observer independently of production helpers. Its SDK-built dyld interposer
+  metadata, owner/group preservation and native inspection/application/verification
+  faults. Uses `chmod`, `ls` and `stat` plus a separate native text observer
+  independently of production helpers. The group fixture differs from the parent
+  directory, and passwordless `sudo` exercises foreign owners with and without
+  privileges. CI sets `CCTAB_TEST_REQUIRE_SUDO=1` to require these fixtures; local
+  runs skip the privileged cases if unavailable. Privileged installer runs receive
+  only isolated HOME/config/data/state locations. Its SDK-built dyld interposer
   observes private, empty staging files through `fstatx_np`; a Rust test separately
-  observes the intended staging ACL before writing bytes. Apple cross-checks
-  compile that Rust test but cannot establish native ACL preservation.
+  observes the intended staging ACL and ownership before writing bytes. Apple
+  cross-checks compile that Rust test but cannot establish native preservation.
 - macOS terminal applications and tmux, Intel macOS runtime behaviour and older
   macOS versions. Native arm64 CI covers the documented process, state and PTY scenarios.
 

@@ -5,6 +5,7 @@
  */
 #include <sys/acl.h>
 #include <sys/stat.h>
+#include <sys/param.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
@@ -84,13 +85,30 @@ static int fail_chmod(const char *path, mode_t mode) {
     }
     return chmod(path, mode);
 }
+static int fail_chown(int fd, uid_t owner, gid_t group) {
+    char path[MAXPATHLEN];
+    int staging = fcntl(fd, F_GETPATH, path) == 0 && strstr(path, ".cctab-tmp.");
+    if (fault("chown") || fault("lost_owner") ||
+        (staging && (fault("late_chown") || fault("late_lost_owner")))) {
+        private_birth(fd);
+        if (fault("lost_owner") || fault("late_lost_owner")) return 0;
+        errno = EPERM;
+        return -1;
+    }
+    return fchown(fd, owner, group);
+}
 static int fail_copy(int from, int to, copyfile_state_t state, copyfile_flags_t flags) {
     if (fault("copy")) {
         if (write(to, "partial", 7) != 7) _exit(93);
         errno = EIO;
         return -1;
     }
-    return fcopyfile(from, to, state, flags);
+    int result = fcopyfile(from, to, state, flags);
+    if (result == 0 && fault("copy_group")) {
+        const char *gid = getenv("CCTAB_TEST_COPY_GID");
+        if (!gid || fchown(to, (uid_t)-1, (gid_t)strtoul(gid, NULL, 10)) != 0) _exit(94);
+    }
+    return result;
 }
 
 #define INTERPOSE(replacement, original) \
@@ -104,4 +122,5 @@ INTERPOSE(fail_set, acl_set_fd_np);
 INTERPOSE(fail_clear, fchmodx_np);
 INTERPOSE(fail_open, openx_np);
 INTERPOSE(fail_chmod, chmod);
+INTERPOSE(fail_chown, fchown);
 INTERPOSE(fail_copy, fcopyfile);

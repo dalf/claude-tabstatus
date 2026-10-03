@@ -735,10 +735,10 @@ fn mode_note(mode: u32, tail: &str) -> String {
     }
 }
 
-/// Report the protection the backend carries, including Darwin's mode AND ACL.
+/// Report the protection the backend carries, including Darwin's owner/group.
 fn kept_note(mode: u32) -> String {
     if sys::HAS_MODES && sys::HAS_SECURITY {
-        mode_note(mode, " and its access control list kept")
+        mode_note(mode, " and its owner, group and access control list kept")
     } else if sys::HAS_MODES {
         mode_note(mode, " kept")
     } else {
@@ -764,8 +764,8 @@ fn could_not_write(path: &Path, e: &std::io::Error) -> String {
 }
 
 /// [`write_atomic`] for settings.json and its backups: the new file also keeps what
-/// `like` carries beyond its mode - on Darwin its ACL, on Windows its DACL, so an
-/// ACL set on the file survives the rename that replaces it (`sys::security_of`). `like` is the
+/// `like` carries beyond its mode - on Darwin its owner/group and ACL, on Windows
+/// its DACL, so an ACL set on the file survives the rename (`sys::security_of`). `like` is the
 /// file being replaced, or for a backup or a restore, the file being copied. Nothing
 /// there: the new file is made exactly as `write_atomic` makes it. An ACL this user
 /// cannot read refuses the write, before anything is written to `path` - the
@@ -836,14 +836,19 @@ fn acl_unreadable(p: &Path, e: &std::io::Error, tail: &str) -> String {
 
 /// Refuse, in a preflight, a settings file whose ACL this user cannot read: every
 /// rewrite of it, and every backup, has to carry that ACL over, so finding out after
-/// the first write would leave a half-done install. Linux adds no ACL query.
+/// the first write would leave a half-done install. Darwin also probes ownership
+/// preservation on an empty private file. Linux adds no syscall here.
 ///
 /// With `allow_no_acl` (`--force`), a filesystem that keeps no Windows ACL is let
 /// through with a warning instead, said here once so the writes that follow need
 /// not repeat it.
 fn refuse_unreadable_acl(p: &Path, allow_no_acl: bool) -> Result<(), String> {
     match sys::security_of(p) {
-        Ok(_) => Ok(()),
+        Ok(None) => Ok(()),
+        Ok(Some(sec)) => sec.preflight(p).map_err(|e| format!(
+            "cannot preserve the protection of {} ({}). Nothing has been changed.",
+            p.display(), e
+        )),
         Err(e) if allow_no_acl && no_acl_here(&e) => {
             say(&format!("settings: WARNING {} is on a filesystem that keeps no Windows", p.display()));
             say("          access control list: its permissions will not be kept (on a WSL");

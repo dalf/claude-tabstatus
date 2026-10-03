@@ -205,11 +205,12 @@ It also means Claude Code no longer clears the title on exit, so this plugin doe
 that at `SessionEnd`.
 
 Your own `settings.json` formatting is kept, and so are its permissions (mode bits
-on Unix, plus ACLs on macOS; the DACL on Windows); a backup is kept at
-`settings.json.cctab-preinstall`. Settings rewrites and backups refuse an ACL
-they cannot read or preserve. On macOS this includes filesystems without ACL
-support; `--force` does not bypass that refusal. A restore keeps the live file's
-protection, or the backup's when the live file is missing. When `install`
+on Unix, plus owner, group and ACLs on macOS; the DACL on Windows); a backup is
+kept at `settings.json.cctab-preinstall`. Settings rewrites and backups refuse an ACL
+they cannot read or preserve. On macOS, filesystems without ACL support and
+operations whose owner or group cannot be preserved with the current privileges
+are also refused; `--force` does not bypass these refusals. A restore keeps the
+live file's protection, or the backup's when the live file is missing. When `install`
 cannot proceed safely, it refuses, and every refusal ends with **"Nothing has
 been changed."** On Windows that includes a `settings.json` on a filesystem that
 keeps no ACL, such as a symlink into a WSL share: edit it from the system it

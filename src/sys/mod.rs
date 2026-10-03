@@ -45,8 +45,8 @@
 //! And A REWRITE'S PROTECTION beyond its mode: [`security_of`] reads what the file
 //! being replaced carries besides its mode bits, and [`create_secured`] creates the
 //! replacement with it before a byte is written. Linux retains its mode-only
-//! policy without additional syscalls. Darwin also preserves ordered ACL entries
-//! and flags, including absence of an ACL. On Windows it is the file's DACL (and
+//! policy without additional syscalls. Darwin also preserves owner/group and ordered
+//! ACL entries and flags, including absence of an ACL. On Windows it is the DACL (and
 //! its owner and group where they can be set), which the rename over it would otherwise
 //! replace with the directory's inherited ACL.
 //!

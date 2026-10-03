@@ -439,6 +439,11 @@ pub fn verify_security(_f: &File, _sec: &Security, _mode: u32) -> io::Result<()>
 }
 
 impl Security {
+    /// Windows retains its existing ownership policy and ACL preflight.
+    pub fn preflight(&self, _path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
     /// For calls that only READ the descriptor, which is all [`set_security`] makes.
     fn ptr(&self) -> *mut core::ffi::c_void {
         self.sd.as_ptr().cast_mut().cast()
