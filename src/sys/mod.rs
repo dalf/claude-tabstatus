@@ -79,8 +79,8 @@ use windows as imp;
 
 pub use imp::{
     destination_ancestors, copy_secured, create_private_dir, create_secured, display_bytes, file_id, file_id_at, file_id_of,
-    gitpath_allowed, home_fallback,
-    is_executable, is_line_end, is_set_aside, is_within, kernel_hostname_file, link_dir, lock_exclusive, mode,
+    gitpath_allowed, home_fallback, hostname_fallback,
+    is_executable, is_set_aside, is_within, kernel_hostname_file, link_dir, lock_exclusive, mode,
     normalize, os_str_from_bytes, os_string_from_vec, probe_dir_link, process_alive,
     process_start_time, remove_dir_command, remove_dir_link, replace_dir_link, replace_file,
     replace_running, replaces_open_files, reserved_name, same_path, same_process, security_of,
@@ -89,6 +89,31 @@ pub use imp::{
     HAS_RECORD_LOCK, HAS_SESSION_CONSOLE, HAS_SESSION_TTY, HAS_UNLINK_RUNNING, NO_STATE_DIR,
     ORIGIN_KEY, RUNTIME_DIR_VAR,
 };
+
+#[cfg(any(not(target_os = "macos"), test))]
+use imp::is_line_end;
+
+/// Last-resort Linux/Windows hostname command. Darwin uses a native call and
+/// never compiles or reaches this fallback.
+#[cfg(not(target_os = "macos"))]
+fn hostname_command() -> Option<Vec<u8>> {
+    use std::process::{Command, Stdio};
+    let out = Command::new("hostname")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // Command substitution strips every trailing newline. Windows' CRLF also
+    // loses its CR; embedded line endings and other bytes remain untouched.
+    let mut v = out.stdout;
+    while v.last().is_some_and(|&c| is_line_end(c)) {
+        v.pop();
+    }
+    (!v.is_empty()).then_some(v)
+}
 
 /// What identifies a file independently of its name: device and inode on Unix, the
 /// volume serial and the 128-bit file id on Windows (ReFS uses all 128 bits). The

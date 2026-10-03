@@ -29,7 +29,7 @@
 //! and the answer is still no. Four reasons, each measured rather than assumed.
 //!
 //! THE RUNTIME QUESTIONS remain adjacent: [`ORIGIN_KEY`], [`RUNTIME_DIR_VAR`], [`NO_STATE_DIR`],
-//! [`kernel_hostname_file`], [`process_start_time`], [`process_alive`] and `fd1_path`.
+//! [`kernel_hostname_file`], [`hostname_fallback`], [`process_start_time`], [`process_alive`] and `fd1_path`.
 //! The installer-only `darwin_acl` module is a separate subsystem with opaque
 //! native resources; its regression tests need native macOS. It does not change
 //! which hook decisions are compiled and tested on Linux.
@@ -141,6 +141,7 @@ pub fn home_fallback() -> Option<OsString> {
 }
 
 /// Whether `b` belongs to a line ending in a command's output: only `\n`.
+#[cfg(any(not(target_os = "macos"), test))]
 pub fn is_line_end(b: u8) -> bool {
     b == b'\n'
 }
@@ -235,13 +236,50 @@ pub fn kernel_hostname_file() -> Option<&'static Path> {
     Some(Path::new("/proc/sys/kernel/hostname"))
 }
 
-/// No file publishes it here: macOS has no `/proc`, and `kern.hostname` is a
-/// `sysctl` and not a path. `None` sends [`crate::location::hostname`] straight on
-/// to `$HOSTNAME` and then to `hostname(1)`, which is where it arrived anyway -
-/// one guaranteed-failing `open` later.
+/// Darwin has no hostname file. Try `$HOSTNAME` before the native fallback,
+/// preserving the environment name's existing precedence.
 #[cfg(target_os = "macos")]
 pub fn kernel_hostname_file() -> Option<&'static Path> {
     None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn hostname_fallback() -> Option<Vec<u8>> {
+    super::hostname_command()
+}
+
+/// Darwin's sys/param.h defines MAXHOSTNAMELEN as 256. Apple's gethostname
+/// implementation uses MAXHOSTNAMELEN + 1 to avoid its small-buffer truncation
+/// branch. libc 0.2.189 binds gethostname(*mut c_char, size_t) -> c_int but does
+/// not expose MAXHOSTNAMELEN. Native SDK fixtures check the limit and signature.
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_HOSTNAME_CAPACITY: usize = 256 + 1;
+
+/// The same kernel hostname that hostname(1) reads, not ComputerName or
+/// LocalHostName. Failure has no command fallback; the renderer supplies `ssh:`.
+#[cfg(target_os = "macos")]
+pub fn hostname_fallback() -> Option<Vec<u8>> {
+    // Nonzero initial bytes cannot fabricate a terminator if the API writes
+    // an incomplete answer. Even success must contain its own NUL in bounds.
+    let mut name = [0xff; DARWIN_HOSTNAME_CAPACITY];
+    // SAFETY: name's pointer addresses writable, initialised storage of exactly
+    // name.len() bytes. The exclusive array borrow and storage remain live for
+    // the synchronous call; gethostname retains no pointer. c_char has byte
+    // alignment/size, and no C-string read is performed on the returned storage.
+    let rc = unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) };
+    hostname_from_native(rc, &name)
+}
+
+/// Keep native bytes intact until location's text::repair boundary. Non-UTF-8
+/// bytes are display input, not an API failure; only the status and framing
+/// determine whether a complete, non-empty answer was supplied.
+#[cfg(any(target_os = "macos", test))]
+fn hostname_from_native(rc: i32, name: &[u8]) -> Option<Vec<u8>> {
+    if rc != 0 {
+        return None;
+    }
+    let end = name.iter().position(|&b| b == 0)?;
+    (end != 0).then(|| name[..end].to_vec())
 }
 
 /// The permission bits, `0o7777`-masked.
@@ -1564,6 +1602,41 @@ fn is_char_device(ft: &FileType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_hostname_requires_success_nonempty_and_termination() {
+        assert_eq!(
+            hostname_from_native(0, b"host.example\0ignored"),
+            Some(b"host.example".to_vec())
+        );
+        assert_eq!(hostname_from_native(-1, b"host\0"), None);
+        assert_eq!(hostname_from_native(1, b"host\0"), None);
+        for name in [&b""[..], &b"\0ignored"[..], &b"unterminated"[..]] {
+            assert_eq!(hostname_from_native(0, name), None);
+        }
+        // The sentinel cannot supply a terminator after a partial native write.
+        let mut name = [0xff; DARWIN_HOSTNAME_CAPACITY];
+        name[..4].copy_from_slice(b"host");
+        assert_eq!(hostname_from_native(0, &name), None);
+    }
+
+    #[test]
+    fn native_hostname_boundary_and_display_bytes_are_preserved() {
+        let mut name = [b'x'; DARWIN_HOSTNAME_CAPACITY];
+        assert_eq!(hostname_from_native(0, &name), None);
+        name[DARWIN_HOSTNAME_CAPACITY - 1] = 0;
+        assert_eq!(
+            hostname_from_native(0, &name),
+            Some(vec![b'x'; DARWIN_HOSTNAME_CAPACITY - 1])
+        );
+        let raw = hostname_from_native(0, b"s\xffv\xe2\x82\0").unwrap();
+        assert_eq!(raw, b"s\xffv\xe2\x82");
+        assert_eq!(crate::text::repair(&raw), "s\u{fffd}v\u{fffd}\u{fffd}");
+        assert_eq!(
+            hostname_from_native(0, "hôte.example\0".as_bytes()),
+            Some("hôte.example".as_bytes().to_vec())
+        );
+    }
 
     #[test]
     fn opened_descriptor_guards_refuse_files_null_and_inspection_errors() {

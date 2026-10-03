@@ -43,6 +43,8 @@ windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Wdk_
 # process's start time; `kill(pid, 0)` with ESRCH/EPERM for its liveness; and
 # `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` for the path fd 1 names, which is the
 # session's own tab. Also supplies O_NOCTTY for both Darwin terminal-open routes.
+# gethostname supplies the SSH hostname without a PATH lookup or subprocess,
+# after non-empty HOSTNAME; its bytes are repaired at the existing text boundary.
 # libc has no required dependency of its own, and the crate sits
 # behind this target exactly as windows-sys sits behind cfg(windows): no Linux or
 # Windows build sees it. Also used by the installer for Darwin ACLs, secure

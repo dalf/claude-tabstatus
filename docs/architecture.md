@@ -694,6 +694,20 @@ with all seventeen ACL/ownership tests and the APFS/APFSX installation suite
 visible behaviour in Terminal.app or iTerm2. The ACL/ownership and APFS/APFSX
 installation-path suites remain required in the native job.
 
+`tests/test_macos_hostname.py` is also required in native arm64 CI. Its SDK-built
+kernel observer independently reads `KERN_HOSTNAME` and compares it to the
+system's `hostname(1)`; the candidate renders that observed input through both
+automatic lookup with empty `PATH` and the existing override path. A recording
+fake `hostname` on `PATH` and dyld observation/faults check native calls,
+precedence, local/override bypasses, failure/empty/unterminated/partial output,
+boundary length, non-UTF-8 repair, existing display processing and doctor's row.
+Both recording fixtures have positive controls in each isolated test environment.
+Missing SDK tools or required observations fail on Darwin. These are dry-run
+title assertions, not delivery or terminal-application observations. At the
+hostname change, execution is pending on a Darwin host; the successful native
+run recorded above predates this suite. Linux Rust tests exercise native-output
+framing and byte handling; Apple cross-checks do not establish runtime behaviour.
+
 The native job also runs payload, semantic state, background, elicitation and
 persistence suites. The latter's strace fault injection remains Linux-only;
 its other delivery and locking tests run on both Unixes. Linux-specific `/proc`
@@ -836,11 +850,46 @@ every main-thread `PostToolUse`.
   reports the same repository and branch `git` does, named after the real toplevel
   rather than after a symlink. The `~` abbreviation still uses the logical `$PWD`,
   so a distro whose `/home` is a symlink keeps its `~`.
-- **The ssh hostname comes from `/proc/sys/kernel/hostname`**, which keeps it
-  fork-free on Linux. Elsewhere it falls back to `$HOSTNAME` and then to a
-  `hostname` fork, the only fork on the paint path outside tmux; `CCTAB_HOST` skips the guessing. If
-  none of the three answers, the prefix becomes a literal `ssh:` rather than
-  nothing, because no prefix means "local".
+- **The SSH hostname is resolved lazily**, only for an SSH prefix or doctor's
+  explicit hostname diagnostic. Non-empty `CCTAB_HOST` bypasses automatic
+  lookup on every platform. Linux then tries `/proc/sys/kernel/hostname`,
+  non-empty `$HOSTNAME` and the existing `hostname` command. Windows tries
+  non-empty `$HOSTNAME` and the command. Darwin tries non-empty `$HOSTNAME`
+  before native `gethostname`, preserving the environment name's precedence.
+  Empty environment inputs fall through. A failed, empty or unterminated Darwin
+  answer ends resolution without executing a command. With no resolved name,
+  the renderer supplies literal `ssh:`, because no prefix means "local".
+
+Darwin's hostname lookup uses the existing macOS-only libc dependency.
+The [Apple manual](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/gethostname.3.html)
+warns that insufficient space may leave output unterminated. The current
+[gethostname implementation](https://github.com/apple-oss-distributions/Libc/blob/main/gen/FreeBSD/gethostname.c)
+reads `CTL_KERN/KERN_HOSTNAME`; it also has a small-buffer branch that truncates
+and inserts a NUL. The [hostname utility](https://github.com/apple-oss-distributions/shell_cmds/blob/main/hostname/hostname.c)
+calls the same API. This is the kernel hostname, not System Configuration's
+ComputerName or LocalHostName.
+
+The reviewed [unistd.h declaration](https://github.com/apple-oss-distributions/Libc/blob/main/include/unistd.h)
+is `int gethostname(char *, size_t)`, matching locked libc 0.2.189's
+`gethostname(*mut c_char, size_t) -> c_int`.
+[sys/param.h](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/param.h)
+defines `MAXHOSTNAMELEN` as 256; libc does not bind that constant. The 257-byte
+stack buffer matches the implementation's `MAXHOSTNAMELEN + 1` threshold,
+avoiding its small-buffer truncation branch. Native test helpers check the
+runner's SDK constant and signature. Initial nonzero sentinel bytes ensure a
+partial write cannot acquire a fabricated terminator from untouched storage.
+Accepting output requires return value zero and a non-empty byte slice ending
+at a NUL found inside the supplied buffer. There is no unbounded C-string read
+or forced terminator. Non-UTF-8 bytes still cross `text::repair` in `location`;
+domain stripping, numeric addresses, host cap, ellipsis and sanitisation remain
+in the renderer. Future SDK limit changes require reviewing this fixed bound.
+
+`sys::hostname_fallback` selects the native API or the existing command within
+the platform seam; callers have no platform branches. The Linux/Windows command
+retains null stdin/stderr, successful-exit checking and removal of all trailing
+line endings (LF on Unix, CR/LF on Windows). This removes Darwin's hostname
+subprocess and dependence on `PATH`; no latency regression was demonstrated by
+the finding and no latency improvement is measured here.
 
 **Elision.** A path is cut at the front on a component boundary, and a
 `repo@branch` at the end, so both Konsole (which elides from the left) and Windows

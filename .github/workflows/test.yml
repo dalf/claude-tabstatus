@@ -128,6 +128,11 @@ jobs:
       - name: Test Unix delivery helper compilation and failure diagnostics
         run: python3 tests/test_unix_delivery_helpers.py -v
 
+      - name: Require native SSH hostname lookup, precedence, bypasses and failure tests
+        env:
+          CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
+        run: python3 tests/test_macos_hostname.py
+
       - name: Require native terminal detection, doctor evidence and title protocol tests
         env:
           CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin

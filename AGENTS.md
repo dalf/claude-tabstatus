@@ -159,6 +159,7 @@ when they agree.
 | direct Unix delivery | `python3 tests/test_unix_delivery.py -v` | Linux, macOS (disposable PTYs) |
 | installer path identity, containment and missing Unicode probes | `python3 tests/test_install_paths.py` | Linux; native macOS with mandatory APFS/APFSX fixtures |
 | settings ACLs, ownership and backup metadata | `python3 tests/test_macos_acl.py` | native macOS (chmod/ls/stat, SDK fault interposition) |
+| SSH hostname precedence, native lookup, bypasses and failures | `python3 tests/test_macos_hostname.py` | native macOS (SDK kernel observer and dyld faults; dry-run rendering) |
 | terminal-family detection, doctor evidence and title protocol | `python3 tests/test_terminal_detection.py` | Linux, Windows; macOS-specific cases require native macOS |
 | tmux window status | `python3 tests/test_tmux_status.py` | Linux (tmux) |
 | corpus fixture helpers | `python3 -m unittest discover -s tests/corpus -p 'test_*.py' -v` | Linux |
@@ -172,6 +173,9 @@ The missing Unicode probes, corrected case-sensitive path fixtures and fault-mes
 assertions have also passed natively. See the recorded results and remaining
 coverage in the validation document. These suites do not establish behaviour in
 a terminal application.
+The hostname suite was added afterwards and native execution is pending; it is
+required in arm64 CI, with SDK compilation, recording controls and native
+observations failing when unavailable rather than silently skipping on Darwin.
 
 The in-crate unit tests are not replaced by the shell and Python harnesses: they
 check argv and environment parsing, the location walk, the length cap and its
@@ -319,6 +323,10 @@ the test process. Keep it that way in any new test.
   concurrent waits, bounded tracking and migration.
 - `test_elicitation.py`: direct MCP elicitation sequences from a synthetic
   fixture (`tests/fixtures/elicitation-v1.json`); no MCP server needed.
+- `test_macos_hostname.py`: independent native kernel hostname observation,
+  compiled-binary precedence, lazy lookup, repair/rendering and doctor checks,
+  with SDK-built dyld faults and validated recording fixtures. Dry-run output
+  only, fresh environments and isolated directories; no hostname changes.
 - `test_state_guarantees.py`: persistence and concurrency guarantees beyond the
   traces.
 - `test_tmux_status.py`: window-list rendering, split panes, background windows,
@@ -421,6 +429,7 @@ branch push, pull request, manual dispatch, and as a reusable workflow.
   `cargo test --locked --all-targets`, builds a native validation binary, and runs
   the payload, state-contract, background, elicitation, state-guarantees and Unix
   delivery suites, the terminal-detection suite, plus the native settings ACL and
+  SSH hostname suites (mandatory SDK observation and fault controls), and the
   installer path suites with mandatory disposable case-insensitive APFS and case-sensitive APFSX volumes
   (lookup semantics verified). No artifacts are uploaded. Both Apple ABI cross-checks
   remain in the Linux job, including Intel. Native arm64 execution has passed;

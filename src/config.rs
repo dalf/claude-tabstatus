@@ -149,8 +149,8 @@ pub struct Config {
     /// painted, because the ABSENCE of one is how a local session is recognized.
     pub ssh: bool,
     /// `CCTAB_HOST` and `$HOSTNAME`. Kept as the raw inputs rather than a
-    /// resolved name: resolving reads `/proc` and, where that is absent, forks
-    /// `hostname`, and neither may happen on a session that will paint no prefix.
+    /// resolved name: resolving can read `/proc`, query Darwin's native API or
+    /// run `hostname` on Linux/Windows. Local rendering needs none of those.
     pub host_override: Option<OsString>,
     pub hostname_env: Option<OsString>,
     /// `$HOME` (`%USERPROFILE%` on Windows without one) with one trailing slash

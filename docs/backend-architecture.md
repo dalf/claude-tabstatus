@@ -488,8 +488,9 @@ degradation is written down rather than silent, but it is a degradation.
 > **every `"/proc` string in `src/` is inside a `cfg(not(target_os = "macos"))`
 > item**, each with a macOS answer next to it — `proc_pidinfo(PROC_PIDTBSDINFO)`
 > for a start time, `kill(pid, 0)` for liveness, `TMPDIR` for the state directory,
-> `None` for the host-name file so `$HOSTNAME` is reached one failed `open`
-> earlier, and `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` for the session's own tab.
+> `None` for the host-name file, then non-empty `$HOSTNAME` before native
+> `gethostname` (no command fallback), and
+> `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` for the session's own tab.
 > `sys::HAS_SESSION_TTY` is `true` there, so **session-start arms the tab and
 > session-end clears it**, through the same prefix/char-device/writable guard Linux
 > uses. Only the lookups are `cfg`-selected; every decision downstream of them is a
@@ -586,7 +587,7 @@ existing `tests/run.sh` assertion changed; the 35 added are purely additive.
 
 | # | why it is not here |
 |---|---|
-| macOS | #28 ported Windows, not macOS. [#1](https://github.com/dalf/claude-tabstatus/issues/1). **Largely here since, at the `sys` layer**: `libc` is a `cfg(target_os = "macos")` dependency with zero transitive deps, and every `/proc` read in `src/` is now inside `cfg(not(target_os = "macos"))` with a macOS answer beside it — start time (`proc_pidinfo`), liveness (`kill(pid, 0)`), state directory (`TMPDIR`), host name (no file, straight to `$HOSTNAME`), origin key (`r`), and the session terminal (`proc_pidfdinfo`), so `sys::HAS_SESSION_TTY` is `true` and session-start and session-end paint. Native builds and arm64 CI **passed at `078c547`**. Intel retains cross-checks only, the corpus remains a Linux specification, and the terminal rows remain source-derived rather than tested in macOS applications. See [validation scope](architecture.md#macos-validation). |
+| macOS | #28 ported Windows, not macOS. [#1](https://github.com/dalf/claude-tabstatus/issues/1). **Largely here since, at the `sys` layer**: `libc` is a `cfg(target_os = "macos")` dependency with zero transitive deps, and every `/proc` read in `src/` is now inside `cfg(not(target_os = "macos"))` with a macOS answer beside it — start time (`proc_pidinfo`), liveness (`kill(pid, 0)`), state directory (`TMPDIR`), host name (non-empty `$HOSTNAME`, then native `gethostname`), origin key (`r`), and the session terminal (`proc_pidfdinfo`), so `sys::HAS_SESSION_TTY` is `true` and session-start and session-end paint. Native builds and arm64 CI **passed at `078c547`**. Intel retains cross-checks only, the corpus remains a Linux specification, and the terminal rows remain source-derived rather than tested in macOS applications. See [validation scope](architecture.md#macos-validation), including pending hostname validation. |
 | the tier-3 restore rule | a **behaviour change**, so it needs its own commit with newly recorded corpus cases, and an owner's decision this branch did not have |
 | an attention channel | this branch builds the seam [#14](https://github.com/dalf/claude-tabstatus/issues/14) needs and stops there. The recommended first channel and its policy table are in [backend-scouting.md §4](backend-scouting.md) |
 | the Windows state layer's file identity | #28 landed it (`8c878bb`); nothing here touches it |

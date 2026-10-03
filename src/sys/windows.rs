@@ -170,6 +170,10 @@ pub fn kernel_hostname_file() -> Option<&'static Path> {
     None
 }
 
+pub fn hostname_fallback() -> Option<Vec<u8>> {
+    super::hostname_command()
+}
+
 /// File identity from `Metadata` alone. std exposes the volume serial and file
 /// index only behind an unstable feature, so this answers `None`; callers treat
 /// that as "cannot prove same file". With a handle, [`file_id_of`] answers.

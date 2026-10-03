@@ -542,6 +542,15 @@ host prefix; `CCTAB_ELLIPSIS` and `CCTAB_HOST` change the marker and the prefix.
 
 `XDG_DATA_HOME` is read only by `install`, to choose where the plugin tree goes.
 
+A non-empty `CCTAB_HOST` sets the SSH hostname. On macOS, a non-empty exported
+`HOSTNAME` comes next, then the native kernel hostname (the same name as
+`hostname`, independent of `PATH`). If the native lookup fails or returns an
+empty or incomplete answer, the prefix is `ssh:`; no command fallback runs.
+Linux tries `/proc/sys/kernel/hostname`, then `HOSTNAME`, then the `hostname`
+command. Windows tries `HOSTNAME`, then the command. Empty environment values
+try the next source. Local hooks do not look up a hostname; `doctor` explicitly
+checks it for its diagnostic row.
+
 ## Troubleshooting
 
 Start with **`tabstatus doctor`** - the binary you downloaded, `./bin/tabstatus`
@@ -587,7 +596,7 @@ does is in
 | `install` refuses a `--tree` directory | it is not empty and was not created by `install`; choose an empty or new directory |
 | *Exec format error* | wrong architecture: only x86_64 builds exist |
 | Konsole tab shows the directory, not the title, over ssh | set `CCTAB_TERMINAL=konsole` on the remote side ([Konsole over ssh](#konsole-over-ssh)) |
-| the ssh prefix is wrong, or a bare `ssh:` | set `CCTAB_HOST` |
+| the ssh prefix is wrong, or a bare `ssh:` | set a non-empty `CCTAB_HOST`; on macOS also check any exported `HOSTNAME` |
 | tab reads `~/code/one ct1 w 1790…` (tmux) | something replaced tmux's title string - a `tmux source-file`, an uninstall while another Claude runs, or a killed Claude. Start a new Claude session or `/clear` |
 | tmux cells never decay | `status` is off or `status-interval` is 0; see [What you must have on](#what-you-must-have-on) |
 | tab stays blue after Ctrl+C | see [Known limitations](#known-limitations) |
