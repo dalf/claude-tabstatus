@@ -70,7 +70,7 @@ sh scripts/build.sh --all    # every target this host can build
   signal: on Linux it is the two Linux targets, on Windows the one MSVC target.
   Darwin lists only its native architecture. Windows is a native port behind
   `src/sys`, built and tested on Windows. `x86_64-pc-windows-gnu` is not a target.
-  There is no aarch64 Linux build target. macOS native execution is pending;
+  There is no aarch64 Linux build target. macOS arm64 native CI has passed;
   see [validation scope](docs/architecture.md#macos-validation).
 - **musl is the Linux default** because it starts faster and carries no glibc
   requirement on a remote box; the measurements are in
@@ -162,9 +162,9 @@ when they agree.
 | golden corpus | `sh tests/corpus/replay.sh bin/tabstatus` | Linux |
 | ConPTY end to end | part of `cargo test` (`tests/conpty.rs`) | Windows |
 
-The macOS entries describe the new native CI job, whose execution is pending;
-see [macOS validation](docs/architecture.md#macos-validation). They do not claim
-a successful native run or testing in a terminal application.
+The macOS entries have passed in native arm64 CI; see
+[macOS validation](docs/architecture.md#macos-validation) for the recorded run.
+They do not establish behaviour in a terminal application.
 
 The in-crate unit tests are not replaced by the shell and Python harnesses: they
 check argv and environment parsing, the location walk, the length cap and its
@@ -362,7 +362,7 @@ limitation it closes; the pre-fix freeze is kept as `cases.jsonl.before-fixes`.
   stream. `test_tmux_status.py` checks the window status line on an attached
   client, not the outer title.
 - macOS terminal applications and tmux, Intel macOS runtime behaviour and older
-  macOS versions. The new arm64 CI job has not yet been executed for this change.
+  macOS versions. Native arm64 CI covers the documented process, state and PTY scenarios.
 
 ## Benchmarking
 
@@ -400,8 +400,8 @@ branch push, pull request, manual dispatch, and as a reusable workflow.
   `cargo test --locked --all-targets`, builds a native validation binary, and runs
   the payload, state-contract, background, elicitation, state-guarantees and Unix
   delivery suites. No artifacts are uploaded. Both Apple ABI cross-checks remain
-  in the Linux job, including Intel. **Native execution pending** for this change;
-  [scope and limits](docs/architecture.md#macos-validation).
+  in the Linux job, including Intel. Native arm64 execution has passed;
+  [evidence, scope and limits](docs/architecture.md#macos-validation).
 - *Windows* (`windows-2025`, steps under Git Bash): `cargo test --locked
   --all-targets` (including the ConPTY, lock and junction tests);
   `sh scripts/build.sh --all`; a check of the `.exe`'s import table that fails on
@@ -469,8 +469,7 @@ Rules:
 ## Roadmap: not yet built
 
 - **macOS** ([issue #1](https://github.com/dalf/claude-tabstatus/issues/1)):
-  native source builds and arm64 automated validation are prepared; native
-  execution is pending. Terminal applications, tmux and Intel runtime behaviour
+  native source builds and arm64 automated validation have passed CI. Terminal applications, tmux and Intel runtime behaviour
   remain unvalidated. No release asset or product support claim is added; see
   [validation scope](docs/architecture.md#macos-validation).
 - **aarch64 Linux**: add `aarch64-unknown-linux-musl` to `TARGETS` in

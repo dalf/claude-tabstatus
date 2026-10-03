@@ -604,7 +604,7 @@ Three kinds of evidence must stay separate:
 | Validation | Scope | Evidence at this change |
 |---|---|---|
 | Cross-checking on Linux | `cargo check --all-targets` for `aarch64-apple-darwin` and `x86_64-apple-darwin`; pure decision tests and ABI size/offset assertions | Available locally; does not link or execute Apple calls |
-| Native automated validation | `macos-15`, Apple Silicon (`aarch64-apple-darwin`), explicitly checked with `uname -m`; linked Rust tests, release-mode validation build, state suites and disposable PTY delivery | Job and tests added; **native execution pending**, no Mac available for this change and no remote workflow triggered |
+| Native automated validation | `macos-15`, Apple Silicon (`aarch64-apple-darwin`), explicitly checked with `uname -m`; linked Rust tests, release-mode validation build, state suites and disposable PTY delivery | Passed on 2026-10-03 at `078c5476c685e66de27a434314ee53bc696840d5`: [native job](https://github.com/dalf/claude-tabstatus/actions/runs/37120757414/job/111196233507) |
 | Terminal-application testing | Terminal.app, iTerm2, Ghostty, Konsole and Claude Code's live hook integration | Not performed on macOS; a PTY byte capture cannot show how a terminal applies an OSC |
 
 The runner label's architecture follows [GitHub's runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
@@ -638,8 +638,8 @@ and PTY tests cover the actual macOS headless path instead of weakening those
 Linux assertions. The Linux golden corpus remains a Linux specification and is
 not replayed as a macOS acceptance suite.
 
-A future successful native run will establish only the tested architecture, OS
-image and scenarios. macOS tmux, terminal application behaviour, real Claude Code
+The successful native run establishes only the tested architecture, OS image
+and scenarios. macOS tmux, terminal application behaviour, real Claude Code
 sessions, Intel runtime behaviour and older macOS versions remain unvalidated.
 Forced PID reuse during terminal lookup/write and kernel permission-denied queries
 are not covered by these native scenarios; synthetic identity/errno tests cover
@@ -656,7 +656,7 @@ same file descriptor's path with `proc_pidfdinfo`. Everything after that - the
 is one shared body, so the two Unixes accept and refuse exactly the same
 terminals. Konsole arming and the direct writes to tmux's panes go the same way,
 through the same guard, on both. The macOS native job now tests those OS calls
-and direct delivery, but its first execution is still pending; see
+and direct delivery, with a successful arm64 run recorded; see
 [macOS validation](#macos-validation) for evidence and limits. On Windows they
 reach it as a **console title** instead: the hook leaves its own
 hidden console, attaches to Claude Code's (`$CLAUDE_PID`), calls

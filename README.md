@@ -39,7 +39,7 @@ work cannot be remembered between hooks. The full policy is in
 |---|---|---|
 | Linux x86_64 | supported; the musl build is static and recommended - it runs on any x86_64 Linux whatever its glibc | `tabstatus-x86_64-unknown-linux-musl` (or `-linux-gnu`) |
 | Windows x86_64, native | supported; needs Git Bash, which Claude Code itself requires on Windows and runs hooks through | `tabstatus-x86_64-pc-windows-msvc.exe` |
-| macOS | **experimental; native validation pending**. The backend and native source build are present, but no successful native run is recorded yet. Automated PTY tests do not establish behaviour in Terminal.app, iTerm2 or other terminal applications; see [issue #1](https://github.com/dalf/claude-tabstatus/issues/1). | none |
+| macOS | **experimental; native arm64 CI validated**. Native builds, process/state checks and disposable PTY delivery passed on macOS 15 arm64; Intel runtime behaviour remains unvalidated. Automated PTY tests do not establish behaviour in Terminal.app, iTerm2 or other terminal applications; see [issue #1](https://github.com/dalf/claude-tabstatus/issues/1). | none |
 | Linux aarch64 / ARM | no build; an x86_64 binary fails with *Exec format error*. Check `uname -m` on a remote VM first | none |
 
 | Terminal | What you get |
