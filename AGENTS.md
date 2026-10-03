@@ -358,9 +358,13 @@ the test process. Keep it that way in any new test.
   overlap, concurrent final exits, duplicate/replacement events, interrupted hooks
   and surviving children, dead-owner recovery and session isolation. Missing
   delivery, a broken carrier and OSC-only text are
-  negative observer controls. Forced Konsole/WezTerm selections are protocol
+  negative observer controls. Fresh status observations clear capture and request
+  a full client redraw; an unchanged cached status and disabled status delivery
+  are required controls, including an acknowledged terminal query and refresh
+  execution markers. Forced Konsole/WezTerm selections are protocol
   tests, not terminal-application evidence. The reviewed 40-test suite passed
-  natively without skips; six lifecycle regressions bring the current suite to 46.
+  natively without skips; six lifecycle regressions and two redraw controls bring
+  the current suite to 48.
   Local root runs skip only the read-only-record case because root
   bypasses mode-bit permissions.
 
@@ -577,6 +581,13 @@ pending restoration history from a settings receipt, preserves established recei
 on failed refreshes, and serialises management operations. Incomplete installs and
 ambiguous legacy records refuse automatic restoration. See
 [ownership and recovery](docs/architecture.md#install-and-uninstall-are-ordered-both-ways).
+
+The P3 tmux acceptance observer defect is corrected: clearing captured PTY bytes
+then requesting only `refresh-client -S` could falsely fail when the status was
+already correct. Fresh observations now request a full redraw. The deterministic
+cached-status regression fails with the old observer; disabled delivery rejects
+stale capture, and OSC-only and broken-carrier controls remain required. See
+[observer correction and evidence](docs/architecture.md#tmux-status-observer-correction).
 
 ### Known defects, reproduced and deferred
 

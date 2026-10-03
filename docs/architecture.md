@@ -733,8 +733,9 @@ panes and client PTYs. Darwin uses validated `en_US.UTF-8`, Linux retains
 observer assumes `/proc` or `/dev/pts`: tmux supplies the pane PID and terminal,
 and `pty.openpty` supplies client terminals. Fresh environments remove inherited
 terminal, SSH, mux, PID and runtime-directory values, including Darwin's `TMPDIR`
-state fallback. State is enabled explicitly, and uninstall isolates HOME, config,
-data and state. Clients, processes, descriptors and servers are cleaned up on
+state fallback. HOME, config, data and state are pinned under each disposable
+directory; stateless controls explicitly clear the state knob. Clients, processes,
+descriptors and servers are cleaned up on
 failure; attachment and carrier timeouts report captured bytes or pane details.
 
 Real ordinary working/waiting/idle hooks use the pane shell's PID and must leave
@@ -744,6 +745,8 @@ excluding outer-title OSCs. Added observations cover all four states, working
 expiry on tmux's own clock with no extra hook and persistent background beyond
 all deadlines. Controls require the positive observers to reject missing delivery,
 a malformed carrier and matching text present only in OSC title bytes.
+The later [observer correction](#tmux-status-observer-correction) adds required
+cached-status and stale-capture controls without changing production semantics.
 Shared arming covers overlapping owners, both exit orders, starts detached,
 reattachment and the client-attached hook's actual arming/restoration bytes.
 Forced Konsole/WezTerm rows are protocol tests, not real terminal applications.
@@ -2072,8 +2075,9 @@ and zero-subprocess gates, state/delivery/install suites, 843 shell assertions a
 the unchanged 312-case corpus. Both source digests matched; both Apple ABI and
 Windows MSVC compile checks passed. These are separate from the historical native
 macOS evidence above. The exact pushed-head CI evidence is recorded in PR #21;
-macOS remains experimental with native arm64 automated validation. The separately
-recorded `refresh-client -S` redraw-observer false failure is unchanged by this fix.
+macOS remains experimental with native arm64 automated validation. That lifecycle
+fix left the separately recorded `refresh-client -S` observer false failure in
+place; the subsequent correction is documented below.
 
 `@cctab_window_color` returns the highest-priority visible state across all Claude
 panes in the window (orange > blue > purple > white), sharing the strip's carrier
@@ -2119,6 +2123,50 @@ elided end while the Konsole arming stays in force. `doctor`'s `layout: WARN` li
 exists because the `title: OK` test cannot catch it (the same `SessionStart` rewrites
 `@cctab_string`, so those two always agree). A per-session policy would need the
 deadlines carried in the record instead.
+
+### Tmux status observer correction
+
+The [Linux push job at `a2d24af`](https://github.com/dalf/claude-tabstatus/actions/runs/37159816520/job/111310748207)
+passed both installer ownership suites, then failed the GNU clock-only decay
+observer with `C:current` missing and `bytes=b''`. The server format had reached
+the expected value before capture was cleared. `refresh-client -S` requests a
+status refresh, and tmux can omit new bytes when its cached status is already
+correct. Empty capture did not establish an incorrect displayed status. The
+push run remains failed; its successful macOS/Windows jobs and the separate
+[PR merge run](https://github.com/dalf/claude-tabstatus/actions/runs/37159819149)
+remain historical evidence.
+
+Both affected observations now clear old PTY capture and call `refresh-client`
+without `-S`, which requests a full client redraw. The decisive assertion still
+requires status text delivered to the attached disposable client, with outer-title
+OSCs filtered out. Clock-only expiry still fires no Claude hook, and the test
+checks that the carrier is unchanged and the fresh redraw contains no state glyph.
+No production TTL, renderer or delivery code changes.
+
+The cached-status regression disables periodic status updates and automatic
+renaming, observes tmux's actual extended device-attributes query, replies with a
+fixture identity and requires tmux to acknowledge it. This prevents the startup
+query timeout's incidental full redraw from rescuing the old observer. An
+`after-refresh-client` hook writes a file marker without changing tmux options;
+changing an option would itself invalidate the display and spoil this control.
+Attachment, the query/acknowledgement, refresh execution and fresh client status
+are all required. The old status-only refresh produces no status bytes; the full
+redraw delivers the unchanged text. A second control disables status delivery and
+seeds matching stale capture, which cannot satisfy the fresh observation. Existing
+missing/broken-carrier and complete/partial OSC-only controls remain effective.
+
+Local validation used fresh `sh scripts/build.sh --all` binaries and tmux 3.7c
+on Linux x86_64. Focused controls passed; all 48 tmux acceptance tests passed
+without skips on each Linux binary. Reverting only the observer to `-S` in a
+disposable test copy fails the new regression with empty capture after verified
+refresh execution. Removing capture clearing fails the disabled-delivery control
+because stale text is accepted. An earlier control without the terminal-query
+reply allowed the old observer to pass on tmux's delayed redraw; the strengthened
+control closes that escape. These controlled failures, rather than repeated CI
+passes, demonstrate the correction. The same suite remains required for both
+Linux binaries and native macOS arm64; Windows checks are unchanged. Exact pushed
+commit CI results are recorded in [PR #21](https://github.com/dalf/claude-tabstatus/pull/21).
+Experimental macOS scope remains as described in [validation limits](#macos-validation).
 
 ### Save and restore
 

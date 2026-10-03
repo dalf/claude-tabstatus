@@ -118,10 +118,11 @@ class TmuxStatusTests(unittest.TestCase):
         self.socket = self.root / "tmux.sock"
         self.assertLess(len(os.fsencode(self.socket)), 104)
         # Fresh environment: no ambient terminal, mux, SSH, PID or Darwin TMPDIR
-        # state fallback. Enable persistence explicitly in cases that need it.
+        # state fallback. Pin state storage; stateless controls clear the knob.
         self.env = {"PATH": "/usr/bin:/bin", "HOME": str(self.root),
                     "CLAUDE_CONFIG_DIR": str(self.root / "config"),
                     "XDG_DATA_HOME": str(self.root / "data"),
+                    "CCTAB_STATE_DIR": str(self.root / "state"),
                     "TERM": "xterm-256color", "LC_ALL": self.utf8_locale, "PS1": ""}
         # The binary's cold paths invoke tmux by name; Homebrew is outside the
         # isolated /usr/bin:/bin PATH even when the harness has found it.
@@ -258,6 +259,9 @@ class TmuxStatusTests(unittest.TestCase):
                     self.read(0)
                 self.captured = b""
 
+            def send(self, data):
+                os.write(master, data)
+
             def diagnostic(self):
                 return f"client exit={client.poll()}; tty={client_tty}; bytes={self.captured[-4096:]!r}"
 
@@ -293,6 +297,12 @@ class TmuxStatusTests(unittest.TestCase):
     def assert_status(self, client, wanted, timeout=5):
         self.assertTrue(client.saw(wanted, timeout=timeout, status=True),
                         f"status {wanted!r} missing: {client.diagnostic()}")
+
+    def redraw_status(self, client):
+        # Forget old bytes, then request a full client redraw. A status-only
+        # refresh (-S) can emit nothing when tmux's cached status is unchanged.
+        client.clear()
+        self.tm("refresh-client", "-t", client.tty)
 
     def publish(self, pane, edge="working", age=0):
         # Invoke the real hook with the disposable pane shell as Claude's tty
@@ -334,6 +344,52 @@ class TmuxStatusTests(unittest.TestCase):
             self.publish(self.pane)
             self.assert_status(client, "🔵 C:current")
 
+    def test_cached_status_redraw_delivers_fresh_bytes_after_capture_clear(self):
+        # Keep the already displayed status unchanged, with no periodic redraw
+        # or hook activity. The after-hook marks execution without setting a
+        # tmux option (which itself would invalidate the cached display).
+        self.tm("set", "-g", "status-interval", "0")
+        self.tm("set", "-w", "-t", self.pane, "automatic-rename", "off")
+        marker = self.root / "refresh-seen"
+        self.tm("set-hook", "-g", "after-refresh-client", f'run-shell "touch {marker}"')
+        with self.attached_client() as client:
+            # Answer the actual extended device-attributes query. Otherwise
+            # tmux's startup query timeout can cause an unrelated full redraw
+            # and rescue the old observer. Require tmux to acknowledge the reply.
+            self.assertTrue(client.saw(b"\x1b[>q"), client.diagnostic())
+            client.clear()
+            client.send(b"\x1bP>|cctab-status-observer\x1b\\")
+            self.wait_for(lambda: self.tm("display-message", "-p", "-c", client.tty,
+                                          "#{client_termtype}"), "cctab-status-observer")
+            self.assert_status(client, "C:current")
+            client.clear()
+            with self.assertRaises(AssertionError):
+                self.assert_status(client, "C:current", timeout=0.2)
+            # Reproduce the old observer's false failure, and require proof that
+            # it reached refresh-client rather than failing before attachment.
+            self.tm("refresh-client", "-S", "-t", client.tty)
+            self.wait_for(marker.exists, True)
+            with self.assertRaises(AssertionError):
+                self.assert_status(client, "C:current", timeout=0.2)
+            marker.unlink()
+            self.redraw_status(client)
+            self.wait_for(marker.exists, True)
+            self.assert_status(client, "C:current")
+
+    def test_status_redraw_rejects_stale_capture_when_delivery_is_disabled(self):
+        self.tm("set", "-g", "status-interval", "0")
+        marker = self.root / "refresh-seen"
+        self.tm("set-hook", "-g", "after-refresh-client", f'run-shell "touch {marker}"')
+        with self.attached_client() as client:
+            self.assert_status(client, "C:current")
+            stale = client.captured
+            self.tm("set", "-g", "status", "off")
+            client.captured = stale
+            self.redraw_status(client)
+            self.wait_for(marker.exists, True)
+            with self.assertRaises(AssertionError):
+                self.assert_status(client, "C:current", timeout=0.2)
+
     def test_attached_status_shows_states_and_expires_on_tmux_clock_without_hooks(self):
         self.start(CCTAB_TTL_WORKING="2", CCTAB_TTL_WAITING="2", CCTAB_TTL_GONE="4")
         with self.attached_client() as client:
@@ -347,10 +403,9 @@ class TmuxStatusTests(unittest.TestCase):
             carrier = self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}")
             self.assert_status(client, "⚪ C:current", timeout=7)
             self.wait_for(lambda: self.rendered(self.pane, True), "C:current", timeout=7)
-            client.clear()
             # A full redraw after decay makes absence observable independently
-            # of tmux's cursor-delta optimisation. This invokes no hook.
-            self.tm("refresh-client", "-S", "-t", client.tty)
+            # of tmux's cached status and cursor-delta optimisation. No hook runs.
+            self.redraw_status(client)
             self.assert_status(client, "C:current")
             self.assertNotRegex(terminal_text_and_backgrounds(client.captured)[0], "[🔵🟠⚪]")
             self.assertEqual(self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}"), carrier)
@@ -576,9 +631,8 @@ class TmuxStatusTests(unittest.TestCase):
                                                        "#{pane_pid}"),
                                  "CCTAB_TERMINAL": terminal}
                                 for pane, terminal in zip(panes, ("konsole", second_terminal))]
-                        if state_record:
-                            for env in envs:
-                                env["CCTAB_STATE_DIR"] = str(self.root / "state")
+                        for env in envs:
+                            env["CCTAB_STATE_DIR"] = str(self.root / "state") if state_record else ""
                         for index, (pane, env) in enumerate(zip(panes, envs)):
                             self.hook("session-start", pane, env,
                                       {"session_id": f"s{index}", "source": "startup"})
@@ -1023,7 +1077,7 @@ class TmuxStatusTests(unittest.TestCase):
                         self.assertEqual(self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}"), before)
             # Read an actual client redraw too: no refused carrier may escape
             # into an unrelated outer terminal or be passed through as JSON.
-            self.tm("refresh-client", "-S", "-t", client.tty)
+            self.redraw_status(client)
             self.assert_status(client, "🔵 C:current")
             outer = self.tm("display-message", "-p", "-t", self.pane, "#{T:@cctab_title}").encode()
             titles = re.findall(rb"\x1b\](?:0|2);(.*?)(?:\x07|\x1b\\)", client.captured, re.S)
