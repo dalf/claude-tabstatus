@@ -1257,9 +1257,10 @@ fn install(dir: Option<OsString>, force: bool) -> Result<(), String> {
 
 /// Every reason to refuse, and the settings document to edit if there is none.
 ///
-/// ONE preflight, in front of the FIRST write, which is what lets every refusal here
-/// still end "Nothing has been changed." honestly. The old second verb wrapped these
-/// refusals AFTER it had written a tree and had to strip that sentence back off them.
+/// ONE preflight, in front of the FIRST installation write. Temporary filename
+/// probes can precede it; refusals leave installation files unchanged. The old
+/// second verb wrapped these refusals AFTER it had written a tree and had to strip
+/// that sentence back off them.
 ///
 /// The settings document is `None` when settings.json is to be written fresh: either
 /// it does not exist, or it exists and holds nothing but whitespace, which Claude Code

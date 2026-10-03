@@ -129,7 +129,7 @@ jobs:
 
       # Both disposable volumes are required. The suite proves lookup semantics
       # before testing; failure to create APFS/APFSX is a failed job, not a skip.
-      - name: Require filesystem-aware installation on case-insensitive APFS and case-sensitive APFSX
+      - name: Require path guards and missing Unicode probes on APFS and case-sensitive APFS
         env:
           CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
         run: python3 tests/test_install_paths.py

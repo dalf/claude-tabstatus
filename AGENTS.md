@@ -157,16 +157,17 @@ when they agree.
 | direct MCP elicitation | `python3 tests/test_elicitation.py` | Linux, Windows, macOS |
 | persistence and concurrency | `python3 tests/test_state_guarantees.py` | Linux, macOS (`fcntl`; strace fault injection Linux-only) |
 | direct Unix delivery | `python3 tests/test_unix_delivery.py -v` | Linux, macOS (disposable PTYs) |
-| installer path identity and containment | `python3 tests/test_install_paths.py` | Linux; native macOS with mandatory APFS/APFSX fixtures |
+| installer path identity, containment and missing Unicode probes | `python3 tests/test_install_paths.py` | Linux; native macOS with mandatory APFS/APFSX fixtures |
 | settings ACLs, ownership and backup metadata | `python3 tests/test_macos_acl.py` | native macOS (chmod/ls/stat, SDK fault interposition) |
 | tmux window status | `python3 tests/test_tmux_status.py` | Linux (tmux) |
 | corpus fixture helpers | `python3 -m unittest discover -s tests/corpus -p 'test_*.py' -v` | Linux |
 | golden corpus | `sh tests/corpus/replay.sh bin/tabstatus` | Linux |
 | ConPTY end to end | part of `cargo test` (`tests/conpty.rs`) | Windows |
 
-The macOS entries have passed in native arm64 CI; see
+The previously recorded macOS suites have passed in native arm64 CI; see
 [macOS validation](docs/architecture.md#macos-validation) for the recorded run.
-They do not establish behaviour in a terminal application.
+The missing Unicode probes and corrected case-sensitive path fixtures await
+native execution. These suites do not establish behaviour in a terminal application.
 
 The in-crate unit tests are not replaced by the shell and Python harnesses: they
 check argv and environment parsing, the location walk, the length cap and its

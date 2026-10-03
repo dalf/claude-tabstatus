@@ -222,8 +222,12 @@ paths reached through ancestor symlinks. On macOS the guards recognise existing
 case and Unicode-normalisation aliases and respect case-sensitive volumes.
 The tree root itself must be a directory, and its generated directory components
 must not be symlinks. Unresolvable paths are refused before installation writes.
-If missing names cannot be compared safely, create the intended ancestor directory
-first so the filesystem can identify it, then run `install` again.
+For differing missing Unicode names on APFS or HFS+, management commands create
+and remove private temporary filename probes beneath the deepest existing ancestor.
+These checks keep no cache and do not run during hooks. The ancestor's timestamps
+can change; interruption or cleanup failure can leave a `.cctab-name-probe-*`
+directory. A probe failure or another filesystem retains uncertainty: create the
+intended ancestor directory first so the filesystem can identify it, then retry.
 
 ## When each colour appears
 

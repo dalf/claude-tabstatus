@@ -892,11 +892,42 @@ on that existing ancestor. Both the [current XNU selector declaration](https://g
 and [Apple's HFS implementation](https://github.com/apple-oss-distributions/hfs/blob/main/core/hfs_vnops.c)
 were checked against the locked libc bindings: 0 means insensitive, 1 sensitive,
 and other answers retain uncertainty. Existing Unicode-normalisation aliases use
-filesystem identity directly. Differing missing non-ASCII names retain uncertainty;
-there is no Unicode folding algorithm or probing directory creation. This matters
+filesystem identity directly. For differing missing non-ASCII names on APFS/HFS,
+`sys/darwin_names.rs` creates a private `.cctab-name-probe-*` directory directly
+under the deepest existing ancestor. It creates one exact name and looks up the
+other with `fstatat(AT_SYMLINK_NOFOLLOW)`. Matching device/inode proves equivalence;
+if the other name is absent, creating both with distinct identities proves
+separation. Failed creation or inspection remains uncertainty. Each component is
+tested on the volume where the missing directories would be created, including
+multiple missing Unicode components. This follows the filesystem-evidence idea
+of [Git's composition probe](https://github.com/git/git/blob/master/compat/precompose_utf8.c),
+but tests each actual pair and keeps no persisted result or userspace Unicode table.
+The probe is limited to APFS/HFS's volume-wide filename semantics; remote and
+unknown filesystems retain uncertainty rather than assuming a sibling directory
+has the same name rules. This matters
 because [APFS preserves spelling but supports normalisation-insensitive lookup and
 both case variants](https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/APFS_Guide/FAQ/FAQ.html).
 Create the intended ancestor first when a comparison lacks sufficient evidence.
+Probe creation uses public `mkdirx_np` from [current XNU sys/stat.h](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/stat.h)
+with mode 0700 and an empty `ACL_FLAG_NO_INHERIT` birth ACL, so inherited allow
+entries cannot expose its contents. The existing settings ACL/ownership helpers
+and their tests are unchanged; a separate directory creation helper shares their
+opaque ACL/filesec declarations. Its actual ACL is also inspected and must have
+no entries before any Unicode names are placed in it. `acl_valid` and `acl_get_entry`
+use [Apple's current declarations](https://github.com/apple-oss-distributions/Libc/blob/main/include/sys/acl.h)
+and [Darwin's empty-ACL iterator result](https://github.com/apple-oss-distributions/Libc/blob/main/posix1e/acl_entry.c).
+The locked libc supplies `arc4random`, `openat`,
+`fstatat`, `mkdirat`, `unlinkat` and `fstatfs`; its inode64 selection is retained.
+No subprocess or dependency is added. Probe operations hold directory handles and
+cleanup removes only the exact empty directories created by that probe, without
+following links or recursively deleting unknown contents. Cleanup is checked
+before accepting the comparison, with a best-effort retry on failure. No result
+is cached: these checks run only on management commands, never on hook events.
+Temporary creation/removal changes ancestor directory timestamps. A killed process
+or persistent cleanup failure can leave a private probe, whose path is reported
+when cleanup fails. Installation files, settings protection, records and links
+remain untouched by a preflight refusal; “Nothing has been changed” describes
+those installation effects, not every filesystem timestamp.
 Linux keeps byte comparison for missing names. Windows keeps spelling identity for
 links, including its system case table, and resolves destination containment; its
 resolution now also propagates inspection failures instead of peeling them away.
@@ -917,7 +948,8 @@ identified candidates; uncertainty names the inspection failure and skips the
 candidate. Uninstall checks that its live destination can be inspected before any
 writes, and retains the root/component link guards for deletion. These are
 filesystem observations at inspection time, **not protection against concurrent
-filesystem replacement**. No handle-relative mutation transaction is introduced.
+filesystem replacement**. Generated-tree/settings mutations still do not form a
+handle-relative transaction.
 
 `tests/test_install_paths.py --reproduce-old` is a native, isolated reproducer:
 first prove case-insensitive lookup, then request `config/SKILLS/claude-tabstatus`
@@ -929,9 +961,22 @@ APFS and APFSX images with hdiutil and prove the lookup semantics; failure to cr
 either volume fails CI. Coverage includes missing config/skills, Unicode aliases,
 `/var` and `/private/var`, ancestor links, checkout guards, inspection failures,
 reinstall/doctor/uninstall identity, root/component symlinks and case-sensitive
-siblings. The previous native ACL/ownership suite remains required. At this change,
-native execution of the path suite and the original APFS reproducer is **pending**:
-local Linux tests and both Apple cross-checks cannot establish filesystem behaviour.
+siblings. Missing Unicode coverage requires safe allowed destinations and refusals
+on both volumes, exact normalisation/case behaviour, private probe birth in an
+ACL-inheriting directory, and native create/lookup/cleanup/filesystem faults.
+The previous native ACL/ownership suite remains required. The native job for
+`f4b9fff` passed the case-insensitive APFS tests but failed its APFSX format name
+and two `/var` spelling assertions. This follow-up uses the case-sensitive format
+name and filesystem-identity assertions; the corrected fixtures and new Unicode
+probes are **pending native execution**. Local Linux tests and Apple cross-checks
+cannot establish their filesystem behaviour. The suite uses APFS volumes; the HFS
+probe path also lacks native runtime coverage.
+`--reproduce-missing-unicode` separately runs against the pre-probe `f4b9fff` binary:
+it proves Unicode lookup equivalence, then requires refusal of the safe
+`café/data/claude-tabstatus` tree with `café/config` also missing. Normal suite
+execution requires that installation to succeed and its live aliases to survive
+reinstall, doctor and uninstall without orphan classification. Native execution
+of that baseline reproducer is also pending locally.
 
 **The marker is written first, before the binary and before either manifest.** It
 is the only evidence of ownership the refusal accepts, so a run killed in that
@@ -1076,7 +1121,9 @@ Both halves preflight every refusal - the tree's ownership and writability, the
 `skills` directory and its writability, `settings.json`'s shape, mode and parent, a
 `settings.json` symlink that does not resolve, and whether there is a state record
 proving the key is ours - so detected unsafe paths are refused before installation
-writes, and every preflight refusal still honestly ends **"Nothing has been changed."** A `settings.json` with
+writes, and every preflight refusal leaves installation files unchanged. Temporary
+Unicode probes have the directory timestamp and interruption limits described above.
+A `settings.json` with
 duplicate members at the top level or inside `env` is refused too: this tool resolves
 first-wins and `JSON.parse` resolves last-wins, so editing it could set a key Claude
 Code never reads.

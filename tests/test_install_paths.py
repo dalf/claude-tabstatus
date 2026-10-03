@@ -5,6 +5,11 @@ Native reproducer (run before changing the binary):
 It requires and proves case-insensitive lookup, then asserts the old late failure
 has written settings, the installation record and the generated tree. Normal
 execution requires refusal with an unchanged fixture instead.
+
+The missing-Unicode limitation has a separate native reproducer:
+  CCTAB_TEST_BIN=/path/to/f4b9fff/tabstatus python3 tests/test_install_paths.py --reproduce-missing-unicode
+It proves Unicode lookup equivalence on disposable APFS, then asserts that the
+pre-probe binary refuses a safe tree with both Unicode parents missing.
 """
 import os
 import hashlib
@@ -63,6 +68,30 @@ def reproduce_old():
         assert (config / "settings.json").read_bytes() != ORIGINAL
         assert not (config / "skills/claude-tabstatus").is_symlink()
         print("REPRODUCED: late link failure after tree, record and settings writes")
+
+
+def reproduce_missing_unicode():
+    if sys.platform != "darwin":
+        raise SystemExit("Native reproducer requires macOS; cross-compilation is insufficient")
+    volume = NativeVolume(sensitive=False)
+    try:
+        with tempfile.TemporaryDirectory(prefix="unicode-repro-", dir=volume.mount) as tmp:
+            root = Path(tmp)
+            reference = root / "reference"
+            reference.mkdir()
+            (reference / "caf\u00e9").mkdir()
+            assert os.path.samefile(reference / "caf\u00e9", reference / "cafe\u0301")
+            env = isolated(root)
+            env["CLAUDE_CONFIG_DIR"] = str(root / "caf\u00e9/config")
+            target = root / "cafe\u0301/data/claude-tabstatus"
+            before = snapshot(root)
+            result = invoke(root, env, "install", "--tree", target)
+            assert result.returncode == 1, result.stdout + result.stderr
+            assert "cannot establish filesystem equivalence" in result.stderr, result.stderr
+            assert snapshot(root) == before
+            print("REPRODUCED: safe tree refused because both Unicode ancestor spellings are missing")
+    finally:
+        volume.close()
 
 
 def snapshot(root):
@@ -243,14 +272,14 @@ class InstallerPaths(unittest.TestCase):
         self.cli("install")
         self.cli("uninstall")
         self.assertTrue(self.link.is_symlink())
-        self.assertEqual(self.link.resolve(), file)
+        self.assertTrue(os.path.samefile(self.link, file))
         self.assertEqual(file.read_text(), "kept")
 
     def test_relative_config_and_default_environment(self):
         self.env["CLAUDE_CONFIG_DIR"] = "config/."
         self.env["XDG_DATA_HOME"] = "data/missing"
         self.cli("install")
-        self.assertEqual(self.link.resolve(), self.data / "missing/claude-tabstatus")
+        self.assertTrue(os.path.samefile(self.link, self.data / "missing/claude-tabstatus"))
         self.assertNotIn("orphan", self.cli("doctor").lower())
         self.cli("uninstall")
         self.assertFalse((self.data / "missing/claude-tabstatus").exists())
@@ -341,7 +370,7 @@ class NativeVolume:
         self.attached = False
         try:
             subprocess.run(["hdiutil", "create", "-size", "256m", "-type", "SPARSE",
-                            "-fs", "APFSX" if sensitive else "APFS", "-volname", "cctab-paths",
+                            "-fs", "Case-sensitive APFS" if sensitive else "APFS", "-volname", "cctab-paths",
                             str(root / "fixture.sparseimage")], check=True, capture_output=True, text=True)
             subprocess.run(["hdiutil", "attach", "-nobrowse", "-mountpoint", str(self.mount),
                             str(root / "fixture.sparseimage")], check=True, capture_output=True, text=True)
@@ -360,17 +389,130 @@ class NativeVolume:
         self.scratch.cleanup()
 
 
+def compile_path_faults(cls):
+    cls.fault_dylib = Path(cls.volume.scratch.name) / "fault.dylib"
+    subprocess.run(["cc", "-Wall", "-Wextra", "-Werror", "-dynamiclib",
+                    str(ROOT / "tests/fixtures/darwin_path_fault.c"), "-o", str(cls.fault_dylib)],
+                   check=True, capture_output=True, text=True)
+
+
+class MissingUnicodePaths:
+    """Shared native tests: every compared destination still has missing parents."""
+    def prove_unicode_lookup(self):
+        reference = self.root / "unicode-reference"
+        reference.mkdir()
+        composed = reference / "caf\u00e9"
+        composed.mkdir()
+        self.assertTrue(os.path.samefile(composed, reference / "cafe\u0301"),
+                        "native normalisation-insensitive lookup is required")
+        uppercase = reference / "CAF\u00c9"
+        if case_insensitive(self.root):
+            self.assertTrue(os.path.samefile(composed, uppercase), "native Unicode case lookup is required")
+        else:
+            uppercase.mkdir()
+            self.assertFalse(os.path.samefile(composed, uppercase), "native Unicode case distinction is required")
+            uppercase.rmdir()
+        different = reference / "caf\u00e8"
+        different.mkdir()
+        self.assertFalse(os.path.samefile(composed, different))
+        different.rmdir()
+        composed.rmdir()
+        reference.rmdir()
+
+    def unicode_config(self):
+        self.prove_unicode_lookup()
+        self.env["CLAUDE_CONFIG_DIR"] = str(self.root / "caf\u00e9/config")
+
+    def test_missing_unicode_allowed_tree_and_live_lifecycle(self):
+        self.unicode_config()
+        target = self.root / "cafe\u0301/data/one/two/claude-tabstatus"
+        self.assertFalse(target.parent.exists())
+        original_config = snapshot(self.config)
+        self.cli("install", "--tree", target)
+        self.assertEqual(snapshot(self.config), original_config)
+        self.env["XDG_DATA_HOME"] = str(self.root / "caf\u00e9/data/one/two")
+        self.assertIn("already correct", self.cli("install"))
+        self.assertNotIn("orphan", self.cli("doctor").lower())
+        self.assertNotIn("orphan", self.cli("uninstall").lower())
+        self.assertFalse(target.exists())
+        self.assertFalse(list(self.root.glob(".cctab-name-probe-*")))
+
+    def test_missing_unicode_aliases_beneath_skills_are_refused(self):
+        self.unicode_config()
+        target = self.root / "cafe\u0301/config/skills/one/two/tree"
+        self.assertFalse((self.root / "caf\u00e9").exists())
+        output = self.refuse("--tree", target)
+        self.assertIn("skills", output)
+        self.assertNotIn("cannot establish", output)
+        # The default tree/environment must use the same evidence, including an
+        # ancestor link; neither the Unicode parent nor skills exists yet.
+        alias = self.root / "alias"
+        alias.symlink_to(self.root, target_is_directory=True)
+        self.env["XDG_DATA_HOME"] = str(alias / "cafe\u0301/config/skills/one/two")
+        self.refuse()
+
+    def test_multiple_missing_unicode_components(self):
+        self.unicode_config()
+        self.env["CLAUDE_CONFIG_DIR"] = str(self.root / "caf\u00e9/c\u00f4t\u00e9/config")
+        self.refuse("--tree", self.root / "cafe\u0301/co\u0302te\u0301/config/skills/new/tree")
+
+    def test_distinct_missing_unicode_names_and_prefix_lookalikes(self):
+        self.unicode_config()
+        self.cli("install", "--tree", self.root / "caf\u00e8/data/claude-tabstatus")
+        self.cli("uninstall")
+        self.cli("install", "--tree", self.root / "cafe\u0301/config/skills2/claude-tabstatus")
+        self.cli("uninstall")
+        self.assertFalse(list(self.root.glob(".cctab-name-probe-*")))
+
+    def test_unicode_probe_failures_refuse_without_installation_writes(self):
+        self.unicode_config()
+        target = self.root / "cafe\u0301/data/tree"
+        self.env["DYLD_INSERT_LIBRARIES"] = str(self.fault_dylib)
+        for fault in ("probe-create", "probe-child", "probe-lookup", "probe-cleanup", "probe-filesystem",
+                      "probe-acl-inspect", "probe-acl-iterate"):
+            for force in (False, True):
+                with self.subTest(fault=fault, force=force):
+                    self.env["CCTAB_TEST_PATH_FAULT"] = fault
+                    output = self.refuse(*(["--force"] if force else []), "--tree", target)
+                    self.assertIn("probe", output)
+
+    def test_persistent_probe_cleanup_failure_reports_private_remainder(self):
+        self.unicode_config()
+        before = snapshot(self.root)
+        self.env["DYLD_INSERT_LIBRARIES"] = str(self.fault_dylib)
+        self.env["CCTAB_TEST_PATH_FAULT"] = "probe-cleanup-persistent"
+        output = self.cli("install", "--tree", self.root / "cafe\u0301/data/tree", ok=False)
+        remainders = list(self.root.glob(".cctab-name-probe-*"))
+        self.assertEqual(len(remainders), 1)
+        self.assertIn(str(remainders[0]), output)
+        self.assertIn("comparison remains uncertain", output)
+        self.assertEqual(remainders[0].stat().st_mode & 0o777, 0o700)
+        self.assertEqual(remainders[0].stat().st_uid, os.getuid())
+        # A failed cleanup may retain our private probe, never installation
+        # content. Fixture teardown removes it; production reports it for inspection.
+        after = {name: value for name, value in snapshot(self.root).items()
+                 if not name.startswith(".cctab-name-probe-")}
+        self.assertEqual(after, before)
+
+    def test_unicode_probe_private_birth_with_inherited_acl(self):
+        self.unicode_config()
+        subprocess.run(["/bin/chmod", "+a",
+                        "everyone allow list,search,add_file,add_subdirectory,file_inherit,directory_inherit",
+                        str(self.root)], check=True, capture_output=True)
+        self.env["DYLD_INSERT_LIBRARIES"] = str(self.fault_dylib)
+        self.env["CCTAB_TEST_PATH_FAULT"] = "probe-observe"
+        output = self.refuse("--tree", self.root / "cafe\u0301/config/skills/tree")
+        self.assertIn("observed private filename probe", output)
+
+
 @unittest.skipUnless(sys.platform == "darwin", "native case-insensitive APFS coverage pending on this host")
-class DarwinInsensitive(InstallerPaths):
+class DarwinInsensitive(MissingUnicodePaths, InstallerPaths):
     @classmethod
     def setUpClass(cls):
         cls.volume = NativeVolume(sensitive=False)
         cls.addClassCleanup(cls.volume.close)
         cls.fixture_parent = cls.volume.mount
-        cls.fault_dylib = Path(cls.volume.scratch.name) / "fault.dylib"
-        subprocess.run(["cc", "-Wall", "-Wextra", "-Werror", "-dynamiclib",
-                        str(ROOT / "tests/fixtures/darwin_path_fault.c"), "-o", str(cls.fault_dylib)],
-                       check=True, capture_output=True, text=True)
+        compile_path_faults(cls)
 
     def test_native_inspection_failures_are_uncertain(self):
         self.env["DYLD_INSERT_LIBRARIES"] = str(self.fault_dylib)
@@ -436,10 +578,9 @@ class DarwinInsensitive(InstallerPaths):
         (checkout / ".claude-plugin/plugin.json").write_text("{}")
         self.refuse("--tree", self.root / "cafe\u0301/checkout/new/tree")
 
-    def test_missing_unicode_names_retain_uncertainty(self):
-        self.env["CLAUDE_CONFIG_DIR"] = str(self.root / "caf\u00e9/config")
-        output = self.refuse("--tree", self.root / "cafe\u0301/config/skills/tree")
-        self.assertIn("cannot establish", output)
+    def test_missing_unicode_case_aliases_are_refused(self):
+        self.unicode_config()
+        self.refuse("--tree", self.root / "CAF\u00c9/config/skills/tree")
 
     def test_var_private_var_live_alias(self):
         real = self.root.resolve()
@@ -457,12 +598,20 @@ class DarwinInsensitive(InstallerPaths):
 
 
 @unittest.skipUnless(sys.platform == "darwin", "native case-sensitive APFSX coverage pending on this host")
-class DarwinSensitive(InstallerPaths):
+class DarwinSensitive(MissingUnicodePaths, InstallerPaths):
     @classmethod
     def setUpClass(cls):
         cls.volume = NativeVolume(sensitive=True)
         cls.addClassCleanup(cls.volume.close)
         cls.fixture_parent = cls.volume.mount
+        compile_path_faults(cls)
+
+    def test_distinct_missing_unicode_case_names_are_allowed(self):
+        self.unicode_config()
+        target = self.root / "CAF\u00c9/config/skills/claude-tabstatus"
+        self.cli("install", "--tree", target)
+        self.assertFalse(os.path.samefile(self.root / "caf\u00e9", self.root / "CAF\u00c9"))
+        self.cli("uninstall")
 
     def test_missing_case_sensitive_sibling_is_allowed(self):
         self.assertFalse(case_insensitive(self.root))
@@ -492,5 +641,7 @@ class DarwinSensitive(InstallerPaths):
 if __name__ == "__main__":
     if "--reproduce-old" in sys.argv:
         reproduce_old()
+    elif "--reproduce-missing-unicode" in sys.argv:
+        reproduce_missing_unicode()
     else:
         unittest.main(verbosity=2)

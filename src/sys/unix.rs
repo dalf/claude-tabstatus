@@ -323,6 +323,8 @@ mod darwin_acl {
     extern "C" {
         fn acl_set_fd_np(fd: libc::c_int, acl: Native, kind: libc::c_uint) -> libc::c_int;
         fn acl_init(count: libc::c_int) -> Native;
+        fn acl_valid(acl: Native) -> libc::c_int;
+        fn acl_get_entry(acl: Native, id: libc::c_int, entry: *mut Native) -> libc::c_int;
         fn acl_free(acl: Native) -> libc::c_int;
         fn acl_get_flagset_np(acl: Native, flags: *mut Native) -> libc::c_int;
         fn acl_add_flag_np(flags: Native, flag: libc::c_uint) -> libc::c_int;
@@ -346,6 +348,8 @@ mod darwin_acl {
         ) -> libc::c_int;
         fn fchmodx_np(fd: libc::c_int, sec: Native) -> libc::c_int;
         fn openx_np(path: *const libc::c_char, flags: libc::c_int, sec: Native) -> libc::c_int;
+        // Public sys/stat.h API; libc 0.2.189 has no binding for it.
+        fn mkdirx_np(path: *const libc::c_char, sec: Native) -> libc::c_int;
     }
 
     struct Acl(NonNull<libc::c_void>);
@@ -526,6 +530,47 @@ mod darwin_acl {
             .map_err(|e| io::Error::new(e.kind(), format!("cannot preserve Darwin owner/group: {e}")))?;
         }
         verify_ownership(f, sec)
+    }
+
+    /// A filename probe must be private at birth even in an ACL-inheriting parent.
+    /// This adds directory creation without changing settings staging/preservation.
+    pub(super) fn create_probe_directory(path: &Path) -> io::Result<()> {
+        let name = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // SAFETY: owned, initially empty ACL and a borrowed flagset.
+        let birth = Acl::own(unsafe { acl_init(0) })?;
+        let mut flags = std::ptr::null_mut();
+        check(unsafe { acl_get_flagset_np(birth.0.as_ptr(), &mut flags) })?;
+        check(unsafe { acl_add_flag_np(flags, ACL_FLAG_NO_INHERIT) })?;
+        let fs = FileSec::new()?;
+        let mode: libc::mode_t = 0o700;
+        fs.set(FILESEC_MODE, (&mode as *const libc::mode_t).cast())?;
+        fs.set(FILESEC_ACL, (&birth.0.as_ptr() as *const Native).cast())?;
+        // SAFETY: live, NUL-terminated path and filesec; mkdir never reuses an entry.
+        check(unsafe { mkdirx_np(name.as_ptr(), fs.0.as_ptr()) })
+    }
+
+    /// Check the newly created directory's actual ACL before placing names in it.
+    pub(super) fn verify_probe_directory(f: &File) -> io::Result<()> {
+        let sec = read(f)?;
+        if let Some(acl) = sec.acl {
+            // SAFETY: owned ACL from a successful fstatx/filesec snapshot. Public
+            // sys/acl.h: ACL_FIRST_ENTRY=0; Apple's acl_entry.c returns -1/EINVAL
+            // at the end of a valid ACL, and 0 when an entry is present.
+            check(unsafe { acl_valid(acl.0.as_ptr()) })?;
+            let mut entry: Native = std::ptr::null_mut();
+            match unsafe { acl_get_entry(acl.0.as_ptr(), 0, &mut entry) } {
+                0 => return Err(io::Error::other("filename probe has access control entries")),
+                -1 => {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EINVAL) {
+                        return Err(error);
+                    }
+                }
+                _ => return Err(io::Error::other("cannot verify filename probe ACL")),
+            }
+        }
+        Ok(())
     }
 
     fn create_private(path: &Path) -> io::Result<File> {
@@ -917,14 +962,14 @@ fn same_missing_name(_ancestor: &Path, a: &OsStr, b: &OsStr) -> Result<bool, Str
 }
 
 #[cfg(target_os = "macos")]
+#[path = "darwin_names.rs"]
+mod darwin_names;
+
+#[cfg(target_os = "macos")]
 fn same_missing_name(ancestor: &Path, a: &OsStr, b: &OsStr) -> Result<bool, String> {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if !a.is_ascii() || !b.is_ascii() {
-        return Err(format!(
-            "cannot establish filesystem equivalence of missing names beneath {}: \
-             create the intended ancestor directory first so it can be identified",
-            ancestor.display()
-        ));
+        return darwin_names::same_missing_name(ancestor, a, b);
     }
     let path = std::ffi::CString::new(ancestor.as_os_str().as_bytes())
         .map_err(|e| format!("invalid directory path: {}", e))?;
