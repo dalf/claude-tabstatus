@@ -166,8 +166,10 @@ when they agree.
 
 The previously recorded macOS suites have passed in native arm64 CI; see
 [macOS validation](docs/architecture.md#macos-validation) for the recorded run.
-The missing Unicode probes and corrected case-sensitive path fixtures await
-native execution. These suites do not establish behaviour in a terminal application.
+The missing Unicode probes and corrected case-sensitive path fixtures have run
+natively; their fault-message assertion correction awaits a native rerun. See the
+recorded results and remaining coverage in the validation document. These suites
+do not establish behaviour in a terminal application.
 
 The in-crate unit tests are not replaced by the shell and Python harnesses: they
 check argv and environment parsing, the location walk, the length cap and its

@@ -967,10 +967,16 @@ ACL-inheriting directory, and native create/lookup/cleanup/filesystem faults.
 The previous native ACL/ownership suite remains required. The native job for
 `f4b9fff` passed the case-insensitive APFS tests but failed its APFSX format name
 and two `/var` spelling assertions. This follow-up uses the case-sensitive format
-name and filesystem-identity assertions; the corrected fixtures and new Unicode
-probes are **pending native execution**. Local Linux tests and Apple cross-checks
-cannot establish their filesystem behaviour. The suite uses APFS volumes; the HFS
-probe path also lacks native runtime coverage.
+name and filesystem-identity assertions. The [native job for `722ec43`](https://github.com/dalf/claude-tabstatus/actions/runs/37136471276/job/111241911812)
+executed both APFS variants and the Unicode scenarios, and passed all 17 ACL/ownership
+tests. Its eight failures were fault-message assertions for child creation and
+lookup: each installation had refused with the fixture unchanged, then the test
+required the word "probe" in a "cannot inspect missing Unicode names" message.
+The assertions now require each fault's failure stage and injected errno instead;
+their native rerun is pending. The later native state/PTY step was skipped after
+the failed path step. Local Linux tests and Apple cross-checks cannot establish
+filesystem behaviour. The suite uses APFS volumes; the HFS probe path also lacks
+native runtime coverage.
 `--reproduce-missing-unicode` separately runs against the pre-probe `f4b9fff` binary:
 it proves Unicode lookup equivalence, then requires refusal of the safe
 `café/data/claude-tabstatus` tree with `café/config` also missing. Normal suite

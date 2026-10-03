@@ -12,6 +12,7 @@ It proves Unicode lookup equivalence on disposable APFS, then asserts that the
 pre-probe binary refuses a safe tree with both Unicode parents missing.
 """
 import os
+import errno
 import hashlib
 import pwd
 from pathlib import Path
@@ -468,13 +469,23 @@ class MissingUnicodePaths:
         self.unicode_config()
         target = self.root / "cafe\u0301/data/tree"
         self.env["DYLD_INSERT_LIBRARIES"] = str(self.fault_dylib)
-        for fault in ("probe-create", "probe-child", "probe-lookup", "probe-cleanup", "probe-filesystem",
-                      "probe-acl-inspect", "probe-acl-iterate"):
+        faults = (
+            ("probe-create", "cannot probe missing Unicode names", errno.EACCES),
+            ("probe-child", "cannot inspect missing Unicode names", errno.EIO),
+            ("probe-lookup", "cannot inspect missing Unicode names", errno.EIO),
+            ("probe-cleanup", "cannot remove filename probe", errno.EIO),
+            ("probe-filesystem", "Unicode filename probes require APFS or HFS", None),
+            ("probe-acl-inspect", "cannot probe missing Unicode names", errno.EIO),
+            ("probe-acl-iterate", "cannot probe missing Unicode names", errno.EIO),
+        )
+        for fault, reason, error in faults:
             for force in (False, True):
                 with self.subTest(fault=fault, force=force):
                     self.env["CCTAB_TEST_PATH_FAULT"] = fault
                     output = self.refuse(*(["--force"] if force else []), "--tree", target)
-                    self.assertIn("probe", output)
+                    self.assertIn(reason, output)
+                    if error is not None:
+                        self.assertIn(f"(os error {error})", output)
 
     def test_persistent_probe_cleanup_failure_reports_private_remainder(self):
         self.unicode_config()
