@@ -647,9 +647,13 @@ are written and the rejected descriptor is closed. Open/write failures and parti
 writes retain recorded restoration policy. A test-only Rust probe compiles the
 production Unix backend against the existing native libc build artefact and checks
 the actual `session_tty`/`write_tty` return values, including inspection-error mapping;
-the real CLI deliberately hides these outcomes. The probe uses `panic=abort` to
-link a release libc artefact; portable compiler tests exercise both abort and unwind
-libraries, with an incompatible consumer as a negative control. Helper build failures
+the real CLI deliberately hides these outcomes. The probe selects a release libc
+artefact and matches `panic=abort` and Rust `lto=fat`, so rustc processes the release
+dependency's LLVM bitcode before invoking Apple's native linker. Debug artefacts
+can omit the bitcode required by [Rust LTO](https://doc.rust-lang.org/rustc/codegen-options/index.html#lto)
+and are not selected. Portable compiler tests link and execute consumers of both
+abort and unwind libraries, including bitcode-only release dependencies, with an
+incompatible panic strategy as a negative control. Helper build failures
 include the compiler diagnostics. Missing open observations and a native
 control that deliberately omits `O_NOCTTY` must fail the flag check. The control
 reports its observed controlling-terminal state; acquiring one is not a required
@@ -659,7 +663,11 @@ successful run above predates them. The
 [first hardening job at f8710ca](https://github.com/dalf/claude-tabstatus/actions/runs/37145349648/job/111268023048)
 passed the ordinary PTY cases but failed while compiling the API probe, before the
 observer tests ran. Its command selected a release libc artefact without matching
-that artefact's abort panic strategy; the corrected build still needs a native rerun.
+that artefact's abort panic strategy. The
+[follow-up job at 1954602](https://github.com/dalf/claude-tabstatus/actions/runs/37146032618/job/111270045915)
+reached the linker after correcting the panic strategy, but failed because Apple's
+LLVM 17 linker could not read the Rust LLVM 23 release bitcode. Neither failed job
+ran the observer tests. The Rust LTO correction still needs a native rerun.
 Cross-checks do not prove runtime open flags or
 controlling-terminal behaviour. ACL, path and detection suites remain required.
 

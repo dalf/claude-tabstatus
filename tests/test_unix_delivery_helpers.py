@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Link the native probe's build path against both Rust panic strategies.
+"""Link the native probe against both panic strategies and release LTO bitcode.
 
 The tiny stand-in dependency tests compiler compatibility, not terminal policy.
-It reproduces the release-library/default-consumer failure without a Darwin host.
+It exercises Cargo's bitcode-only dependency form without a Darwin host.
 """
 from pathlib import Path
 import subprocess
@@ -26,21 +26,27 @@ class ProbeCompilationTests(unittest.TestCase):
         cls.consumer = cls.root / "probe.rs"
         cls.consumer.write_text('fn main() { println!("{}", libc::witness()); }\n')
 
-    def library(self, strategy):
-        library = self.root / f"liblibc_{strategy}.rlib"
+    def library(self, strategy, bitcode_only=False):
+        library = self.root / f"liblibc_{strategy}_{bitcode_only}.rlib"
+        # Cargo uses linker-plugin-lto for release dependencies under Rust LTO:
+        # these archives contain bitcode instead of native machine-code objects.
+        flags = (["-C", "linker-plugin-lto", "-C", "embed-bitcode=no"]
+                 if bitcode_only else ["-C", "embed-bitcode=yes"])
         delivery.compile_helper(["rustc", "--edition=2021", "--crate-name", "libc",
                                  "--crate-type", "rlib", "-C", f"panic={strategy}",
-                                 str(self.dependency), "-o", str(library)])
+                                 *flags, str(self.dependency), "-o", str(library)])
         return library
 
-    def test_probe_links_abort_and_unwind_libraries(self):
+    def test_probe_links_abort_and_unwind_libraries_with_release_bitcode(self):
         for strategy in ("abort", "unwind"):
-            with self.subTest(strategy=strategy):
-                output = self.root / f"probe-{strategy}"
-                delivery.compile_contract_probe(self.target, self.library(strategy), output,
-                                                source=self.consumer)
-                result = subprocess.run([str(output)], capture_output=True, timeout=5)
-                self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"7\n", b""))
+            for bitcode_only in (False, True):
+                with self.subTest(strategy=strategy, bitcode_only=bitcode_only):
+                    output = self.root / f"probe-{strategy}-{bitcode_only}"
+                    library = self.library(strategy, bitcode_only)
+                    delivery.compile_contract_probe(self.target, library, output,
+                                                    source=self.consumer)
+                    result = subprocess.run([str(output)], capture_output=True, timeout=5)
+                    self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"7\n", b""))
 
     def test_default_unwind_consumer_fails_with_visible_compiler_diagnostic(self):
         # Negative control: the old command must fail with the actual diagnostic.

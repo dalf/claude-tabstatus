@@ -44,11 +44,11 @@ def compile_helper(command):
 
 def compile_contract_probe(target, library, output, source=ROOT / "tests/fixtures/unix_tty_contract.rs",
                            compiler="rustc"):
-    # Release libc is built with panic=abort. A default unwind consumer cannot
-    # link it; an abort consumer can also use the debug library. Match the
-    # production strategy regardless of which existing artefact was selected.
+    # Match the release libc artefact's panic strategy and Rust LTO. Cargo's
+    # release dependency can contain LLVM bitcode only; let rustc consume that
+    # bitcode instead of passing it to Apple's potentially older native linker.
     compile_helper([compiler, "--edition=2021", "--target", target, "-C", "panic=abort",
-                    str(source), "--extern", f"libc={library}",
+                    "-C", "lto=fat", str(source), "--extern", f"libc={library}",
                     "-L", f"dependency={library.parent}", "-o", str(output)])
 
 
@@ -220,15 +220,16 @@ class DarwinTerminalOpenTests(UnixDeliveryFixture):
                               (["-DOBSERVER_CONTROL"], cls.control)):
             compile_helper(["cc", "-Wall", "-Wextra", "-Werror", *flags,
                             source, "-o", str(output)])
-        # The native CI job has already built the locked libc dependency. Reuse
-        # it to expose API results under faults, without a production test switch.
+        # The native CI job has already built the locked release libc dependency.
+        # Reuse it to expose API results under faults. Debug artefacts may omit
+        # bitcode, so do not mix profiles according to their modification times.
         target = "aarch64-apple-darwin" if os.uname().machine == "arm64" else "x86_64-apple-darwin"
         build = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
         if not build.is_absolute():
             build = ROOT / build
-        libraries = list((build / target).glob("*/deps/liblibc-*.rlib"))
+        libraries = list((build / target / "release" / "deps").glob("liblibc-*.rlib"))
         if not libraries:
-            raise RuntimeError("build the native Rust target before testing the API contract")
+            raise RuntimeError("build the native Rust target in release mode before testing the API contract")
         library = max(libraries, key=lambda p: p.stat().st_mtime_ns)
         cls.probe = Path(cls.native.name) / "contract"
         compile_contract_probe(target, library, cls.probe)
