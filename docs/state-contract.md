@@ -309,11 +309,14 @@ This is an existing lifecycle limitation, not an ownership-retirement rule.
 
 The wire writer emits `cts5`, preserving both anonymous permission provenance
 (`?p`) and known background (`g <epoch>`). The optional `s <surface>` line records
-what the session ARMED, and is written only by a session that armed something, so a
-record for a session that armed nothing is byte for byte what it was before the line
-existed; a surface name this build has no row for reads as absent rather than as a
-different terminal. Readers also accept `cts1`–`cts4`,
-without interpreting their reserved `g` fields. Guarded older readers refuse
+a conservative restore obligation when startup routing selects appearance bytes.
+It is not a delivery receipt: skipped/headless delivery and failed or partial
+writes do not cancel it. Sessions with no appearance route add no `s` line, and
+absence cannot state a negative arming policy. A surface name this build has no
+row for reads as absent rather than as a different terminal. The
+[arming and restore contract](backend-architecture.md#the-armed-record) describes
+source precedence, delivery ordering and the stable-topology limitation.
+Readers also accept `cts1`–`cts4`, without interpreting their reserved `g` fields. Guarded older readers refuse
 ordinary updates of newer records rather than silently dropping activity.
 Recognized older records migrate on a changed write; missing historical owner
 provenance or background knowledge cannot be reconstructed. Unknown fields are ignored; invalid individual

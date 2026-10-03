@@ -265,62 +265,82 @@ match every variant's name, not merely the ones this build probes.
 
 ## The armed record
 
-`session_end` currently re-derives `Konsole && !tmux` **from the end hook's
-environment**, while `session_start` derived it from the start hook's. Change
-`CCTAB_TERMINAL`, or attach a tmux client, between the two and you get a restore
-with no arm or an arm with no restore. Pairing the two byte strings in one const
-fixes the spelling, not the lifetime.
+Arming sources select **which surface's restore bytes to attempt**. They do not
+record confirmed writes, and even a completed write does not prove that a terminal
+applied the bytes. `Armed::resolve` in `src/armed.rs` chooses the first available
+answer in this order:
 
-What a backend arms must be **recorded** where the end hook reads it back, and
-restore must be driven by that record. Three rungs, in order of preference:
-
-| rung | store | available when |
+| rung | source | meaning |
 |---|---|---|
-| 1 | the multiplexer's own key-value store (`@cctab_armed`) | inside tmux |
-| 2 | the session state record (`s <surface>`) | a state directory exists |
-| 3 | `ArmSource::Assumed` — today's predicate, labelled as an assumption | neither |
+| 1 | tmux session option `@cctab_armed` | retained shared arming policy; a surface name carries the restore obligation, `-` says no retained policy |
+| 2 | session record `s <surface>` | conservative restore obligation for the selected appearance route; no negative value |
+| 3 | `ArmSource::Assumed` | legacy assumption from the current hook's environment when neither store answers |
 
-**LANDED**, as `src/armed.rs`. `Armed::resolve` is the ladder and the only place it
-exists; `mux::route` takes the surface as an ARGUMENT instead of reading
-`stack.leaf`, so `emit::session_end` and `tmux::session_end` compose the restore
-from what was recorded rather than from what this hook's environment now says.
-`Route::appearance` carries the channel and the surface together, because splitting
-them is how half a decision comes from a record and half from the environment.
+The record grammar is specified in
+[time and persistence](state-contract.md#time-and-persistence). Unknown surface
+names read as absent, so a later version cannot make this version select arbitrary
+bytes. Missing or unreadable stores fall through to the next rung. Rung 3 preserves
+the historical behaviour exercised by the stateless golden corpus; it cannot
+recover a startup surface that the end hook's environment no longer names.
 
-**The two stores are asymmetric, deliberately.** Rung 1 is written by *every*
-`SessionStart` — the surface's name, or `-` for "armed nothing" — so it can state a
-negative, and a session that armed nothing is not restored by a `CCTAB_TERMINAL`
-that names Konsole only at the end. Rung 2 is written *only* by a session that
-armed, because a line written on every session would change the bytes of every
-state record on disk and of every assertion about one. So rung 2 fixes "an arm with
-no restore" and stays silent about "a restore with no arm", falling through to rung
-3 there. Both stores read an unrecognised value as **absent**, never as a different
-surface — the same rule the platform stamp follows — so a name from a later version
-drops a rung instead of choosing escape bytes.
+**Ordering and partial writes.** `SessionStart` resolves state and routing first.
+Inside tmux it then attempts to install the shared policy and reattachment hook,
+and attempts client arming. Next it writes the optional session `s` line, before
+the direct startup write. That direct write combines arming (when routed directly)
+and title bytes in one ordered buffer and one guarded terminal acquisition;
+`write_all` can issue several writes and is not atomic. An error may follow a
+complete arm and a partial title. Startup therefore keeps the restore obligation
+after both skipped delivery and errors. A headless start can leave an `s` line
+without sending any arming bytes. This conservative behaviour and the existing
+record bytes are preserved; the line is not a delivery receipt.
 
-**Where the tests are**, because these are the first in the project's history for
-this defect. `tests/run.sh`'s tmux section drives a private server and asserts the
-DECISION: a `CCTAB_TERMINAL` changed between start and end still restores; a session
-that armed nothing is not restored by a late one; two claudes in one tab do not
-un-arm each other, and the last one out does; an unreadable, unknown or absent
-record degrades to rung 3 with exit 0. Its state section asserts that only a session
-which armed writes an `s` line. `tests/test_tmux_status.py` asserts the BYTES, over
-a real client attached to a pty it owns both ends of — the only way to see them,
-since they go to the ptys `list-clients` names. **Both pty tests fail against the
-binary built one commit earlier**, and so does the decision, checked directly on a
-private server: that binary leaves `client-attached[1971]` installed after a
-`session-end` whose `CCTAB_TERMINAL` changed, and this one takes it off.
+**Detached tmux and shared ownership.** Tmux records policy before any client
+writes, including starts with no attached clients. Its `client-attached[1971]`
+hook applies that policy to later attaching clients. A non-arming start uses
+`set -o` to initialise `-` only if no shared record exists; it cannot erase an
+outstanding obligation or reattachment hook. The last Claude pane attempts the
+restore, even if another pane selected the arming surface. Teardown removes the
+policy and hook after the attempt, including when detached or when delivery
+fails, so later attaches do not arm after the last owner has left.
 
-**Honest limitation:** rung 3 is exactly today's behaviour and today's bug. It is
-also the *only* configuration the 312-case corpus runs under, because `tests/run.sh`
-unsets the state directory globally and no corpus case uses tmux. So the defect is
-repaired where a store exists and merely *labelled* where one does not — which is
-also why the corpus stayed byte-identical through the repair. The
-alternative — record-then-arm as one transaction — deletes the arm from the
-`pty-session-start-konsole` case, and byte-identity is non-negotiable. Rung 2 is
-therefore a SECOND write, after the arming it describes: a crash in between leaves
-no record and `session_end` degrades to the assumption, which is what it did before
-the line existed.
+**Delivery outcomes.** Direct and client writes return `io::Result<bool>`:
+`Ok(false)` means delivery was skipped, `Ok(true)` means the write or console API
+call completed, and `Err` means an operation failed, possibly after a partial
+write. For a client list, `true` means at least one completed write; a refused or
+unresolvable destination remains a skip, and an empty list is a detached skip.
+Every listed client is attempted even after a failure, and the first error is
+returned. A client-listing error is also returned. Startup and teardown attempt
+both client and direct delivery before returning an error to the silent hook
+boundary. The `tmux-arm` management verb likewise remains silent and exits zero
+for delivery outcomes. No receipts, retry state or terminal acknowledgements are
+persisted. Tmux configuration commands and state persistence remain best effort;
+a recorded policy does not prove that every configuration command succeeded.
+
+**Stable topology and best-effort restoration.** Only the surface is remembered.
+`mux::route` selects the delivery channel from the **current** stack; direct
+delivery resolves the **current** `CLAUDE_PID` destination, and tmux writes to its
+**currently attached** clients. Changing `CCTAB_TERMINAL` alone no longer loses the
+remembered surface when a store answers, but changing `TMUX`, `TMUX_PANE`,
+`CCTAB_NO_TMUX`, the session process's terminal, or the surrounding multiplexer
+can redirect or prevent restoration. No original terminal identity is retained.
+Detach/reattach within the same tmux session is supported through retained policy;
+a client that detaches before teardown cannot receive its restore. Mixed terminal
+types attached to one tmux session share the selected policy.
+
+Persistence failure, hook interruption, guard refusal, missing destinations and
+write failures can all prevent restoration. `SessionEnd` reads the session record
+before state resolution removes it, and tmux retires its policy after the last
+owner's attempt. Neither cleanup waits for acknowledgement or retries later. The
+restore uses Konsole's stock formats, not a saved custom profile.
+
+**Focused checks.** `emit` unit tests distinguish skipped and completed writes and
+inject failures before, during and after the arm in a combined startup buffer.
+The client-writer unit test proves that an error does not stop later clients.
+`tests/test_state_guarantees.py` checks headless obligations, real disposable-PTY
+startup/restore bytes, and a syscall-injected startup write failure whose record
+still drives restoration. `tests/test_tmux_status.py` covers attached and detached
+shared ownership, reattachment and final cleanup on private servers. These tests
+observe bytes and policy, not terminal application.
 
 ## Attention (#14)
 
@@ -622,11 +642,13 @@ user instead.
 1. **The armed record's fix does not reach the configuration the corpus tests.**
    See above. With neither tmux nor a state directory there is nowhere to write a
    record, so rung 3 is all there is — and rung 3 is the defect, now wearing its
-   own name in `doctor`. Rung 2 additionally cannot say "nothing was armed", so a
-   `CCTAB_TERMINAL` that names Konsole only at the END still writes a restore to a
-   tab outside tmux that may never have been armed. That is harmless — the bytes
-   are Konsole's compiled-in defaults — and it is the price of not changing the
-   record format for the sessions that armed nothing.
+   own name in `doctor`. Rung 2 additionally has no negative value, so a
+   `CCTAB_TERMINAL` that names Konsole only at the END can still select a restore
+   for a tab outside tmux that may never have been armed. A conservative `s` line
+   can do the same after skipped startup delivery. Those bytes select Konsole's
+   stock formats and may replace custom formats; the record does not establish
+   what the terminal applied. See the [arming contract](#the-armed-record) for
+   the stable-topology and best-effort limits.
 2. **Six of the capability rows were written from vendor source, not from a running
    terminal** (Windows Terminal, conhost, iTerm2, Terminal.app, Ghostty, VS Code).
    A test can prove a row is well-*formed*; it cannot prove it is *true*. The row

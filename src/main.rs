@@ -117,12 +117,12 @@ fn paint(edge: Edge) -> io::Result<()> {
     // decision. Deliberate parsing changes have named golden-corpus updates.
     let session = state::Session::open(state_dir, &payload);
     // RUNG 2 of the armed record, read HERE because `resolve` is where the
-    // SessionEnd branch DELETES the file, and what it holds is the fact that
+    // SessionEnd branch DELETES the file, and what it holds is the obligation that
     // decides what to restore. Only that edge asks, so no painting edge pays for
     // it.
     let recorded = match (edge, &session) {
         (Edge::SessionEnd, Some(s)) => s.armed(),
-        _ => Support::Unsupported("only session end reads back what was armed"),
+        _ => Support::Unsupported("only session end reads back the restore obligation"),
     };
     let resolved = match &session {
         Some(s) => s.resolve(edge, &payload),
@@ -145,11 +145,9 @@ fn paint(edge: Edge) -> io::Result<()> {
         return emit::dry_run(&composed.title);
     }
 
-    // WHAT WAS ARMED. At SessionStart the leaf this environment names IS the
-    // surface about to be armed, so rung 3 is not an assumption there - it is the
-    // act itself. At SessionEnd it is a guess about a hook that ran an unbounded
-    // time ago, so the stores are asked first: the multiplexer's, then this
-    // session's record, then, labelled, the old predicate. See [`armed`].
+    // The planned surface at start; at end, the retained restore obligation or
+    // legacy assumption. Neither a record nor a completed write acknowledges
+    // terminal application. The destination still comes from this hook's stack.
     let armed = match paint {
         Paint::SessionEnd => Armed::resolve(
             cfg.stack.tmux().map_or(
@@ -183,25 +181,28 @@ fn paint(edge: Edge) -> io::Result<()> {
             // Before the first title lands, for the same reason the Konsole
             // arming precedes it: a tab painted before it can show the paint.
             tmux::session_start(&cfg, route);
-            tmux::arm_konsole(&cfg, route);
-            // RUNG 2, written AFTER the arming it describes and before the one
-            // this process still has to do, so that a crash anywhere in here
-            // leaves no claim that outlives what actually went out. `tmux` wrote
-            // rung 1 inside its own batch, for the same reason.
+            let clients = tmux::arm_konsole(&cfg, route);
+            // RUNG 2 is a conservative restore obligation, recorded before the
+            // combined direct arm/title write. Keep it on skips and errors: an
+            // aggregate error can follow a complete arm and a partial title.
+            // tmux records shared policy before client writes, even detached.
             if let (Some(s), Some(a)) = (&session, route.appearance) {
                 s.note_armed(a.surface);
             }
-            emit::session_start(&payload, &cfg, route)
+            let direct = emit::session_start(&payload, &cfg, route);
+            // Both deliveries run even if one fails. Completed/skipped outcomes
+            // do not alter the obligation; failures travel to the hook boundary.
+            clients.and(direct).map(drop)
         }
         Paint::SessionEnd => {
             let r = emit::session_end(&cfg, route);
-            tmux::session_end(&cfg, route);
-            r
+            let clients = tmux::session_end(&cfg, route);
+            r.and(clients).map(drop)
         }
         Paint::Line(_) | Paint::LineWithBackground(_) => match route.title {
             // Claude Code may wrap terminalSequence in tmux passthrough, which
             // bypasses pane_title. Our carrier must reach the pane's pty as raw OSC.
-            Channel::Direct => emit::pane_title(&payload, &cfg),
+            Channel::Direct => emit::pane_title(&payload, &cfg).map(drop),
             Channel::Protocol => emit::json_line(&payload),
             // A title on the client registry is the RENDERER's own write - tmux
             // emits the outer OSC 0 from the format SessionStart installed, on its

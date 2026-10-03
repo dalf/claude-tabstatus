@@ -10,10 +10,13 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import threading
 import unittest
+
+from corpus.runner import Helpers
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -221,6 +224,70 @@ class StateGuaranteesTests(unittest.TestCase):
             if process is not None and process.poll() is None:
                 process.kill()
                 process.communicate(timeout=5)
+
+
+class ArmingDeliveryTests(unittest.TestCase):
+    """The s line is a restore obligation even when startup delivers no bytes."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="cctab-arming-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.helpers = Helpers(str(self.root))
+        self.addCleanup(self.helpers.close)
+        self.env = {"PATH": "/usr/bin:/bin", "HOME": str(self.root),
+                    "CLAUDE_CONFIG_DIR": str(self.root / "config"),
+                    "XDG_DATA_HOME": str(self.root / "data"),
+                    "CCTAB_STATE_DIR": str(self.root / "state"),
+                    "CCTAB_TERMINAL": "konsole"}
+        self.record = self.root / "state" / "s1"
+
+    def hook(self, edge, env, prefix=()):
+        result = subprocess.run([*prefix, str(BIN), edge], env=env, cwd=self.root,
+                                input=b'{"session_id":"s1","source":"startup"}',
+                                capture_output=True, timeout=10)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, b"", b""))
+
+    def test_skipped_and_headless_starts_keep_a_conservative_obligation(self):
+        for pid in (None, "0", str(self.helpers.file_pid())):
+            with self.subTest(pid=pid):
+                env = dict(self.env)
+                if pid is not None:
+                    env["CLAUDE_PID"] = pid
+                self.hook("session-start", env)
+                self.assertIn(b"s konsole\n", self.record.read_bytes())
+                self.assertEqual(Path(self.helpers.file_path).read_bytes(), b"")
+                self.hook("session-end", dict(env, CCTAB_TERMINAL="wezterm"))
+                self.assertFalse(self.record.exists())
+
+    def assert_restore(self, env):
+        self.hook("session-end", dict(env, CCTAB_TERMINAL="wezterm"))
+        self.assertEqual(self.helpers.drain_pty(),
+                         b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07"
+                         b"\x1b]0;\x07")
+        self.assertFalse(self.record.exists())
+
+    def test_completed_start_records_obligation_and_restores_remembered_surface(self):
+        env = dict(self.env, CLAUDE_PID=str(self.helpers.pty_pid()))
+        self.hook("session-start", env)
+        data = self.helpers.drain_pty()
+        self.assertTrue(data.startswith(b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07"
+                                        b"\x1b]0;"), data)
+        self.assertIn(b"s konsole\n", self.record.read_bytes())
+        self.assert_restore(env)
+
+    @unittest.skipUnless(shutil.which("strace"), "strace required for write-failure injection")
+    def test_failed_direct_start_keeps_obligation_and_still_restores(self):
+        env = dict(self.env, CLAUDE_PID=str(self.helpers.pty_pid()))
+        trace = self.root / "trace"
+        # Only writes to our allocated pty are faulted; record I/O is unaffected.
+        self.hook("session-start", env,
+                  ("strace", "-qq", "-yy", "-o", str(trace), "-e", "trace=write",
+                   "-e", "inject=write:error=EIO", "-P", self.helpers.pty_path))
+        self.assertIn("(INJECTED)", trace.read_text())
+        self.assertEqual(self.helpers.drain_pty(), b"")
+        self.assertIn(b"s konsole\n", self.record.read_bytes())
+        self.assert_restore(env)
 
 
 if __name__ == "__main__":

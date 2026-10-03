@@ -65,7 +65,7 @@ pub fn json_line(title: &str) -> io::Result<()> {
 
 /// Update tmux's pane-title carrier without Claude Code's OSC passthrough layer.
 /// Reuses the session pty guard and executes no subprocess on the hot path.
-pub fn pane_title(title: &str, cfg: &Config) -> io::Result<()> {
+pub fn pane_title(title: &str, cfg: &Config) -> io::Result<bool> {
     let mut out = Vec::with_capacity(title.len() + 5);
     out.extend_from_slice(b"\x1b]0;");
     out.extend_from_slice(title.as_bytes());
@@ -90,15 +90,19 @@ fn escape_into(out: &mut String, s: &str) {
     }
 }
 
-/// Arm this tab and paint it, in ONE write.
+/// Arm this tab and paint it, in one ordered buffer (not an atomic write).
 ///
-/// One write, and therefore one guarded acquisition of the session's tab, is why
+/// One buffer and one guarded acquisition of the session's tab are why
 /// the arming is composed here rather than sent by whoever decided it: the arming
 /// has to precede the title in the same byte stream. WHETHER it belongs in this
 /// buffer is [`crate::mux::route`]'s answer - `Channel::Direct` means the session's
 /// own tab, which is this buffer, and `Channel::Clients` means the multiplexer's
 /// clients, which is not.
-pub fn session_start(title: &str, cfg: &Config, route: Route) -> io::Result<()> {
+pub fn session_start(title: &str, cfg: &Config, route: Route) -> io::Result<bool> {
+    write_session(cfg, &startup_bytes(title, cfg, route), title)
+}
+
+fn startup_bytes(title: &str, cfg: &Config, route: Route) -> Vec<u8> {
     let caps = cfg.stack.leaf.caps();
     let mut out: Vec<u8> = Vec::with_capacity(title.len() + 96);
     if let Some(surface) = route.arms(Channel::Direct) {
@@ -118,11 +122,11 @@ pub fn session_start(title: &str, cfg: &Config, route: Route) -> io::Result<()> 
     // The arming has to precede the title, or the tab is painted before it can
     // show what was painted.
     let _ = compose::push_title(&mut out, caps, title);
-    write_session(cfg, &out, title)
+    out
 }
 
-/// Restore the tab and blank its title, in one write.
-pub fn session_end(cfg: &Config, route: Route) -> io::Result<()> {
+/// Restore the tab and blank its title, in one ordered buffer.
+pub fn session_end(cfg: &Config, route: Route) -> io::Result<bool> {
     let caps = cfg.stack.leaf.caps();
     let mut out: Vec<u8> = Vec::with_capacity(96);
     if let Some(surface) = route.arms(Channel::Direct) {
@@ -149,12 +153,16 @@ pub fn session_end(cfg: &Config, route: Route) -> io::Result<()> {
 /// title. Never where the layer above RENDERS the tab: the title is then that
 /// layer's carrier, not a tab's. The test is the cap and not `mux.is_some()`,
 /// because screen renders nothing and its title is still a tab's.
-fn write_session(cfg: &Config, bytes: &[u8], title: &str) -> io::Result<()> {
+///
+/// `Ok(false)` means skipped by the guard; `Ok(true)` means the write/API call
+/// completed, not that the terminal applied it. An error can follow a partial
+/// write, including a complete arm followed by a failed title. None of these
+/// outcomes cancels a previously recorded restore obligation.
+fn write_session(cfg: &Config, bytes: &[u8], title: &str) -> io::Result<bool> {
     if sys::HAS_SESSION_CONSOLE {
         return match (cfg.claude_pid.as_deref(), cfg.stack.renders_title()) {
-            // Refused or painted, it is not a failure: see `write_pty`.
-            (Some(pid), false) => sys::set_session_title(pid, title).map(drop),
-            _ => Ok(()),
+            (Some(pid), false) => sys::set_session_title(pid, title),
+            _ => Ok(false),
         };
     }
     write_pty(cfg, bytes)
@@ -162,18 +170,73 @@ fn write_session(cfg: &Config, bytes: &[u8], title: &str) -> io::Result<()> {
 
 /// Write to the session's pty, resolved by [`sys::session_tty`] under the
 /// headless guard documented there.
-fn write_pty(cfg: &Config, bytes: &[u8]) -> io::Result<()> {
-    match cfg.claude_pid.as_deref().and_then(sys::session_tty) {
-        Some(mut tty) => tty.write_all(bytes),
+fn write_pty(cfg: &Config, bytes: &[u8]) -> io::Result<bool> {
+    write_to(cfg.claude_pid.as_deref().and_then(sys::session_tty), bytes)
+}
+
+fn write_to(tty: Option<impl Write>, bytes: &[u8]) -> io::Result<bool> {
+    match tty {
+        Some(mut tty) => tty.write_all(bytes).map(|()| true),
         // No pty is not a failure: a redirected `claude -p` has no tab, and there
         // is nothing to report to a hook whose output is a protocol.
-        None => Ok(()),
+        None => Ok(false),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::armed::Armed;
+    use crate::edge::Paint;
+    use crate::surface::Surface;
+
+    #[test]
+    fn missing_or_invalid_session_destination_is_skipped_not_written() {
+        let mut cfg = Config::for_test();
+        for pid in [None, Some("0"), Some("not-a-pid")] {
+            cfg.claude_pid = pid.map(Into::into);
+            assert!(!write_session(&cfg, b"unused", "unused").unwrap());
+            assert!(!pane_title("unused", &cfg).unwrap());
+        }
+    }
+
+    #[test]
+    fn combined_startup_can_fail_after_the_arm_was_written() {
+        if !sys::HAS_SESSION_TTY {
+            return;
+        }
+        let mut cfg = Config::for_test();
+        cfg.stack.leaf = Surface::Konsole;
+        let route = crate::mux::route(&cfg.stack, Paint::SessionStart, Armed::assumed(cfg.stack.leaf));
+        let bytes = startup_bytes("title", &cfg, route);
+        let arm = Surface::Konsole.caps().arming.as_ref().unwrap().pair().0;
+        assert_eq!(bytes, [arm, b"\x1b]0;title\x07"].concat());
+
+        struct FailAfter {
+            accepted: Vec<u8>,
+            limit: usize,
+        }
+        impl Write for FailAfter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let n = bytes.len().min(self.limit - self.accepted.len());
+                if n == 0 {
+                    return Err(io::Error::other("injected write failure"));
+                }
+                self.accepted.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        for limit in [0, 1, arm.len(), arm.len() + 3] {
+            let mut writer = FailAfter { accepted: Vec::new(), limit };
+            assert!(write_to(Some(&mut writer), &bytes).is_err());
+            assert_eq!(writer.accepted, bytes[..limit]);
+        }
+        let mut complete = Vec::new();
+        assert!(write_to(Some(&mut complete), &bytes).unwrap());
+        assert_eq!(complete, bytes);
+        assert!(!write_to(None::<Vec<u8>>, &bytes).unwrap());
+    }
 
     fn escaped(s: &str) -> String {
         let mut out = String::new();

@@ -892,18 +892,19 @@ pub fn set_session_title(_claude_pid: &OsStr, _title: &str) -> io::Result<bool> 
 
 /// Write to a pty NAMED BY tmux - an attached client's terminal - under the same
 /// guard [`session_tty`] applies to fd 1: under /dev/pts or /dev/tty, a character
-/// device, and writable. A failure is nothing to report: the client may have
-/// detached between the listing and the write.
-pub fn write_tty(path: &Path, bytes: &[u8]) {
+/// device, and writable. `Ok(false)` is a refused/unresolvable destination;
+/// `Ok(true)` is a completed write, not terminal acknowledgement. An open/write
+/// error is returned; a write error may follow a partial write. The client may
+/// have detached between the listing and the write.
+pub fn write_tty(path: &Path, bytes: &[u8]) -> io::Result<bool> {
     if !is_tty_path(path) {
-        return;
+        return Ok(false);
     }
     if !path.metadata().is_ok_and(|m| is_char_device(&m.file_type())) {
-        return;
+        return Ok(false);
     }
-    if let Ok(mut f) = OpenOptions::new().write(true).open(path) {
-        let _ = f.write_all(bytes);
-    }
+    let mut f = OpenOptions::new().write(true).open(path)?;
+    f.write_all(bytes).map(|()| true)
 }
 
 /// A byte prefix, not `Path::starts_with`: /dev/ttyS0 is a single component, so

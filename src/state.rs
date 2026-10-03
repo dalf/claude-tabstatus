@@ -416,7 +416,7 @@ fn id_str(raw: &[u8]) -> Option<String> {
 ///   g 1790380620                            last positive main Stop snapshot
 ///   p 3709427 84460384                         the session's (pid, start time)
 ///   w aec99e1f4bda1972b:1790380630 -:1790380631
-///   s konsole                                  the surface this session ARMED
+///   s konsole                                  the surface this session may need to restore
 /// ```
 ///
 /// Each `w` word is one wait: its owner, a colon, and the epoch at which THAT wait
@@ -434,14 +434,10 @@ fn id_str(raw: &[u8]) -> Option<String> {
 /// macOS `r <pid> <microseconds since the epoch>` ([`sys::ORIGIN_KEY`]): one key
 /// per ENCODING, and each platform reads the others' as no origin.
 ///
-/// The optional `s` line is rung 2 of [`crate::armed`], and it is written ONLY by
-/// a session that actually armed something - which is what keeps every record
-/// written before this commit readable, keeps every record written by a session
-/// that armed nothing byte-for-byte what it was, and keeps the 312-case corpus,
-/// which has no state directory at all, untouched. The price is that this rung can
-/// say "konsole armed" and cannot say "nothing armed"; its silence falls through
-/// to the assumption, exactly as a missing file does. An older reader skips the
-/// key like any other unknown one, so the tag does not move.
+/// The optional `s` line is rung 2 of [`crate::armed`]: a conservative restore
+/// obligation written only when startup routing selects appearance bytes. It
+/// records no delivery receipt, including for skipped/headless starts. Absence
+/// falls through to the legacy assumption; older readers skip this optional key.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Record {
     base: Glyph,
@@ -1018,7 +1014,7 @@ impl Session {
         let _ = fs::remove_file(&self.path);
     }
 
-    /// RUNG 2, read back: what this session armed, according to its own record.
+    /// RUNG 2, read back: this session's conservative restore obligation.
     ///
     /// It takes NO LOCK and it is called before [`Session::resolve`], because the
     /// `SessionEnd` branch of that function DELETES this file - and unlocked is the
@@ -1036,28 +1032,19 @@ impl Session {
         };
         match r.armed.and_then(|n| surface::by_name(n.as_bytes())) {
             Some(s) => Support::Available(Some(s)),
-            None => Support::Unsupported("the record says nothing about what was armed"),
+            None => Support::Unsupported("the record has no restore obligation"),
         }
     }
 
-    /// RUNG 2, written: remember the surface whose appearance bytes just went out.
+    /// RUNG 2: remember the selected surface before direct startup delivery.
     ///
-    /// AFTER the arming and not before, which is the whole reason this is a second
-    /// write rather than a field of the record `SessionStart` already writes.
-    /// Record-then-arm as one transaction would have to run before the routing
-    /// exists, and a routing computed before the record would be the record
-    /// describing an intention rather than an act - so a crash in between leaves no
-    /// record, and `session_end` degrades to the assumption, which is exactly what
-    /// it did before this line existed.
+    /// This is a second locked update because routing follows state resolution.
+    /// It is creation-capable even for headless starts whose default state needed
+    /// no file. A skipped or failed write does not cancel it: the combined
+    /// arm/title write may fail after arming has reached the destination.
     ///
-    /// A failed lock or a failed write is silence for the same reason: the rung
-    /// below is the old behaviour, so losing this costs nothing that was ever had.
-    ///
-    /// It is CREATION-CAPABLE, unlike the painting edges: `SessionStart` writes no
-    /// file at all when the record it would write is the one a session with no
-    /// record is already assumed to have - which is every session whose
-    /// `$CLAUDE_PID` names nothing - and this is a fact about the session that no
-    /// default can stand in for.
+    /// Persistence is best effort. Lock/write failure leaves restoration relying
+    /// on the other rungs, without a guarantee if the environment later changes.
     pub fn note_armed(&self, surface: Surface) {
         let Some(_lock) = self.lock(true) else { return };
         let (was, mut now, _) = self.load();
@@ -2594,16 +2581,11 @@ mod tests {
         assert_eq!(f.record(), "");
     }
 
-    /// RUNG 2, end to end: what a session armed survives to the end hook, and a
-    /// session that armed nothing writes a record byte for byte what it always
-    /// wrote.
-    ///
-    /// The second half is the one that had to be true before this line could
-    /// exist: every state record on disk, and every assertion about one in
-    /// `tests/run.sh` and the six Python suites, is a record of a session that
-    /// armed nothing.
+    /// Rung 2 preserves an optional restore obligation through ordinary updates
+    /// and reads it before teardown. A session with no appearance route keeps
+    /// the existing record bytes without adding an arming field.
     #[test]
-    fn what_a_session_armed_is_written_only_when_it_armed_and_read_back_at_the_end() {
+    fn a_restore_obligation_is_optional_preserved_and_read_back_at_the_end() {
         let f = Fixture::new("armed");
         let start =
             payload(r#"{"session_id":"s1","hook_event_name":"SessionStart","source":"startup"}"#);
@@ -2611,7 +2593,7 @@ mod tests {
         plain.resolve(Edge::SessionStart, &start);
         let untouched = format!("cts5\nb i\n{}", f.origin_line());
         assert_eq!(f.record(), untouched);
-        // A session that armed nothing never calls `note_armed`, so this is the
+        // A session with no appearance route never calls `note_armed`, so this is the
         // whole of the claim: the file is what it was.
         assert!(matches!(plain.armed(), Support::Unsupported(_)));
         plain.note_armed(Surface::Konsole);

@@ -431,6 +431,9 @@ impl Route {
 /// Re-deriving the second from the environment is the defect; taking both from one
 /// argument is the repair. The surface is asked for `arming` and never for its
 /// NAME, so a surface that grows an arming later needs no edit here.
+///
+/// Only the surface is remembered. Channel selection below uses the CURRENT
+/// stack; restoration assumes stable topology and remembers no destination.
 pub fn route(stack: &Stack, paint: Paint, armed: Armed) -> Route {
     let title = match (paint, stack.renders_title()) {
         // session start and end write the tab themselves whatever is above them:

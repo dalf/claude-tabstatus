@@ -494,6 +494,60 @@ class TmuxStatusTests(unittest.TestCase):
                                 self.assertEqual(option("@cctab_armed"), "")
                                 self.assertEqual(option("client-attached[1971]"), "")
 
+    def test_detached_policy_survives_other_start_and_reattach_until_last_owner(self):
+        arm = b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07"
+        restore = b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07"
+        other = self.new_window("second")
+
+        def option(name):
+            return self.tm("display-message", "-p", "-t", self.pane, "#{" + name + "}")
+
+        self.assertEqual(self.tm("list-clients", "-t", self.pane), "")
+        envs = [{"CLAUDE_PID": self.tm("display-message", "-p", "-t", pane, "#{pane_pid}"),
+                 "CCTAB_TERMINAL": surface, "CCTAB_STATE_DIR": str(self.root / "state")}
+                for pane, surface in ((self.pane, "konsole"), (other, "wezterm"))]
+        for index, pane in enumerate((self.pane, other)):
+            self.hook("session-start", pane, envs[index], {"session_id": f"s{index}"})
+            self.wait_for(lambda: self.tm("display-message", "-p", "-t", pane,
+                                          "#{pane_title}").split()[-2:-1], ["i"])
+        self.assertEqual(option("@cctab_armed"), "konsole")
+        rearm = option("client-attached[1971]")
+        self.assertIn("tmux-arm", rearm)
+        self.assertIn("s konsole", (self.root / "state" / "s0").read_text().splitlines())
+        report = self.hook("doctor", self.pane).decode()
+        self.assertIn("retained policy, not confirmed delivery", report)
+        self.assertIn("none attached", report)
+
+        with self.attached_client() as client:
+            self.assertTrue(client.saw(arm), "detached policy did not arm the attaching client")
+            self.hook("session-end", self.pane, dict(envs[0], CCTAB_TERMINAL="wezterm"),
+                      {"session_id": "s0"})
+            self.wait_for(lambda: option("pane_title"), "")
+            self.assertFalse(client.saw(restore, timeout=0.3))
+            self.assertEqual(option("@cctab_armed"), "konsole")
+            self.assertEqual(option("client-attached[1971]"), rearm)
+        self.wait_for(lambda: self.tm("list-clients", "-t", self.pane), "")
+        # The remaining owner never selected Konsole, but retains its policy.
+        with self.attached_client() as client:
+            self.assertTrue(client.saw(arm), "shared policy was lost before reattachment")
+            self.hook("session-end", other, envs[1], {"session_id": "s1"})
+            self.assertTrue(client.saw(restore))
+            self.assertEqual(option("@cctab_armed"), "")
+            self.assertEqual(option("client-attached[1971]"), "")
+        self.wait_for(lambda: self.tm("list-clients", "-t", self.pane), "")
+        with self.attached_client() as client:
+            self.assertFalse(client.saw(arm, timeout=0.3), "retired policy armed a later client")
+
+    def test_last_detached_owner_retires_policy_without_a_restore_receipt(self):
+        self.hook("session-start", self.pane, {"CCTAB_TERMINAL": "konsole"})
+        self.assertEqual(self.tm("list-clients", "-t", self.pane), "")
+        self.hook("session-end", self.pane, {"CCTAB_TERMINAL": "wezterm"})
+        for name in ("@cctab_armed", "client-attached[1971]"):
+            self.assertEqual(self.tm("display-message", "-p", "-t", self.pane,
+                                     "#{" + name + "}"), "")
+        with self.attached_client() as client:
+            self.assertFalse(client.saw(b"\x1b]50;", timeout=0.3))
+
     def test_a_session_that_armed_nothing_is_not_restored_by_a_late_terminal(self):
         """The other half of the same defect, and the reason `-` is a value.
 

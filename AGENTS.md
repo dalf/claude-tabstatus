@@ -27,7 +27,7 @@ carries the management verbs (`install`, `uninstall`, `doctor`, `version`,
 | `src/surface/` | the leaf terminal, chosen at runtime and dispatched statically: `probe.rs` the detection table and the `CCTAB_TERMINAL` override, `rows.rs` the fourteen capability rows as `const` data with their provenance, `compose.rs` the bytes a row spells |
 | `src/mux/` | the multiplexer axis: `mod.rs` detects tmux or screen and `route`s who owns the title and which channel the leaf's bytes ride; `tmux.rs` the tmux integration: the record, `set-titles-string`, window-status formats, restore |
 | `src/clock.rs` | the one clock (`CCTAB_NOW` pins it) and the one TTL grammar, shared by the state record's expiry and the tmux carrier |
-| `src/armed.rs` | what `SessionStart` armed, recorded where `SessionEnd` reads it back: tmux's `@cctab_armed`, then the record's `s` line, then the old assumption under its own name |
+| `src/armed.rs` | restore obligations and their provenance, read by `SessionEnd`: tmux's `@cctab_armed`, then the record's `s` line, then the old assumption under its own name |
 | `src/manage.rs` | all management verbs: `install`, `uninstall`, `doctor`, `version`, `tmux-format`, `tmux-arm`, `print-embedded`, `help` |
 | `src/tree.rs` | the generated plugin tree that `install` materialises and Claude Code loads |
 | `src/embedded.rs` | `hooks/hooks.json` and `.claude-plugin/plugin.json`, compiled in with `include_str!` |

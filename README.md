@@ -581,7 +581,12 @@ does is in
 - **Konsole repaints the tab on a ~2s tick**, so the dot trails the real state by
   up to about two seconds.
 - **The Konsole restore puts back Konsole's stock formats** (`%d : %n` and
-  `(%u) %H`), not a customised profile's.
+  `(%u) %H`), not a customised profile's. Restoration is best effort: it remembers
+  the terminal type, not the original terminal destination. Keep the session's
+  terminal and tmux routing stable. Detach/reattach within the same tmux session
+  is supported, but a client detached when the last Claude exits cannot receive
+  the restore. Failed or interrupted writes are not retried; a recorded restore
+  obligation does not prove that the terminal applied the arming.
 - **`KONSOLE_*` is inherited environment**: an xterm launched from a Konsole
   shell carries it, and there the switch sets the font instead. Set
   `CCTAB_TERMINAL` to anything other than `konsole` to turn it off.

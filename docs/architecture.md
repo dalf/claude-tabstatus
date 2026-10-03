@@ -400,7 +400,7 @@ b i                                            base = w | a | i
 g 1790380620                                   last main Stop reporting background
 p 3709427 84460384                             the session's (pid, start time)
 w aec99e1f4bda1972b:1790380630 -:1790380631    one wait per word: owner, then epoch
-s konsole                                      the surface this session ARMED
+s konsole                                      the surface this session may need to restore
 ```
 
 On macOS the origin line is `r <pid> <us>` and on Windows
@@ -435,15 +435,11 @@ the [contract](state-contract.md#transitions-and-retirement), and why child
 completion alone does not prove a workflow ended is in the
 [indicator policy](indicator-semantics.md#background-lifecycle-and-reconciliation).
 
-The optional `s` line is written **only** by a session that actually armed its
-terminal - today, Konsole - and it is what `SessionEnd` restores from when there is
-no tmux server to hold the same fact. A surface name this build has no row for
-reads as **absent**, never as a different terminal, so the end hook falls back to
-its own environment rather than writing bytes at random. Its silence therefore
-means "nothing is recorded" and not "nothing was armed": a session that armed
-nothing writes exactly the record it always wrote, which is what keeps every record
-already on disk, and the 312-case golden corpus, byte for byte unchanged. The
-normative rule is in [time and persistence](state-contract.md#time-and-persistence).
+The optional `s` line follows the normative rule in
+[time and persistence](state-contract.md#time-and-persistence). It records a
+conservative restore obligation, not confirmed delivery; the
+[arming and restore contract](backend-architecture.md#the-armed-record) explains
+its ordering, fallback and best-effort limits.
 
 The `n` key is reserved, last in the file so free-form text would arrive whole, for
 a cached session title; it is not implemented (see the roadmap in
@@ -1494,10 +1490,13 @@ one server are two different outer tabs, and a server-wide record would let eith
 one's `SessionEnd` erase the other's. Within a tmux session it is a shared restore
 obligation: an arming start records the surface's name; a non-arming start uses
 tmux's `set -o` to initialise `-` only if no record exists. It preserves both an
-outstanding arm and its reattach hook. The last Claude pane restores the tab and
-removes both, regardless of which pane armed it. `SessionEnd` reads it back instead
+outstanding policy and its reattach hook. The last Claude pane attempts restoration
+and removes both, regardless of which pane selected the policy. `SessionEnd` reads it back instead
 of guessing from its own environment - so a `CCTAB_TERMINAL` that changes
-mid-session no longer loses the restore. A value naming no surface this build knows reads as **absent**,
+mid-session no longer loses the remembered surface. This is retained policy, written
+before client delivery, including detached starts; it proves no terminal application.
+The [arming contract](backend-architecture.md#the-armed-record) states the current-destination
+and best-effort restoration limits. A value naming no surface this build knows reads as **absent**,
 never as a different terminal. `tabstatus uninstall` removes it with the hook.
 
 `@cctab_window_color` returns the highest-priority visible state across all Claude

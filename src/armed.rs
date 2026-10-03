@@ -1,47 +1,26 @@
-//! What a backend ARMED, recorded where the END hook can read it back.
+//! Restore obligations, not receipts for terminal application.
 //!
-//! This is the LIFETIME half of this project's named recurring defect. The
-//! spelling half is already fixed: [`crate::surface::Arming`] pairs the arm and
-//! the restore in one const, so a restore whose bytes drifted from its arm cannot
-//! be written. But pairing two byte strings says nothing about WHEN they are
-//! chosen, and `session_end` chose them by re-deriving the arming condition FROM
-//! THE END HOOK'S OWN ENVIRONMENT - `CCTAB_TERMINAL`, `$TMUX`, `KONSOLE_*` - while
-//! `session_start` had derived it from the START hook's, minutes or hours earlier.
-//! Change any of those in between and the two answers differ: a restore with no
-//! arm, or, far worse, an arm with no restore, which leaves the tab governed by
-//! `LocalTabTitleFormat=%w` for as long as it lives.
+//! [`Armed::resolve`] chooses the surface whose restore bytes to attempt:
+//! 1. tmux's session-scoped `@cctab_armed` retains shared arming policy. A surface
+//!    name is recorded before client writes, even while detached; `-` means no
+//!    retained policy. A non-arming start cannot erase another pane's policy.
+//! 2. The session record's `s <surface>` is a conservative restore obligation.
+//!    It is written after routing, after the tmux client attempts, and before
+//!    the combined direct arm/title write. Skips, failures and partial writes
+//!    do not cancel it. It has no negative value; absence falls through.
+//! 3. [`ArmSource::Assumed`] reuses the end hook's environment, the legacy
+//!    assumption when neither store answers.
 //!
-//! So: what a backend arms must be RECORDED, and restore must be driven by that
-//! record. Three rungs, in order of preference:
+//! None is a confirmed-write record. Even a completed write only confirms the
+//! transport accepted bytes, not that a terminal applied them. Unknown surface
+//! names read as absent, so a later version cannot make us choose arbitrary bytes.
 //!
-//! | rung | store | available when |
-//! |---|---|---|
-//! | 1 | the multiplexer's own key-value store (`@cctab_armed`) | inside tmux |
-//! | 2 | the session state record (`s <surface>`) | a state directory exists |
-//! | 3 | [`ArmSource::Assumed`] - the old predicate, LABELLED as an assumption | neither |
-//!
-//! **Rung 3 is not a cop-out; it is the honest name for today's behaviour.** It is
-//! also the only rung the 312-case corpus exercises, because `tests/run.sh` unsets
-//! the state directory globally and no corpus case drives a live tmux server. That
-//! is precisely why the corpus stays byte-identical across this commit: every
-//! corpus case takes rung 3, and rung 3 is the predicate that was already there.
-//!
-//! THE STORES ARE ASYMMETRIC, and the asymmetry is deliberate. Rung 1 can say
-//! "nothing armed" (`-`), initialised by a non-arming SessionStart only if no
-//! shared record exists. A later non-arming start preserves an outstanding arm;
-//! the last Claude pane restores it, even if that pane did not arm it. Rung 2
-//! cannot record a negative: a record line written on
-//! every session would change the bytes of every state record on disk, and the
-//! record format's own rule is that an update never changes what it did not mean
-//! to. So rung 2 answers only "this surface armed", and its silence falls through
-//! to rung 3 - which fixes "an arm with no restore" everywhere a state directory
-//! exists, and "a restore with no arm" only inside tmux.
-//!
-//! AN UNRECOGNISED VALUE READS AS ABSENT, never as a different surface. Both
-//! stores are read with [`crate::surface::by_name`], which answers `None` for a
-//! name no row in this build spells - so a value written by a later version, or a
-//! `@cctab_armed` a user set by hand, drops to the next rung instead of choosing
-//! bytes at random. That is the same rule the platform stamp follows.
+//! Only the surface is remembered. The delivery channel and destination come
+//! from the current stack, process and tmux client registry. Restoration assumes
+//! stable topology (with tmux detach/reattach handled by its retained policy),
+//! and remains best effort: stores can fail, guards can skip, writes can fail,
+//! and teardown retires the obligation without acknowledgement or retries.
+//! See docs/backend-architecture.md, "The armed record", for the full limits.
 
 use crate::support::Support;
 use crate::surface::Surface;
@@ -52,10 +31,9 @@ use crate::surface::Surface;
 /// store that remembers and an environment that was asked again.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ArmSource {
-    /// Rung 1: the multiplexer's own key-value store, written by the same
-    /// SessionStart that armed.
+    /// Rung 1: retained shared tmux policy, including starts with no clients.
     Mux,
-    /// Rung 2: the session's state record.
+    /// Rung 2: a conservative restore obligation in the session record.
     Record,
     /// Rung 3: nothing remembered, so the arming condition was re-derived from
     /// THIS hook's environment. The old behaviour, and the old bug, wearing its
@@ -69,8 +47,8 @@ impl ArmSource {
     /// place.
     pub fn why(self) -> &'static str {
         match self {
-            ArmSource::Mux => "recorded by the multiplexer, so session end restores what was armed",
-            ArmSource::Record => "recorded in the session's state record",
+            ArmSource::Mux => "recorded by the multiplexer as retained policy, not confirmed delivery",
+            ArmSource::Record => "restore obligation recorded in the session state, not confirmed delivery",
             ArmSource::Assumed => {
                 "ASSUMED from this hook's environment - no store could answer, so a \
                  CCTAB_TERMINAL that changes mid-session loses the restore"
@@ -79,9 +57,9 @@ impl ArmSource {
     }
 }
 
-/// What remains armed (shared across Claude panes in tmux), and which rung said so.
+/// Which surface to attempt restoring, and the source of that decision.
 ///
-/// `surface` is `None` for "nothing was armed", which is a real answer and not an
+/// `surface` is `None` for "no retained arming policy", a real answer and not an
 /// absence: rung 1 can state it. The absences all live in the `Support` values
 /// handed to [`Armed::resolve`], which is how the ladder is written without a
 /// second absence vocabulary.
@@ -94,9 +72,8 @@ pub struct Armed {
 impl Armed {
     /// Rung 3: the leaf this hook's own environment resolved, labelled.
     ///
-    /// SessionStart uses this and is RIGHT to: at the moment of arming, the leaf
-    /// the environment names IS the surface that arms. It is only the END hook, an
-    /// unbounded time later, for which the same derivation is a guess.
+    /// At SessionStart this selects the intended surface. At SessionEnd it is
+    /// only an assumption about an earlier hook; it proves no delivery at either edge.
     pub fn assumed(leaf: Surface) -> Armed {
         Armed { surface: Some(leaf), source: ArmSource::Assumed }
     }
@@ -122,8 +99,8 @@ impl Armed {
         Armed::assumed(leaf)
     }
 
-    /// The surface whose appearance bytes are in force, if any. `None` is
-    /// "nothing is armed", and [`crate::mux::route`] turns it into no appearance
+    /// The surface whose restore bytes are owed or assumed, if any. `None` is
+    /// "no retained policy", and [`crate::mux::route`] turns it into no appearance
     /// channel at all.
     pub fn surface(self) -> Option<Surface> {
         self.surface
@@ -174,7 +151,7 @@ mod tests {
             assert!(armed.surface() == Some(Surface::Konsole));
             assert!(armed.surface().is_some_and(|s| s.caps().arming.is_some()));
         }
-        // And the other direction: a store that says nothing armed is not talked
+        // And the other direction: a store with no retained policy is not talked
         // out of it by an environment that now names Konsole.
         let none = Armed::resolve(Support::Available(None), NOTHING, Surface::Konsole);
         assert!(none.surface().is_none());
@@ -201,7 +178,7 @@ mod tests {
     }
 
     /// Every rung names itself in words a reader can act on, and only the
-    /// assumption admits what it costs.
+    /// assumption names the missing evidence.
     #[test]
     fn every_rung_says_which_one_it_is() {
         for s in [ArmSource::Mux, ArmSource::Record, ArmSource::Assumed] {

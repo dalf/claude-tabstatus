@@ -127,15 +127,15 @@ const OPT_EXE: &str = "@cctab_exe";
 /// would let either one's SessionEnd delete the other's. Measured on tmux 3.7c: a
 /// session value shadows a server value, and unsetting it falls back to the server
 /// one - which is why the unset below leaves the empty string that reads as "no
-/// record" rather than as "nothing was armed".
+/// record" rather than as "no retained arming policy".
 const OPT_ARMED: &str = "@cctab_armed";
 
-/// What [`OPT_ARMED`] holds when no SessionStart has armed the shared tab.
+/// What [`OPT_ARMED`] holds when no shared arming policy has been retained.
 ///
 /// A sentinel rather than an empty value, because the two are different answers
 /// and the empty one has to keep meaning "no record here". Without it, every tmux
 /// server that predates this commit - and every session whose SessionStart hook
-/// never ran - would read as "nothing was armed" and silently lose its restore.
+/// never ran - would read as "no retained arming policy" and silently lose its restore.
 /// No surface is named `-`, so [`crate::surface::by_name`] answers `None` for it
 /// the same way it answers `None` for a name from the future.
 const ARMED_NONE: &str = "-";
@@ -395,9 +395,8 @@ pub fn session_start(cfg: &Config, route: Route) {
     // which a tmux older than 3.0 has no syntax for, and measured, a command that
     // fails at the END of a `;`-chained batch leaves every command before it
     // applied. So an old tmux loses the re-arm and keeps the whole decay.
-    // The hook exists to re-arm what `route` armed, so it is gated on the SAME
-    // answer and never on the leaf's name a second time: a re-arm installed for a
-    // leaf whose arming did not go out is an arming with no matching un-arming.
+    // The hook and record retain the SAME policy, before any client write.
+    // Detached starts legitimately install both without delivering any bytes.
     match (armed, exe_path()) {
         // A path with a single quote in it has no representation inside ARM_HOOK's
         // sh quoting, and a path that is not UTF-8 cannot go into a format at all.
@@ -482,7 +481,7 @@ fn set(c: &mut Command, name: &str, value: &str) {
     c.arg("set").arg("-s").arg("--").arg(name).arg(value);
 }
 
-/// Record an arm at SESSION scope, or initialise a never-armed session.
+/// Record shared policy at SESSION scope before delivery, or initialise `-`.
 fn remember_armed(c: &mut Command, t: &Tmux, armed: Option<Surface>) {
     if c.get_args().next().is_some() {
         c.arg(";");
@@ -550,28 +549,28 @@ fn exe_path() -> Option<String> {
 /// It takes the pty as an argument instead of asking tmux, so the hook costs one
 /// fork and no socket round trip, and so the verb needs no `$TMUX` of its own.
 /// [`sys::write_tty`] is the guard: /dev/pts or /dev/tty, a character device,
-/// writable, and silent about any of that failing.
-pub fn arm_tty(path: &OsStr) {
+/// writable. The caller keeps this hook silent even on a write failure.
+pub fn arm_tty(path: &OsStr) -> io::Result<bool> {
     // The verb exists only for Konsole, so it reads Konsole's row directly rather
     // than resolving a surface it has no environment for: the hook fires in a tmux
     // server's own environment, where nothing names the leaf.
     if let Some(a) = &Surface::Konsole.caps().arming {
-        sys::write_tty(Path::new(path), a.pair().0);
+        return sys::write_tty(Path::new(path), a.pair().0);
     }
+    Ok(false)
 }
 
 /// Take the re-arm hook back off, and the armed record with it.
 ///
 /// ONE function, because the two have exactly one lifetime between them: the hook
-/// exists to re-arm on reattach what SessionStart armed, and the record exists to
-/// say what that was. Dropping one without the other leaves either a hook that
-/// re-arms a tab nothing will restore, or a record claiming an arm the reattach
-/// will no longer renew - both spellings of the same defect.
+/// exists to apply the retained policy on reattach, and the record exists to
+/// select its eventual restore bytes. Dropping one without the other leaves a
+/// hook without a restore obligation, or policy that reattachment cannot renew.
 ///
 /// The record is UNSET rather than set to [`ARMED_NONE`]: the session option
 /// falls back to the server's, which we never write, so the answer becomes the
 /// empty string - "no record here" - and the next rung gets to speak. Saying
-/// "nothing was armed" would be a claim about a session that no longer exists.
+/// "no retained arming policy" would be a claim about a session that no longer exists.
 fn disarm(t: &Tmux) {
     let mut c = Command::new("tmux");
     c.arg("set-hook").arg("-u");
@@ -583,7 +582,7 @@ fn disarm(t: &Tmux) {
     run(c);
 }
 
-/// RUNG 1: the surface this tmux session recorded as armed, read back out of the
+/// RUNG 1: this tmux session's retained arming policy, read back out of the
 /// multiplexer's own key-value store.
 ///
 /// An `Available` answer STOPS the ladder, so every way of not knowing has to be
@@ -591,7 +590,7 @@ fn disarm(t: &Tmux) {
 /// between the two hooks, a server whose SessionStart predates this record, or a
 /// value naming a surface this build has no row for. Any of those falls through to
 /// the state record and then to the assumption; only the server's own `-` is
-/// allowed to say "nothing was armed", and only because SessionStart writes it.
+/// allowed to say "no retained arming policy", and only because SessionStart writes it.
 ///
 /// ONE round trip, on SessionEnd and on doctor, both of which already exec tmux.
 /// Nothing on the paint path reaches this.
@@ -611,7 +610,7 @@ pub fn armed(t: &Tmux) -> Support<Option<Surface>> {
 /// query is a report that can disagree with the paint path.
 fn armed_value(v: &str) -> Support<Option<Surface>> {
     if v.is_empty() {
-        return Support::Unsupported("this tmux session holds no record of what was armed");
+        return Support::Unsupported("this tmux session holds no retained arming policy");
     }
     if v == ARMED_NONE {
         return Support::Available(None);
@@ -643,12 +642,13 @@ fn armed_value(v: &str) -> Support<Option<Surface>> {
 /// of the condition hidden inside [`to_clients`], while `emit::session_start`
 /// carried the complementary half. Two halves in two files is how a pane gets
 /// armed twice.
-pub fn arm_konsole(cfg: &Config, route: Route) {
-    let Some(surface) = route.arms(Channel::Clients) else { return };
-    let Some(t) = cfg.stack.tmux() else { return };
+pub fn arm_konsole(cfg: &Config, route: Route) -> io::Result<bool> {
+    let Some(surface) = route.arms(Channel::Clients) else { return Ok(false) };
+    let Some(t) = cfg.stack.tmux() else { return Ok(false) };
     if let Some(a) = &surface.caps().arming {
-        to_clients(t, a.pair().0);
+        return to_clients(t, a.pair().0);
     }
+    Ok(false)
 }
 
 /// Put the tab formats back, but only when no OTHER claude is left in this
@@ -657,12 +657,12 @@ pub fn arm_konsole(cfg: &Config, route: Route) {
 /// Our own pane is excluded from the count rather than relied on to have been
 /// cleared already: session end's empty title travels through the pty and tmux's
 /// parser, and racing that would silently skip the restore.
-pub fn session_end(cfg: &Config, route: Route) {
+pub fn session_end(cfg: &Config, route: Route) -> io::Result<bool> {
     // WHOSE bytes came out of the record, not out of this hook's environment; see
     // [`crate::armed`]. All this function still decides is whether anyone else is
     // using them.
-    let Some(surface) = route.arms(Channel::Clients) else { return };
-    let Some(t) = cfg.stack.tmux() else { return };
+    let Some(surface) = route.arms(Channel::Clients) else { return Ok(false) };
+    let Some(t) = cfg.stack.tmux() else { return Ok(false) };
     let mut c = Command::new("tmux");
     c.arg("display-message").arg("-p");
     t.target(&mut c);
@@ -672,14 +672,17 @@ pub fn session_end(cfg: &Config, route: Route) {
     // the tab armed: the session that does turn the lights out has to still be
     // able to read what to put back.
     if capture(c).is_ok_and(|s| s.contains('1')) {
-        return;
+        return Ok(false);
     }
-    if let Some(a) = &surface.caps().arming {
-        to_clients(t, a.pair().1);
-    }
-    // The last claude in this session is going: nothing is left for a reattach to
-    // re-arm, and nothing is left armed for a record to describe.
+    let delivered = match &surface.caps().arming {
+        Some(a) => to_clients(t, a.pair().1),
+        None => Ok(false),
+    };
+    // Retire the policy even if restoration failed or no client was attached:
+    // the last Claude is leaving, so future attaches must not arm again. This
+    // is best-effort cleanup, not an acknowledgement or a pending retry queue.
     disarm(t);
+    delivered
 }
 
 /// `1` once per pane of this session that carries a record and is not ours.
@@ -701,15 +704,34 @@ fn others_expr(t: &Tmux) -> String {
 /// presence is no longer its business: it used to carry the tmux half of the
 /// arming condition in that `let Some` - the half `emit.rs` complemented, and the
 /// half that made lifting the caller's body into a method an unconditional arm.
-fn to_clients(t: &Tmux, bytes: &[u8]) {
+///
+/// `Ok(true)` means at least one completed write, `Ok(false)` none (detached or
+/// all destinations skipped). Return the first error after trying every client;
+/// it can coexist with complete or partial writes to other clients. No outcome
+/// proves terminal application or changes the retained arming policy.
+fn to_clients(t: &Tmux, bytes: &[u8]) -> io::Result<bool> {
     let mut c = Command::new("tmux");
     c.arg("list-clients");
     t.target(&mut c);
     c.arg("-F").arg("#{client_tty}");
-    let Ok(out) = capture(c) else { return };
+    let out = capture(c).map_err(|_| io::Error::other("tmux client listing failed"))?;
+    write_clients(&out, bytes, sys::write_tty)
+}
+
+fn write_clients(
+    out: &str,
+    bytes: &[u8],
+    mut write: impl FnMut(&Path, &[u8]) -> io::Result<bool>,
+) -> io::Result<bool> {
+    let mut result = Ok(false);
     for line in out.lines().filter(|l| !l.is_empty()) {
-        sys::write_tty(Path::new(line), bytes);
+        // Evaluate the next write even when an earlier client failed.
+        result = match (result, write(Path::new(line), bytes)) {
+            (Ok(any), Ok(wrote)) => Ok(any || wrote),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        };
     }
+    result
 }
 
 /// Make a value safe to splice into a format's TEXT, which is a different
@@ -1296,7 +1318,7 @@ pub fn report(cfg: &Config) -> Vec<String> {
         "           restore: {}",
         match record.surface().filter(|s| s.caps().arming.is_some()) {
             Some(s) => format!("{}, {}", s.caps().name, record.source().why()),
-            None => format!("nothing armed, {}", record.source().why()),
+            None => format!("no arming policy, {}", record.source().why()),
         }
     ));
     if cfg.stack.leaf == Surface::Konsole {
@@ -1304,7 +1326,7 @@ pub fn report(cfg: &Config) -> Vec<String> {
             "           arm: {}",
             match get(9) {
                 h if h == ARM_HOOK =>
-                    "OK   client-attached re-arms this tab's Konsole format on every \
+                    "OK   client-attached attempts Konsole arming on every \
                      reattach",
                 "" => "WARN no client-attached hook, so a detach/reattach lands in an \
                        un-armed tab. Remedy: /clear, which re-runs SessionStart",
@@ -1398,6 +1420,28 @@ pub fn format_lines(cfg: &Config) -> [String; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_writes_distinguish_skips_and_continue_after_failure() {
+        assert!(!write_clients("", b"arm", |_, _| panic!("detached")).unwrap());
+        assert!(!write_clients("skipped\n", b"arm", |_, _| Ok(false)).unwrap());
+        assert!(write_clients("skipped\nwritten\n", b"arm", |p, _| {
+            Ok(p == Path::new("written"))
+        }).unwrap());
+        let mut seen = Vec::new();
+        let result = write_clients("failed\nwritten\nskipped\nfailed-again\n", b"arm", |p, bytes| {
+            assert_eq!(bytes, b"arm");
+            seen.push(p.to_path_buf());
+            match p.to_str().unwrap() {
+                "failed" => Err(io::Error::other("first failure, possibly partial")),
+                "failed-again" => Err(io::Error::other("second failure")),
+                "written" => Ok(true),
+                _ => Ok(false),
+            }
+        });
+        assert_eq!(seen.len(), 4);
+        assert_eq!(result.unwrap_err().to_string(), "first failure, possibly partial");
+    }
 
     #[test]
     fn a_tmux_env_is_a_socket_path_and_two_numbers() {
@@ -1540,7 +1584,7 @@ mod tests {
 
     /// The armed record's grammar, which is the whole of rung 1's reliability.
     ///
-    /// Three answers and not two: "nothing was armed" is a STATEMENT, and the
+    /// Three answers and not two: "no retained arming policy" is a STATEMENT, and the
     /// empty string has to keep meaning "no record here", or every tmux server
     /// that predates this option - and every session whose SessionStart hook never
     /// ran - would read as a session that armed nothing and silently lose its

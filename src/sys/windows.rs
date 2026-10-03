@@ -1951,7 +1951,9 @@ fn read_word(p: &Process, at: usize) -> Option<usize> {
 }
 
 /// tmux client ptys do not exist on native Windows.
-pub fn write_tty(_path: &Path, _bytes: &[u8]) {}
+pub fn write_tty(_path: &Path, _bytes: &[u8]) -> io::Result<bool> {
+    Ok(false)
+}
 
 /// A file's DACL read and set through the Win32 named-object calls - not through
 /// [`security_of`] and [`create_secured`], which the tests using these are grading.

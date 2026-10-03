@@ -3629,10 +3629,10 @@ else
            | grep -c 'restore: konsole, ASSUMED from this hook')"
     # The record line is printed for every session inside tmux, not only in Konsole
     # mode: "armed, and nothing here can say by whom" is the shape of the defect.
-    check 'and prints the line outside konsole mode too, saying nothing is armed' '1' \
+    check 'and prints the line outside konsole mode too, saying no arming policy' '1' \
         "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
               TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" doctor 2>&1 \
-           | grep -c 'restore: nothing armed, ')"
+           | grep -c 'restore: no arming policy, ')"
     # uninstall owns the session-scoped record too: the server-wide sweep cannot
     # reach it, so a forgotten unset would outlive the uninstall that reported
     # success.

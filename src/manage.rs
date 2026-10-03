@@ -214,7 +214,8 @@ impl Subcommand {
             }
             Subcommand::TmuxArm(tty) => match tty {
                 Some(t) => {
-                    tmux::arm_tty(&t);
+                    // Reattachment is best effort; keep tmux's hook silent.
+                    let _ = tmux::arm_tty(&t);
                     0
                 }
                 None => {
