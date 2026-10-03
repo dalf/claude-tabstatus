@@ -2982,12 +2982,29 @@ mod tests {
         );
     }
 
+    // Use an actual exited pid rather than u32::MAX: macOS deliberately
+    // refuses to pass the latter to kill(2), whose signed argument names groups.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    fn exited_origin() -> Origin {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start a disposable process");
+        let pid = child.id();
+        assert!(child.wait().expect("reap the child").success());
+        assert_eq!(sys::process_alive(pid), Some(false));
+        Origin { pid, start: 1 }
+    }
+
     /// The reaper's decision, which is the one piece of this module that deletes
     /// something. Two properties matter: a record whose origin is a live process is
     /// never reapable however old it is, and nothing the reaper cannot PROVE is
     /// ours is reapable at all.
     #[test]
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn the_reaper_reaps_a_dead_session_and_provably_not_a_live_one() {
         let f = Fixture::new("reap");
         fs::create_dir_all(&f.dir).expect("a writable state dir");
@@ -3009,7 +3026,7 @@ mod tests {
 
         // THE LIVE CASE. Our own pid, with its real start time: this is exactly
         // what a live session's record looks like, and no age can make it stale.
-        let mine = Origin::mine_from(std::process::id()).expect("our own /proc entry");
+        let mine = Origin::mine_from(std::process::id()).expect("our own process start time");
         let live = write(
             "live",
             &Record { origin: Some(mine), ..Record::fresh() }.render(),
@@ -3018,12 +3035,12 @@ mod tests {
         assert!(mine.alive());
         assert_eq!(verdict(&live), None);
 
-        // A pid that cannot be running: the kernel's own maximum plus nothing.
-        // /proc/<pid> is absent, so the origin is gone.
+        // A real child that has exited and been waited for. An out-of-range
+        // pid is unverifiable on macOS, not evidence of a dead process.
         let dead = write(
             "dead",
             &Record {
-                origin: Some(Origin { pid: u32::MAX, start: 1 }),
+                origin: Some(exited_origin()),
                 ..Record::fresh()
             }
             .render(),
@@ -3070,6 +3087,22 @@ mod tests {
         // id - and a directory, which `remove_file` cannot take and which doctor
         // must therefore not promise.
         let mut untouchable = Vec::new();
+        if cfg!(target_os = "macos") {
+            // kill(2) cannot ask about this unsigned pid. Even age must not
+            // turn an unverifiable origin into proof that a session has died.
+            let unknown = write(
+                "unverifiable",
+                &Record {
+                    origin: Some(Origin { pid: u32::MAX, start: 1 }),
+                    ..Record::fresh()
+                }
+                .render(),
+            );
+            age(&unknown);
+            assert_eq!(sys::process_alive(u32::MAX), None);
+            assert_eq!(verdict(&unknown), None);
+            untouchable.push(unknown);
+        }
         for (name, body) in [
             ("notes.txt", "a shopping list"),
             ("id_rsa", "-----BEGIN OPENSSH PRIVATE KEY-----"),
@@ -3131,11 +3164,11 @@ mod tests {
 
     /// `doctor`'s report is generated from the same verdicts the reaper acts on.
     #[test]
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn doctor_reports_where_the_records_are_what_they_hold_and_which_are_stale() {
         let f = Fixture::new("survey");
         fs::create_dir_all(&f.dir).expect("a writable state dir");
-        let mine = Origin::mine_from(std::process::id()).expect("our own /proc entry");
+        let mine = Origin::mine_from(std::process::id()).expect("our own process start time");
         fs::write(
             f.dir.join("live"),
             Record {
@@ -3155,7 +3188,7 @@ mod tests {
         fs::write(
             f.dir.join("dead"),
             Record {
-                origin: Some(Origin { pid: u32::MAX, start: 1 }),
+                origin: Some(exited_origin()),
                 ..Record::fresh()
             }
             .render(),

@@ -27,6 +27,7 @@ project with similar ones.
 - [The per-session record](#the-per-session-record)
 - [Stale records and the reaper](#stale-records-and-the-reaper)
 - [Locking and atomic writes](#locking-and-atomic-writes)
+- [macOS validation](#macos-validation)
 - [Windows console-title painting](#windows-console-title-painting)
 - [Location resolution](#location-resolution)
 - [Install and uninstall mechanics](#install-and-uninstall-mechanics)
@@ -596,6 +597,55 @@ wait, so main-thread edges paint nothing until that agent's next tool call or it
 And because NTFS compares names without case, two session ids differing only in
 case would share one record; Claude Code's ids are lowercase UUIDs.
 
+## macOS validation
+
+Three kinds of evidence must stay separate:
+
+| Validation | Scope | Evidence at this change |
+|---|---|---|
+| Cross-checking on Linux | `cargo check --all-targets` for `aarch64-apple-darwin` and `x86_64-apple-darwin`; pure decision tests and ABI size/offset assertions | Available locally; does not link or execute Apple calls |
+| Native automated validation | `macos-15`, Apple Silicon (`aarch64-apple-darwin`), explicitly checked with `uname -m`; linked Rust tests, release-mode validation build, state suites and disposable PTY delivery | Job and tests added; **native execution pending**, no Mac available for this change and no remote workflow triggered |
+| Terminal-application testing | Terminal.app, iTerm2, Ghostty, Konsole and Claude Code's live hook integration | Not performed on macOS; a PTY byte capture cannot show how a terminal applies an OSC |
+
+The runner label's architecture follows [GitHub's runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+Intel macOS retains its cross-check; it has no native execution coverage here.
+`scripts/build.sh` selects the current Darwin architecture for local validation
+builds. Neither architecture gains a release asset or a support claim from this job.
+
+The native Rust process test queries a real child's start time twice, checks its
+identity and a deliberately mismatched timestamp, then waits for exit and checks
+liveness again. On macOS the timestamp must fall within the child's creation
+interval in epoch microseconds. The reaper and doctor tests now include macOS,
+retain an aged live record and remove a real exited child's record. An impossible
+PID is not used as evidence of death: macOS deliberately reports it unverifiable.
+The existing multi-process lock/race tests also run in the native Rust suite.
+
+`tests/test_unix_delivery.py` captures exact session-start/session-end bytes from
+newly allocated raw PTYs, with hook stdio on pipes. It checks the Apple Terminal,
+iTerm2, generic and Konsole rows, the remembered restore obligation after a
+surface change, the ordinary hook's matching protocol payload, and the native
+record origin key. These row selections simulate configuration, not terminal apps.
+Missing, malformed and exited PIDs, compaction and dry-run must deliver no bytes.
+File, pipe and `/dev/null` redirections retain a real controlling terminal: the
+suite checks that neither that terminal nor the redirected output receives a title.
+Every subprocess and state directory is disposable; no user terminal is a target.
+
+The native job also runs payload, semantic state, background, elicitation and
+persistence suites. The latter's strace fault injection remains Linux-only;
+its other delivery and locking tests run on both Unixes. Linux-specific `/proc`
+parsing and canonical-path unit tests retain their guards. The new native child
+and PTY tests cover the actual macOS headless path instead of weakening those
+Linux assertions. The Linux golden corpus remains a Linux specification and is
+not replayed as a macOS acceptance suite.
+
+A future successful native run will establish only the tested architecture, OS
+image and scenarios. macOS tmux, terminal application behaviour, real Claude Code
+sessions, Intel runtime behaviour and older macOS versions remain unvalidated.
+Forced PID reuse during terminal lookup/write and kernel permission-denied queries
+are not covered by these native scenarios; synthetic identity/errno tests cover
+only their decision rules.
+The Linux zero-subprocess gate is unchanged and still required for both binaries.
+
 ## Windows console-title painting
 
 `session-start` and `session-end`, which the hook protocol cannot carry, reach the
@@ -605,10 +655,10 @@ same file descriptor's path with `proc_pidfdinfo`. Everything after that - the
 `/dev/pts/` or `/dev/tty` prefix, the character-device test, the writable test -
 is one shared body, so the two Unixes accept and refuse exactly the same
 terminals. Konsole arming and the direct writes to tmux's panes go the same way,
-through the same guard, on both. **The macOS route has never been run on a Mac**:
-no machine in this project can link a macOS binary, only type-check one, and the
-struct layout it depends on is asserted at compile time rather than tested. On
-Windows they reach it as a **console title** instead: the hook leaves its own
+through the same guard, on both. The macOS native job now tests those OS calls
+and direct delivery, but its first execution is still pending; see
+[macOS validation](#macos-validation) for evidence and limits. On Windows they
+reach it as a **console title** instead: the hook leaves its own
 hidden console, attaches to Claude Code's (`$CLAUDE_PID`), calls
 `SetConsoleTitleW` - the idle title, or an empty one at the end - and detaches; the
 pseudo console under Windows Terminal forwards that as an OSC 0.

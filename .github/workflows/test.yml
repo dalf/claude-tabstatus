@@ -44,16 +44,12 @@ jobs:
           cargo test --locked --target x86_64-unknown-linux-musl
           cargo test --locked --target x86_64-unknown-linux-gnu
 
-      # No runner here builds for a Mac, and src/sys/unix.rs declares two structs
-      # of macOS's own ABI to resolve a session's pty. Their layout is asserted at
-      # compile time - `const _: () = assert!(size_of::<...>() == ...)` - so this
-      # type-check IS the check, and it is the only thing standing between a
-      # hand-written layout and a guess. `check` does not link, so no Apple SDK is
-      # needed; both ABIs, because they are two different ones.
+      # Keep both ABI checks, including Intel macOS which the native arm64 job
+      # does not execute. These assert layouts but do not link or test OS calls.
       - name: Check the macOS ABI declarations on both Apple targets
         run: |
-          cargo check --locked --target aarch64-apple-darwin
-          cargo check --locked --target x86_64-apple-darwin
+          cargo check --locked --all-targets --target aarch64-apple-darwin
+          cargo check --locked --all-targets --target x86_64-apple-darwin
 
       - name: Build release binaries and source manifests
         run: sh scripts/build.sh --all
@@ -76,6 +72,7 @@ jobs:
             CCTAB_TEST_BIN="$binary" python3 tests/test_state_contract.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_background.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_state_guarantees.py
+            CCTAB_TEST_BIN="$binary" python3 tests/test_unix_delivery.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_elicitation.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_tmux_status.py
             CCTAB_TEST_BIN="$binary" sh tests/run.sh
@@ -96,6 +93,43 @@ jobs:
             bin/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
+
+  macos:
+    name: Native macOS arm64 validation (no release artifact)
+    # macos-15 is Apple Silicon; assert this below so coverage cannot drift.
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust and verify native architecture
+        run: |
+          test "$(uname -m)" = arm64
+          rustup toolchain install stable --profile minimal --target aarch64-apple-darwin
+          rustup default stable
+          rustc -vV
+          sw_vers
+
+      - name: Link and run native Rust tests (including process identity and reaping)
+        run: cargo test --locked --all-targets --target aarch64-apple-darwin
+
+      - name: Build native validation binary
+        run: sh scripts/build.sh
+
+      - name: Run native state and disposable PTY tests
+        env:
+          CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
+        run: |
+          python3 tests/test_payload.py
+          python3 tests/test_state_contract.py
+          python3 tests/test_background.py
+          python3 tests/test_elicitation.py
+          python3 tests/test_state_guarantees.py
+          python3 tests/test_unix_delivery.py -v
 
   windows:
     name: Build and test Windows binary

@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -276,7 +277,8 @@ class ArmingDeliveryTests(unittest.TestCase):
         self.assertIn(b"s konsole\n", self.record.read_bytes())
         self.assert_restore(env)
 
-    @unittest.skipUnless(shutil.which("strace"), "strace required for write-failure injection")
+    @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("strace"),
+                         "Linux strace required for write-failure injection")
     def test_failed_direct_start_keeps_obligation_and_still_restores(self):
         env = dict(self.env, CLAUDE_PID=str(self.helpers.pty_pid()))
         trace = self.root / "trace"

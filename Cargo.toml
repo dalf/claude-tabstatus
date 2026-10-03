@@ -48,10 +48,10 @@ windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Wdk_
 #
 # Two of the three use libc's OWN declarations and hand-write no layout. The third
 # needs `struct proc_fileinfo`, `struct vnode_fdinfowithpath` and the flavour
-# constant, which libc does not declare, so src/sys/unix.rs writes them - and,
-# because nothing in this project can link a macOS binary to check a layout, it
-# ASSERTS every size and offset it depends on at compile time. CI type-checks both
-# Apple ABIs, so those asserts run somewhere other than a developer's machine.
+# constant, which libc does not declare, so src/sys/unix.rs writes them and asserts
+# the required sizes and offsets at compile time. CI type-checks both Apple ABIs;
+# the native arm64 job additionally links and exercises the OS calls and PTY path.
+# Native execution status and limits: docs/architecture.md#macos-validation.
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
 

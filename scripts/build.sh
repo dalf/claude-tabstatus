@@ -87,6 +87,15 @@ fi
 # .cargo/config.toml links its C runtime statically, so the .exe does not need
 # the Visual C++ Redistributable.
 case $(uname -s) in
+Darwin)
+    # Native validation builds only; these are not release assets.
+    case $(uname -m) in
+    arm64) host=aarch64-apple-darwin ;;
+    x86_64) host=x86_64-apple-darwin ;;
+    *) printf 'error: unsupported Darwin architecture\n' >&2; exit 1 ;;
+    esac
+    TARGETS=$host
+    ;;
 MINGW* | MSYS* | CYGWIN* | Windows_NT)
     host=x86_64-pc-windows-msvc
     TARGETS=$host

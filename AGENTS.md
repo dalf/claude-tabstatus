@@ -64,13 +64,14 @@ sh scripts/build.sh --all    # every target this host can build
 | `x86_64-unknown-linux-musl` | **default on Linux**, static-pie |
 | `x86_64-unknown-linux-gnu` | builds; dynamic, needs `GLIBC_2.34` |
 | `x86_64-pc-windows-msvc` | **default on Windows**, static CRT, built on Windows only |
+| `aarch64-apple-darwin`, `x86_64-apple-darwin` | native validation builds only; `build.sh` selects the Darwin host architecture; no release assets |
 
 - **Each host lists only the targets it can build**, so `--all` is a success
   signal: on Linux it is the two Linux targets, on Windows the one MSVC target.
-  Windows is a native port behind `src/sys`, not a cross-compile, so it is built
-  and tested on Windows. `x86_64-pc-windows-gnu` is not a target. There is no
-  macOS target ([issue #1](https://github.com/dalf/claude-tabstatus/issues/1))
-  and no aarch64 one; on macOS `build.sh` would wrongly pick the Linux list.
+  Darwin lists only its native architecture. Windows is a native port behind
+  `src/sys`, built and tested on Windows. `x86_64-pc-windows-gnu` is not a target.
+  There is no aarch64 Linux build target. macOS native execution is pending;
+  see [validation scope](docs/architecture.md#macos-validation).
 - **musl is the Linux default** because it starts faster and carries no glibc
   requirement on a remote box; the measurements are in
   [docs/architecture.md](docs/architecture.md).
@@ -148,17 +149,22 @@ when they agree.
 
 | suite | command | platforms |
 |---|---|---|
-| in-crate unit tests | `cargo test --locked` (CI: `--all-targets` on Windows, per target on Linux) | Linux, Windows |
+| in-crate unit tests | `cargo test --locked` (CI: `--all-targets` on Windows, per target on Linux and macOS) | Linux, Windows, macOS |
 | shell integration suite | `sh tests/run.sh` | Linux |
-| payload policy | `python3 tests/test_payload.py` | Linux, Windows |
-| semantic state traces | `python3 tests/test_state_contract.py -v` | Linux, Windows |
-| background lifecycle traces | `python3 tests/test_background.py` | Linux, Windows |
-| direct MCP elicitation | `python3 tests/test_elicitation.py` | Linux, Windows |
-| persistence and concurrency | `python3 tests/test_state_guarantees.py` | Linux (`fcntl`) |
+| payload policy | `python3 tests/test_payload.py` | Linux, Windows, macOS |
+| semantic state traces | `python3 tests/test_state_contract.py -v` | Linux, Windows, macOS |
+| background lifecycle traces | `python3 tests/test_background.py` | Linux, Windows, macOS |
+| direct MCP elicitation | `python3 tests/test_elicitation.py` | Linux, Windows, macOS |
+| persistence and concurrency | `python3 tests/test_state_guarantees.py` | Linux, macOS (`fcntl`; strace fault injection Linux-only) |
+| direct Unix delivery | `python3 tests/test_unix_delivery.py -v` | Linux, macOS (disposable PTYs) |
 | tmux window status | `python3 tests/test_tmux_status.py` | Linux (tmux) |
 | corpus fixture helpers | `python3 -m unittest discover -s tests/corpus -p 'test_*.py' -v` | Linux |
 | golden corpus | `sh tests/corpus/replay.sh bin/tabstatus` | Linux |
 | ConPTY end to end | part of `cargo test` (`tests/conpty.rs`) | Windows |
+
+The macOS entries describe the new native CI job, whose execution is pending;
+see [macOS validation](docs/architecture.md#macos-validation). They do not claim
+a successful native run or testing in a terminal application.
 
 The in-crate unit tests are not replaced by the shell and Python harnesses: they
 check argv and environment parsing, the location walk, the length cap and its
@@ -258,7 +264,8 @@ the binary.
 
 `state::tests::concurrent_hooks_of_one_session_lose_no_update` runs hooks of one
 session as separate processes, released together, and must lose no update, on
-Linux and Windows. Its controls switch the lock off in the test build only:
+Linux, Windows and the native macOS job. Its controls switch the lock off in the
+test build only:
 
 ```sh
 cargo test race_control -- --ignored --nocapture   # stops at the first lost update
@@ -345,17 +352,17 @@ limitation it closes; the pre-fix freeze is kept as `cases.jsonl.before-fixes`.
 
 ### What the suite does not assert
 
-- The real emitting path of `session-start` and `session-end` on Unix needs an
-  allocated pty, which would cost a dependency in `tests/run.sh`. The golden corpus
-  covers it byte for byte (82 bytes for a startup: the Konsole OSC 50 arming pair
-  then the idle title; 0 bytes for a compaction), and it is checked by hand. On
-  Windows `tests/conpty.rs` covers it.
+- The shell suite does not allocate PTYs. `tests/test_unix_delivery.py` checks
+  exact Unix startup/exit delivery and headless guards using Python's standard
+  library; the Linux golden corpus independently preserves its historical bytes.
+  On Windows `tests/conpty.rs` covers delivery.
 - tmux re-emitting the title to an attached client from `set-titles-string`: the
   shell suite asserts the whole server side, including that the same paint
   renders differently after a wait with no hook firing, but not the client
   stream. `test_tmux_status.py` checks the window status line on an attached
   client, not the outer title.
-- Anything on macOS.
+- macOS terminal applications and tmux, Intel macOS runtime behaviour and older
+  macOS versions. The new arm64 CI job has not yet been executed for this change.
 
 ## Benchmarking
 
@@ -386,18 +393,24 @@ branch push, pull request, manual dispatch, and as a reusable workflow.
 - *Linux* (`ubuntu-24.04`): installs `musl-tools`, `tmux` and `strace`; `cargo test --locked`
   for both Linux targets; `sh scripts/build.sh --all`; the corpus fixture unit
   tests and subprocess-checker tests; then, for **each** Linux binary, the required
-  subprocess/delivery gate, all six Python suites, `tests/run.sh`
-  and the golden corpus. Uploads both binaries and their `SHA256SUMS` as the
+  subprocess/delivery gate, all six existing Python suites, the Unix delivery suite,
+  `tests/run.sh` and the golden corpus. Uploads both binaries and their `SHA256SUMS` as the
   `linux-binaries` artifact.
+- *macOS* (`macos-15`, arm64 / `aarch64-apple-darwin`): links and executes
+  `cargo test --locked --all-targets`, builds a native validation binary, and runs
+  the payload, state-contract, background, elicitation, state-guarantees and Unix
+  delivery suites. No artifacts are uploaded. Both Apple ABI cross-checks remain
+  in the Linux job, including Intel. **Native execution pending** for this change;
+  [scope and limits](docs/architecture.md#macos-validation).
 - *Windows* (`windows-2025`, steps under Git Bash): `cargo test --locked
   --all-targets` (including the ConPTY, lock and junction tests);
   `sh scripts/build.sh --all`; a check of the `.exe`'s import table that fails on
   any Visual C++ runtime DLL (`vcruntime*`, `msvcp*`, `ucrtbase`,
   `api-ms-win-crt-*`); then `test_payload`, `test_state_contract`,
   `test_background` and `test_elicitation`. `tests/run.sh`, the corpus,
-  `test_state_guarantees` and `test_tmux_status` assume a Unix userland and run on
-  Linux only. Uploads the `.exe` and its `SHA256SUMS` (written with `--text`, so
-  the line format matches Linux) as `windows-binaries`.
+  `test_state_guarantees`, `test_unix_delivery` and `test_tmux_status` require Unix;
+  the shell, corpus and tmux suites run only on Linux. Uploads the `.exe` and its
+  `SHA256SUMS` (written with `--text`, so the line format matches Linux) as `windows-binaries`.
 
 **Release** ([`.github/workflows/release.yml`](.github/workflows/release.yml)) runs
 on every pushed tag. It calls the Test workflow on the tagged commit, downloads the
@@ -455,9 +468,11 @@ Rules:
 
 ## Roadmap: not yet built
 
-- **macOS** ([issue #1](https://github.com/dalf/claude-tabstatus/issues/1)): no
-  target in `scripts/build.sh`, no release asset, no tested `src/sys/unix.rs` path
-  for the session-start and session-end titles or tmux.
+- **macOS** ([issue #1](https://github.com/dalf/claude-tabstatus/issues/1)):
+  native source builds and arm64 automated validation are prepared; native
+  execution is pending. Terminal applications, tmux and Intel runtime behaviour
+  remain unvalidated. No release asset or product support claim is added; see
+  [validation scope](docs/architecture.md#macos-validation).
 - **aarch64 Linux**: add `aarch64-unknown-linux-musl` to `TARGETS` in
   `scripts/build.sh` and to the release assets. Until then the x86_64 binary
   fails at `exec` with *Exec format error*; `doctor` already compares the tree's

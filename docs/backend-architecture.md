@@ -487,11 +487,12 @@ degradation is written down rather than silent, but it is a degradation.
 > uses. Only the lookups are `cfg`-selected; every decision downstream of them is a
 > pure function the Linux `cargo test` runs.
 >
-> The warning stands, and it is the only thing here that was ever load-bearing:
-> **nothing in it has ever been RUN on a Mac.** No machine in this project can link
-> a macOS binary, only type-check one, and no CI runner is a Mac. "It compiles" is
-> still not "it works". [#1](https://github.com/dalf/claude-tabstatus/issues/1)
-> remains open; what closed is the type-checks-and-means-nothing reading of it.
+> Native arm64 CI now links and exercises process identity, reaping, locks and
+> disposable PTY delivery. **Its execution is pending for this change**: adding a
+> job does not establish runtime correctness. Intel remains cross-checked only;
+> terminal applications and macOS tmux remain unvalidated. See
+> [macOS validation](architecture.md#macos-validation) for the evidence boundary.
+> [#1](https://github.com/dalf/claude-tabstatus/issues/1) remains open.
 
 ### What `doctor` prints
 
@@ -577,7 +578,7 @@ existing `tests/run.sh` assertion changed; the 35 added are purely additive.
 
 | # | why it is not here |
 |---|---|
-| macOS | #28 ported Windows, not macOS. [#1](https://github.com/dalf/claude-tabstatus/issues/1). **Largely here since, at the `sys` layer**: `libc` is a `cfg(target_os = "macos")` dependency with zero transitive deps, and every `/proc` read in `src/` is now inside `cfg(not(target_os = "macos"))` with a macOS answer beside it — start time (`proc_pidinfo`), liveness (`kill(pid, 0)`), state directory (`TMPDIR`), host name (no file, straight to `$HOSTNAME`), origin key (`r`), and the session terminal (`proc_pidfdinfo`), so `sys::HAS_SESSION_TTY` is `true` and session-start and session-end paint. What remains is not a `/proc` read: **nothing has ever been run on a Mac** (no machine here can link a macOS binary, and no CI runner is a Mac), the 312-case corpus is a Linux specification, `scripts/build.sh` still refuses to list a target it has not run, and the macOS terminal rows in §3 of the scouting file are written from vendor source rather than from a running terminal. |
+| macOS | #28 ported Windows, not macOS. [#1](https://github.com/dalf/claude-tabstatus/issues/1). **Largely here since, at the `sys` layer**: `libc` is a `cfg(target_os = "macos")` dependency with zero transitive deps, and every `/proc` read in `src/` is now inside `cfg(not(target_os = "macos"))` with a macOS answer beside it — start time (`proc_pidinfo`), liveness (`kill(pid, 0)`), state directory (`TMPDIR`), host name (no file, straight to `$HOSTNAME`), origin key (`r`), and the session terminal (`proc_pidfdinfo`), so `sys::HAS_SESSION_TTY` is `true` and session-start and session-end paint. Native builds and an arm64 CI job are now prepared, but **native execution is pending**. Intel retains cross-checks only, the corpus remains a Linux specification, and the terminal rows remain source-derived rather than tested in macOS applications. See [validation scope](architecture.md#macos-validation). |
 | the tier-3 restore rule | a **behaviour change**, so it needs its own commit with newly recorded corpus cases, and an owner's decision this branch did not have |
 | an attention channel | this branch builds the seam [#14](https://github.com/dalf/claude-tabstatus/issues/14) needs and stops there. The recommended first channel and its policy table are in [backend-scouting.md §4](backend-scouting.md) |
 | the Windows state layer's file identity | #28 landed it (`8c878bb`); nothing here touches it |
@@ -658,22 +659,12 @@ user instead.
    both halves compiling**, because the moment `Terminal` becomes `Surface` every
    call site must move. That is `aaba975` here, and it landed that way. The 312
    replay says whether a byte changed; bisecting inside it is not pleasant.
-4. **Fake backends prove our *model* of a platform, not the platform.** The old
-   branch's answer to this was a fake backend and a Linux test; #28's answer is a
-   `windows-2025` runner that builds and runs the suite. For **macOS** the weakness
-   stands unchanged and unaddressed: nothing in CI runs there, `unix.rs` takes the
-   `/proc` path, and every Linux test stays green while the reads mean nothing.
-
-   > **HALF OF THIS IS NOW WRONG AND THE OTHER HALF IS SHARPER.** `unix.rs` does
-   > not take the `/proc` path on macOS any more — every `/proc` read in `src/` is
-   > `cfg(not(target_os = "macos"))` with a macOS call beside it. But **nothing in
-   > CI runs on a Mac** is exactly as true as it was, and that is the whole of the
-   > weakness: the macOS bodies are each a call and a `?`, every *decision* around
-   > them is a pure function a Linux test exercises, and the one hand-written
-   > layout is asserted at compile time on both Apple ABIs in CI. What no assert
-   > and no Linux test can reach is whether the calls behave as their kernel's
-   > source says — and that is now the only thing standing, which is a smaller
-   > claim than "the reads mean nothing" and a claim that cannot be closed here.
+4. **Fake backends and cross-checks cannot validate OS calls.** Windows has a
+   native runner. macOS now has an arm64 job that links and executes tests,
+   including real processes and disposable PTYs, but **native execution is still
+   pending for this change**. The Intel target has only cross-checks. Neither
+   layout assertions nor workflow configuration closes the runtime gap; see
+   [macOS validation](architecture.md#macos-validation).
 5. **Generic code with zero instantiations is type-checked but never
    monomorphised.** A bound only codegen would reject is not caught on Linux. The
    safety net is the fake staying a *complete* impl; if it drifts, the net thins
@@ -694,8 +685,9 @@ user instead.
    > `u32` fails three of the seven, an `off_t` written as `i32` fails one.
    >
    > **Two parts survive, and they are what a future backend should copy the
-   > caution from.** First, a *signature* still is not checked, because nothing
-   > here links: whether `proc_pidfdinfo` resolves at all is unobserved. Second, a
+   > caution from.** First, cross-checks do not link: the new native arm64 job
+   > must actually succeed before `proc_pidfdinfo` linking and execution have
+   > evidence. Its execution is pending for this change. Second, a
    > size assert cannot see two same-width fields transposed — measured, not
    > argued: `fi_type` and `fi_guardflags` swapped compiles clean on both Apple
    > targets with all seven asserts green. That is survivable in this one case only

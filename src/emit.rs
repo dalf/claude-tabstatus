@@ -12,11 +12,12 @@
 //!     `terminalSequence` cannot carry them: SessionStart is too early - the TUI
 //!     writer is not mounted yet, so the sequence is dropped - and the Konsole
 //!     arming sequence is OSC 50, which is not on the allowlist above. On Linux the
-//!     bytes go to the pty, resolved through /proc. On Windows there is no pty but
+//!     bytes go to the pty, resolved through /proc; macOS uses proc_pidfdinfo.
+//!     On Windows there is no pty but
 //!     there is the console Claude Code runs in, and its TITLE is set instead
 //!     ([`sys::set_session_title`]), which the pseudo console forwards to the tab as
 //!     an OSC 0; the Konsole arming has no console form and is not sent. Both are
-//!     behind a headless guard, and elsewhere (macOS) nothing is painted.
+//!     behind a headless guard. Native validation status is in docs/architecture.md.
 
 use crate::config::Config;
 use crate::mux::{Channel, Route};

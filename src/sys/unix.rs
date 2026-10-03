@@ -9,9 +9,9 @@
 //! ONLY THE SYSTEM CALL IS `cfg`-SELECTED. Every decision either side makes - the
 //! errno-to-liveness mapping, the packing of a start time into the one number a
 //! record stores - is a pure function compiled on both and exercised by the Linux
-//! test run, because there is no Mac in this project's CI to run a macOS branch on
-//! and an untested branch is how a wrong answer ships. The `cfg` bodies are a call
-//! and a `?`; they contain no test of their own.
+//! test run. Native arm64 macOS CI additionally exercises the actual calls and
+//! PTY delivery; cross-checks alone do not establish runtime correctness. The
+//! `cfg` bodies are a call and a `?`; their decisions stay testable on Linux.
 //!
 //! THE LINE IS `libc`, NOT THE PLATFORM. That is the rule, and it is the one to follow
 //! when adding anything here. An item that names a `libc` symbol is a CALL, and it
@@ -432,9 +432,9 @@ pub fn process_alive(pid: u32) -> Option<bool> {
 /// can name, or the kernel filled less than the whole struct.
 ///
 /// `libc` declares both the call and `proc_bsdinfo`, so nothing here is a
-/// hand-written `#[repr(C)]` layout - which matters because no machine in this
-/// project can LINK a macOS binary, only type-check one, and a guessed layout
-/// would be memory corruption that no test here could catch.
+/// hand-written `#[repr(C)]` layout. The native process test checks the returned
+/// start time against the child's creation interval, as well as its stable identity;
+/// cross-checking a declaration alone cannot validate the kernel's answer.
 #[cfg(target_os = "macos")]
 pub fn process_start_time(pid: u32) -> Option<u64> {
     let pid = pid_to_ask_about(pid)?;
@@ -705,8 +705,7 @@ fn fd1_path(claude_pid: &OsStr) -> Option<PathBuf> {
 /// `nb` is a byte count, not a status: `nb <= 0` is the error return, and it does
 /// not convert. BOTH halves of that matter, because `libproc`'s userland wrapper
 /// and the system call under it do not agree on how a failure looks - one reports
-/// it as -1 and the other can surface 0 - and this project cannot run either to
-/// settle which arrives. It does not have to: requiring EXACTLY `want` refuses
+/// it as -1 and the other can surface 0. Requiring EXACTLY `want` refuses
 /// every value that is not a full struct, by construction, so the distinction has
 /// no way to matter here and no claim about it is relied on. `ENOENT` means the
 /// vnode was REVOKED - an fd whose terminal went away - and it is the same `None`
@@ -767,12 +766,11 @@ mod abi {
     /// 2.0 and this program is GPL-3.0-or-later, so an ABI is the only thing that may
     /// cross, and an ABI is an interface rather than an expression of one.
     ///
-    /// WHAT MAKES IT SOUND WITHOUT A MAC. No machine in this project can link a macOS
-    /// binary, so a hand-written layout is normally a guess, and the last word on this
-    /// function said so. It is not a guess here because the layout is ASSERTED rather
-    /// than assumed: the `const _` block below fails the macOS `cargo check` - which
-    /// this project does run, for both Apple ABIs - unless every size and offset is the
-    /// one measured against the header. The nested types are libc's OWN
+    /// LAYOUT CHECKS ARE NOT RUNTIME VALIDATION. The `const _` block below fails
+    /// `cargo check` on both Apple ABIs unless the required sizes and offsets match
+    /// the header. Native arm64 CI separately links and exercises this call through
+    /// disposable PTYs and redirected stdout; see docs/architecture.md for execution
+    /// status and remaining limits. The nested types are libc's OWN
     /// (`vinfo_stat`, `vnode_info`, `vnode_info_path`), and libc checks those against
     /// Apple's real SDK on its own CI; what is added here is five scalars and two
     /// fields, all of which the asserts pin.
@@ -922,9 +920,49 @@ fn is_char_device(ft: &FileType) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn native_process_identity_and_headless_guard_follow_a_real_child() {
+        use std::process::{Command, Stdio};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros();
+        // cat waits for EOF on our pipe. Its stdout is /dev/null, so this test
+        // cannot target the developer's terminal even when cargo is interactive.
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start a disposable process");
+        let pid = child.id();
+        let start = process_start_time(pid);
+        let again = process_start_time(pid);
+        let alive = process_alive(pid);
+        let same = start.and_then(|s| same_process(pid, s));
+        let different = start.and_then(|s| same_process(pid, s + 1));
+        let tty = session_tty(OsStr::new(&pid.to_string()));
+        let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros();
+        // Finish the child before assertions, including on a failing OS query.
+        drop(child.stdin.take());
+        assert!(child.wait().expect("reap the child").success());
+
+        let start = start.expect("the kernel supplies a real process start time");
+        assert!(start > 0);
+        assert_eq!(again, Some(start));
+        assert_eq!(alive, Some(true));
+        assert_eq!(same, Some(true));
+        assert_eq!(different, Some(false), "a changed start time is a different identity");
+        assert!(tty.is_none(), "a character device alone is not a terminal");
+        if cfg!(target_os = "macos") {
+            assert!((before..=after).contains(&u128::from(start)), "epoch microseconds: {start}");
+        }
+        assert_eq!(process_start_time(pid), None);
+        assert_eq!(process_alive(pid), Some(false));
+        assert_eq!(same_process(pid, start), Some(false));
+    }
+
     /// The reaper's liveness question, decided here so that the macOS body is a
-    /// call and not a branch - and run on Linux, which is the only place this
-    /// project can run anything.
+    /// call and not a branch, and tested on Linux as well as native macOS.
     ///
     /// `EPERM` is the one that matters: a process this user may not signal exists,
     /// and calling it dead would unlink a live session's record. `Some(false)` is a
