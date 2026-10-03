@@ -30,10 +30,13 @@
 //! is unchanged: the env key switches Claude Code's own title painting off and the
 //! plugin paints the replacement, so "key set, plugin gone" is the one combination
 //! that paints NO title at all. The tree goes before both because it is INERT until
-//! the symlink points at it - so an abort anywhere before that last step leaves a
-//! first-time user exactly as they were. `uninstall` mirrors it: settings first, the
-//! link next, the tree last. Both halves preflight every refusal, so the window
-//! between the writes holds nothing that can decide to stop.
+//! the symlink points at it. Settings can already have changed when a later step
+//! fails. Saved restoration history precedes the settings write; a separate
+//! ownership receipt follows it. An interrupted first install remains pending,
+//! with automatic recovery refused rather than inferred from the current key.
+//! `uninstall` mirrors it: settings first, the link next, the tree last. Preflight
+//! catches known refusals, but later I/O errors and concurrent edits can still stop
+//! either command. Management operations share an OS lock; hooks never take it.
 //!
 //! And the symlink is repointed with rename(2), not unlink-then-symlink. Hooks fire
 //! constantly; a path that resolves to nothing for even a moment is a hook exec'ing a
@@ -50,17 +53,20 @@
 use crate::embedded::{self, Verdict};
 use crate::settings::{self, Outcome};
 use crate::tree;
-use crate::config::{self, Config, Terminal};
+use crate::config::{self, Config};
 use crate::edge::{Glyph, Paint};
-use crate::{json, render, state, sys, tmux};
+use crate::surface::{self, Elide, Surface, Terminator};
+use crate::support::{Presence, Support, YES};
+use crate::mux::{tmux, MuxKind, Stack};
+use crate::{json, location, render, state, sys};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 const KEY: &str = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE";
 const PLUGIN: &str = "claude-tabstatus";
-const STATE_VERSION: i32 = 3;
+const STATE_VERSION: i32 = 4;
 
 /// One of this half's options. Spelled here and nowhere else; which subcommand
 /// accepts which is [`Subcommand::parse`]'s business.
@@ -68,8 +74,11 @@ enum Flag {
     Force,
     RestoreBackup,
     KeepTree,
-    /// `--tree <dir>`, the only option here that takes a value.
+    /// `--tree <dir>`, install's only option that takes a value.
     Tree,
+    /// `--surface <name>`, doctor's only option, and the other one here that takes
+    /// a value.
+    Surface,
 }
 
 impl Flag {
@@ -79,6 +88,7 @@ impl Flag {
             b"--restore-backup" => Some(Flag::RestoreBackup),
             b"--keep-tree" => Some(Flag::KeepTree),
             b"--tree" => Some(Flag::Tree),
+            b"--surface" => Some(Flag::Surface),
             _ => None,
         }
     }
@@ -100,7 +110,13 @@ pub enum Subcommand {
         restore_backup: bool,
         keep_tree: bool,
     },
-    Doctor,
+    /// `doctor [--surface <name>]` - what is installed and what would paint, or,
+    /// with a surface named, the capability table of a terminal THIS MACHINE CANNOT
+    /// RUN. The table is `&'static` data all the way down, which is how the Windows
+    /// column gets read before any Windows box exists.
+    Doctor {
+        surface: Option<OsString>,
+    },
     /// The word `standalone` used to be a second install verb, for a machine with no
     /// checkout. `install` now does exactly what it did, everywhere, so the word is
     /// kept only long enough to say so: a name that used to work and now errors
@@ -151,9 +167,9 @@ impl Subcommand {
         Some(match first?.as_encoded_bytes() {
             b"install" => install_options(rest),
             b"uninstall" => uninstall_options(rest),
-            // These three take no options and IGNORE any argument given, which is
-            // what they have always done: `doctor --force` runs doctor.
-            b"doctor" => Subcommand::Doctor,
+            b"doctor" => doctor_options(rest),
+            // These two take no options and IGNORE any argument given, which is
+            // what they have always done.
             b"standalone" => Subcommand::StandaloneGone,
             b"print-embedded" => Subcommand::PrintEmbedded(rest.first().cloned()),
             b"tmux-format" => Subcommand::TmuxFormat,
@@ -182,8 +198,12 @@ impl Subcommand {
                 force,
                 restore_backup,
                 keep_tree,
-            } => with_ctx(|c| uninstall(c, force, restore_backup, keep_tree)),
-            Subcommand::Doctor => with_ctx(doctor),
+            } => with_ctx(|_| {
+                let _lock = management_lock(&config_dir()?)?;
+                uninstall(&Ctx::new()?, force, restore_backup, keep_tree)
+            }),
+            Subcommand::Doctor { surface: None } => with_ctx(doctor),
+            Subcommand::Doctor { surface: Some(name) } => surface_table(&name),
             Subcommand::StandaloneGone => {
                 fail("`standalone` is now just `install`.");
                 fail("install always writes the plugin tree from the copies compiled into");
@@ -200,7 +220,8 @@ impl Subcommand {
             }
             Subcommand::TmuxArm(tty) => match tty {
                 Some(t) => {
-                    tmux::arm_tty(&t);
+                    // Reattachment is best effort; keep tmux's hook silent.
+                    let _ = tmux::arm_tty(&t);
                     0
                 }
                 None => {
@@ -286,6 +307,31 @@ fn install_options(rest: &[OsString]) -> Subcommand {
     Subcommand::Install { tree, force }
 }
 
+/// `doctor [--surface <name>]`.
+///
+/// Every other argument is still passed over rather than refused - a report is the
+/// one command that must run on the configuration that is broken, and `doctor
+/// --force` has always been a report - so this looks for the single option doctor
+/// takes and ignores the rest.
+fn doctor_options(rest: &[OsString]) -> Subcommand {
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        if !matches!(Flag::parse(arg), Some(Flag::Surface)) {
+            continue;
+        }
+        return match it.next() {
+            Some(n) if !n.is_empty() && !n.as_encoded_bytes().starts_with(b"-") => {
+                Subcommand::Doctor { surface: Some(n.clone()) }
+            }
+            _ => Subcommand::BadUsage(format!(
+                "--surface needs the terminal to print the table for, one of: {}",
+                surface_names()
+            )),
+        };
+    }
+    Subcommand::Doctor { surface: None }
+}
+
 fn uninstall_options(rest: &[OsString]) -> Subcommand {
     let mut force = false;
     let mut restore_backup = false;
@@ -295,8 +341,10 @@ fn uninstall_options(rest: &[OsString]) -> Subcommand {
             Some(Flag::Force) => force = true,
             Some(Flag::RestoreBackup) => restore_backup = true,
             Some(Flag::KeepTree) => keep_tree = true,
-            // `--tree` is a real flag, but only install takes it.
-            Some(Flag::Tree) | None => return Subcommand::BadOption(arg.clone()),
+            // `--tree` and `--surface` are real flags, and neither is uninstall's.
+            Some(Flag::Tree) | Some(Flag::Surface) | None => {
+                return Subcommand::BadOption(arg.clone())
+            }
         }
     }
     Subcommand::Uninstall {
@@ -358,7 +406,10 @@ fn usage() {
         "                               be kept (Windows, on a WSL share)\n",
         "      --restore-backup         roll settings.json back to the pre-install copy\n",
         "      --keep-tree              leave the generated plugin tree on disk\n",
-        "  tabstatus doctor             report what is installed and what would paint\n",
+        "  tabstatus doctor             report what is installed and what would paint,\n",
+        "                               including the capability table of the three axes\n",
+        "      --surface <name>         print that table for a terminal this machine is\n",
+        "                               not running, and nothing else\n",
         "  tabstatus tmux-format        print the two outer-tab tmux format strings\n",
         "  tabstatus tmux-arm <tty>     re-arm one Konsole tab; tmux's client-attached\n",
         "                               hook runs this, so a reattach is armed again\n",
@@ -480,7 +531,7 @@ fn config_dir() -> Result<PathBuf, String> {
     }
 }
 
-/// A path made absolute and lexically normalised, ONCE, before anything looks at it.
+/// A path made absolute before anything looks at it.
 ///
 /// Everything downstream compares these paths, writes through them and RECORDS them,
 /// and a raw `--tree` string defeated all three. `--tree skills/claude-tabstatus` run
@@ -492,14 +543,9 @@ fn config_dir() -> Result<PathBuf, String> {
 /// later `uninstall` from a different directory removed files from whatever else
 /// happened to be named that.
 ///
-/// `fs::canonicalize` is the wrong tool: it resolves symlinks - which is what makes it
-/// right for settings.json and wrong here - and it FAILS on a path that does not exist
-/// yet, which the tree usually does not. So `..` and `.` are folded textually.
-///
-/// Before that, `sys::normalize` picks the ONE spelling this path is compared,
-/// printed and recorded by. Nothing on Unix; on Windows, where `\\?\C:\x`,
-/// `C:\X` and `C:\PROGRA~1`-style short names all name one directory, it is what keeps
-/// a re-install from reading its own live tree as an orphan.
+/// Keep the final root link visible to lstat and allow missing destinations.
+/// Unix keeps `..` for kernel resolution, including `alias/..`; Windows retains
+/// its existing spelling normalisation. Identity is asked separately through sys.
 fn absolute(p: &Path) -> Result<PathBuf, String> {
     let abs = if p.is_absolute() {
         p.to_path_buf()
@@ -515,19 +561,7 @@ fn absolute(p: &Path) -> Result<PathBuf, String> {
             })?
             .join(p)
     };
-    let abs = sys::normalize(&abs);
-    let mut out = PathBuf::new();
-    for c in abs.components() {
-        match c {
-            Component::CurDir => {}
-            // At the root `..` is the root, which is what `pop` returning false means.
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    Ok(if out.as_os_str().is_empty() { PathBuf::from("/") } else { out })
+    Ok(sys::normalize(&abs))
 }
 
 impl Ctx {
@@ -541,6 +575,7 @@ impl Ctx {
     /// Everything in `new` except finding the plugin directory, so `install` can work
     /// on the tree it RESOLVED rather than one it had to discover.
     fn at(tree: PathBuf, tree_from: TreeFrom) -> Result<Ctx, String> {
+        let tree = absolute(&tree)?;
         let config = config_dir()?;
         let skills = config.join("skills");
         let link = skills.join(PLUGIN);
@@ -594,6 +629,61 @@ fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// A stable, empty anchor, never renamed, swept or deleted on uninstall. All
+/// management readers that mutate installation files hold it through retirement.
+/// Kernel release on exit handles interrupted owners without PID lock stealing.
+fn management_lock(config: &Path) -> Result<fs::File, String> {
+    fs::create_dir_all(config).map_err(|e| could_not_write(config, &e))?;
+    let anchor = config.join("claude-tabstatus.lock");
+    let acquire = || -> std::io::Result<fs::File> {
+        match fs::symlink_metadata(&anchor) {
+            Ok(m) if !m.is_file() => return Err(std::io::Error::other("invalid management lock anchor")),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        let file = sys::with_mode(&mut options, 0o600).open(&anchor)?;
+        if std::env::var("CCTAB_TEST_MANAGE_POINT").ok().as_deref() == Some("lock-acquired") {
+            if let Some(dir) = std::env::var_os("CCTAB_TEST_MANAGE_DIR") {
+                fs::write(PathBuf::from(dir).join("requested"), b"lock")?;
+            }
+        }
+        sys::lock_exclusive(&file)?;
+        let meta = fs::symlink_metadata(&anchor)?;
+        let id = sys::file_id_of(&file).ok_or_else(|| std::io::Error::other("unknown lock identity"))?;
+        if !meta.is_file() || Some(id) != sys::file_id_at(&anchor, &meta) {
+            return Err(std::io::Error::other("management lock anchor changed"));
+        }
+        management_checkpoint("lock-acquired", None)?;
+        Ok(file)
+    };
+    acquire().map_err(|e| format!("cannot lock management operations at {}: {}", anchor.display(), e))
+}
+
+/// Opt-in, bounded filesystem barriers for the actual candidate binary's cold
+/// management tests. A missing observation/release is an error, never a passing
+/// control. With no test directory there is no extra filesystem work.
+fn management_checkpoint(point: &str, staged: Option<&Path>) -> std::io::Result<()> {
+    let Some(dir) = std::env::var_os("CCTAB_TEST_MANAGE_DIR") else { return Ok(()) };
+    if std::env::var("CCTAB_TEST_MANAGE_POINT").ok().as_deref() != Some(point) {
+        return Ok(());
+    }
+    let dir = PathBuf::from(dir);
+    fs::write(dir.join("reached"), staged.map(|p| p.as_os_str().as_encoded_bytes()).unwrap_or(point.as_bytes()))?;
+    let start = std::time::Instant::now();
+    while !dir.join("release").is_file() {
+        if start.elapsed() > std::time::Duration::from_secs(20) {
+            return Err(std::io::Error::other(format!("management checkpoint {point} timed out")));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if fs::read(dir.join("release"))? == b"fail" {
+        return Err(std::io::Error::other(format!("management checkpoint {point} failed")));
+    }
+    Ok(())
+}
+
 /// Where the plugin directory IS, for the two commands that have to work on whatever
 /// is already there.
 ///
@@ -623,7 +713,7 @@ fn live_tree(config: &Path) -> Result<(PathBuf, TreeFrom), String> {
     if let Some(t) = recorded_tree(config) {
         return Ok((t, TreeFrom::Record));
     }
-    Ok((tree::default_tree()?, TreeFrom::Default))
+    Ok((absolute(&tree::default_tree()?)?, TreeFrom::Default))
 }
 
 /// The tree the state record says this install owns, as install wrote it.
@@ -690,10 +780,11 @@ fn mode_note(mode: u32, tail: &str) -> String {
     }
 }
 
-/// `" (mode 0600 kept)"` where the mode is the protection, and where it is not
-/// (Windows) the access control list `write_settings` and `copy_settings` carry over.
+/// Report the protection the backend carries, including Darwin's owner/group.
 fn kept_note(mode: u32) -> String {
-    if sys::HAS_MODES {
+    if sys::HAS_MODES && sys::HAS_SECURITY {
+        mode_note(mode, " and its owner, group and access control list kept")
+    } else if sys::HAS_MODES {
         mode_note(mode, " kept")
     } else {
         " (its access control list kept)".to_string()
@@ -718,8 +809,8 @@ fn could_not_write(path: &Path, e: &std::io::Error) -> String {
 }
 
 /// [`write_atomic`] for settings.json and its backups: the new file also keeps what
-/// `like` carries beyond its mode - on Windows, its DACL, so an ACL the user set on
-/// the file survives the rename that replaces it (`sys::security_of`). `like` is the
+/// `like` carries beyond its mode - on Darwin its owner/group and ACL, on Windows
+/// its DACL, so an ACL set on the file survives the rename (`sys::security_of`). `like` is the
 /// file being replaced, or for a backup or a restore, the file being copied. Nothing
 /// there: the new file is made exactly as `write_atomic` makes it. An ACL this user
 /// cannot read refuses the write, before anything is written to `path` - the
@@ -736,28 +827,26 @@ fn write_settings(path: &Path, bytes: &[u8], mode: u32, like: &Path, allow_no_ac
         Err(e) if allow_no_acl && no_acl_here(&e) => None,
         Err(e) => return Err(acl_unreadable(like, &e, &format!("{} was not changed", path.display()))),
     };
-    write_atomic_as(path, bytes, mode, keep.as_ref()).map_err(|e| could_not_write(path, &e))
+    atomic_as_at(path, mode, keep.as_ref(), Some("settings-staged"), |f| f.write_all(bytes))
+        .map_err(|e| could_not_write(path, &e))
 }
 
 /// The one refusal `--force` lifts: a filesystem with no Windows ACL to carry.
 fn no_acl_here(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::Unsupported
+    sys::CAN_FORCE_ACL && e.kind() == std::io::ErrorKind::Unsupported
 }
 
-/// A copy of settings.json at `to`, exactly as private as `from`: its mode on Unix,
-/// where `fs::copy` carries it, and on Windows its DACL, which `CopyFileExW` does not
-/// copy - so a backup, which holds the same secrets, was born with the directory's
-/// ACL. There the copy is written as `write_settings` writes, from `from`'s bytes
-/// (so it does not keep `from`'s timestamps, as `CopyFileExW` did). `what` names it
-/// in an error: `"the backup "`, or nothing.
+/// A copy with the SOURCE's protection, staged securely and replaced atomically.
+/// Linux retains fs::copy; Darwin retains copyfile's non-ACL metadata work on the
+/// secured fd; Windows retains its byte-copy policy. See sys::copy_secured.
 fn copy_settings(from: &Path, to: &Path, what: &str, allow_no_acl: bool) -> Result<(), String> {
     let fail = |e: &std::io::Error| format!("cannot write {}{}: {}", what, to.display(), e);
     match sys::security_of(from) {
         Ok(None) => fs::copy(from, to).map(drop).map_err(|e| fail(&e)),
         Err(e) if allow_no_acl && no_acl_here(&e) => fs::copy(from, to).map(drop).map_err(|e| fail(&e)),
         Ok(Some(sec)) => {
-            let bytes = fs::read(from).map_err(|e| fail(&e))?;
-            write_atomic_as(to, &bytes, mode_of(from).unwrap_or(0o600), Some(&sec)).map_err(|e| fail(&e))
+            atomic_as(to, mode_of(from).unwrap_or(0o600), Some(&sec), |f| sys::copy_secured(from, f, &sec))
+                .map_err(|e| fail(&e))
         }
         Err(e) => Err(acl_unreadable(from, &e, &format!("{} was not written", to.display()))),
     }
@@ -768,7 +857,7 @@ fn copy_settings(from: &Path, to: &Path, what: &str, allow_no_acl: bool) -> Resu
 /// share): there is nothing to read, and the permissions it does keep - Unix ones -
 /// cannot be carried from here either.
 fn acl_unreadable(p: &Path, e: &std::io::Error, tail: &str) -> String {
-    if e.kind() == std::io::ErrorKind::Unsupported {
+    if no_acl_here(e) {
         return format!(
             "{} is on a filesystem that keeps no Windows access control list ({}): a copy \
              or rewrite of it made from Windows would not keep its permissions (on a WSL \
@@ -778,6 +867,9 @@ fn acl_unreadable(p: &Path, e: &std::io::Error, tail: &str) -> String {
             e,
             tail
         );
+    }
+    if e.kind() == std::io::ErrorKind::Unsupported {
+        return format!("cannot preserve the access control list of {} ({}). {}.", p.display(), e, tail);
     }
     format!(
         "cannot read the access control list of {} ({}), and the file written in its \
@@ -790,14 +882,19 @@ fn acl_unreadable(p: &Path, e: &std::io::Error, tail: &str) -> String {
 
 /// Refuse, in a preflight, a settings file whose ACL this user cannot read: every
 /// rewrite of it, and every backup, has to carry that ACL over, so finding out after
-/// the first write would leave a half-done install. Never refuses on Unix.
+/// the first write would leave a half-done install. Darwin also probes ownership
+/// preservation on an empty private file. Linux adds no syscall here.
 ///
 /// With `allow_no_acl` (`--force`), a filesystem that keeps no Windows ACL is let
 /// through with a warning instead, said here once so the writes that follow need
 /// not repeat it.
 fn refuse_unreadable_acl(p: &Path, allow_no_acl: bool) -> Result<(), String> {
     match sys::security_of(p) {
-        Ok(_) => Ok(()),
+        Ok(None) => Ok(()),
+        Ok(Some(sec)) => sec.preflight(p).map_err(|e| format!(
+            "cannot preserve the protection of {} ({}). Nothing has been changed.",
+            p.display(), e
+        )),
         Err(e) if allow_no_acl && no_acl_here(&e) => {
             say(&format!("settings: WARNING {} is on a filesystem that keeps no Windows", p.display()));
             say("          access control list: its permissions will not be kept (on a WSL");
@@ -809,6 +906,16 @@ fn refuse_unreadable_acl(p: &Path, allow_no_acl: bool) -> Result<(), String> {
 }
 
 fn write_atomic_as(path: &Path, bytes: &[u8], mode: u32, keep: Option<&sys::Security>) -> std::io::Result<()> {
+    atomic_as(path, mode, keep, |f| f.write_all(bytes))
+}
+
+fn atomic_as<F>(path: &Path, mode: u32, keep: Option<&sys::Security>, write: F) -> std::io::Result<()>
+where F: FnOnce(&mut fs::File) -> std::io::Result<()> {
+    atomic_as_at(path, mode, keep, None, write)
+}
+
+fn atomic_as_at<F>(path: &Path, mode: u32, keep: Option<&sys::Security>, checkpoint: Option<&str>, write: F) -> std::io::Result<()>
+where F: FnOnce(&mut fs::File) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let name = path.file_name().map(|n| n.as_encoded_bytes().to_vec()).unwrap_or_default();
     let mut tmp_name = b".".to_vec();
@@ -821,13 +928,25 @@ fn write_atomic_as(path: &Path, bytes: &[u8], mode: u32, keep: Option<&sys::Secu
             Some(sec) => sys::create_secured(&tmp, sec)?,
             None => sys::with_mode(fs::OpenOptions::new().write(true).create_new(true), mode).open(&tmp)?,
         };
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        drop(f);
+        if let Some(sec) = keep {
+            // A secured file is born private; restore the intended mode before
+            // configuration bytes, without permitting directory ACL inheritance.
+            sys::set_mode(&tmp, mode)?;
+            sys::verify_security(&f, sec, mode)?;
+        }
+        write(&mut f)?;
         // create_new honours `mode` only through the open(2) mode argument,
         // which umask narrows. Set it explicitly so a umask of 022 cannot
         // widen - or narrow - what we asked for.
         sys::set_mode(&tmp, mode)?;
+        if let Some(sec) = keep {
+            sys::verify_security(&f, sec, mode)?;
+        }
+        f.sync_all()?;
+        drop(f);
+        if let Some(point) = checkpoint {
+            management_checkpoint(point, Some(&tmp))?;
+        }
         fs::rename(&tmp, path)
     })();
     if res.is_err() {
@@ -864,8 +983,12 @@ fn dir_writable(p: &Path) -> bool {
 /// not record the state the first one left. "Which tree this install OWNS" is
 /// rewritten every time, because `install --tree <somewhere else>` moves it and a
 /// record naming the old one would leave the new tree unfindable and the old one an
-/// orphan. Splitting them is what made this state_version 3.
+/// orphan. Splitting them made state_version 3. Version 4 separates these from
+/// settings completion and retains legacy link-witness provenance explicitly.
 struct State {
+    ownership: Ownership,
+    legacy_tree: Option<PathBuf>,
+    legacy_witness_saved: bool,
     env_had: bool,
     env_raw: Option<Vec<u8>>,
     /// Whether the `env` OBJECT was already in the file. Without this, uninstall
@@ -876,11 +999,38 @@ struct State {
     link_target: Option<Vec<u8>>,
 }
 
+/// Restoration history is not a receipt. A pending first install may have
+/// stopped on either side of the settings rename. Legacy receipts are deliberately
+/// never promoted just by rewriting their record.
+#[derive(Clone, Copy, PartialEq)]
+enum Ownership {
+    Pending,
+    Confirmed,
+    Legacy,
+}
+
+impl Ownership {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Confirmed => "confirmed",
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
 fn state_text(c: &Ctx, s: &State) -> Vec<u8> {
     let mut out = String::new();
     out.push_str("{\n");
     out.push_str(&format!("  \"state_version\": {},\n", STATE_VERSION));
     out.push_str("  \"written_by\": \"tabstatus install\",\n");
+    out.push_str(&format!("  \"settings_ownership\": {},\n", json::quote(s.ownership.name().as_bytes())));
+    if s.ownership == Ownership::Legacy {
+        if let Some(witness) = &s.legacy_tree {
+            out.push_str(&format!("  \"legacy_completion_link\": {},\n",
+                json::quote(witness.as_os_str().as_encoded_bytes())));
+        }
+    }
     // The tree this install owns. The v2 field here was called "repo" and was never
     // read back by anything, which is why renaming it costs nothing - and it has to
     // be READ back now, because it is how `uninstall` finds the tree when the link no
@@ -921,7 +1071,7 @@ fn read_state(c: &Ctx) -> Result<Option<State>, String> {
     let raw = read_file(&c.state)?;
     let v = json::parse(&raw).map_err(|e| {
         format!(
-            "{} is not valid JSON ({}). Delete it and re-run with --force to \
+            "{} is not valid JSON ({}). Move it aside and re-run with --force to \
              uninstall anyway.",
             c.state.display(),
             e
@@ -930,6 +1080,55 @@ fn read_state(c: &Ctx) -> Result<Option<State>, String> {
     let root = v
         .as_obj()
         .ok_or_else(|| format!("{} is not a JSON object", c.state.display()))?;
+    let invalid = || format!("{}. Nothing has been changed.",
+        recovery_needed(c, "the installation record is incomplete or mismatched"));
+    if record_duplicates(&v) {
+        return Err(invalid());
+    }
+    let version = match root.get("state_version").map(|m| &m.val) {
+        Some(json::J::Num(n)) => n.as_slice(),
+        _ => return Err(invalid()),
+    };
+    let ownership = match (version, root.get("settings_ownership")) {
+        (b"4", Some(m)) => match m.val.as_str() {
+            Some(b"pending") => Ownership::Pending,
+            Some(b"confirmed") => Ownership::Confirmed,
+            Some(b"legacy") => Ownership::Legacy,
+            _ => return Err(invalid()),
+        },
+        (b"1" | b"2" | b"3", None) => Ownership::Legacy,
+        _ => return Err(invalid()),
+    };
+    if root.get("env_key").and_then(|m| m.val.as_str()) != Some(KEY.as_bytes()) {
+        return Err(invalid());
+    }
+    if version == b"4" || root.get("settings_path").is_some() {
+        // Keep byte-repaired path spellings compatible, and accept aliases only
+        // with filesystem evidence. A path match is a guard, never a receipt.
+        let path = json::parse(json::quote(c.settings.as_os_str().as_encoded_bytes()).as_bytes())?;
+        let recorded = root.get("settings_path").and_then(|m| m.val.as_str());
+        if recorded != path.as_str() && !recorded.is_some_and(|p| {
+            sys::same_path(&PathBuf::from(sys::os_string_from_vec(p.to_vec())), &c.settings) == Ok(true)
+        }) {
+            return Err(invalid());
+        }
+    }
+    if version == b"4" {
+        if root.get("written_by").and_then(|m| m.val.as_str()) != Some(b"tabstatus install")
+            || root.get("tree").and_then(|m| m.val.as_str()).is_none_or(|p| {
+                !PathBuf::from(sys::os_string_from_vec(p.to_vec())).is_absolute()
+            })
+        {
+            return Err(invalid());
+        }
+        for name in ["env_key_before", "env_object_before", "symlink_before"] {
+            if root.get(name).and_then(|m| m.val.as_obj())
+                .and_then(|o| o.get("had")).and_then(|m| m.val.as_bool()).is_none()
+            {
+                return Err(invalid());
+            }
+        }
+    }
     let (mut env_had, mut env_raw) = (false, None);
     if let Some(m) = root.get("env_key_before") {
         if let Some(o) = m.val.as_obj() {
@@ -942,7 +1141,7 @@ fn read_state(c: &Ctx) -> Result<Option<State>, String> {
                 // span, so a state file from before this binary existed still
                 // restores a value the user had set themselves.
                 if let Some(v) = o.get("value") {
-                    if !matches!(v.val, json::J::Null) {
+                    if env_had {
                         env_raw = Some(raw[v.val_start..v.end].to_vec());
                     }
                 }
@@ -965,7 +1164,96 @@ fn read_state(c: &Ctx) -> Result<Option<State>, String> {
             link_target = o.get("target").and_then(|x| x.val.as_str()).map(|s| s.to_vec());
         }
     }
-    Ok(Some(State { env_had, env_raw, env_object_had, link_had, link_target }))
+    if version == b"4" {
+        let before = root.get("env_key_before").unwrap().val.as_obj().unwrap();
+        let link = root.get("symlink_before").unwrap().val.as_obj().unwrap();
+        let raw_valid = match before.get("raw").map(|m| &m.val) {
+            Some(json::J::Null) => !env_had,
+            Some(json::J::Str(raw)) => env_had && json::parse(raw).is_ok(),
+            _ => false,
+        };
+        let link_valid = match link.get("target").map(|m| &m.val) {
+            Some(json::J::Null) => !link_had,
+            Some(json::J::Str(t)) => link_had && !t.is_empty(),
+            _ => false,
+        };
+        if !raw_valid || !link_valid || (env_had && !env_object_had && ownership != Ownership::Legacy) {
+            return Err(invalid());
+        }
+    } else {
+        for name in ["env_key_before", "symlink_before"] {
+            if root.get(name).and_then(|m| m.val.as_obj())
+                .and_then(|o| o.get("had")).and_then(|m| m.val.as_bool()).is_none() {
+                return Err(invalid());
+            }
+        }
+        if env_had != env_raw.is_some() || link_had != link_target.is_some()
+            || env_raw.as_ref().is_some_and(|raw| json::parse(raw).is_err()) {
+            return Err(invalid());
+        }
+    }
+    let legacy_witness_saved = version == b"4" && ownership == Ownership::Legacy;
+    let legacy_tree = if legacy_witness_saved {
+        root.get("legacy_completion_link")
+    } else { root.get("tree").or_else(|| root.get("repo")) }
+        .and_then(|m| m.val.as_str())
+        .map(|p| PathBuf::from(sys::os_string_from_vec(p.to_vec())))
+        .filter(|p| p.is_absolute());
+    if version == b"4" && (legacy_witness_saved != root.get("legacy_completion_link").is_some()
+        || (legacy_witness_saved && legacy_tree.is_none())) {
+        return Err(invalid());
+    }
+    Ok(Some(State { ownership, legacy_tree, legacy_witness_saved, env_had, env_raw, env_object_had, link_had, link_target }))
+}
+
+fn record_duplicates(v: &json::J) -> bool {
+    match v {
+        json::J::Obj(o) => o.members.iter().enumerate().any(|(i, m)| {
+            o.members[..i].iter().any(|n| n.key == m.key) || record_duplicates(&m.val)
+        }),
+        json::J::Arr(a) => a.iter().any(record_duplicates),
+        _ => false,
+    }
+}
+
+fn recovery_needed(c: &Ctx, why: &str) -> String {
+    format!("{}: {}. Saved restoration history does not prove a completed settings update. \
+             Automatic restoration is refused. Review env.{} in {} and the original \
+             value in {}; restore only that key manually if appropriate, then move the record \
+             aside and re-run. uninstall --restore-backup requests whole-file recovery from \
+             the pre-install backup, including unrelated settings; invalid records must first \
+             be moved aside. --force does not \
+             confirm an incomplete record.",
+            c.state.display(), why, KEY, c.settings.display(), c.state.display())
+}
+
+fn require_ownership(c: &Ctx, s: &State) -> Result<(), String> {
+    match s.ownership {
+        Ownership::Confirmed => Ok(()),
+        Ownership::Pending => Err(format!("{}. Nothing has been changed.",
+            recovery_needed(c, "settings ownership is pending after an incomplete install"))),
+        Ownership::Legacy => {
+            // Old installers linked LAST. A link moved from its recorded original
+            // target to the recorded installation is a historical completion
+            // witness. An unchanged/pre-existing link is ambiguous; neither a
+            // marker nor the current value "1" supplies the missing evidence.
+            let Some(installed) = &s.legacy_tree else {
+                return Err(format!("{}. Nothing has been changed.", recovery_needed(c, "legacy settings ownership is ambiguous")));
+            };
+            let live = link_target(&c.link);
+            let original = s.link_target.as_ref().map(|t| {
+                let p = PathBuf::from(sys::os_string_from_vec(t.clone()));
+                if p.is_absolute() { p } else { c.skills.join(p) }
+            });
+            let moved = !s.link_had || original.as_ref()
+                .is_some_and(|p| sys::same_path(p, installed) == Ok(false));
+            if moved && (s.legacy_witness_saved || live.as_ref().is_some_and(|p| sys::same_path(p, installed) == Ok(true))) {
+                Ok(())
+            } else {
+                Err(format!("{}. Nothing has been changed.", recovery_needed(c, "legacy settings ownership is ambiguous")))
+            }
+        }
+    }
 }
 
 // --- the skills symlink -----------------------------------------------------
@@ -976,14 +1264,19 @@ enum LinkState {
     Link(PathBuf, bool),
     Dir,
     Other,
+    Unreadable(String),
 }
 
 fn link_state(p: &Path) -> LinkState {
     match fs::symlink_metadata(p) {
-        Err(_) => LinkState::Absent,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => LinkState::Absent,
+        Err(e) => LinkState::Unreadable(format!("cannot inspect {}: {}", p.display(), e)),
         Ok(md) => {
             if md.file_type().is_symlink() {
-                let t = fs::read_link(p).unwrap_or_default();
+                let t = match fs::read_link(p) {
+                    Ok(t) => t,
+                    Err(e) => return LinkState::Unreadable(format!("cannot read {}: {}", p.display(), e)),
+                };
                 LinkState::Link(t, fs::metadata(p).is_ok())
             } else if md.is_dir() {
                 LinkState::Dir
@@ -992,6 +1285,17 @@ fn link_state(p: &Path) -> LinkState {
             }
         }
     }
+}
+
+/// read_link's relative target is relative to the link's parent, never our cwd.
+/// Keep the raw spelling in LinkState for the write-once restoration record.
+fn same_link_target(c: &Ctx, target: &Path) -> Result<bool, String> {
+    let target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        c.skills.join(target)
+    };
+    sys::same_path(&target, &c.tree)
 }
 
 /// The refusal both writers share for a settings.json symlink that does not
@@ -1136,23 +1440,33 @@ fn resolve_tree(dir: Option<OsString>, config: &Path) -> Result<(PathBuf, TreeFr
             return Ok((t, TreeFrom::Link));
         }
     }
-    Ok((tree::default_tree()?, TreeFrom::Default))
+    Ok((absolute(&tree::default_tree()?)?, TreeFrom::Default))
 }
 
-/// Four writes, in the order the module header explains, with every refusal decided
-/// before the first of them.
+/// The writes follow the module header's order. Known refusals are preflighted;
+/// later failure leaves history and its ownership status available for recovery.
 ///
 /// It resolves its own tree rather than being handed one by `with_ctx`, because
 /// install is the command that DECIDES where the plugin directory is. Everything else
 /// discovers it.
 fn install(dir: Option<OsString>, force: bool) -> Result<(), String> {
     let config = config_dir()?;
+    let (tree, from) = resolve_tree(dir.clone(), &config)?;
+    let c = Ctx::at(tree, from)?;
+    // Keep ordinary preflight refusals free of installation writes. Once this
+    // passes, lock before deciding ownership, then resolve and preflight again:
+    // a competing install/uninstall may have changed the link or settings.
+    install_preflight(&c, force)?;
+    let _lock = management_lock(&config)?;
     let (tree, from) = resolve_tree(dir, &config)?;
     let c = Ctx::at(tree, from)?;
     let exe = std::env::current_exe()
         .map_err(|e| format!("cannot find my own path ({}), so there is nothing to copy", e))?;
 
     let (existing, prior) = install_preflight(&c, force)?;
+    if let Some(s) = &prior {
+        require_ownership(&c, s)?;
+    }
     install_header(&c, &exe);
     // Clear this tool's own scratch files left by a killed run, in the directories it
     // is about to write.
@@ -1169,8 +1483,21 @@ fn install(dir: Option<OsString>, force: bool) -> Result<(), String> {
     for line in lines {
         say(&line);
     }
-    record_state(&c, prior, existing.as_deref())?;
-    write_env_key(&c, existing, force)?;
+    let mut saved = record_state(&c, prior, existing.as_deref())?;
+    management_checkpoint("history-saved", None).map_err(|e| e.to_string())?;
+    write_env_key(&c, existing, force).map_err(|e| {
+        if saved.ownership == Ownership::Pending {
+            format!("{}\n{}", e, recovery_needed(&c, "settings ownership remains pending"))
+        } else { e }
+    })?;
+    management_checkpoint("settings-written", None).map_err(|e| e.to_string())?;
+    if saved.ownership == Ownership::Pending {
+        saved.ownership = Ownership::Confirmed;
+        atomic_as_at(&c.state, 0o600, None, Some("ownership-staged"), |f| {
+            f.write_all(&state_text(&c, &saved))
+        }).map_err(|e| format!("{}. {}", could_not_write(&c.state, &e),
+            recovery_needed(&c, "settings were updated but ownership could not be finalised")))?;
+    }
     link_the_plugin(&c, &promise)?;
 
     say("");
@@ -1192,9 +1519,10 @@ fn install(dir: Option<OsString>, force: bool) -> Result<(), String> {
 
 /// Every reason to refuse, and the settings document to edit if there is none.
 ///
-/// ONE preflight, in front of the FIRST write, which is what lets every refusal here
-/// still end "Nothing has been changed." honestly. The old second verb wrapped these
-/// refusals AFTER it had written a tree and had to strip that sentence back off them.
+/// ONE preflight, in front of the FIRST installation write. Temporary filename
+/// probes can precede it; refusals leave installation files unchanged. The old
+/// second verb wrapped these refusals AFTER it had written a tree and had to strip
+/// that sentence back off them.
 ///
 /// The settings document is `None` when settings.json is to be written fresh: either
 /// it does not exist, or it exists and holds nothing but whitespace, which Claude Code
@@ -1211,6 +1539,8 @@ fn install_preflight(c: &Ctx, force: bool) -> Result<(Option<Vec<u8>>, Option<St
     if let Some(why) = tree::refuse_target(&c.tree, &c.skills) {
         return Err(why);
     }
+    tree::preflight_components(&c.tree)
+        .map_err(|e| format!("{}. Nothing has been changed.", e))?;
     if let Some(d) = nearest_existing(&c.tree) {
         if !d.is_dir() {
             return Err(format!(
@@ -1231,6 +1561,10 @@ fn install_preflight(c: &Ctx, force: bool) -> Result<(Option<Vec<u8>>, Option<St
     match link_state(&c.link) {
         LinkState::Dir => return Err(refuse_link(&c.link, &format!("a real directory, not a {}", sys::DIR_LINK))),
         LinkState::Other => return Err(refuse_link(&c.link, &format!("not a {}", sys::DIR_LINK))),
+        LinkState::Unreadable(e) => return Err(format!("{}. Nothing has been changed.", e)),
+        LinkState::Link(t, _) => {
+            same_link_target(c, &t).map_err(|e| format!("cannot compare the plugin target: {}. Nothing has been changed.", e))?;
+        }
         _ => {}
     }
     // `<config>/skills` itself, which the last step has to create or write into.
@@ -1374,7 +1708,7 @@ fn install_header(c: &Ctx, exe: &Path) {
 /// the first write, that a directory they have been editing stops being the plugin.
 fn repoint_warning(c: &Ctx) {
     let LinkState::Link(t, _) = link_state(&c.link) else { return };
-    if sys::same_path(&t, &c.tree) {
+    if same_link_target(c, &t) != Ok(false) {
         return;
     }
     say(&format!("plugin:   {}", c.link.display()));
@@ -1403,7 +1737,7 @@ fn is_checkout(p: &Path) -> bool {
 /// A v2 record is upgraded IN PLACE rather than replaced, because its first half -
 /// what settings.json and the symlink looked like before any of this - is unrecoverable
 /// once it is lost, and it is the only thing `uninstall` has to go on.
-fn record_state(c: &Ctx, prior: Option<State>, existing: Option<&[u8]>) -> Result<(), String> {
+fn record_state(c: &Ctx, prior: Option<State>, existing: Option<&[u8]>) -> Result<State, String> {
     match prior {
         Some(prior) => {
             // The prior half, re-emitted verbatim, with this install's tree beside it.
@@ -1426,6 +1760,7 @@ fn record_state(c: &Ctx, prior: Option<State>, existing: Option<&[u8]>) -> Resul
                     )),
                 }
             }
+            Ok(prior)
         }
         None => {
             let (link_had, link_target) = match link_state(&c.link) {
@@ -1441,6 +1776,9 @@ fn record_state(c: &Ctx, prior: Option<State>, existing: Option<&[u8]>) -> Resul
                 None => false,
             };
             let s = State {
+                ownership: Ownership::Pending,
+                legacy_tree: None,
+                legacy_witness_saved: false,
                 env_had: env_raw.is_some(),
                 env_raw,
                 env_object_had,
@@ -1449,9 +1787,9 @@ fn record_state(c: &Ctx, prior: Option<State>, existing: Option<&[u8]>) -> Resul
             };
             write_atomic(&c.state, &state_text(c, &s), 0o600)?;
             say(&format!("state:    recorded the prior state in {}", c.state.display()));
+            Ok(s)
         }
     }
-    Ok(())
 }
 
 /// Which version the record on disk claims, as its source text, so an upgrade can say
@@ -1493,8 +1831,8 @@ fn write_env_key(c: &Ctx, existing: Option<Vec<u8>>, force: bool) -> Result<(), 
                 if now != doc {
                     return Err(format!(
                         "{} changed while this installer was running (another \
-                         Claude Code session writing it, most likely). Nothing \
-                         was changed; the backup is at {}.",
+                         Claude Code session writing it, most likely). The installer \
+                         has not replaced settings.json; the backup is at {}.",
                         c.settings.display(),
                         c.backup.display()
                     ));
@@ -1514,10 +1852,9 @@ fn write_env_key(c: &Ctx, existing: Option<Vec<u8>>, force: bool) -> Result<(), 
     Ok(())
 }
 
-/// The LAST step, and the only irreversible one: it is the one write that changes what
-/// code a running session executes, so an abort at any earlier point is a complete
-/// no-op for a first-time user - the tree is inert until this link points at it, and
-/// settings.json is recoverable from its backup and the record.
+/// The LAST step changes what code a running session executes. Settings have
+/// already changed; their receipt and original narrow restoration history are
+/// recorded before this step, so a later ordinary uninstall can undo them.
 ///
 /// It comes after `verify` inside the tree write, because that is what proves the new
 /// target works, and after settings.json, because "env key set + plugin gone" is the
@@ -1568,7 +1905,7 @@ fn link_the_plugin(c: &Ctx, promise: &RecordedPrior) -> Result<(), String> {
             say(&format!("{}created", link_label()));
             say(&format!("          {} -> {}", c.link.display(), c.tree.display()));
         }
-        LinkState::Link(t, resolves) if sys::same_path(&t, &c.tree) => {
+        LinkState::Link(t, resolves) if same_link_target(c, &t)? => {
             if resolves {
                 say(&format!("{}already correct", link_label()));
                 say(&format!("          {} -> {}", c.link.display(), c.tree.display()));
@@ -1644,6 +1981,7 @@ fn link_the_plugin(c: &Ctx, promise: &RecordedPrior) -> Result<(), String> {
         }
         LinkState::Dir => return Err(refuse_link(&c.link, &format!("a real directory, not a {}", sys::DIR_LINK))),
         LinkState::Other => return Err(refuse_link(&c.link, &format!("not a {}", sys::DIR_LINK))),
+        LinkState::Unreadable(e) => return Err(e),
     }
     Ok(())
 }
@@ -2151,8 +2489,14 @@ fn uninstall_preflight(c: &Ctx, force: bool, restore_backup: bool, keep_tree: bo
     match link_state(&c.link) {
         LinkState::Dir => return Err(refuse_link(&c.link, &format!("a real directory, not a {}", sys::DIR_LINK))),
         LinkState::Other => return Err(refuse_link(&c.link, &format!("not a {}", sys::DIR_LINK))),
+        LinkState::Unreadable(e) => return Err(format!("{}. Nothing has been changed.", e)),
         _ => {}
     }
+    // Failure to identify the tree must not turn into permission to delete it.
+    sys::destination_ancestors(&c.tree)
+        .map_err(|e| format!("cannot inspect the live tree: {}. Nothing has been changed.", e))?;
+    sys::destination_ancestors(&c.skills)
+        .map_err(|e| format!("cannot inspect the plugin directory: {}. Nothing has been changed.", e))?;
     // The tree goes LAST and holds the binary. Where a running program's file cannot
     // be deleted (Windows), an uninstall run BY that binary would undo everything else
     // and then fail to remove it - a half-removed tree reported as removed - so that
@@ -2199,6 +2543,11 @@ fn uninstall_preflight(c: &Ctx, force: bool, restore_backup: bool, keep_tree: bo
         refuse_unreadable_acl(&c.backup, force)?;
     }
     let state = read_state(c)?;
+    if !restore_backup {
+        if let Some(s) = &state {
+            require_ownership(c, s)?;
+        }
+    }
 
     // The put-back, asked before anything changes, as install asks about its link:
     // `unlink_the_plugin` removes the current link BEFORE it makes the recorded one,
@@ -2269,8 +2618,7 @@ fn remove_env_key(c: &Ctx, prior: &Prior, force: bool, restore_backup: bool) -> 
         json::parse(&raw).map_err(|e| {
             format!("{} is not valid JSON ({}). Refusing to restore it.", c.backup.display(), e)
         })?;
-        let mode = mode_of(&c.backup).or_else(|| mode_of(&c.settings)).unwrap_or(0o600);
-        // The ACL (Windows): the LIVE file's, as every rewrite keeps it - it is the
+        // The ACL and mode: the LIVE file's, as every rewrite keeps them - it is the
         // newest word on who may read this file, and may have been tightened since
         // install. Only with no live file does the restored one take the backup's,
         // which is the ACL the file had when it was backed up.
@@ -2281,9 +2629,10 @@ fn remove_env_key(c: &Ctx, prior: &Prior, force: bool, restore_backup: bool) -> 
         } else {
             &c.backup
         };
+        let mode = mode_of(like).unwrap_or(0o600);
         write_settings(&c.settings, &raw, mode, like, force)?;
         say(&format!("settings: restored from {}", c.backup.display()));
-        if !sys::HAS_MODES {
+        if sys::HAS_SECURITY {
             say(if like == &c.settings {
                 "          (the access control list of the file it replaced kept)"
             } else {
@@ -2439,6 +2788,7 @@ fn unlink_the_plugin(c: &Ctx, prior: &Prior) -> Result<(), String> {
         LinkState::Absent => say(&format!("{}not present - nothing to remove", link_label())),
         LinkState::Dir => return Err(refuse_link(&c.link, &format!("a real directory, not a {}", sys::DIR_LINK))),
         LinkState::Other => return Err(refuse_link(&c.link, &format!("not a {}", sys::DIR_LINK))),
+        LinkState::Unreadable(e) => return Err(e),
     }
     Ok(())
 }
@@ -2495,6 +2845,13 @@ fn remove_records() {
 /// Read-only by construction: the one command whose job is to explain a broken
 /// config has to be able to run on the config that is broken.
 fn doctor(c: &Ctx) -> Result<(), String> {
+    // ONE resolution, for the whole report. This built `Config::from_env()` three
+    // separate times, and each one re-ran the whole of `mux::resolve` - survivable
+    // while detection was two getenvs, and not survivable now: `MuxOracle::leaf_hint`
+    // MAY EXEC, so three constructions are three forks whose answers can disagree,
+    // which is precisely the doctor-versus-reality mismatch this report exists to
+    // remove. Every `report_*` below takes the stack that was resolved here.
+    let cfg = Config::from_env();
     say(&format!("tabstatus {} ({})", env!("CARGO_PKG_VERSION"), target_triple()));
     report_tree(c);
     say(&format!("config:    {}", c.config.display()));
@@ -2505,9 +2862,10 @@ fn doctor(c: &Ctx) -> Result<(), String> {
     report_env_key(c)?;
     report_state(c);
     report_record();
-    report_runtime();
-    report_tmux();
-    report_title();
+    report_runtime(&cfg);
+    report_stack(&cfg);
+    report_tmux(&cfg);
+    report_title(&cfg);
     Ok(())
 }
 
@@ -2569,13 +2927,21 @@ fn report_tree(c: &Ctx) {
 /// path.
 fn orphan_trees(c: &Ctx) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    for cand in [recorded_tree(&c.config), tree::default_tree().ok()].into_iter().flatten() {
-        if !sys::same_path(&cand, &c.tree)
-            && !out.iter().any(|o| sys::same_path(o, &cand))
-            && tree::is_generated(&cand)
-        {
-            out.push(cand);
+    'candidate: for cand in [recorded_tree(&c.config), tree::default_tree().ok()].into_iter().flatten() {
+        if !tree::is_generated(&cand) {
+            continue;
         }
+        for other in std::iter::once(&c.tree).chain(out.iter()) {
+            match sys::same_path(&cand, other) {
+                Ok(true) => continue 'candidate,
+                Ok(false) => {}
+                Err(e) => {
+                    say(&format!("tree:      WARN cannot identify {} as an orphan: {}. Left alone.", cand.display(), e));
+                    continue 'candidate;
+                }
+            }
+        }
+        out.push(cand);
     }
     out
 }
@@ -2728,24 +3094,24 @@ fn report_plugin(c: &Ctx) {
             "plugin:    FAIL not linked. Run `tabstatus install`. ({})",
             c.link.display()
         )),
-        LinkState::Link(t, true) if sys::same_path(&t, &c.tree) && is_checkout(&t) => {
-            say(&format!(
-                "plugin:    WARN {} points at a CHECKOUT, not at a generated tree:",
-                c.link.display()
-            ));
-            say(&format!("           {}", t.display()));
-            say("           That is the wiring from before the plugin directory became build");
-            say("           output - a `git checkout` there changes what every running session");
-            say("           runs. `tabstatus install` repoints it at a generated tree.");
-        }
-        LinkState::Link(t, true) if sys::same_path(&t, &c.tree) => {
-            say(&format!("plugin:    OK   linked, {} -> {}", c.link.display(), t.display()))
-        }
-        LinkState::Link(t, true) => say(&format!(
-            "plugin:    WARN {} points at {}, not at the tree above",
-            c.link.display(),
-            t.display()
-        )),
+        LinkState::Link(t, true) => match same_link_target(c, &t) {
+            Err(e) => say(&format!("plugin:    WARN cannot identify the plugin target: {}", e)),
+            Ok(true) if is_checkout(&c.skills.join(&t)) => {
+                say(&format!(
+                    "plugin:    WARN {} points at a CHECKOUT, not at a generated tree:",
+                    c.link.display()
+                ));
+                say(&format!("           {}", t.display()));
+                say("           That is the wiring from before the plugin directory became build");
+                say("           output - a `git checkout` there changes what every running session");
+                say("           runs. `tabstatus install` repoints it at a generated tree.");
+            }
+            Ok(true) => say(&format!("plugin:    OK   linked, {} -> {}", c.link.display(), t.display())),
+            Ok(false) => say(&format!(
+                "plugin:    WARN {} points at {}, not at the tree above",
+                c.link.display(), t.display()
+            )),
+        },
         LinkState::Link(t, false) => say(&format!(
             "plugin:    FAIL {} is a broken {} to {}",
             c.link.display(),
@@ -2756,6 +3122,7 @@ fn report_plugin(c: &Ctx) {
             "plugin:    WARN {} is a real directory, not a link to the plugin tree",
             c.link.display()
         )),
+        LinkState::Unreadable(e) => say(&format!("plugin:    WARN {}", e)),
         LinkState::Other => {
             say(&format!("plugin:    WARN {} exists and is not a {}", c.link.display(), sys::DIR_LINK))
         }
@@ -2874,18 +3241,22 @@ fn report_record() {
     }
 }
 
-/// What the runtime half would decide from this environment: which terminal, which
-/// glyph position, and whether there is a pty to write to.
-fn report_runtime() {
+/// What the runtime half would decide from this environment: which terminal, why,
+/// and which glyph position that implies.
+///
+/// The `pty:` line this used to end with is now the platform axis's `session
+/// terminal` row, where the fact belongs: `$CLAUDE_PID` is how a PLATFORM reaches
+/// the session's own terminal, and it was the one line here that was not about the
+/// leaf. Its four sentences are unchanged.
+fn report_runtime(cfg: &Config) {
     let konsole_vars = config::flag("KONSOLE_VERSION") || config::flag("KONSOLE_DBUS_SESSION");
-    let mux = if config::flag("TMUX") {
-        "tmux"
-    } else if config::flag("STY") {
-        "screen"
-    } else {
-        ""
-    };
-    let konsole = Terminal::detect() == Terminal::Konsole;
+    // The layer the ENVIRONMENT claimed, carried out of the one resolution rather
+    // than re-read from `$TMUX` and `$STY` here. It is deliberately not
+    // `stack.mux.is_some()`: a `$TMUX` that is not `<socket>,<pid>,<session>` leaves
+    // nothing to drive and still swallowed the leaf's evidence, and this line has
+    // always named the layer that did the swallowing.
+    let mux = cfg.stack.claimed.map_or("", |k| k.caps().name);
+    let konsole = cfg.stack.leaf == Surface::Konsole;
     // The REASON matters more than the answer, because there are now three of
     // them and they disagree: an explicit CCTAB_TERMINAL, inherited KONSOLE_*,
     // and a multiplexer that makes the inherited kind meaningless.
@@ -2944,32 +3315,456 @@ fn report_runtime() {
         },
         implied
     ));
-    match config::var_nonempty("CLAUDE_PID") {
+}
+
+// --- doctor: the three axes -------------------------------------------------
+
+/// The capability table's columns, FIXED so that a report from Linux and one from a
+/// Windows build diff cleanly. That matters more here than anywhere else in the
+/// report: fourteen surface rows exist, six of them have never had a byte delivered
+/// to them, and the only way to compare a column that was measured with one that was
+/// read out of vendor source is to have them land in the same place.
+const AXIS_W: usize = 12;
+const VALUE_W: usize = 29;
+const NAME_W: usize = 22;
+/// `ok` / `n/a` / `off` / `?` / `fail` and one space - [`Support::label`] is the only
+/// place those five words are spelled, so this is the only place their width is.
+const LABEL_W: usize = 6;
+/// Where a capability's own text starts, and therefore where a second line of it is
+/// indented to.
+const DETAIL_COL: usize = 2 + NAME_W + LABEL_W;
+
+/// One axis: which of the three, what it resolved to, and one phrase about the whole
+/// of it.
+fn axis(which: &str, value: &str, note: &str) {
+    say(format!("{which:<AXIS_W$}{value:<VALUE_W$}{note}").trim_end());
+}
+
+/// One capability, in two columns: the verdict word and the one thing a reader can
+/// act on.
+fn row(name: &str, label: &str, detail: &str) {
+    say(format!("  {name:<NAME_W$}{label:<LABEL_W$}{detail}").trim_end());
+}
+
+/// A capability whose verdict IS a [`Support`], which is all of them but two.
+///
+/// `Support::label` and `Support::reason` are the whole formatter - doctor cannot
+/// invent a sixth word, and cannot print an absence without the reason the row
+/// carries - and `detail` is what to show when the answer is `ok` and there is
+/// therefore no reason to print: the grammar, the path, the pid.
+fn cap<T>(name: &str, s: &Support<T>, detail: &str) {
+    row(name, s.label(), s.reason().as_deref().unwrap_or(detail));
+}
+
+/// A second line of one capability's text, under the first.
+fn more(detail: &str) {
+    say(format!("{:DETAIL_COL$}{detail}", "").trim_end());
+}
+
+/// Which OSC and how it is terminated, which is one fact: VTE drops a BEL-terminated
+/// `OSC 9;4` on purpose, so a report naming the sequence without its terminator
+/// would say that VTE and kitty agree.
+fn grammar((osc, t): (&str, Terminator)) -> String {
+    format!("{osc} {}", t.name())
+}
+
+/// An escape sequence as a REPORT can print it: the bytes themselves, with ESC and
+/// BEL named rather than written.
+///
+/// doctor is read in the terminal whose tab is misbehaving. A report that echoed the
+/// real control bytes would arm that terminal while describing the arming.
+fn visible(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for &b in bytes {
+        match b {
+            0x1b => out.push_str("ESC"),
+            0x07 => out.push_str(" BEL"),
+            0x20..=0x7e => out.push(char::from(b)),
+            other => out.push_str(&format!("\\x{other:02x}")),
+        }
+    }
+    out
+}
+
+/// Every name `--surface` accepts, which is every variant's - including the ones
+/// this build could never detect, because over ssh an override is the only way a
+/// leaf is knowable at all.
+fn surface_names() -> String {
+    Surface::ALL
+        .iter()
+        .map(|s| s.caps().name)
+        .collect::<Vec<&str>>()
+        .join(", ")
+}
+
+/// The three axes and what each one can do, from the stack resolved ONCE at the top
+/// of the report.
+///
+/// This is the user-visible payoff of the whole backend refactor: the axes existed
+/// and nobody could see them. Platform verdicts lift the paint path's native
+/// answers; the surface resolves its protocol catalogue against version evidence
+/// here, without adding version queries to the painting path.
+fn report_stack(cfg: &Config) {
+    report_platform(cfg);
+    report_leaf(
+        cfg.stack.leaf,
+        Some(&leaf_evidence(cfg)),
+        surface::version_evidence(cfg.stack.leaf, cfg.stack.claimed.is_some()),
+    );
+    report_mux(&cfg.stack);
+}
+
+/// Can this build NAME the leaf, and what named it? The `Support` shape is not a
+/// dressing-up: "nothing named it" is a capability this session does not have, and
+/// the two ways of not having it - an override nobody set, and evidence a
+/// multiplexer swallowed - have different remedies.
+fn leaf_evidence(cfg: &Config) -> Support<String> {
+    let in_mux = cfg.stack.claimed.is_some();
+    leaf_evidence_in(
+        config::var_nonempty("CCTAB_TERMINAL").as_deref(),
+        cfg.stack.leaf_hint,
+        surface::evidence(in_mux),
+        in_mux,
+    )
+}
+
+fn leaf_evidence_in(
+    override_: Option<&std::ffi::OsStr>,
+    hint: Option<Surface>,
+    evidence: Option<surface::Evidence>,
+    in_mux: bool,
+) -> Support<String> {
+    match (override_.filter(|v| !v.is_empty()), hint, evidence) {
+        (Some(v), _, _) => Support::Available(format!(
+            "CCTAB_TERMINAL={}",
+            String::from_utf8_lossy(v.as_encoded_bytes())
+        )),
+        // A mux hint outranks probes even if both name the same family or the
+        // hint names Unknown. NoOracle supplies None in the current doctor path.
+        (None, Some(_), _) => Support::Available("the multiplexer".to_owned()),
+        (None, None, Some(evidence)) => Support::Available(evidence.to_string()),
+        (None, None, None) if in_mux => {
+            Support::Unsupported("a multiplexer swallowed the environment's evidence")
+        }
+        (None, None, None) => Support::Unsupported("nothing in the environment named it"),
+    }
+}
+
+/// The platform axis: what this build's operating system supplies.
+///
+/// THE MAPPING LIVES HERE AND NOWHERE ELSE. `crate::sys` answers in `Option`, `bool`
+/// and `HAS_*`, which is the right shape for a caller that has to branch, and those
+/// answers are lifted into [`Support`] at this boundary - the only place a REPORT is
+/// produced. No signature in `sys` changes to serve a report, and no row below can
+/// claim a capability whose constant the paint path does not read.
+///
+/// The session's own terminal is reported from `$CLAUDE_PID` and deliberately NOT by
+/// opening it: on Windows the console route attaches a console, and releasing one
+/// invalidates this process's stdout handles - so a report that proved the
+/// capability by taking it would truncate itself, on exactly the platform it exists
+/// to explain.
+fn report_platform(cfg: &Config) {
+    axis(
+        "platform",
+        std::env::consts::OS,
+        &format!(
+            "a record carries its session's origin as `{} <pid> <start>`",
+            sys::ORIGIN_KEY
+        ),
+    );
+    // The four sentences the `pty:` line used to print, unchanged, now as one row's
+    // verdict plus its reason. Which of them applies is decided by the two platform
+    // constants and by the stack resolved at the top of the report - never by a
+    // second `Tmux::detect()`, which is the drift this commit removes.
+    let pid = cfg
+        .claude_pid
+        .as_deref()
+        .map(|p| String::from_utf8_lossy(p.as_encoded_bytes()).into_owned());
+    let session: Presence = match (&pid, sys::HAS_SESSION_CONSOLE, cfg.stack.tmux().is_some()) {
+        (None, _, _) => Support::Unsupported(
+            "CLAUDE_PID is not set, so this is not a hook subprocess (session-start \
+             and session-end would do nothing)",
+        ),
         // The same test `emit::write_session` makes: inside tmux the title is tmux's
         // carrier, so no console is titled.
-        Some(p) if sys::HAS_SESSION_CONSOLE && tmux::Tmux::detect().is_some() => say(&format!(
-            "pty:       CLAUDE_PID={} - no pty here, and inside tmux no console title is \
-             set either, so session-start and session-end paint nothing directly",
-            String::from_utf8_lossy(p.as_encoded_bytes())
-        )),
-        Some(p) if sys::HAS_SESSION_CONSOLE => say(&format!(
-            "pty:       CLAUDE_PID={} - no pty here: session-start and session-end set the \
-             title of its console instead, when it is a 64-bit process, an ancestor of \
-             the hook, and its stdout is that console",
-            String::from_utf8_lossy(p.as_encoded_bytes())
-        )),
-        Some(p) if !sys::HAS_SESSION_TTY => say(&format!(
-            "pty:       CLAUDE_PID={} - but this platform has no pty to resolve from it, so \
+        (Some(_), true, true) => Support::Unsupported(
+            "no pty here, and inside tmux no console title is set either, so \
              session-start and session-end paint nothing directly",
-            String::from_utf8_lossy(p.as_encoded_bytes())
-        )),
-        Some(p) => say(&format!(
-            "pty:       CLAUDE_PID={} - session-start and session-end write it directly",
-            String::from_utf8_lossy(p.as_encoded_bytes())
-        )),
-        None => say("pty:       CLAUDE_PID is not set, so this is not a hook subprocess \
-                  (session-start and session-end would do nothing)"),
+        ),
+        (Some(_), true, false) => YES,
+        (Some(_), false, _) if !sys::HAS_SESSION_TTY => Support::Unsupported(
+            "this platform has no pty to resolve from it, so session-start and \
+             session-end paint nothing directly",
+        ),
+        (Some(_), false, _) => YES,
+    };
+    cap(
+        "session terminal",
+        &session,
+        &match (&pid, sys::HAS_SESSION_CONSOLE) {
+            (Some(p), true) => format!(
+                "CLAUDE_PID={p} - session-start and session-end set the title of its \
+                 console, when it is a 64-bit process, an ancestor of the hook, and \
+                 its stdout is that console"
+            ),
+            (Some(p), false) => {
+                format!("CLAUDE_PID={p} - session-start and session-end write it directly")
+            }
+            (None, _) => String::new(),
+        },
+    );
+    if let Some(p) = &pid {
+        if !session.is_available() {
+            more(&format!("CLAUDE_PID={p}"));
+        }
     }
+    // OUR OWN pid, because what is under test here is the platform primitive and not
+    // some other process: the session's pid may be gone, and on native Windows it
+    // may never have been exported at all.
+    let me = std::process::id();
+    let stamp: Support<u64> = match sys::process_start_time(me) {
+        Some(t) => Support::Available(t),
+        None => Support::Unsupported(
+            "this platform will not say when a pid started, so the reaper falls back \
+             to the record's mtime",
+        ),
+    };
+    cap(
+        "process stamp",
+        &stamp,
+        &match &stamp {
+            Support::Available(t) => format!("{t}, this process (pid {me})"),
+            _ => String::new(),
+        },
+    );
+    let lock: Presence = if sys::HAS_RECORD_LOCK {
+        YES
+    } else {
+        Support::Unsupported("no record lock here that can be proven held, so the \
+                              whole state layer stays off")
+    };
+    cap(
+        "record lock",
+        &lock,
+        "a record is written under an exclusive lock proven to hold that same file",
+    );
+    let dir: Support<PathBuf> = match state::dir() {
+        Some(d) => Support::Available(d),
+        None if sys::HAS_RECORD_LOCK => Support::Unsupported(sys::NO_STATE_DIR),
+        None => Support::Unsupported("there is no record lock to protect one"),
+    };
+    cap(
+        "state dir",
+        &dir,
+        &match &dir {
+            Support::Available(d) => format!("{} (CCTAB_STATE_DIR, else ${})", d.display(), sys::RUNTIME_DIR_VAR),
+            _ => String::new(),
+        },
+    );
+    let modes: Presence = if sys::HAS_MODES {
+        YES
+    } else {
+        Support::Unsupported(
+            "no POSIX mode bits here, so the directory's own inherited ACL is what \
+             keeps a record private",
+        )
+    };
+    cap("file modes", &modes, "the record directory is created 0700");
+    let unlink: Presence = if sys::HAS_UNLINK_RUNNING {
+        YES
+    } else {
+        Support::Unsupported(
+            "a running program's own file cannot be replaced in one rename here, so \
+             install renames it aside first",
+        )
+    };
+    cap(
+        "replace while running",
+        &unlink,
+        "one rename, atomic, over the very binary the hooks exec",
+    );
+    row(
+        "plugin link",
+        "ok",
+        &format!("a {} points Claude Code's config at the generated tree", sys::DIR_LINK),
+    );
+    // `Support::gate` layers OUR knob over the platform's answer, which is what stops
+    // this row claiming to be the name that gets painted when `CCTAB_HOST` is what
+    // does.
+    let named = location::hostname(cfg);
+    let host: Support<String> = match named {
+        Some(h) => Support::Available(h),
+        None => Support::Unsupported("nothing here names this machine"),
+    }
+    .gate(cfg.host_override.as_ref().map(|_| "CCTAB_HOST"));
+    cap(
+        "hostname",
+        &host,
+        match &host {
+            Support::Available(h) => h,
+            _ => "",
+        },
+    );
+}
+
+/// The surface axis: the leaf terminal's whole capability row.
+///
+/// `evidence` is `None` for `doctor --surface <name>`, where there is no session to
+/// have evidence about - the point of that spelling is to read a table for a machine
+/// this is not. Versioned protocols use the surface's reporting resolver in both
+/// modes; the offline catalogue never borrows evidence from the local environment.
+fn report_leaf(
+    s: Surface,
+    evidence: Option<&Support<String>>,
+    version: surface::VersionEvidence,
+) {
+    let c = s.caps();
+    axis("surface", c.name, &format!("{}, {}", c.human, c.source.why()));
+    if let Some(e) = evidence {
+        cap(
+            "evidence",
+            e,
+            match e {
+                Support::Available(what) => what,
+                _ => "",
+            },
+        );
+    }
+    // Not a `Support`: which end of a label a terminal throws away is not a
+    // capability it has or lacks. The layout DECISION is `glyph:` above, which
+    // `CCTAB_GLYPH_POS` can win; this is the measurement under it.
+    let (word, cut) = match c.elide {
+        Elide::Left => ("left", "the tab label is cut from the left, so a glyph goes last"),
+        Elide::Right => ("right", "the tab label is cut from the right, so a glyph goes first"),
+        Elide::Unknown => ("?", "no truncation behaviour has ever been observed here"),
+    };
+    row("elide", word, cut);
+    cap("title (OSC 0)", &c.title.osc0, "icon name and window title together");
+    cap("title (OSC 1)", &c.title.osc1, "");
+    cap("title (OSC 2)", &c.title.osc2, "");
+    cap("title stack (CSI 22t)", &c.title.stack_22t, "");
+    report_protocol("tab colour", &c.tab_color, version, |g| g.grammar());
+    let a = &c.attention;
+    cap("bell", &a.bell, "");
+    report_protocol("notification", &a.notify, version, |g| g.grammar());
+    report_protocol("taskbar progress", &a.progress, version, |g| g.grammar());
+    cap("acknowledge", &a.acknowledge, "");
+    // `Option<Arming>` has nowhere to carry a reason, so the two absences are spelled
+    // here. They are not the same absence: twelve surfaces need no arming, and
+    // `Unknown` is REFUSED one, because appearance bytes are never written to a
+    // terminal that cannot be named.
+    let armed: Presence = match (&c.arming, s) {
+        (Some(_), _) => YES,
+        (None, Surface::Unknown) => {
+            Support::Unsupported("a terminal that cannot be named is sent no appearance bytes")
+        }
+        (None, _) => Support::Unsupported("a title shows here with nothing armed first"),
+    };
+    // The pair, always together: `Arming::pair` is the only way to read either one
+    // out, because an arm whose restore drifted from it is this project's named
+    // recurring defect and a report is where a drift would be seen.
+    match &c.arming {
+        Some(arm) => {
+            let (on, off) = arm.pair();
+            cap("arm / restore", &armed, &visible(on));
+            more(&format!("back to {}", visible(off)));
+            more("which is the terminal's COMPILED-IN default, not your profile");
+        }
+        None => cap("arm / restore", &armed, ""),
+    }
+}
+
+/// Format the resolved claim and retain the catalogue grammar and requirement
+/// even when the running terminal's version cannot establish support.
+fn report_protocol<T>(
+    name: &str,
+    protocol: &surface::Protocol<T>,
+    version: surface::VersionEvidence,
+    syntax: impl Fn(&T) -> (&'static str, Terminator),
+) {
+    let detail = protocol
+        .catalogue
+        .emittable()
+        .map(|g| grammar(syntax(g)))
+        .unwrap_or_default();
+    cap(name, protocol.reported(version), &detail);
+    if let Some(minimum) = protocol.minimum {
+        more(&format!("{detail}; requires {minimum} or newer"));
+    } else if !detail.is_empty() && !protocol.catalogue.is_available() {
+        more(&detail);
+    }
+}
+
+/// The multiplexer axis: which one the environment claimed, whether it is one we can
+/// drive, and what it does for us.
+fn report_mux(st: &Stack) {
+    // The three absences a single `Option<Mux>` flattened into one: our knob turned
+    // it off, the environment named one we cannot drive, and there is none. Only the
+    // first has a remedy, and it is the name of the knob.
+    let driving: Presence = match (&st.mux, st.disabled_by, st.claimed) {
+        (Some(_), _, _) => YES,
+        (None, Some(knob), _) => Support::Disabled(knob),
+        (None, None, Some(MuxKind::Tmux)) => Support::Unsupported(
+            "$TMUX is not <socket>,<pid>,<session>, so there is nothing to drive",
+        ),
+        (None, None, Some(_)) => {
+            Support::Unsupported("the environment names one and nothing here can drive it")
+        }
+        (None, None, None) => Support::Unsupported("neither $TMUX nor $STY is set"),
+    };
+    axis(
+        "multiplexer",
+        st.claimed.map_or("none", |k| k.caps().name),
+        &if driving.is_available() {
+            String::new()
+        } else {
+            driving.to_string()
+        },
+    );
+    // The rows describe what we could ASK of it, so they are printed for a
+    // multiplexer that is actually there and for no other.
+    let Some(m) = &st.mux else { return };
+    let caps = m.caps();
+    cap(
+        "outer title",
+        &caps.title_renderer(),
+        "it re-renders its own format on a timer, which is what lets a glyph decay",
+    );
+    cap(
+        "client registry",
+        &caps.client_registry,
+        "it names each attached client's pty, where the leaf's appearance bytes go",
+    );
+}
+
+/// `doctor --surface <name>`: one surface's capability table, for a terminal this
+/// machine cannot run.
+///
+/// Every input is `&'static` data, so this needs no terminal, no config directory and
+/// no session - which is how a human reads the Windows column before any Windows box
+/// exists. It prints the surface axis ALONE: the other two describe this machine, and
+/// this spelling is about another one.
+fn surface_table(name: &OsStr) -> i32 {
+    let want = name.as_encoded_bytes();
+    let Some(s) = surface::by_name(want) else {
+        fail(&format!(
+            "no surface is named {}. One of: {}",
+            String::from_utf8_lossy(want),
+            surface_names()
+        ));
+        return 1;
+    };
+    version();
+    report_leaf(s, None, surface::VersionEvidence::Catalogue);
+    // At the AXIS's own column, not a capability's: indented to `more`'s depth it
+    // would read as a third line of the arming row above it.
+    say(&format!(
+        "{:AXIS_W$}CCTAB_TERMINAL={} is what names this surface to a session that \
+         cannot detect it",
+        "",
+        s.caps().name
+    ));
+    0
 }
 
 /// Inside tmux or not, the socket, the pane, whether the decay's clock is running,
@@ -2979,16 +3774,16 @@ fn report_runtime() {
 /// Two tmux invocations, both read-only, both on a cold path. Nothing here is a
 /// copy of what the runtime half decides: [`tmux::report`] is in the module that
 /// decides it.
-fn report_tmux() {
-    for line in tmux::report(&Config::from_env()) {
+fn report_tmux(cfg: &Config) {
+    for line in tmux::report(cfg) {
         say(&line);
     }
 }
 
 /// The runtime half's own pipeline, CALLED rather than copied, so this line cannot
 /// drift from what actually paints.
-fn report_title() {
-    let title = render::compose(Paint::Line(Glyph::Idle), &Config::from_env()).title;
+fn report_title(cfg: &Config) {
+    let title = render::compose(Paint::Line(Glyph::Idle), cfg).title;
     let mut line = b"title:     ".to_vec();
     line.extend_from_slice(title.as_bytes());
     line.push(b'\n');
@@ -3001,6 +3796,37 @@ fn report_title() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leaf_evidence_honours_the_same_override_hint_probe_ladder() {
+        for hint in [None, Some(Surface::WezTerm), Some(Surface::WindowsTerminal),
+                     Some(Surface::Unknown)] {
+            for in_mux in [false, true] {
+                for (raw, expected) in [
+                    (Some("ITeRm2"), "CCTAB_TERMINAL=ITeRm2"),
+                    (Some("unsupported"), "CCTAB_TERMINAL=unsupported"),
+                    (Some(""), if hint.is_some() { "the multiplexer" } else { "$WT_SESSION" }),
+                    (None, if hint.is_some() { "the multiplexer" } else { "$WT_SESSION" }),
+                ] {
+                    let reported = leaf_evidence_in(raw.map(std::ffi::OsStr::new), hint,
+                        Some(surface::Evidence { var: "WT_SESSION", value: None }), in_mux);
+                    assert_eq!(reported.ok().as_deref(), Some(expected));
+                }
+            }
+        }
+        let reported = leaf_evidence_in(None, None,
+            Some(surface::Evidence { var: "LC_TERMINAL", value: Some("iTerm2") }), false);
+        assert_eq!(reported.ok().as_deref(), Some("$LC_TERMINAL=iTerm2"));
+        for in_mux in [false, true] {
+            let absent = leaf_evidence_in(None, None, None, in_mux);
+            assert_eq!(absent.label(), "n/a");
+            assert_eq!(absent.reason().as_deref(), Some(if in_mux {
+                "a multiplexer swallowed the environment's evidence"
+            } else {
+                "nothing in the environment named it"
+            }));
+        }
+    }
 
     fn parse(words: &[&str]) -> Subcommand {
         let all: Vec<OsString> = words.iter().map(OsString::from).collect();
@@ -3026,7 +3852,7 @@ mod tests {
         // an idle tab.
         assert!(matches!(parse(&["standalone"]), Subcommand::StandaloneGone));
         assert!(matches!(parse(&["standalone", "/tmp/x"]), Subcommand::StandaloneGone));
-        assert!(matches!(parse(&["doctor"]), Subcommand::Doctor));
+        assert!(matches!(parse(&["doctor"]), Subcommand::Doctor { surface: None }));
         for w in ["version", "--version", "-V"] {
             assert!(matches!(parse(&[w]), Subcommand::Version), "{}", w);
         }
@@ -3126,10 +3952,57 @@ mod tests {
 
     #[test]
     fn the_three_read_only_verbs_ignore_their_arguments() {
-        // Reproduced, not improved: `doctor --force` has always run doctor.
-        assert!(matches!(parse(&["doctor", "--force", "--bogus"]), Subcommand::Doctor));
+        // Reproduced, not improved: `doctor --force` has always run doctor, and the
+        // one option doctor now takes must not turn the others into refusals.
+        assert!(matches!(
+            parse(&["doctor", "--force", "--bogus"]),
+            Subcommand::Doctor { surface: None }
+        ));
         assert!(matches!(parse(&["version", "--bogus"]), Subcommand::Version));
         assert!(matches!(parse(&["help", "--bogus"]), Subcommand::Help));
+    }
+
+    /// `--surface` takes a value, is found among arguments doctor ignores, and names
+    /// the fourteen when it is given nothing usable - a report must not fall through
+    /// to the paint path and paint an idle tab, which is what a `None` from `parse`
+    /// would have done.
+    #[test]
+    fn the_surface_table_is_asked_for_by_name_or_refused_by_name() {
+        for words in [
+            vec!["doctor", "--surface", "konsole"],
+            vec!["doctor", "--force", "--surface", "konsole"],
+        ] {
+            match parse(&words) {
+                Subcommand::Doctor { surface: Some(n) } => assert_eq!(n, OsString::from("konsole")),
+                _ => panic!("{words:?} should name a surface"),
+            }
+        }
+        for words in [
+            vec!["doctor", "--surface"],
+            vec!["doctor", "--surface", ""],
+            vec!["doctor", "--surface", "--force"],
+        ] {
+            match parse(&words) {
+                Subcommand::BadUsage(why) => {
+                    assert!(why.contains("windows-terminal"), "{why}");
+                    assert!(why.contains("konsole"), "{why}");
+                }
+                _ => panic!("{words:?} should be a BadUsage naming the fourteen"),
+            }
+        }
+    }
+
+    /// Every one of the fourteen names reaches its own row, because that list is what
+    /// the refusal above prints and what a reader over ssh has to choose from.
+    #[test]
+    fn every_surface_name_the_refusal_prints_is_a_surface() {
+        let printed = surface_names();
+        for s in Surface::ALL {
+            let name = s.caps().name;
+            assert!(printed.contains(name), "{name} is not offered");
+            let found = surface::by_name(name.to_uppercase().as_bytes());
+            assert!(matches!(found, Some(f) if f == *s), "{name}");
+        }
     }
 
     /// The verbs must be as disjoint from the edge names as the old ones.
@@ -3210,6 +4083,9 @@ mod tests {
     #[test]
     fn the_state_record_is_json_and_round_trips_what_uninstall_reads() {
         let s = State {
+            ownership: Ownership::Confirmed,
+            legacy_tree: None,
+            legacy_witness_saved: false,
             env_had: true,
             // The value's original SOURCE text, quotes included.
             env_raw: Some(b"\"0\"".to_vec()),
@@ -3244,6 +4120,9 @@ mod tests {
     #[test]
     fn a_record_with_nothing_recorded_writes_explicit_nulls() {
         let s = State {
+            ownership: Ownership::Pending,
+            legacy_tree: None,
+            legacy_witness_saved: false,
             env_had: false,
             env_raw: None,
             env_object_had: false,
@@ -3267,6 +4146,9 @@ mod tests {
         let mut c = ctx();
         c.tree = PathBuf::from(sys::os_string_from_vec(b"/tree/tr\xf0\x9f\x98x".to_vec()));
         let raw = state_text(&c, &State {
+            ownership: Ownership::Pending,
+            legacy_tree: None,
+            legacy_witness_saved: false,
             env_had: false,
             env_raw: None,
             env_object_had: false,
@@ -3773,14 +4655,15 @@ mod tests {
     fn a_filesystem_with_no_acl_is_refused_for_what_it_is() {
         let e = std::io::Error::new(std::io::ErrorKind::Unsupported, std::io::Error::from_raw_os_error(1));
         let m = acl_unreadable(Path::new("settings.json"), &e, "Nothing has been changed");
-        assert!(m.starts_with("settings.json is on a filesystem that keeps no Windows access control list"), "{m}");
+        assert_eq!(m.starts_with("settings.json is on a filesystem that keeps no Windows access control list"), sys::CAN_FORCE_ACL, "{m}");
         assert!(m.ends_with("Nothing has been changed."), "{m}");
-        assert!(m.contains("re-run with --force"), "the way through is named: {m}");
+        assert_eq!(m.contains("re-run with --force"), sys::CAN_FORCE_ACL, "{m}");
         let e = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         let m = acl_unreadable(Path::new("settings.json"), &e, "Nothing has been changed");
         assert!(m.starts_with("cannot read the access control list of settings.json"), "{m}");
         assert!(!m.contains("--force"), "an unreadable ACL is not something --force lifts: {m}");
-        assert!(!no_acl_here(&e) && no_acl_here(&std::io::Error::from(std::io::ErrorKind::Unsupported)));
+        assert!(!no_acl_here(&e));
+        assert_eq!(no_acl_here(&std::io::Error::from(std::io::ErrorKind::Unsupported)), sys::CAN_FORCE_ACL);
     }
 
     /// `--force` lifts the no-ACL refusal, and only it. Needs a settings.json on a

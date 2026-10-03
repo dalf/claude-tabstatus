@@ -1,5 +1,5 @@
 #!/bin/sh
-# What the wait-ownership record costs per edge, measured rather than remembered.
+# Optional dry-run measurements of wait ownership; no routing or delivery timing.
 #
 #   sh scripts/bench-state.sh                        bin/tabstatus against itself
 #   sh scripts/bench-state.sh <baseline-binary>      ...and against a baseline
@@ -23,10 +23,9 @@
 #   * the paired delta is computed per round against that round's own baseline arm
 #     and reported as the MEDIAN of those, not as a difference of the two minima.
 #
-# WHAT IT DOES NOT MEASURE: the harness fork Claude Code pays to launch the hook,
-# which is the larger half of the 767us a real edge costs. Every arm here pays one
-# fork of its own and no more, so the DELTAS are the thing to read and the absolute
-# figures are a floor, not a hook's cost.
+# WHAT IT DOES NOT MEASURE: Claude Code's full hook pipeline, routing, carrier
+# construction or terminal delivery. Every arm pays the timing shell's launch
+# of the binary, so the DELTAS are the thing to read, not end-to-end latency.
 #
 # LAST RUN on this machine, two independent 21-round passes of 200 execs, no
 # baseline argument, so the comparison is the layer against ITSELF switched off:
@@ -147,7 +146,7 @@ b i
     esac
 }
 
-printf 'bench: %s execs x %s interleaved rounds\n' "$EXECS" "$ROUNDS"
+printf 'bench-state (dry-run, excludes routing and delivery): %s execs x %s interleaved rounds\n' "$EXECS" "$ROUNDS"
 printf '  new      %s\n' "$NEW"
 [ -z "$BASE" ] || printf '  baseline %s\n' "$BASE"
 printf '\n'

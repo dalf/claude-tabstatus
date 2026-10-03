@@ -22,12 +22,14 @@
 //! brief window documented where it is implemented; [`sweep_replaced`] collects what
 //! that sequence could not delete at the time.
 //!
-//! And PATH IDENTITY: [`normalize`], [`same_path`] and [`is_within`]. On Unix a path
-//! is its bytes and all three are the plain comparison. On Windows one directory has
-//! many spellings - any letter case, an 8.3 short name, a `\\?\` prefix - and every
-//! refusal, "already correct" and "orphan" decision install makes compares paths, so
-//! they have to agree on what "the same directory" means. [`strip_home_prefix`] is
-//! the same comparison for the tab title's `~`, by spelling alone, with no filesystem
+//! And MANAGEMENT PATH IDENTITY: [`normalize`] preserves root-link inspection;
+//! [`same_path`] and [`is_within`] return errors when identity or destination
+//! containment cannot be established. Unix identifies existing directories by
+//! device/inode, following permitted ancestor links; Darwin asks the filesystem
+//! about missing ASCII names and retains uncertainty for missing Unicode aliases.
+//! Windows retains its distinction between link spelling and resolved destination.
+//! [`destination_ancestors`] supplies the physical checkout-containment walk.
+//! [`strip_home_prefix`] is separate: the tab title's `~` uses spelling alone, with no filesystem
 //! call: on Windows letter case, `/` or `\` and a `\\?\` prefix still do not matter,
 //! but an 8.3 short name - which only the disk can expand - does.
 //!
@@ -44,20 +46,26 @@
 //!
 //! And A REWRITE'S PROTECTION beyond its mode: [`security_of`] reads what the file
 //! being replaced carries besides its mode bits, and [`create_secured`] creates the
-//! replacement with it before a byte is written. On Unix that is nothing - the mode
-//! is the protection, the caller keeps it, and [`Security`] is uninhabited, so no
-//! Unix write makes one more syscall. On Windows it is the file's DACL (and its owner
-//! and group where they can be set), which the rename over it would otherwise
+//! replacement with it before a byte is written. Linux retains its mode-only
+//! policy without additional syscalls. Darwin also preserves owner/group and ordered
+//! ACL entries and flags, including absence of an ACL. On Windows it is the DACL (and
+//! its owner and group where they can be set), which the rename over it would otherwise
 //! replace with the directory's inherited ACL.
 //!
 //! And THE SESSION'S TAB, for the two edges `terminalSequence` cannot carry. On Unix
-//! it is a pty, resolved by [`session_tty`] and written as bytes. On Windows it is
-//! the console Claude Code runs in, and [`set_session_title`] sets that console's
+//! it is a pty, resolved by [`session_tty`] and written as bytes.
+//! Pathname guards are supplemented by character-device and terminal
+//! checks on the acquired File; that File is retained through delivery. Darwin
+//! terminal opens explicitly request O_NOCTTY. Inspection/open failures return
+//! None from session_tty; write_tty propagates descriptor-metadata/open/write
+//! errors, and returns Ok(false) for type/terminal-check refusals.
+//! On Windows it is the console Claude Code runs in, and [`set_session_title`]
+//! sets that console's
 //! title, which the pseudo console forwards to the terminal as an OSC 0. Each backend
 //! has both functions; the one with nothing to reach says so (`None`, `Ok(false)`),
 //! and [`HAS_SESSION_TTY`] and [`HAS_SESSION_CONSOLE`] say which route exists. Both
-//! routes sit behind the same HEADLESS GUARD - paint only a terminal that provably
-//! belongs to this session - documented at each.
+//! routes sit behind a HEADLESS GUARD documented at each. Unix descriptor checks
+//! establish type/TTY eligibility, not process/terminal identity across races.
 
 #[cfg(unix)]
 mod unix;
@@ -70,15 +78,42 @@ mod windows;
 use windows as imp;
 
 pub use imp::{
-    create_private_dir, create_secured, display_bytes, file_id, file_id_at, file_id_of, gitpath_allowed, home_fallback,
-    is_executable, is_line_end, is_set_aside, is_within, kernel_hostname_file, link_dir, lock_exclusive, mode,
+    destination_ancestors, copy_secured, create_private_dir, create_secured, display_bytes, file_id, file_id_at, file_id_of,
+    gitpath_allowed, home_fallback, hostname_fallback,
+    is_executable, is_set_aside, is_within, kernel_hostname_file, link_dir, lock_exclusive, mode,
     normalize, os_str_from_bytes, os_string_from_vec, probe_dir_link, process_alive,
     process_start_time, remove_dir_command, remove_dir_link, replace_dir_link, replace_file,
     replace_running, replaces_open_files, reserved_name, same_path, same_process, security_of,
-    session_tty, set_mode, set_session_title, strip_home_prefix, sweep_replaced, with_mode, write_tty, Security, DIR_LINK, HAS_MODES,
+    session_tty, set_mode, set_session_title, strip_home_prefix, sweep_replaced, verify_security,
+    with_mode, write_tty, Security, CAN_FORCE_ACL, DIR_LINK, HAS_MODES, HAS_SECURITY,
     HAS_RECORD_LOCK, HAS_SESSION_CONSOLE, HAS_SESSION_TTY, HAS_UNLINK_RUNNING, NO_STATE_DIR,
     ORIGIN_KEY, RUNTIME_DIR_VAR,
 };
+
+#[cfg(any(not(target_os = "macos"), test))]
+use imp::is_line_end;
+
+/// Last-resort Linux/Windows hostname command. Darwin uses a native call and
+/// never compiles or reaches this fallback.
+#[cfg(not(target_os = "macos"))]
+fn hostname_command() -> Option<Vec<u8>> {
+    use std::process::{Command, Stdio};
+    let out = Command::new("hostname")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // Command substitution strips every trailing newline. Windows' CRLF also
+    // loses its CR; embedded line endings and other bytes remain untouched.
+    let mut v = out.stdout;
+    while v.last().is_some_and(|&c| is_line_end(c)) {
+        v.pop();
+    }
+    (!v.is_empty()).then_some(v)
+}
 
 /// What identifies a file independently of its name: device and inode on Unix, the
 /// volume serial and the 128-bit file id on Windows (ReFS uses all 128 bits). The
@@ -132,9 +167,7 @@ mod tests {
         assert_eq!(HAS_RECORD_LOCK, proven);
         assert_eq!(HAS_MODES, mode(&m).is_some());
         assert_eq!(HAS_MODES, is_executable(&m).is_some());
-        // Where the mode is the protection there is nothing more to carry; where there
-        // is no mode, an existing file's ACL is.
-        assert_eq!(HAS_MODES, security_of(&exe).expect("readable").is_none());
+        assert_eq!(HAS_SECURITY, security_of(&exe).expect("readable").is_some());
         // Without a console route the function answers "not painted" for anything,
         // our own pid included - so a caller branching on the constant and one calling
         // the function agree.

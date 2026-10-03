@@ -12,13 +12,16 @@
 //!     `terminalSequence` cannot carry them: SessionStart is too early - the TUI
 //!     writer is not mounted yet, so the sequence is dropped - and the Konsole
 //!     arming sequence is OSC 50, which is not on the allowlist above. On Linux the
-//!     bytes go to the pty, resolved through /proc. On Windows there is no pty but
+//!     bytes go to the pty, resolved through /proc; macOS uses proc_pidfdinfo.
+//!     On Windows there is no pty but
 //!     there is the console Claude Code runs in, and its TITLE is set instead
 //!     ([`sys::set_session_title`]), which the pseudo console forwards to the tab as
 //!     an OSC 0; the Konsole arming has no console form and is not sent. Both are
-//!     behind a headless guard, and elsewhere (macOS) nothing is painted.
+//!     behind a headless guard. Native validation status is in docs/architecture.md.
 
-use crate::config::{Config, Terminal};
+use crate::config::Config;
+use crate::mux::{Channel, Route};
+use crate::surface::compose;
 use crate::sys;
 use std::fmt::Write as _;
 use std::io::{self, Write};
@@ -63,7 +66,7 @@ pub fn json_line(title: &str) -> io::Result<()> {
 
 /// Update tmux's pane-title carrier without Claude Code's OSC passthrough layer.
 /// Reuses the session pty guard and executes no subprocess on the hot path.
-pub fn pane_title(title: &str, cfg: &Config) -> io::Result<()> {
+pub fn pane_title(title: &str, cfg: &Config) -> io::Result<bool> {
     let mut out = Vec::with_capacity(title.len() + 5);
     out.extend_from_slice(b"\x1b]0;");
     out.extend_from_slice(title.as_bytes());
@@ -88,22 +91,22 @@ fn escape_into(out: &mut String, s: &str) {
     }
 }
 
-/// Konsole's per-tab title format, set to "the title the shell sent" and back to
-/// Konsole's COMPILED-IN defaults. Named here rather than spelled at each use,
-/// because inside tmux the same two byte strings go to a tmux CLIENT's pty
-/// instead of to this pane - and an arming with no matching restore is this
-/// project's named defect.
+/// Arm this tab and paint it, in one ordered buffer (not an atomic write).
 ///
-/// SEAM: TabColor=#RRGGBB rides in this same property list - and whoever adds it
-/// must add TabColor=#000000 to the restore, or the colour outlives the session.
-pub const KONSOLE_ARM: &[u8] = b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07";
-pub const KONSOLE_RESTORE: &[u8] =
-    b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07";
+/// One buffer and one guarded acquisition of the session's tab are why
+/// the arming is composed here rather than sent by whoever decided it: the arming
+/// has to precede the title in the same byte stream. WHETHER it belongs in this
+/// buffer is [`crate::mux::route`]'s answer - `Channel::Direct` means the session's
+/// own tab, which is this buffer, and `Channel::Clients` means the multiplexer's
+/// clients, which is not.
+pub fn session_start(title: &str, cfg: &Config, route: Route) -> io::Result<bool> {
+    write_session(cfg, &startup_bytes(title, cfg, route), title)
+}
 
-/// Arm this tab and paint it, in one write.
-pub fn session_start(title: &str, cfg: &Config) -> io::Result<()> {
+fn startup_bytes(title: &str, cfg: &Config, route: Route) -> Vec<u8> {
+    let caps = cfg.stack.leaf.caps();
     let mut out: Vec<u8> = Vec::with_capacity(title.len() + 96);
-    if cfg.terminal == Terminal::Konsole && cfg.tmux.is_none() {
+    if let Some(surface) = route.arms(Channel::Direct) {
         // %w makes the OSC 0 payload the entire tab text. Under Konsole's stock
         // formats an OSC 0 title is invisible in the tab, which is why Claude's
         // own title never shows up there. Konsole applies profile properties per
@@ -113,41 +116,54 @@ pub fn session_start(title: &str, cfg: &Config) -> io::Result<()> {
         //
         // Inside tmux this pane is not the tab, so the sequence would be
         // swallowed; `tmux::arm_konsole` writes it to the attached client's pty
-        // instead, which is why the Konsole test above also asks for no tmux.
-        out.extend_from_slice(KONSOLE_ARM);
+        // instead, which is why `route` answers `Channel::Clients` there and this
+        // block is skipped.
+        let _ = compose::push_arm(&mut out, surface.caps());
     }
     // The arming has to precede the title, or the tab is painted before it can
     // show what was painted.
-    out.extend_from_slice(b"\x1b]0;");
-    out.extend_from_slice(title.as_bytes());
-    out.push(0x07);
-    write_session(cfg, &out, title)
+    let _ = compose::push_title(&mut out, caps, title);
+    out
 }
 
-/// Restore the tab and blank its title, in one write.
-pub fn session_end(cfg: &Config) -> io::Result<()> {
+/// Restore the tab and blank its title, in one ordered buffer.
+pub fn session_end(cfg: &Config, route: Route) -> io::Result<bool> {
+    let caps = cfg.stack.leaf.caps();
     let mut out: Vec<u8> = Vec::with_capacity(96);
-    if cfg.terminal == Terminal::Konsole && cfg.tmux.is_none() {
+    if let Some(surface) = route.arms(Channel::Direct) {
         // We own restore: with the built-in terminal title disabled - which the
         // installer does, otherwise it repaints over ours every 960ms - Claude
-        // Code no longer clears the title on exit either. The two formats below
-        // are Konsole's COMPILED-IN defaults, not whatever a customized profile
-        // had, because that is all we can know.
-        out.extend_from_slice(KONSOLE_RESTORE);
+        // Code no longer clears the title on exit either. The two formats in the
+        // capability row are Konsole's COMPILED-IN defaults, not whatever a
+        // customized profile had, because that is all we can know.
+        //
+        // WHOSE row is [`crate::armed`]'s answer and not `cfg.stack.leaf`'s: this
+        // hook runs an unbounded time after the one that armed, and a
+        // `CCTAB_TERMINAL` changed in between used to turn this whole block off
+        // and leave the tab governed by `%w` forever.
+        let _ = compose::push_restore(&mut out, surface.caps());
     }
-    out.extend_from_slice(b"\x1b]0;\x07");
+    // An EMPTY title is the unpaint, so it is composed as a title rather than
+    // spelled as its own literal.
+    let _ = compose::push_title(&mut out, caps, "");
     write_session(cfg, &out, "")
 }
 
 /// Deliver session-start or session-end: `bytes` to the pty - or, where the session's
 /// tab is a console rather than a pty (Windows), `title` alone as that console's
-/// title. Never inside tmux there: the title is then tmux's carrier, not a tab's.
-fn write_session(cfg: &Config, bytes: &[u8], title: &str) -> io::Result<()> {
+/// title. Never where the layer above RENDERS the tab: the title is then that
+/// layer's carrier, not a tab's. The test is the cap and not `mux.is_some()`,
+/// because screen renders nothing and its title is still a tab's.
+///
+/// `Ok(false)` means skipped by the guard; `Ok(true)` means the write/API call
+/// completed, not that the terminal applied it. An error can follow a partial
+/// write, including a complete arm followed by a failed title. None of these
+/// outcomes cancels a previously recorded restore obligation.
+fn write_session(cfg: &Config, bytes: &[u8], title: &str) -> io::Result<bool> {
     if sys::HAS_SESSION_CONSOLE {
-        return match (cfg.claude_pid.as_deref(), &cfg.tmux) {
-            // Refused or painted, it is not a failure: see `write_pty`.
-            (Some(pid), None) => sys::set_session_title(pid, title).map(drop),
-            _ => Ok(()),
+        return match (cfg.claude_pid.as_deref(), cfg.stack.renders_title()) {
+            (Some(pid), false) => sys::set_session_title(pid, title),
+            _ => Ok(false),
         };
     }
     write_pty(cfg, bytes)
@@ -155,18 +171,73 @@ fn write_session(cfg: &Config, bytes: &[u8], title: &str) -> io::Result<()> {
 
 /// Write to the session's pty, resolved by [`sys::session_tty`] under the
 /// headless guard documented there.
-fn write_pty(cfg: &Config, bytes: &[u8]) -> io::Result<()> {
-    match cfg.claude_pid.as_deref().and_then(sys::session_tty) {
-        Some(mut tty) => tty.write_all(bytes),
+fn write_pty(cfg: &Config, bytes: &[u8]) -> io::Result<bool> {
+    write_to(cfg.claude_pid.as_deref().and_then(sys::session_tty), bytes)
+}
+
+fn write_to(tty: Option<impl Write>, bytes: &[u8]) -> io::Result<bool> {
+    match tty {
+        Some(mut tty) => tty.write_all(bytes).map(|()| true),
         // No pty is not a failure: a redirected `claude -p` has no tab, and there
         // is nothing to report to a hook whose output is a protocol.
-        None => Ok(()),
+        None => Ok(false),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::armed::Armed;
+    use crate::edge::Paint;
+    use crate::surface::Surface;
+
+    #[test]
+    fn missing_or_invalid_session_destination_is_skipped_not_written() {
+        let mut cfg = Config::for_test();
+        for pid in [None, Some("0"), Some("not-a-pid")] {
+            cfg.claude_pid = pid.map(Into::into);
+            assert!(!write_session(&cfg, b"unused", "unused").unwrap());
+            assert!(!pane_title("unused", &cfg).unwrap());
+        }
+    }
+
+    #[test]
+    fn combined_startup_can_fail_after_the_arm_was_written() {
+        if !sys::HAS_SESSION_TTY {
+            return;
+        }
+        let mut cfg = Config::for_test();
+        cfg.stack.leaf = Surface::Konsole;
+        let route = crate::mux::route(&cfg.stack, Paint::SessionStart, Armed::assumed(cfg.stack.leaf));
+        let bytes = startup_bytes("title", &cfg, route);
+        let arm = Surface::Konsole.caps().arming.as_ref().unwrap().pair().0;
+        assert_eq!(bytes, [arm, b"\x1b]0;title\x07"].concat());
+
+        struct FailAfter {
+            accepted: Vec<u8>,
+            limit: usize,
+        }
+        impl Write for FailAfter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let n = bytes.len().min(self.limit - self.accepted.len());
+                if n == 0 {
+                    return Err(io::Error::other("injected write failure"));
+                }
+                self.accepted.extend_from_slice(&bytes[..n]);
+                Ok(n)
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        for limit in [0, 1, arm.len(), arm.len() + 3] {
+            let mut writer = FailAfter { accepted: Vec::new(), limit };
+            assert!(write_to(Some(&mut writer), &bytes).is_err());
+            assert_eq!(writer.accepted, bytes[..limit]);
+        }
+        let mut complete = Vec::new();
+        assert!(write_to(Some(&mut complete), &bytes).unwrap());
+        assert_eq!(complete, bytes);
+        assert!(!write_to(None::<Vec<u8>>, &bytes).unwrap());
+    }
 
     fn escaped(s: &str) -> String {
         let mut out = String::new();

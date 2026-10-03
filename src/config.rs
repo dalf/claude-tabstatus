@@ -17,9 +17,14 @@
 //! into a visible U+FFFD rather than thrown away for the default.
 
 use crate::edge::Glyph;
+use crate::mux::{self, Stack};
+use crate::surface::Elide;
 use crate::sys;
 use crate::text;
-use crate::tmux::Tmux;
+// Only `for_test` names a leaf: `from_env` gets the whole stack from
+// `mux::resolve` and never picks one itself.
+#[cfg(test)]
+use crate::surface::Surface;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
@@ -44,56 +49,6 @@ fn var_or(key: &str, default: &str) -> String {
     }
 }
 
-/// Which terminal is drawing the tab, to the extent it can be known.
-///
-/// `$TMUX` / `$STY` take the multiplexer case out: `KONSOLE_*` leaks into any
-/// child launched from a Konsole shell, and into every pane of a tmux server that
-/// was first started under Konsole, so inside a multiplexer those variables say
-/// nothing about the terminal actually drawing the tab.
-///
-/// `CCTAB_TERMINAL` overrides all of it, and is the only honest signal in the
-/// topology this exists for: ssh does not forward `KONSOLE_*`, so a session
-/// reached over ssh from a Konsole tab - inside tmux or not - has nothing to
-/// detect. `konsole` names it; any other value says explicitly that it is NOT
-/// Konsole, which is how a false positive from a leaked `KONSOLE_*` is turned off.
-///
-/// It is the one knob in this file that changes what paints OUTSIDE tmux as well
-/// as in, which is why it is opt-in and why the name is matched case-INSENSITIVELY
-/// (ASCII): a byte compare made `CCTAB_TERMINAL=Konsole` mean "explicitly not
-/// Konsole" and silently turned the arming and the suffix layout OFF - the exact
-/// opposite of what the user typed.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Terminal {
-    Konsole,
-    Unknown,
-}
-
-impl Terminal {
-    /// What `CCTAB_TERMINAL` says, or `None` when it says nothing.
-    fn from_override(raw: Option<&OsStr>) -> Option<Terminal> {
-        let v = raw.map(OsStr::as_encoded_bytes)?;
-        Some(if v.eq_ignore_ascii_case(b"konsole") {
-            Terminal::Konsole
-        } else {
-            Terminal::Unknown
-        })
-    }
-
-    pub fn detect() -> Terminal {
-        if let Some(t) = Terminal::from_override(var_nonempty("CCTAB_TERMINAL").as_deref()) {
-            return t;
-        }
-        if !flag("TMUX")
-            && !flag("STY")
-            && (flag("KONSOLE_VERSION") || flag("KONSOLE_DBUS_SESSION"))
-        {
-            Terminal::Konsole
-        } else {
-            Terminal::Unknown
-        }
-    }
-}
-
 /// Where the glyph goes relative to the location.
 ///
 /// Konsole's tab bar elides from the LEFT - `QTabBar::setElideMode(Qt::ElideLeft)`
@@ -110,15 +65,18 @@ pub enum GlyphPos {
 }
 
 impl GlyphPos {
-    fn parse(raw: Option<&OsStr>, terminal: Terminal) -> GlyphPos {
+    fn parse(raw: Option<&OsStr>, elide: Elide) -> GlyphPos {
         match raw.map(OsStr::as_encoded_bytes) {
             Some(b"suffix") => GlyphPos::Suffix,
             Some(b"both") => GlyphPos::Both,
             // An unrecognised value falls through to prefix rather than failing.
             Some(_) => GlyphPos::Prefix,
-            None => match terminal {
-                Terminal::Konsole => GlyphPos::Suffix,
-                Terminal::Unknown => GlyphPos::Prefix,
+            // `Elide::Unknown` takes the same layout as `Right` and is not the
+            // same fact: prefix is the SAFE default for a terminal we could not
+            // name, and the row says which of the two it is.
+            None => match elide {
+                Elide::Left => GlyphPos::Suffix,
+                Elide::Right | Elide::Unknown => GlyphPos::Prefix,
             },
         }
     }
@@ -174,7 +132,11 @@ pub struct Config {
     /// Print the computed title and emit nothing at all. This is what makes the
     /// edge table testable with no Claude session.
     pub dry_run: bool,
-    pub terminal: Terminal,
+    /// The multiplexer, the leaf terminal and the layout the leaf implies, all
+    /// resolved ONCE and in that order. What the leaf can do is a `&'static` row -
+    /// `stack.leaf.caps()` - reached by a `match`, so carrying it costs exactly
+    /// what carrying the two-variant `Terminal` it replaces cost.
+    pub stack: Stack,
     pub glyph_pos: GlyphPos,
     pub ellipsis: String,
     glyph_working: String,
@@ -187,8 +149,8 @@ pub struct Config {
     /// painted, because the ABSENCE of one is how a local session is recognized.
     pub ssh: bool,
     /// `CCTAB_HOST` and `$HOSTNAME`. Kept as the raw inputs rather than a
-    /// resolved name: resolving reads `/proc` and, where that is absent, forks
-    /// `hostname`, and neither may happen on a session that will paint no prefix.
+    /// resolved name: resolving can read `/proc`, query Darwin's native API or
+    /// run `hostname` on Linux/Windows. Local rendering needs none of those.
     pub host_override: Option<OsString>,
     pub hostname_env: Option<OsString>,
     /// `$HOME` (`%USERPROFILE%` on Windows without one) with one trailing slash
@@ -198,19 +160,20 @@ pub struct Config {
     pub pwd: Option<OsString>,
     pub git_dir: Option<OsString>,
     pub claude_pid: Option<OsString>,
-    /// The tmux server this session runs inside, when there is one. It decides
-    /// ONE thing on the paint path - whether the OSC 0 carries a tab title or a
-    /// record - and everything else it is used for is a cold path.
-    pub tmux: Option<Tmux>,
 }
 
 impl Config {
     pub fn from_env() -> Config {
-        let terminal = Terminal::detect();
+        // `NoOracle` is what makes the hot path's zero forks a TYPE fact: the
+        // multiplexer is asked for leaf evidence here, and the answer this oracle
+        // gives is a constant. An edge that wants the real answer has to name a
+        // different oracle, which is a visible edit rather than a forgotten one.
+        let stack = mux::resolve(&mut mux::NoOracle);
+        let glyph_pos = GlyphPos::parse(var_nonempty("CCTAB_GLYPH_POS").as_deref(), stack.elide);
         Config {
             dry_run: var("CCTAB_DRY_RUN").is_some_and(|v| v.as_encoded_bytes() == b"1"),
-            terminal,
-            glyph_pos: GlyphPos::parse(var_nonempty("CCTAB_GLYPH_POS").as_deref(), terminal),
+            stack,
+            glyph_pos,
             ellipsis: var_or("CCTAB_ELLIPSIS", DEFAULT_ELLIPSIS),
             glyph_working: var_or("CCTAB_GLYPH_WORKING", DEFAULT_GLYPH_WORKING),
             glyph_waiting: var_or("CCTAB_GLYPH_WAITING", DEFAULT_GLYPH_WAITING),
@@ -233,7 +196,6 @@ impl Config {
             pwd: var("PWD"),
             git_dir: var_nonempty("GIT_DIR"),
             claude_pid: var_nonempty("CLAUDE_PID"),
-            tmux: Tmux::detect(),
         }
     }
 
@@ -243,7 +205,14 @@ impl Config {
     pub fn for_test() -> Config {
         Config {
             dry_run: false,
-            terminal: Terminal::Unknown,
+            stack: Stack {
+                leaf_hint: None,
+                mux: None,
+                claimed: None,
+                disabled_by: None,
+                leaf: Surface::Unknown,
+                elide: Elide::Unknown,
+            },
             glyph_pos: GlyphPos::Prefix,
             ellipsis: DEFAULT_ELLIPSIS.to_owned(),
             glyph_working: DEFAULT_GLYPH_WORKING.to_owned(),
@@ -259,7 +228,6 @@ impl Config {
             pwd: None,
             git_dir: None,
             claude_pid: None,
-            tmux: None,
         }
     }
 
@@ -319,20 +287,6 @@ mod tests {
     }
 
     #[test]
-    fn the_terminal_override_names_konsole_in_any_case() {
-        let t = |v: Option<&str>| Terminal::from_override(v.map(OsStr::new));
-        for yes in ["konsole", "Konsole", "KONSOLE", "kOnSoLe"] {
-            assert!(matches!(t(Some(yes)), Some(Terminal::Konsole)), "{yes}");
-        }
-        // Anything else is an explicit NOT Konsole, which is what turns a leaked
-        // KONSOLE_* off; only absence leaves the detection to the environment.
-        for no in ["wezterm", "konsol", "konsolex", "xterm", " konsole"] {
-            assert!(matches!(t(Some(no)), Some(Terminal::Unknown)), "{no}");
-        }
-        assert!(t(None).is_none());
-    }
-
-    #[test]
     fn zero_turns_the_cap_off() {
         assert_eq!(cap(Some("0"), 32, 8), Cap::Off);
         assert_eq!(cap(Some("0"), 16, 4), Cap::Off);
@@ -387,19 +341,22 @@ mod tests {
 
     #[test]
     fn glyph_pos_parses_the_two_named_positions_and_nothing_else() {
-        let p = |s: Option<&str>, t| GlyphPos::parse(s.map(OsStr::new), t);
-        assert!(p(Some("suffix"), Terminal::Unknown) == GlyphPos::Suffix);
-        assert!(p(Some("both"), Terminal::Unknown) == GlyphPos::Both);
-        assert!(p(Some("prefix"), Terminal::Konsole) == GlyphPos::Prefix);
-        assert!(p(Some("sideways"), Terminal::Konsole) == GlyphPos::Prefix);
+        let p = |s: Option<&str>, e| GlyphPos::parse(s.map(OsStr::new), e);
+        assert!(p(Some("suffix"), Elide::Unknown) == GlyphPos::Suffix);
+        assert!(p(Some("both"), Elide::Unknown) == GlyphPos::Both);
+        assert!(p(Some("prefix"), Elide::Left) == GlyphPos::Prefix);
+        assert!(p(Some("sideways"), Elide::Left) == GlyphPos::Prefix);
     }
 
     #[test]
     fn an_unset_glyph_pos_lets_the_terminal_decide() {
         // And `CCTAB_GLYPH_POS=''` is unset, because `var_nonempty` feeds this.
-        let p = |t| GlyphPos::parse(None, t);
-        assert!(p(Terminal::Konsole) == GlyphPos::Suffix);
-        assert!(p(Terminal::Unknown) == GlyphPos::Prefix);
+        let p = |e| GlyphPos::parse(None, e);
+        assert!(p(Elide::Left) == GlyphPos::Suffix);
+        assert!(p(Elide::Right) == GlyphPos::Prefix);
+        // A surface nobody could name paints where a surface that truncates from
+        // the right does, because that is the safe end to keep.
+        assert!(p(Elide::Unknown) == GlyphPos::Prefix);
     }
 
     #[test]

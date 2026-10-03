@@ -42,6 +42,7 @@ trap 'cleanup; exit 130' HUP INT TERM
 # every assertion below would flip. Neutralise the detection here; the
 # glyph-position section sets these explicitly, per case.
 unset KONSOLE_VERSION KONSOLE_DBUS_SESSION TMUX STY CCTAB_GLYPH_POS
+unset CCTAB_TERMINAL ITERM_SESSION_ID LC_TERMINAL TERM_PROGRAM WT_SESSION CCTAB_NO_TMUX
 # And XDG_DATA_HOME, which is NEW here and the one that now decides where a real
 # plugin tree lands: `install` materialises one, so an install section with only HOME
 # and CLAUDE_CONFIG_DIR redirected would write 680 KB into the RUNNER'S OWN
@@ -506,6 +507,16 @@ check 'a path location needs no external command' '⚪ ~/code/bug_fedora' \
     "$(cd -- "$tmp/code/bug_fedora" && PATH= HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
 check 'an elided path needs no external command' '⚪ …/four/five/six/seven/eight' \
     "$(cd -- "$tmp/one/two/three/four/five/six/seven/eight" && PATH= HOME=$tmp CCTAB_DRY_RUN=1 "$bin" idle </dev/null)"
+# Empty PATH cannot detect attempted subprocesses. Linux CI separately requires
+# tests/check_hot_subprocesses.py with a working strace and disposable PTYs.
+# Timing stays opt-in. With no explicit baseline this only measures calibration.
+if [ "${CCTAB_BENCH-}" = 1 ]; then
+    if CCTAB_BENCH_BIN=$bin sh "$repo/scripts/bench-hot.sh" "${CCTAB_BENCH_BASELINE:---calibrate}"; then
+        check 'optional dry-run measurement completed' '0' '0'
+    else
+        check 'optional dry-run measurement completed' '0' '1'
+    fi
+fi
 
 # --- JSON-hostile names ---------------------------------------------------
 # The sanitizer is slice 1's, but slice 2 gave it three new ways to be fed: a
@@ -1222,11 +1233,13 @@ check 'uninstall: an env the installer created is removed' '' \
     "$(diff "$tmp/settings.noenv" "$_cfg/settings.json")"
 # A state file written by the SHELL installer (state_version 1) still restores a
 # value the user had set themselves: it recorded the value under a different name,
-# and its source text is what gets spliced back.
+# and its source text is what gets spliced back. A linked installation witnesses
+# the old installer reaching its final step; an orphan record is ambiguous.
 rm -rf "$_cfg"
 mkdir -p "$_cfg"
 printf '{\n  "env": {\n    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1",\n    "X": "y"\n  }\n}\n' >"$_cfg/settings.json"
-printf '{"state_version":1,"written_by":"claude-tabstatus install.sh","env_key":"CLAUDE_CODE_DISABLE_TERMINAL_TITLE","env_key_before":{"had":true,"value":"0"},"symlink_before":{"had":false,"target":null}}\n' >"$_cfg/claude-tabstatus.state"
+_ins install >/dev/null
+printf '{"state_version":1,"repo":"%s","written_by":"claude-tabstatus install.sh","env_key":"CLAUDE_CODE_DISABLE_TERMINAL_TITLE","env_key_before":{"had":true,"value":"0"},"symlink_before":{"had":false,"target":null}}\n' "$_itree" >"$_cfg/claude-tabstatus.state"
 _ins uninstall >/dev/null
 check 'uninstall: a state_version 1 record still restores the old value' \
     '{
@@ -1539,7 +1552,7 @@ _sa install >/dev/null
 
 # THE MIGRATION. The live wiring before this change was
 # <config>/skills/claude-tabstatus -> the CHECKOUT, with a state_version 2 record whose
-# symlink_before.target is that same checkout. Both halves of that matter, and the
+# symlink_before.target is an earlier checkout. Both halves of that matter, and the
 # second one is invisible from the code: restoring the recorded target on a later
 # uninstall would rebuild the exact wiring this change exists to abolish.
 _mghome=$tmp/mg-home
@@ -1547,9 +1560,13 @@ _mgcfg=$tmp/mg-config
 _mgdata=$tmp/mg-data
 _mgtree=$_mgdata/claude-tabstatus
 _mgco=$tmp/mg-checkout
+_mgprior=$tmp/mg-prior-checkout
 mkdir -p "$_mghome" "$tmp/mg-state" "$_mgcfg/skills" "$_mgco/.claude-plugin" "$_mgco/hooks" "$_mgco/.git"
 cp "$repo/.claude-plugin/plugin.json" "$_mgco/.claude-plugin/plugin.json"
 cp "$repo/hooks/hooks.json" "$_mgco/hooks/hooks.json"
+mkdir -p "$_mgprior/.claude-plugin" "$_mgprior/hooks"
+cp "$repo/.claude-plugin/plugin.json" "$_mgprior/.claude-plugin/plugin.json"
+cp "$repo/hooks/hooks.json" "$_mgprior/hooks/hooks.json"
 _mg() {
     ( HOME=$_mghome CLAUDE_CONFIG_DIR=$_mgcfg XDG_DATA_HOME=$_mgdata \
       CCTAB_STATE_DIR=$tmp/mg-state "$_sabin" "$@" </dev/null 2>&1 )
@@ -1558,7 +1575,7 @@ printf 'migration section: checkout %s -> tree %s\n' "$_mgco" "$_mgtree"
 ln -s "$_mgco" "$_mgcfg/skills/claude-tabstatus"
 printf '{\n  "env": {\n    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"\n  }\n}\n' >"$_mgcfg/settings.json"
 printf '{"state_version":2,"written_by":"tabstatus install","repo":"%s","settings_path":"%s","env_key":"CLAUDE_CODE_DISABLE_TERMINAL_TITLE","env_object_before":{"had":false},"env_key_before":{"had":false,"raw":null},"symlink_before":{"had":true,"target":"%s"}}\n' \
-    "$_mgco" "$_mgcfg/settings.json" "$_mgco" >"$_mgcfg/claude-tabstatus.state"
+    "$_mgco" "$_mgcfg/settings.json" "$_mgprior" >"$_mgcfg/claude-tabstatus.state"
 # doctor FIRST, because doctor is what somebody runs when a tab misbehaves, and it is
 # therefore how the migration gets discovered.
 _mgdoc=$(_mg doctor)
@@ -1589,9 +1606,9 @@ check 'install: the checkout gained no marker, no bin/ - nothing at all' '.claud
 hooks/hooks.json' \
     "$(cd -- "$_mgco" && find . -mindepth 1 -type f | sed 's|^\./||' | LC_ALL=C sort)"
 check 'install: upgraded the v2 record and said so' 'yes' \
-    "$(printf '%s' "$_mgout" | grep -q 'state:    upgraded the record to state_version 3' && printf yes)"
+    "$(printf '%s' "$_mgout" | grep -q 'state:    upgraded the record to state_version 4' && printf yes)"
 check 'install: the record keeps the prior state write-once' 'yes' \
-    "$(grep -q "\"symlink_before\": {\"had\": true, \"target\": \"$_mgco\"}" "$_mgcfg/claude-tabstatus.state" && printf yes)"
+    "$(grep -q "\"symlink_before\": {\"had\": true, \"target\": \"$_mgprior\"}" "$_mgcfg/claude-tabstatus.state" && printf yes)"
 check 'install: and now names the tree it owns' 'yes' \
     "$(grep -q "\"tree\": \"$_mgtree\"" "$_mgcfg/claude-tabstatus.state" && printf yes)"
 check 'install: closes by saying which tree live sessions paint through' 'yes' \
@@ -1600,7 +1617,7 @@ check 'install: closes by saying which tree live sessions paint through' 'yes' \
 # putting it back would rebuild the wiring this change abolishes. Declined, and said.
 _mgun=$(_mg uninstall)
 check 'uninstall: declines to restore a recorded prior target that is a checkout' 'yes' \
-    "$(printf '%s' "$_mgun" | grep -q "the recorded prior target was the checkout at $_mgco" && printf yes)"
+    "$(printf '%s' "$_mgun" | grep -q "the recorded prior target was the checkout at $_mgprior" && printf yes)"
 check 'uninstall: so the link is removed rather than pointed back at it' '' \
     "$(ls -d "$_mgcfg/skills/claude-tabstatus" 2>/dev/null)"
 check 'uninstall: and the checkout itself is untouched' 'yes' \
@@ -1804,7 +1821,7 @@ check 'install --tree: a plain git repo above is not a reason to refuse' 'yes' \
        [ -x "$_sadots/.local/share/claude-tabstatus/bin/tabstatus" ] && printf yes)"
 # Under <config>/skills, install would be asked to symlink a directory to itself.
 check 'install --tree: refuses a target under the skills directory' 'yes' \
-    "$(_sa install --tree "$_sacfg/skills/claude-tabstatus" | grep -q 'symlink a directory to itself' && printf yes)"
+    "$(_sa install --tree "$_sacfg/skills/another-tree" | grep -q 'symlink a directory to itself' && printf yes)"
 # A target that exists and is NOT a directory. This used to reach create_dir_all and
 # print `cannot create <path>: File exists (os error 17)` - which reads like a bug and
 # lacks the closing sentence every real refusal ends with.
@@ -1847,18 +1864,19 @@ printf 'theirs\n' >"$_bdvictim/tabstatus"
 # The WRITE side: <tree>/hooks replaced by a link out of the tree.
 rm -f "$_bdtree/hooks/hooks.json"; rmdir "$_bdtree/hooks"
 ln -s "$_bdvictim" "$_bdtree/hooks"
+_bdbefore=$(cksum "$_bdtree/.tabstatus-generated" "$_bdcfg/settings.json" "$_bdcfg/claude-tabstatus.state" "$_bdtree/bin/tabstatus")
 _bdout=$(_bd install)
 check 'install: refuses to write through a symlinked component, and names it' 'yes' \
     "$(printf '%s' "$_bdout" \
        | grep -q "$_bdtree/hooks is not a directory, so hooks/hooks.json is not provably inside" \
        && printf yes)"
 check 'install: and the file outside the tree is untouched' 'theirs' "$(cat "$_bdvictim/hooks.json")"
-# That failure is the FIRST write, and it lands under a header that may just have
-# announced a repoint - so it has to say the live wiring did not move.
-check 'install: a failure in the tree says the symlink and settings were not touched' 'yes' \
-    "$(printf '%s' "$_bdout" | grep -q 'was NOT touched, and neither were settings.json or the' && printf yes)"
-check 'install: and says a re-run resumes rather than refusing' 'yes' \
-    "$(printf '%s' "$_bdout" | grep -q 'so a re-run resumes into it' && printf yes)"
+# Existing unsafe components are refused during preflight, before any generated
+# file, settings or installation record can be rewritten.
+check 'install: the preflight refusal says nothing has changed' 'yes' \
+    "$(printf '%s' "$_bdout" | grep -q 'Nothing has been changed.' && printf yes)"
+check 'install: marker, binary, settings and record are unchanged' "$_bdbefore" \
+    "$(cksum "$_bdtree/.tabstatus-generated" "$_bdcfg/settings.json" "$_bdcfg/claude-tabstatus.state" "$_bdtree/bin/tabstatus")"
 check 'install: and the plugin link really is still where it was' "$_bdtree" \
     "$(readlink "$_bdcfg/skills/claude-tabstatus")"
 rm -f "$_bdtree/hooks"; mkdir -p "$_bdtree/hooks"
@@ -1894,7 +1912,9 @@ check 'install --tree: and no real directory was created at the link path' '' \
     "$(ls -d "$_nmcfg/skills/claude-tabstatus" 2>/dev/null)"
 check 'install --tree: and settings.json was not created either' '' \
     "$(ls "$_nmcfg/settings.json" 2>/dev/null)"
-check 'install --tree: .. is folded before any check runs' 'yes' \
+# The component before .. must exist; the kernel resolves it, including links.
+mkdir -p "$_nmdata"
+check 'install --tree: existing .. resolves before containment checks' 'yes' \
     "$(_nm "$tmp" install --tree "$_nmdata/../nm-config/skills/claude-tabstatus" \
        | grep -q 'symlink a directory to itself' && printf yes)"
 # A DANGLING --tree used to answer NotFound to fs::metadata, read as "absent, go ahead",
@@ -2216,6 +2236,235 @@ check 'doctor names the remedy on the multiplexer line' '1' \
     "$(cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
           TMUX=nonsense "$bin" doctor 2>&1 \
        | grep -c 'If the outer terminal IS Konsole, set CCTAB_TERMINAL=konsole')"
+
+# --- doctor: the three axes ------------------------------------------------
+# The user-visible payoff of the backend split: until this section the platform,
+# the surface and the multiplexer each existed as an axis and NOTHING PRINTED THEM.
+# Every verdict below is `Support`'s own word - ok / n/a / off / ? / fail, spelled
+# in exactly one place in the crate - and the columns are FIXED, because the whole
+# point of a table whose six vendor-source rows have never had a byte delivered to
+# them is that a report from here and a report from a Windows build can be diffed
+# against each other.
+_axes() { # _axes <env assignments...> -- doctor, from the plain directory
+    ( cd -- "$tmp/plaindir" && env HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          SSH_TTY= SSH_CONNECTION= "$@" "$bin" doctor </dev/null 2>&1 )
+}
+_axdoc=$(_axes CLAUDE_PID=4242)
+# The platform line names the RECORD KEY, because that one letter is the whole of
+# what a Unix record and a Windows record disagree about, and a report read on one
+# platform about a state directory shared with the other has to be able to say so.
+check 'doctor: the platform axis names the key a record carries its origin under' '1' \
+    "$(printf '%s\n' "$_axdoc" \
+       | grep -c '^platform    linux                        a record carries its session.s origin as `p <pid> <start>`$')"
+# The one row that is not there to be `ok`: the suite unsets XDG_RUNTIME_DIR and
+# CCTAB_STATE_DIR, so this is the platform axis reporting an absence with the two
+# names a reader can act on - which is the whole difference between `Support` and
+# the `Option<PathBuf>` it is lifted from.
+check 'doctor: the platform axis names both variables when there is nowhere to record' '1' \
+    "$(printf '%s\n' "$_axdoc" \
+       | grep -c '^  state dir             n/a   no CCTAB_STATE_DIR and no XDG_RUNTIME_DIR$')"
+check 'doctor: the platform axis reports the hostname rung that answered' '1' \
+    "$(printf '%s\n' "$_axdoc" | grep -c '^  hostname              ok    ')"
+# HAS_RECORD_LOCK, HAS_MODES and HAS_UNLINK_RUNNING, lifted into the same five
+# words the surface rows use. Their signatures in `sys` do not change to say this:
+# the mapping is here, at the reporting boundary, and nowhere else.
+check 'doctor: the platform constants print as the same five words' '3' \
+    "$(printf '%s\n' "$_axdoc" \
+       | grep -c '^  \(record lock\|file modes\|replace while running\) *ok  ')"
+check 'doctor: the session terminal is named by the pid it is reached through' '1' \
+    "$(printf '%s\n' "$_axdoc" \
+       | grep -c '^  session terminal      ok    CLAUDE_PID=4242 - session-start and session-end write it directly$')"
+check 'doctor: and says what is missing when it is not a hook subprocess' '1' \
+    "$(_axes CLAUDE_PID= \
+       | grep -c '^  session terminal      n/a   CLAUDE_PID is not set, so this is not a hook subprocess (session-start and session-end would do nothing)$')"
+# `CCTAB_HOST` does not make the kernel stop answering: it decides whether the
+# answer is the one that gets painted, which is `Support::gate` - our knob layered
+# over a fact the platform already stated - and `off` naming the knob is the word no
+# tri-state in this crate could say before the axis existed.
+check 'doctor: our own knob turns the platform hostname off by name' '1' \
+    "$(_axes CCTAB_HOST=box | grep -c '^  hostname              off   CCTAB_HOST$')"
+
+# The surface axis, and the provenance that is the reason the rows carry one: six of
+# the fourteen were written from vendor source and nobody has ever delivered a byte
+# to them. A reader who sees `ok` is owed the difference.
+check 'doctor: a measured surface row says it was measured' '1' \
+    "$(_axes CCTAB_TERMINAL=konsole \
+       | grep -c '^surface     konsole                      Konsole, measured on a running terminal$')"
+check 'doctor: and an unidentified one admits it was inferred' '1' \
+    "$(printf '%s\n' "$_axdoc" \
+       | grep -c '^surface     unknown                      an unidentified terminal, inferred, never read and never run$')"
+# What NAMED the leaf, as its own row, because "nothing named it" is a capability
+# this session does not have and the two ways of not having it differ in remedy.
+check 'doctor: the evidence row names the variable that answered' '1' \
+    "$(_axes KONSOLE_VERSION=260801 | grep -c '^  evidence              ok    \$KONSOLE_VERSION$')"
+check 'doctor: the override is evidence too, and outranks it' '1' \
+    "$(_axes KONSOLE_VERSION=260801 CCTAB_TERMINAL=wezterm \
+       | grep -c '^  evidence              ok    CCTAB_TERMINAL=wezterm$')"
+check 'doctor: inside a multiplexer the evidence is gone, and says why' '1' \
+    "$(_axes KONSOLE_VERSION=260801 TMUX=nonsense \
+       | grep -c "^  evidence              n/a   a multiplexer swallowed the environment's evidence\$")"
+check 'doctor: and with nothing in the environment there was none to swallow' '1' \
+    "$(printf '%s\n' "$_axdoc" \
+       | grep -c '^  evidence              n/a   nothing in the environment named it$')"
+# Versioned catalogue entries need evidence about the running terminal. The
+# override names a family only; a claimed mux vetoes even valid version values.
+# Fixed columns keep multi-word capability names from affecting label extraction.
+_version_labels() {
+    sed -n '/^  notification /p; /^  tab colour /p; /^  taskbar progress /p' \
+        | cut -c25-30 | tr -d ' ' | tr '\n' '|'
+}
+for _case in '220400:n/a|n/a|n/a|' '230399:n/a|n/a|n/a|' \
+    '230400:n/a|ok|n/a|' '230401:n/a|ok|n/a|' \
+    '241199:n/a|ok|n/a|' '241200:ok|ok|n/a|' '241201:ok|ok|n/a|' \
+    '260399:ok|ok|n/a|' '260400:ok|ok|ok|' '260401:ok|ok|ok|'; do
+    _ver=${_case%%:*}
+    check "doctor: Konsole version boundary $_ver" "${_case#*:}" \
+        "$(_axes KONSOLE_VERSION=$_ver | _version_labels)"
+done
+for _ver in '' bad 23.04 23040 0230400 +230400 ' 230400' 230400beta 230000 231300 999999; do
+    check "doctor: unknown or invalid Konsole version '$_ver' is unverified" '?|?|?|' \
+        "$(_axes CCTAB_TERMINAL=konsole KONSOLE_VERSION="$_ver" | _version_labels)"
+done
+check 'doctor: an override without a version is unverified' '?|?|?|' \
+    "$(_axes CCTAB_TERMINAL=konsole | _version_labels)"
+check 'doctor: DBus family evidence without a version is unverified' '?|?|?|' \
+    "$(_axes KONSOLE_DBUS_SESSION=/Sessions/1 | _version_labels)"
+for _muxenv in 'TMUX=nonsense' 'STY=screen' 'TMUX=/tmp/not-a-server,1,0'; do
+    check "doctor: $_muxenv makes inherited versions unreliable even with mux disabled" '?|?|?|' \
+        "$(_axes CCTAB_TERMINAL=konsole KONSOLE_VERSION=260400 CCTAB_NO_TMUX=1 "$_muxenv" | _version_labels)"
+done
+check 'doctor: empty mux evidence does not veto a version' 'ok|ok|ok|' \
+    "$(_axes KONSOLE_VERSION=260400 TMUX= STY= | _version_labels)"
+
+# The arm and its restore, PRINTED AS A PAIR, because an arm whose restore drifted
+# from it is this project's named recurring defect and a report is where a drift
+# would be seen. Named, never written: doctor is read in the terminal whose tab is
+# misbehaving, and a report that echoed the real bytes would arm it.
+_axkon=$(_axes CCTAB_TERMINAL=konsole)
+check 'doctor: the arming is printed with ESC and BEL named' '1' \
+    "$(printf '%s\n' "$_axkon" \
+       | grep -c '^  arm / restore         ok    ESC\]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w BEL$')"
+check 'doctor: and the restore it is paired with, on the line under it' '1' \
+    "$(printf '%s\n' "$_axkon" \
+       | grep -c '^                              back to ESC\]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H BEL$')"
+check 'doctor: which is said to be the compiled-in default and not your profile' '1' \
+    "$(printf '%s\n' "$_axkon" | grep -c 'COMPILED-IN default, not your profile')"
+check 'doctor: writes no escape byte of its own, anywhere in the report' '0' \
+    "$(printf '%s' "$_axkon" | tr -cd '\033' | wc -c | tr -d ' ')"
+check 'doctor: a surface with no appearance bytes says which absence it is' '1' \
+    "$(printf '%s\n' "$_axdoc" \
+       | grep -c '^  arm / restore         n/a   a terminal that cannot be named is sent no appearance bytes$')"
+
+# The multiplexer axis. `none` is not one word: our kill switch, a `$TMUX` that is
+# not one, and a plain local tab are three different absences, and only the first
+# has a remedy - the name of the knob.
+check 'doctor: no multiplexer at all says what it looked for' '1' \
+    "$(printf '%s\n' "$_axdoc" \
+       | grep -c '^multiplexer none                         n/a: neither \$TMUX nor \$STY is set$')"
+check 'doctor: our kill switch is named where the multiplexer would be' '1' \
+    "$(_axes TMUX=/tmp/s,1,0 CCTAB_NO_TMUX=1 \
+       | grep -c '^multiplexer tmux                         off: CCTAB_NO_TMUX$')"
+check 'doctor: a $TMUX that is not one is claimed and not driveable' '1' \
+    "$(_axes TMUX=nonsense \
+       | grep -c '^multiplexer tmux                         n/a: \$TMUX is not <socket>,<pid>,<session>, so there is nothing to drive$')"
+# screen is in the axis to answer `$STY` and for nothing else, and the ROW says so -
+# the reason lives with the cap, not in the report. This is invariant I1 printed.
+check 'doctor: screen is named a multiplexer that renders no title' '1' \
+    "$(_axes STY=1234.pts-0.host \
+       | grep -c "^  outer title           n/a   it draws no outer tab of its own, so \$STY only suppresses the leaf's evidence\$")"
+check 'doctor: and names no client pty either' '1' \
+    "$(_axes STY=1234.pts-0.host \
+       | grep -c "^  client registry       n/a   screen names no client's pty in a format\$")"
+
+# --- doctor --surface <name> -----------------------------------------------
+# The capability table of a terminal THIS MACHINE CANNOT RUN, which is how the
+# Windows column gets read before any Windows box exists. Const data all the way
+# down: no terminal, no session, and - pinned here - no config directory either.
+_nowhere=$tmp/no-such-config-anywhere
+check 'doctor --surface: prints a table with no config directory at all' '0' \
+    "$(cd -- "$tmp/plaindir" && HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere \
+          "$bin" doctor --surface windows-terminal </dev/null >/dev/null 2>&1; printf %s $?)"
+_wt=$(cd -- "$tmp/plaindir" && HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere \
+          "$bin" doctor --surface windows-terminal </dev/null 2>&1)
+check 'doctor --surface: the row that forced a fifth word prints as that word' '1' \
+    "$(printf '%s\n' "$_wt" \
+       | grep -c '^  title (OSC 0)         ?     profiles.suppressApplicationTitle silently discards it$')"
+check 'doctor --surface: uncertain Windows notification keeps its reason and grammar' '1' \
+    "$(printf '%s\n' "$_wt" | grep -A1 '^  notification          ?     compatibility.allowOSC777, default false$' \
+       | grep -c '^                              OSC 777 notify BEL$')"
+_vscode=$("$bin" doctor --surface vscode </dev/null 2>&1)
+check 'doctor --surface: uncertain VS Code notification keeps its reason and grammar' '1' \
+    "$(printf '%s\n' "$_vscode" | grep -A1 '^  notification          ?     .*enable-notifications setting$' \
+       | grep -c '^                              OSC 99 ST$')"
+_conhost=$("$bin" doctor --surface conhost </dev/null 2>&1)
+check 'doctor --surface: uncertain conhost progress has no invented grammar' '1' \
+    "$(printf '%s\n' "$_conhost" | grep -A1 '^  taskbar progress      ?     .*not documented$' \
+       | grep -c '^  acknowledge ')"
+check 'doctor --surface: the vendor-source provenance is on the surface line' '1' \
+    "$(printf '%s\n' "$_wt" \
+       | grep -c '^surface     windows-terminal             Windows Terminal, read from vendor source, never run$')"
+check 'doctor --surface: names the override that is the only way to reach it' '1' \
+    "$(printf '%s\n' "$_wt" | grep -c 'CCTAB_TERMINAL=windows-terminal is what names this surface')"
+check 'doctor --surface: and says nothing about THIS machine' '0' \
+    "$(printf '%s\n' "$_wt" | grep -c '^platform \|^multiplexer \|^tmux:\|^title:')"
+# Every one of the fourteen, because the enum is total so that an override over ssh
+# can name a leaf this build could never detect.
+_axall=0
+for _s in unknown konsole vte kitty alacritty wezterm foot ghostty xterm iterm2 \
+          apple-terminal windows-terminal conhost vscode; do
+    _axall=$((_axall + $( ( cd -- "$tmp/plaindir" && HOME=$_nowhere \
+        CLAUDE_CONFIG_DIR=$_nowhere "$bin" doctor --surface "$_s" </dev/null 2>&1 ) \
+        | grep -c "^surface     $_s ")))
+done
+check 'doctor --surface: all fourteen names print their own row' '14' "$_axall"
+check 'doctor --surface: the name is matched case-insensitively, as the override is' '1' \
+    "$( ( cd -- "$tmp/plaindir" && HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere \
+          "$bin" doctor --surface KONSOLE </dev/null 2>&1 ) | grep -c '^surface     konsole ')"
+# A refusal must NAME the alternatives, and must not fall through to the paint path:
+# an unrecognised subcommand word paints an idle tab, and a mistyped surface must not.
+check 'doctor --surface: a name that is not one is refused, with the fourteen' '1' \
+    "$( ( cd -- "$tmp/plaindir" && HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere \
+          "$bin" doctor --surface kosnole </dev/null 2>&1 ) \
+       | grep -c '^error: no surface is named kosnole\. One of: unknown, konsole, ')"
+check 'doctor --surface: and exits non-zero' '1' \
+    "$( ( cd -- "$tmp/plaindir" && HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere \
+          "$bin" doctor --surface kosnole </dev/null >/dev/null 2>&1 ); printf %s $?)"
+check 'doctor --surface: with nothing after it, the fourteen are the message' '1' \
+    "$( ( cd -- "$tmp/plaindir" && HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere \
+          "$bin" doctor --surface </dev/null 2>&1 ) \
+       | grep -c '^error: --surface needs the terminal to print the table for, one of: unknown, ')"
+# Reproduced, not improved: doctor has always ignored every other argument, because
+# a report is the one command that has to run on the configuration that is broken.
+check 'doctor: still ignores an option it does not know' '1' \
+    "$( ( cd -- "$tmp/plaindir" && HOME=$tmp CLAUDE_CONFIG_DIR=$tmp/tcfg \
+          "$bin" doctor --force </dev/null 2>&1 ) | grep -c '^title:')"
+# The two spellings print the SAME rows, which is the fixed-column claim as a test:
+# the block a Linux reader sees for konsole and the block they would read for a
+# surface they cannot run share the rows that do not depend on version evidence.
+_axblock=$(printf '%s\n' "$_axkon" | sed -n '/^surface /,/^multiplexer /p' \
+    | grep -v '^multiplexer ' | grep -v '^  evidence ' \
+    | grep -Ev '^  (tab colour|notification|taskbar progress) ')
+_onblock=$( ( cd -- "$tmp/plaindir" && HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere \
+    "$bin" doctor --surface konsole </dev/null 2>&1 ) | sed -n '/^surface /,$p' \
+    | grep -v '^            CCTAB_TERMINAL=' \
+    | grep -Ev '^  (tab colour|notification|taskbar progress) ')
+check 'doctor --surface: non-versioned rows and protocol requirements match the full report' \
+    "$_axblock" "$_onblock"
+
+# Offline catalogue mode ignores even a valid local version, retains all three
+# grammars and states each floor, without requiring a terminal or config directory.
+_catalogue=$(HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere KONSOLE_VERSION=260400 \
+    "$bin" doctor --surface konsole </dev/null 2>&1)
+check 'doctor --surface: catalogue entries are not running-version claims' '?|?|?|' \
+    "$(printf '%s\n' "$_catalogue" | _version_labels)"
+for _requirement in 'OSC 777 notify BEL; requires Konsole 23.04.0 or newer' \
+    'OSC 34 BEL; requires Konsole 24.12.0 or newer' \
+    'OSC 9;4 BEL; requires Konsole 26.04.0 or newer'; do
+    check "doctor --surface: $_requirement" '1' \
+        "$(printf '%s\n' "$_catalogue" | grep -Fc "$_requirement")"
+done
+check 'doctor --surface: explicitly identifies the versioned catalogue claims' '3' \
+    "$(printf '%s\n' "$_catalogue" | grep -c 'protocol catalogue only; no running terminal version checked')"
 
 # --- the state layer: wait ownership --------------------------------------
 # Everything above this point is the STATELESS program, because the suite unsets
@@ -2561,6 +2810,48 @@ check 'state: SessionStart reaps a record nothing has touched for a day' 'gone' 
     "$([ -e "$_sd/dead-session-0000" ] && printf present || printf gone)"
 check 'state: SessionStart does not reap a live record' 'present' \
     "$([ -e "$_sd/$_sid" ] && printf present || printf gone)"
+
+# RUNG 2 OF THE ARMED RECORD. What a backend arms is recorded where the END hook
+# reads it back, and the state record is the rung for a session with no multiplexer
+# to hold one. It is written ONLY by a session that actually armed something, which
+# is what keeps every record above - and every corpus case, which has no state
+# directory at all - byte for byte what it was.
+#
+# These run OUTSIDE dry run, because the dry-run short circuit returns before
+# anything is routed and therefore before anything is armed. CLAUDE_PID stays empty,
+# so no pty is touched and no origin line is stamped.
+_sd2=$tmp/state-armed
+sarm() {
+    (cd -- "$tmp/repos/plain" && printf '%s\n' "$(pl SessionStart ',"source":"startup"')" \
+        | env HOME=$tmp CCTAB_STATE_DIR=$_sd2 CCTAB_NOW=1000000 CLAUDE_PID= "$@" \
+          "$bin" session-start >/dev/null 2>&1)
+}
+srec() { tr '\n' '|' <"$_sd2/$_sid" 2>/dev/null; }
+rm -rf "$_sd2"
+sarm CCTAB_TERMINAL=konsole
+check 'state: a session that armed records the surface it armed' 'cts5|b i|s konsole|' "$(srec)"
+# With no `$CLAUDE_PID` there is no origin to stamp, so the record SessionStart
+# would write is the one a session with no record is already assumed to have, and
+# `write_if_changed` creates no file at all. That is the pre-existing behaviour, and
+# these two assert that only a session which ARMED changes it.
+rm -rf "$_sd2"
+sarm CCTAB_TERMINAL=wezterm
+check 'state: and a session that armed nothing still writes no record at all' 'gone' \
+    "$([ -e "$_sd2/$_sid" ] && printf present || printf gone)"
+rm -rf "$_sd2"
+sarm
+check 'state: as does one with no terminal to name at all' 'gone' \
+    "$([ -e "$_sd2/$_sid" ] && printf present || printf gone)"
+# The line survives every later write, because every write starts from the record it
+# read - so the end hook, hours later, still finds it.
+rm -rf "$_sd2"
+sarm CCTAB_TERMINAL=konsole
+(cd -- "$tmp/repos/plain" && printf '%s\n' "$(stop_busy)" \
+    | env HOME=$tmp CCTAB_DRY_RUN=1 CCTAB_STATE_DIR=$_sd2 CCTAB_NOW=1000009 CLAUDE_PID= \
+      "$bin" idle >/dev/null 2>&1)
+check 'state: and later edges carry it through untouched' 'cts5|b i|g 1000009|s konsole|' \
+    "$(srec)"
+rm -rf "$_sd2"
 
 # WHAT THE REAPER MAY NOT TOUCH. CCTAB_STATE_DIR is a documented user knob, so the
 # directory is not always one we created - and `reapable` used to fall back to
@@ -3054,11 +3345,10 @@ else
             || echo "[$(tm display-message -p '#{@cctab_exe}')]")"
     check 'the hook is scoped to our session, not the server' '' \
         "$(tm show-hooks -g | grep 'client-attached\[1971\]')"
-    # Not Konsole takes it back off: the layout and the TTLs are already
-    # last-SessionStart-wins, and an arming in force while the strip moved back to
-    # the end Konsole elides is worse than either.
+    # A plain start shares the tab: it cannot revoke another Claude's re-arm.
     tsession_start "$tmp/code/one"
-    check 'a later plain session-start removes the hook again' '' \
+    check 'a later plain session-start preserves the shared re-arm hook' \
+        "run-shell -b \"'#{@cctab_exe}' tmux-arm '#{client_tty}'\"" \
         "$(tm display-message -p -t t:w0.0 '#{client-attached[1971]}')"
     # A user's own hooks live in the same array, and a BARE `set-hook -g
     # client-attached` replaces the WHOLE of it - measured. Ours is one index.
@@ -3251,6 +3541,116 @@ else
     check 'screen gets nothing, deliberately' \
         '{"terminalSequence":"\u001b]0;🔵 ~/plain\u0007","suppressOutput":true}' \
         "$(cd -- "$tmp/plain" && HOME=$tmp STY=1234.pts-0.host "$bin" working </dev/null)"
+
+    # --- the armed record ---------------------------------------------------
+    # THE DEFECT, driven end to end on a real server. `session_end` used to decide
+    # whether to restore the tab by re-deriving the arming condition FROM ITS OWN
+    # environment, while `session_start` had derived it from the start hook's, an
+    # unbounded time earlier. Change CCTAB_TERMINAL in between and the two answers
+    # differ - and the direction that hurts leaves Konsole's `LocalTabTitleFormat=%w`
+    # in force for the life of the tab, with nothing left that will ever put it back.
+    #
+    # WHAT IS ASSERTED HERE is the DECISION and the record behind it: @cctab_armed,
+    # and the client-attached hook, which `tmux::disarm` takes off in the same branch
+    # and under the same condition as the restore write. The restore BYTES need a
+    # real attached client on a pty this suite cannot allocate; they are asserted in
+    # tests/test_tmux_status.py, over a pty, against an attached client.
+    tsession_end() {
+        _d=$1
+        shift
+        (cd -- "$_d" && env -u CLAUDE_PID HOME=$tmp TMUX="$tsock,1,0" TMUX_PANE=%0 "$@" \
+            "$bin" session-end </dev/null >/dev/null 2>&1)
+    }
+    tarmed() { tm display-message -p -t %0 '#{@cctab_armed}'; }
+    thook() { tm display-message -p -t %0 '#{client-attached[1971]}'; }
+    # A clean slate: no other claude pane in this session may carry a record, or
+    # every session-end below takes the "somebody else is still painting" branch.
+    for _p in t:w0.0 t:w1.0 t:w1.1 t:shell.0; do tput_title "$_p" '' >/dev/null 2>&1; done
+
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check 'session-start records the surface it armed' 'konsole' "$(tarmed)"
+    check 'and a session-start that arms nothing preserves the shared obligation' 'konsole' \
+        "$(tsession_start "$tmp/code/one" CCTAB_TERMINAL=wezterm; tarmed)"
+    # THE CASE THIS COMMIT EXISTS FOR. Armed as Konsole; CCTAB_TERMINAL is something
+    # else by the time the session ends. Before the record, the end hook re-derived
+    # "not Konsole", wrote nothing, took no hook off, and left the tab armed forever.
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check 'the re-arm hook is installed by the konsole start' '1' \
+        "$(thook | grep -c 'tmux-arm')"
+    tsession_end "$tmp/code/one" CCTAB_TERMINAL=wezterm
+    check 'a CCTAB_TERMINAL changed mid-session still restores the tab' '' "$(thook)"
+    check 'and the record goes with the arm it described' '' "$(tarmed)"
+    # The other half of the same defect: a store that says NOTHING was armed is not
+    # talked out of it by an environment that now claims Konsole.
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=wezterm
+    tsession_end "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check 'and a session that armed nothing is not restored by a late CCTAB_TERMINAL' '-' \
+        "$(tarmed)"
+
+    # TWO LIVE SESSIONS, one tab. The arming is per TAB and inside tmux one tab holds
+    # every window, so the claude that leaves first must neither restore the tab nor
+    # delete the record the other one still needs.
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    tput_title t:w1.0 "~/code/two ct1 w $(tm display-message -p '%s')"
+    tsession_end "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check 'one session ending leaves the other one armed' 'konsole' "$(tarmed)"
+    check 'and leaves the re-arm hook in place for it' '1' "$(thook | grep -c 'tmux-arm')"
+    # And the last one out does turn the lights off - with the terminal changed under
+    # it, so this is the record answering and not the environment.
+    tput_title t:w1.0 ''
+    tsession_end "$tmp/code/one" CCTAB_TERMINAL=vte
+    check 'the last session ending does restore the tab' '' "$(thook)"
+    check 'and clears the record with it' '' "$(tarmed)"
+
+    # DEGRADING. Whatever goes wrong with the record, the answer is rung 3 - the old
+    # predicate, which is the behaviour every one of the 312 corpus cases runs on -
+    # and never a panic, never a missing restore. Exit 0 is asserted with it, because
+    # a hook that exits non-zero blocks a tool call.
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    tm set -t %0 -- @cctab_armed konsole-from-the-future
+    check 'a record naming a surface this build has no row for is ignored' '0' \
+        "$(cd -- "$tmp/code/one" && env -u CLAUDE_PID HOME=$tmp TMUX="$tsock,1,0" TMUX_PANE=%0 \
+              CCTAB_TERMINAL=konsole "$bin" session-end </dev/null >/dev/null 2>&1; printf %s $?)"
+    check 'and the end hook falls back to this environment, which says konsole' '' "$(thook)"
+    # A session that crashed between arming and recording - or one armed by a build
+    # that predates the record - leaves the option unset, which must read as "no
+    # record" and not as "nothing was armed".
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    tm set -ut %0 -- @cctab_armed
+    tsession_end "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check 'an absent record degrades to the old predicate, which still restores' '' \
+        "$(thook)"
+
+    # doctor prints WHICH RUNG answered, because "this tab will be restored" means
+    # two very different things depending on whether anything remembers.
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check 'doctor names the surface the multiplexer recorded' '1' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 CCTAB_TERMINAL=konsole "$bin" doctor 2>&1 \
+           | grep -c 'restore: konsole, recorded by the multiplexer')"
+    check 'and says so even when this session is not the one that armed' '1' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 CCTAB_TERMINAL=wezterm "$bin" doctor 2>&1 \
+           | grep -c 'restore: konsole, recorded by the multiplexer')"
+    check 'with no record at all, doctor calls the answer an assumption' '1' \
+        "$(tm set -ut %0 -- @cctab_armed
+           cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 CCTAB_TERMINAL=konsole "$bin" doctor 2>&1 \
+           | grep -c 'restore: konsole, ASSUMED from this hook')"
+    # The record line is printed for every session inside tmux, not only in Konsole
+    # mode: "armed, and nothing here can say by whom" is the shape of the defect.
+    check 'and prints the line outside konsole mode too, saying no arming policy' '1' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" doctor 2>&1 \
+           | grep -c 'restore: no arming policy, ')"
+    # uninstall owns the session-scoped record too: the server-wide sweep cannot
+    # reach it, so a forgotten unset would outlive the uninstall that reported
+    # success.
+    tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
+    check 'uninstall takes the armed record off with the hook' '' \
+        "$(cd -- "$tmp/code/one" && HOME=$tmp CLAUDE_CONFIG_DIR=$tucfg \
+              TMUX="$tsock,1,0" TMUX_PANE=%0 "$bin" uninstall --force >/dev/null 2>&1
+           tarmed)"
 
     tmux_gone
     printf 'tmux section: private server %s, killed.\n' "$tsock"

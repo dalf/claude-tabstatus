@@ -1,10 +1,88 @@
-//! The Unix backend of [`crate::sys`]. Linux-specific where it reads `/proc`;
-//! elsewhere those functions find nothing and answer "unknown".
+//! The Unix backend of [`crate::sys`]. One body for every Unix, except for the
+//! handful of questions whose ANSWER differs: a process's start time and its
+//! liveness, the session's pty, the record's origin key, and the variable naming
+//! the state directory. Those are `cfg`-selected in place - Linux reads `/proc`,
+//! macOS calls `libc` - and everything else on this page is shared. WHY THEY SIT
+//! NEXT TO EACH OTHER rather than in a file of their own is the last section here,
+//! because it has been asked and it deserves an answer and not an assertion.
+//!
+//! FOR HOOK PROCESS LOOKUPS, ONLY THE SYSTEM CALL IS `cfg`-SELECTED. Every decision either side makes - the
+//! errno-to-liveness mapping, the packing of a start time into the one number a
+//! record stores - is a pure function compiled on both and exercised by the Linux
+//! test run. Native arm64 macOS CI additionally exercises the actual calls and
+//! PTY delivery; cross-checks alone do not establish runtime correctness. The
+//! `cfg` bodies are a call and a `?`; their decisions stay testable on Linux.
+//!
+//! THE LINE IS `libc`, NOT THE PLATFORM. That is the rule, and it is the one to follow
+//! when adding anything here. An item that names a `libc` symbol is a CALL, and it
+//! carries its own `#[cfg(target_os = "macos")]`: `libc` is a
+//! `[target.'cfg(target_os = "macos")'.dependencies]` entry, so on a Linux build the
+//! crate does not exist and naming it is a hard error. An item that names no `libc`
+//! symbol is a DECISION, and it is compiled on both under
+//! `#[cfg(any(target_os = "macos", test))]`. `EPERM` and `ESRCH` are written out by
+//! hand for exactly that reason - spelling them `libc::EPERM` would move
+//! `liveness_from_kill` to the wrong side of the line - and the macOS-only assert
+//! beside them is what checks the two numbers against the real ones on a build that
+//! has them.
+//!
+//! WHY THIS IS ONE FILE AND NOT THREE. The mix reads like two files wedged into one,
+//! and the answer is still no. Four reasons, each measured rather than assumed.
+//!
+//! THE RUNTIME QUESTIONS remain adjacent: [`ORIGIN_KEY`], [`RUNTIME_DIR_VAR`], [`NO_STATE_DIR`],
+//! [`kernel_hostname_file`], [`hostname_fallback`], [`process_start_time`], [`process_alive`] and `fd1_path`.
+//! The installer-only `darwin_acl` module is a separate subsystem with opaque
+//! native resources; its regression tests need native macOS. It does not change
+//! which hook decisions are compiled and tested on Linux.
+//!
+//! THE ADJACENCY IS THE PROOF, and it is the real argument. Linux
+//! [`process_start_time`] and macOS [`process_start_time`] are 48 lines apart, and
+//! `bsdinfo_start` - the pure function both of them are stripped down to - is 107
+//! lines below that, so that the two kernels being asked the SAME question is
+//! something a reviewer checks by scrolling. `proc_spells_a_pid_canonically_...`
+//! exists only to show the two answer one string identically. Across three files each
+//! of those becomes a claim in a comment instead of something the eye can check.
+//!
+//! THE PROPERTY WORTH PROTECTING IS ALREADY COMPILER-ENFORCED, and a split would
+//! WEAKEN it. `mod tests` below carries no `target_os` gate and names every
+//! dual-compiled item, so mistagging one is a build failure and not a silent skip:
+//! retag `bsdinfo_start` as macOS-only and the Linux test run answers
+//! `error[E0425]: cannot find function bsdinfo_start`, five times. Under a
+//! `#[cfg(target_os = "macos")] mod macos;` the same mistake - a decision written into
+//! the macOS half with its own test beside it - compiles clean on Linux and executes
+//! nothing. The guard is the un-gated test module, and moving the decisions away from
+//! it is what would remove the guard.
+//!
+//! AND std's OWN SHAPE AGREES. `sys/fs/unix.rs` is longer than this page with more
+//! `target_os` forks in it, and std interleaves them in place; where std does give an
+//! OS a file of its own - `sys/random/apple.rs` - it is a subsystem with a separate
+//! implementation, not a handful of divergent answers. std nests, but its
+//! `sys/pal/unix/` children are subsystems and not operating systems. By that
+//! criterion this file is a `fs/unix.rs`.
+//!
+//! WHAT A THIRD UNIX WOULD COST, which is the test any layout here has to pass.
+//! FreeBSD widens `any(target_os = "macos", test)` by one term and adds one arm to
+//! three questions. Under a per-OS split it would ALSO have to move
+//! `liveness_from_kill` and `pid_to_ask_about` back out of a file named for macOS,
+//! because they are facts about `kill(2)` that every BSD shares and not macOS facts at
+//! all. The seam that looks tidiest today is the one that would have to be undone.
+//!
+//! THE ONE THING THAT WAS GENUINELY FILE-SHAPED has been named rather than moved:
+//! `mod abi`, the two `proc_info.h` declarations and the seven asserts that pin their
+//! layout. Those have no Linux counterpart, so they had nothing to be adjacent to, and
+//! one `#[cfg]` on the module replaced ten on its items. If they ever do leave this
+//! file, that module is already the boundary and nothing else has to move with them.
+//!
+//! THE ACCEPTANCE GATE for any change to this file, and the cheapest one there is: the
+//! leaf names of `cargo test -- --list` must come back unchanged. A decision that
+//! stops being compiled still reports success, because a test that does not exist
+//! cannot fail. The `unix` guard is load-bearing the same way, and it comes free from
+//! `#[cfg(unix)] mod unix;` in [`super`] rather than from anything written here:
+//! `cfg(test)` is true on Windows too, and `parse_pid` reads `OsStrExt::as_bytes`.
 
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, FileType, Metadata, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -18,7 +96,22 @@ pub const HAS_RECORD_LOCK: bool = true;
 /// [`mode`] always answers, and [`set_mode`] applies what it is given.
 pub const HAS_MODES: bool = true;
 
-/// [`session_tty`] can resolve a pty - through `/proc`, so on Linux.
+/// [`session_tty`] can resolve a pty on every Unix here. Linux reads the symlink
+/// `/proc/<pid>/fd/1`; macOS asks `proc_pidfdinfo` for the same fd's vnode path.
+/// Only that lookup differs - see [`fd1_path`] - and the guard downstream of it is
+/// one body. The constant and the function have to agree, because `doctor` reads the
+/// constant to say whether `session-start` and `session-end` have a route at all.
+///
+/// THREE CALLERS, NOT ONE, which is worth saying where the constant is written
+/// because flipping it on macOS moved two of them without touching their files.
+/// `manage.rs`'s `doctor` prints the `session terminal` row from it;
+/// `mux::Channel::Direct::carries_raw` reads it to decide whether the session's own
+/// tab is a BYTE route, and `mux::route` therefore now sends Konsole's OSC 50
+/// arming down that channel on macOS as it already did on Linux. That is the
+/// intended meaning - the two facts are one fact, "the session's own tab is a pty
+/// we can write to" - and it is inert unless [`crate::surface::Surface::Konsole`]
+/// was detected anyway. It is still a behaviour change in a file this declaration
+/// does not name, so it is named here.
 pub const HAS_SESSION_TTY: bool = true;
 
 /// [`set_session_title`] has no console to title: a Unix terminal takes its title
@@ -48,13 +141,9 @@ pub fn home_fallback() -> Option<OsString> {
 }
 
 /// Whether `b` belongs to a line ending in a command's output: only `\n`.
+#[cfg(any(not(target_os = "macos"), test))]
 pub fn is_line_end(b: u8) -> bool {
     b == b'\n'
-}
-
-/// The file the kernel publishes its host name in, read without a fork.
-pub fn kernel_hostname_file() -> Option<&'static Path> {
-    Some(Path::new("/proc/sys/kernel/hostname"))
 }
 
 /// Whether a resolved gitdir, `GIT_DIR` or `HEAD` path may be handed to the
@@ -111,13 +200,87 @@ pub fn reserved_name(_name: &str) -> bool {
 /// The key a record's origin is written under. It differs per platform because the
 /// numbers do: a pid and a start time from one OS say nothing about a process on
 /// another, and each side reads the other's key as an unknown field - no origin.
+///
+/// Three keys because there are three ENCODINGS, not three operating systems:
+/// `p` is clock ticks since boot, `q` a 100ns FILETIME, and `r` microseconds since
+/// the epoch (see [`process_start_time`]). A number under a key this build does not
+/// know is not a start time it can compare, and `Record::parse` skips it like any
+/// unknown field - absent, never different.
+#[cfg(not(target_os = "macos"))]
 pub const ORIGIN_KEY: &str = "p";
+#[cfg(target_os = "macos")]
+pub const ORIGIN_KEY: &str = "r";
 
 /// The variable naming the per-user directory the state directory defaults under.
+#[cfg(not(target_os = "macos"))]
 pub const RUNTIME_DIR_VAR: &str = "XDG_RUNTIME_DIR";
 
+/// `XDG_RUNTIME_DIR` is a freedesktop variable and macOS does not set one, so
+/// reading it there switches the whole state layer - wait ownership included - off
+/// on a platform that has everywhere to put a record. `TMPDIR` is what launchd
+/// sets per user, to `/var/folders/<hash>/T`: 0700, owned by this user, and emptied
+/// by the OS, so its volatility matches `XDG_RUNTIME_DIR`'s and the reaper's
+/// one-day mtime fallback keeps the justification it already has.
+#[cfg(target_os = "macos")]
+pub const RUNTIME_DIR_VAR: &str = "TMPDIR";
+
 /// Why there is no state directory, when neither variable is set.
+#[cfg(not(target_os = "macos"))]
 pub const NO_STATE_DIR: &str = "no CCTAB_STATE_DIR and no XDG_RUNTIME_DIR";
+#[cfg(target_os = "macos")]
+pub const NO_STATE_DIR: &str = "no CCTAB_STATE_DIR and no TMPDIR";
+
+/// The file the kernel publishes its host name in, read without a fork.
+#[cfg(not(target_os = "macos"))]
+pub fn kernel_hostname_file() -> Option<&'static Path> {
+    Some(Path::new("/proc/sys/kernel/hostname"))
+}
+
+/// Darwin has no hostname file. Try `$HOSTNAME` before the native fallback,
+/// preserving the environment name's existing precedence.
+#[cfg(target_os = "macos")]
+pub fn kernel_hostname_file() -> Option<&'static Path> {
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn hostname_fallback() -> Option<Vec<u8>> {
+    super::hostname_command()
+}
+
+/// Darwin's sys/param.h defines MAXHOSTNAMELEN as 256. Apple's gethostname
+/// implementation uses MAXHOSTNAMELEN + 1 to avoid its small-buffer truncation
+/// branch. libc 0.2.189 binds gethostname(*mut c_char, size_t) -> c_int but does
+/// not expose MAXHOSTNAMELEN. Native SDK fixtures check the limit and signature.
+#[cfg(any(target_os = "macos", test))]
+const DARWIN_HOSTNAME_CAPACITY: usize = 256 + 1;
+
+/// The same kernel hostname that hostname(1) reads, not ComputerName or
+/// LocalHostName. Failure has no command fallback; the renderer supplies `ssh:`.
+#[cfg(target_os = "macos")]
+pub fn hostname_fallback() -> Option<Vec<u8>> {
+    // Nonzero initial bytes cannot fabricate a terminator if the API writes
+    // an incomplete answer. Even success must contain its own NUL in bounds.
+    let mut name = [0xff; DARWIN_HOSTNAME_CAPACITY];
+    // SAFETY: name's pointer addresses writable, initialised storage of exactly
+    // name.len() bytes. The exclusive array borrow and storage remain live for
+    // the synchronous call; gethostname retains no pointer. c_char has byte
+    // alignment/size, and no C-string read is performed on the returned storage.
+    let rc = unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) };
+    hostname_from_native(rc, &name)
+}
+
+/// Keep native bytes intact until location's text::repair boundary. Non-UTF-8
+/// bytes are display input, not an API failure; only the status and framing
+/// determine whether a complete, non-empty answer was supplied.
+#[cfg(any(target_os = "macos", test))]
+fn hostname_from_native(rc: i32, name: &[u8]) -> Option<Vec<u8>> {
+    if rc != 0 {
+        return None;
+    }
+    let end = name.iter().position(|&b| b == 0)?;
+    (end != 0).then(|| name[..end].to_vec())
+}
 
 /// The permission bits, `0o7777`-masked.
 pub fn mode(m: &Metadata) -> Option<u32> {
@@ -135,20 +298,523 @@ pub fn with_mode(opts: &mut OpenOptions, mode: u32) -> &mut OpenOptions {
     opts.mode(mode)
 }
 
-/// What a rewrite carries over from the file it replaces BEYOND its mode - and on
-/// Unix that is nothing: the mode is the protection, and the caller already keeps
-/// it. Uninhabited, so [`security_of`] provably answers `None` and
-/// [`create_secured`] is never reached: no syscall is added to any Unix write.
+/// Linux keeps the existing mode-only behaviour; Darwin also carries an ACL.
+pub const HAS_SECURITY: bool = cfg!(target_os = "macos");
+/// Only the Windows backend permits the unsupported-filesystem `--force` escape.
+pub const CAN_FORCE_ACL: bool = false;
+
+/// No additional protection is carried by the Linux backend. This does not claim
+/// that every Unix filesystem's protection consists solely of mode bits.
+#[cfg(not(target_os = "macos"))]
 pub enum Security {}
 
+#[cfg(not(target_os = "macos"))]
+impl Security {
+    pub fn preflight(&self, _path: &Path) -> io::Result<()> {
+        match *self {}
+    }
+}
+
 /// Always `None`, without a syscall; see [`Security`].
+#[cfg(not(target_os = "macos"))]
 pub fn security_of(_path: &Path) -> io::Result<Option<Security>> {
     Ok(None)
 }
 
 /// Unreachable: there is no [`Security`] to apply.
+#[cfg(not(target_os = "macos"))]
 pub fn create_secured(_path: &Path, sec: &Security) -> io::Result<File> {
     match *sec {}
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn copy_secured(_from: &Path, _to: &mut File, sec: &Security) -> io::Result<()> {
+    match *sec {}
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn verify_security(_f: &File, sec: &Security, _mode: u32) -> io::Result<()> {
+    match *sec {}
+}
+
+#[cfg(target_os = "macos")]
+pub use darwin_acl::{copy_secured, create_secured, security_of, verify_security, Security};
+
+/// Installer-only Darwin calls. libc 0.2.189 supplies fpathconf, fcopyfile, the
+/// flags and mode_t, but not the opaque ACL/filesec APIs. Declarations below are
+/// from Apple's sys/acl.h and sys/fcntl.h; see docs/architecture.md for provenance.
+/// No hook calls this module.
+#[cfg(target_os = "macos")]
+mod darwin_acl {
+    use super::*;
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::macos::fs::MetadataExt as DarwinMetadataExt;
+    use std::ptr::NonNull;
+
+    type Native = *mut libc::c_void;
+    const ACL_TYPE_EXTENDED: libc::c_uint = 0x100;
+    const ACL_FLAG_NO_INHERIT: libc::c_uint = 1 << 17;
+    const FILESEC_MODE: libc::c_uint = 4;
+    const FILESEC_ACL: libc::c_uint = 5;
+
+    extern "C" {
+        fn acl_set_fd_np(fd: libc::c_int, acl: Native, kind: libc::c_uint) -> libc::c_int;
+        fn acl_init(count: libc::c_int) -> Native;
+        fn acl_valid(acl: Native) -> libc::c_int;
+        fn acl_get_entry(acl: Native, id: libc::c_int, entry: *mut Native) -> libc::c_int;
+        fn acl_free(acl: Native) -> libc::c_int;
+        fn acl_get_flagset_np(acl: Native, flags: *mut Native) -> libc::c_int;
+        fn acl_add_flag_np(flags: Native, flag: libc::c_uint) -> libc::c_int;
+        fn acl_size(acl: Native) -> libc::ssize_t;
+        fn acl_copy_ext(buf: Native, acl: Native, size: libc::ssize_t) -> libc::ssize_t;
+        fn filesec_init() -> Native;
+        fn filesec_free(sec: Native);
+        fn filesec_query_property(
+            sec: Native,
+            property: libc::c_uint,
+            present: *mut libc::c_int,
+        ) -> libc::c_int;
+        fn filesec_get_property(sec: Native, property: libc::c_uint, value: Native) -> libc::c_int;
+        // Same inode64 selection as libc::fstat; arm64 has no legacy inode ABI.
+        #[cfg_attr(not(target_arch = "aarch64"), link_name = "fstatx_np$INODE64")]
+        fn fstatx_np(fd: libc::c_int, stat: *mut libc::stat, sec: Native) -> libc::c_int;
+        fn filesec_set_property(
+            sec: Native,
+            property: libc::c_uint,
+            value: *const libc::c_void,
+        ) -> libc::c_int;
+        fn fchmodx_np(fd: libc::c_int, sec: Native) -> libc::c_int;
+        fn openx_np(path: *const libc::c_char, flags: libc::c_int, sec: Native) -> libc::c_int;
+        // Public sys/stat.h API; libc 0.2.189 has no binding for it.
+        fn mkdirx_np(path: *const libc::c_char, sec: Native) -> libc::c_int;
+    }
+
+    struct Acl(NonNull<libc::c_void>);
+    impl Acl {
+        fn own(p: Native) -> io::Result<Self> {
+            NonNull::new(p)
+                .map(Self)
+                .ok_or_else(io::Error::last_os_error)
+        }
+        fn bytes(&self) -> io::Result<Vec<u8>> {
+            // SAFETY: a live ACL; acl_size and acl_copy_ext keep no pointers. The
+            // external format is zero-initialised by libc, includes ordered ACEs
+            // and ACL/entry flags, and does not include internal iterator state.
+            let size = unsafe { acl_size(self.0.as_ptr()) };
+            if size < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // u64 storage provides alignment for the native implementation.
+            let mut buf = vec![0u64; (size as usize).div_ceil(8)];
+            if unsafe { acl_copy_ext(buf.as_mut_ptr().cast(), self.0.as_ptr(), size) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: buf owns at least size initialised bytes, copied before drop.
+            Ok(unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), size as usize) }.to_vec())
+        }
+    }
+    impl Drop for Acl {
+        fn drop(&mut self) {
+            // SAFETY: the allocation returned by acl_init/filesec_get_property, once.
+            unsafe {
+                acl_free(self.0.as_ptr());
+            }
+        }
+    }
+
+    struct FileSec(NonNull<libc::c_void>);
+    impl FileSec {
+        fn new() -> io::Result<Self> {
+            // SAFETY: no arguments; caller owns the returned filesec allocation.
+            NonNull::new(unsafe { filesec_init() })
+                .map(Self)
+                .ok_or_else(io::Error::last_os_error)
+        }
+        fn set(&self, property: libc::c_uint, value: *const libc::c_void) -> io::Result<()> {
+            // SAFETY: callers supply a live property value of the header's type,
+            // or the documented REMOVE_ACL sentinel. filesec copies the value.
+            check(unsafe { filesec_set_property(self.0.as_ptr(), property, value) })
+        }
+    }
+    impl Drop for FileSec {
+        fn drop(&mut self) {
+            // SAFETY: this owns the filesec and its separate copied ACL buffer.
+            unsafe {
+                filesec_free(self.0.as_ptr());
+            }
+        }
+    }
+    fn check(rc: libc::c_int) -> io::Result<()> {
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// An existing file with no ACL still has an ownership/security snapshot.
+    /// Outer None alone means missing source and permits directory inheritance.
+    pub struct Security {
+        acl: Option<Acl>,
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+    }
+
+    impl Security {
+        /// Ask the filesystem with an empty private file, rather than guessing
+        /// whether these credentials can retain the source's ownership. This
+        /// catches privilege failures before installation/uninstallation writes.
+        pub fn preflight(&self, path: &Path) -> io::Result<()> {
+            let mut name = OsString::from(".");
+            name.push(path.file_name().unwrap_or(OsStr::new("settings")));
+            name.push(format!(".cctab-owner-probe.{}", std::process::id()));
+            let probe = path.parent().unwrap_or(Path::new(".")).join(name);
+            // EXCL: a colliding file belongs to somebody else and is never removed.
+            let f = create_private(&probe)?;
+            let result = apply_ownership(&f, self);
+            drop(f);
+            let cleanup = fs::remove_file(&probe);
+            result.and(cleanup)
+        }
+    }
+
+    fn read(f: &File) -> io::Result<Security> {
+        // SAFETY: live fd; this pathconf selector has a definite boolean answer.
+        match unsafe { libc::fpathconf(f.as_raw_fd(), libc::_PC_EXTENDED_SECURITY_NP) } {
+            1 => (),
+            0 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "filesystem does not support Darwin ACLs",
+                ))
+            }
+            _ => return Err(io::Error::last_os_error()),
+        }
+        let fs = FileSec::new()?;
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: live fd, writable libc stat (matching inode64 ABI) and filesec.
+        // Do NOT infer absence from acl_get_fd_np's NULL/ENOENT: that can mean
+        // either absent FILESEC_ACL or a failed underlying fstatx. Require a
+        // successful snapshot and then query the property explicitly.
+        check(unsafe { fstatx_np(f.as_raw_fd(), &mut stat, fs.0.as_ptr()) })?;
+        let mut present = 0;
+        check(unsafe { filesec_query_property(fs.0.as_ptr(), FILESEC_ACL, &mut present) })?;
+        let acl = if present == 0 {
+            None
+        } else {
+            let mut p: Native = std::ptr::null_mut();
+            // SAFETY: live filesec and acl_t output. FILESEC_ACL returns a NEW
+            // allocation; filesec retains its own separate native buffer.
+            check(unsafe {
+                filesec_get_property(fs.0.as_ptr(), FILESEC_ACL, (&mut p as *mut Native).cast())
+            })?;
+            Some(Acl::own(p)?)
+        };
+        Ok(Security {
+            acl,
+            uid: stat.st_uid,
+            gid: stat.st_gid,
+        })
+    }
+
+    pub fn security_of(path: &Path) -> io::Result<Option<Security>> {
+        let f = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        read(&f).map(Some)
+    }
+
+    fn apply(f: &File, sec: &Security) -> io::Result<()> {
+        match &sec.acl {
+            // SAFETY: live fd and ACL, which the call copies, keeping entry order.
+            Some(acl) => {
+                check(unsafe { acl_set_fd_np(f.as_raw_fd(), acl.0.as_ptr(), ACL_TYPE_EXTENDED) })
+            }
+            None => {
+                let fs = FileSec::new()?;
+                // sys/fcntl.h: this sentinel is the property argument itself,
+                // NOT a pointer to an acl_t containing the sentinel.
+                fs.set(FILESEC_ACL, 1usize as *const libc::c_void)?;
+                // SAFETY: live fd/filesec. Removes the empty staging ACL too.
+                check(unsafe { fchmodx_np(f.as_raw_fd(), fs.0.as_ptr()) })
+            }
+        }
+    }
+
+    fn verify_ownership(f: &File, sec: &Security) -> io::Result<()> {
+        let got = f.metadata()?;
+        if got.uid() != sec.uid || got.gid() != sec.gid {
+            return Err(io::Error::other("Darwin owner/group was not preserved"));
+        }
+        Ok(())
+    }
+
+    fn apply_ownership(f: &File, sec: &Security) -> io::Result<()> {
+        let got = f.metadata()?;
+        if got.uid() != sec.uid || got.gid() != sec.gid {
+            // Change only the differing IDs. Darwin requires privileges to change
+            // owner, and group membership to change group. Never accept best effort.
+            // SAFETY: live fd; (uid_t/gid_t)-1 leaves that ID unchanged.
+            check(unsafe {
+                libc::fchown(
+                    f.as_raw_fd(),
+                    if got.uid() == sec.uid { libc::uid_t::MAX } else { sec.uid },
+                    if got.gid() == sec.gid { libc::gid_t::MAX } else { sec.gid },
+                )
+            })
+            .map_err(|e| io::Error::new(e.kind(), format!("cannot preserve Darwin owner/group: {e}")))?;
+        }
+        verify_ownership(f, sec)
+    }
+
+    /// A filename probe must be private at birth even in an ACL-inheriting parent.
+    /// This adds directory creation without changing settings staging/preservation.
+    pub(super) fn create_probe_directory(path: &Path) -> io::Result<()> {
+        let name = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // SAFETY: owned, initially empty ACL and a borrowed flagset.
+        let birth = Acl::own(unsafe { acl_init(0) })?;
+        let mut flags = std::ptr::null_mut();
+        check(unsafe { acl_get_flagset_np(birth.0.as_ptr(), &mut flags) })?;
+        check(unsafe { acl_add_flag_np(flags, ACL_FLAG_NO_INHERIT) })?;
+        let fs = FileSec::new()?;
+        let mode: libc::mode_t = 0o700;
+        fs.set(FILESEC_MODE, (&mode as *const libc::mode_t).cast())?;
+        fs.set(FILESEC_ACL, (&birth.0.as_ptr() as *const Native).cast())?;
+        // SAFETY: live, NUL-terminated path and filesec; mkdir never reuses an entry.
+        check(unsafe { mkdirx_np(name.as_ptr(), fs.0.as_ptr()) })
+    }
+
+    /// Check the newly created directory's actual ACL before placing names in it.
+    pub(super) fn verify_probe_directory(f: &File) -> io::Result<()> {
+        let sec = read(f)?;
+        if let Some(acl) = sec.acl {
+            // SAFETY: owned ACL from a successful fstatx/filesec snapshot. Public
+            // sys/acl.h: ACL_FIRST_ENTRY=0; Apple's acl_entry.c returns -1/EINVAL
+            // at the end of a valid ACL, and 0 when an entry is present.
+            check(unsafe { acl_valid(acl.0.as_ptr()) })?;
+            let mut entry: Native = std::ptr::null_mut();
+            match unsafe { acl_get_entry(acl.0.as_ptr(), 0, &mut entry) } {
+                0 => return Err(io::Error::other("filename probe has access control entries")),
+                -1 => {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::EINVAL) {
+                        return Err(error);
+                    }
+                }
+                _ => return Err(io::Error::other("cannot verify filename probe ACL")),
+            }
+        }
+        Ok(())
+    }
+
+    fn create_private(path: &Path) -> io::Result<File> {
+        let name = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // Birth ACL: empty with NO_INHERIT. open(0600) alone would still inherit
+        // directory allow entries. openx's kernel inheritance pass also filters
+        // inherited ACEs, so apply the ORIGINAL ACL afterwards, on the empty file.
+        let birth = Acl::own(unsafe { acl_init(0) })?;
+        let mut flags = std::ptr::null_mut();
+        // SAFETY: live ACL and output pointer; flagset is borrowed from birth.
+        check(unsafe { acl_get_flagset_np(birth.0.as_ptr(), &mut flags) })?;
+        check(unsafe { acl_add_flag_np(flags, ACL_FLAG_NO_INHERIT) })?;
+        let fs = FileSec::new()?;
+        let mode: libc::mode_t = 0o600;
+        fs.set(FILESEC_MODE, (&mode as *const libc::mode_t).cast())?;
+        fs.set(FILESEC_ACL, (&birth.0.as_ptr() as *const Native).cast())?;
+        // SAFETY: nul-terminated path and live filesec. EXCL never opens an
+        // existing entry; returned fd is owned and CLOEXEC, just like OpenOptions.
+        let fd = unsafe {
+            openx_np(
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                fs.0.as_ptr(),
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+
+    pub fn create_secured(path: &Path, sec: &Security) -> io::Result<File> {
+        let f = create_private(path)?;
+        // chown can clear set-ID bits: ownership precedes ACL application and the
+        // caller's final chmod. All of this happens before configuration bytes.
+        if let Err(e) = apply_ownership(&f, sec)
+            .and_then(|()| apply(&f, sec))
+            .and_then(|()| verify_protection(&f, sec))
+        {
+            drop(f);
+            let _ = fs::remove_file(path);
+            return Err(e);
+        }
+        Ok(f)
+    }
+
+    /// Retain the STAT/XATTR/DATA metadata work of std's Darwin fs::copy. Do not
+    /// ask copyfile to copy ACLs: it merges explicit source and inherited TARGET
+    /// entries rather than preserving all source ACEs. The target is secured
+    /// already; verify its ownership and ACL again after copyfile and final chmod,
+    /// including copyfile's otherwise best-effort fchown.
+    pub fn copy_secured(from: &Path, to: &mut File, _sec: &Security) -> io::Result<()> {
+        let source = File::open(from)?;
+        // std's successful clone path also retains birth time; COPYFILE_STAT
+        // handles access/modification times but does not copy birth time.
+        let metadata = source.metadata()?;
+        let mut attrs: libc::attrlist = unsafe { std::mem::zeroed() };
+        attrs.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
+        attrs.commonattr = libc::ATTR_CMN_CRTIME;
+        let mut birth = libc::timespec {
+            tv_sec: metadata.st_birthtime(),
+            tv_nsec: metadata.st_birthtime_nsec(),
+        };
+        // SAFETY: the single requested attribute is a writable, aligned timespec.
+        check(unsafe {
+            libc::fsetattrlist(
+                to.as_raw_fd(),
+                (&mut attrs as *mut libc::attrlist).cast(),
+                (&mut birth as *mut libc::timespec).cast(),
+                std::mem::size_of::<libc::timespec>(),
+                0,
+            )
+        })?;
+        // SAFETY: live fds; NULL makes copyfile own/free its internal state.
+        check(unsafe {
+            libc::fcopyfile(
+                source.as_raw_fd(),
+                to.as_raw_fd(),
+                std::ptr::null_mut(),
+                libc::COPYFILE_DATA | libc::COPYFILE_STAT | libc::COPYFILE_XATTR,
+            )
+        })
+    }
+
+    fn verify_protection(f: &File, sec: &Security) -> io::Result<()> {
+        let got = read(f)?;
+        if got.uid != sec.uid || got.gid != sec.gid {
+            return Err(io::Error::other("Darwin owner/group was not preserved"));
+        }
+        let bytes = |s: &Security| s.acl.as_ref().map(Acl::bytes).transpose();
+        if bytes(&got)? != bytes(sec)? {
+            return Err(io::Error::other("Darwin ACL was not preserved"));
+        }
+        Ok(())
+    }
+    pub fn verify_security(f: &File, sec: &Security, wanted: u32) -> io::Result<()> {
+        verify_protection(f, sec)?;
+        if mode(&f.metadata()?) != Some(wanted) {
+            return Err(io::Error::other("Darwin mode was not preserved"));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::process::Command;
+
+        fn run(command: &str, args: &[&OsStr]) -> String {
+            let out = Command::new(command)
+                .args(args)
+                .output()
+                .expect("native tool");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).expect("tool output")
+        }
+        fn acl(path: &Path) -> Vec<String> {
+            run("/bin/ls", &[OsStr::new("-lde"), path.as_os_str()])
+                .lines()
+                .skip(1)
+                .map(str::to_owned)
+                .collect()
+        }
+
+        #[test]
+        fn ownership_preflight_removes_its_probe_but_keeps_collisions() {
+            let dir = std::env::temp_dir()
+                .join(format!("cctab-darwin-owner-probe-{}", std::process::id()));
+            fs::create_dir(&dir).expect("mkdir");
+            let source = dir.join("source");
+            fs::write(&source, b"secret").expect("fixture");
+            let sec = security_of(&source).expect("readable").expect("existing");
+            let probe = dir.join(format!(".source.cctab-owner-probe.{}", std::process::id()));
+            sec.preflight(&source).expect("ownership possible");
+            assert!(!probe.exists());
+            fs::write(&probe, b"somebody else's file").expect("collision");
+            assert_eq!(sec.preflight(&source).expect_err("EXCL").kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read(&probe).expect("kept"), b"somebody else's file");
+            assert_eq!(fs::read(&source).expect("untouched"), b"secret");
+            fs::remove_dir_all(dir).expect("cleanup");
+        }
+
+        /// chmod sets fixtures and ls observes them independently of our helpers.
+        /// Check the returned staging fd, including ownership, with ZERO bytes.
+        #[test]
+        fn staging_has_the_source_protection_before_any_configuration_bytes() {
+            let dir =
+                std::env::temp_dir().join(format!("cctab-darwin-staging-{}", std::process::id()));
+            fs::create_dir(&dir).expect("mkdir");
+            let source = dir.join("source");
+            fs::write(&source, b"secret").expect("fixture");
+            let parent_group = dir.metadata().expect("stat dir").gid();
+            let groups = run("/usr/bin/id", &[OsStr::new("-G")]);
+            if let Some(group) = groups.split_whitespace()
+                .find(|g| g.parse::<u32>().expect("group ID") != parent_group) {
+                run("/usr/bin/chgrp", &[OsStr::new(group), source.as_os_str()]);
+            }
+            set_mode(&source, 0o2640).expect("fixture mode");
+            let owner = source.metadata().expect("stat source");
+            run(
+                "/bin/chmod",
+                &[
+                    OsStr::new("+a"),
+                    OsStr::new("group:everyone allow read,file_inherit,directory_inherit"),
+                    dir.as_os_str(),
+                ],
+            );
+            for explicit in [false, true] {
+                run("/bin/chmod", &[OsStr::new("-N"), source.as_os_str()]);
+                if explicit {
+                    run(
+                        "/bin/chmod",
+                        &[
+                            OsStr::new("+a"),
+                            OsStr::new("user:nobody deny read,write,execute"),
+                            source.as_os_str(),
+                        ],
+                    );
+                }
+                let wanted = acl(&source);
+                let sec = security_of(&source)
+                    .expect("ACL readable")
+                    .expect("existing");
+                let target = dir.join("staging");
+                let mut f = create_secured(&target, &sec).expect("secured");
+                assert_eq!(f.metadata().expect("stat").len(), 0);
+                let staging = f.metadata().expect("stat");
+                assert_eq!((staging.uid(), staging.gid()), (owner.uid(), owner.gid()));
+                assert_eq!(acl(&target), wanted, "staging before write");
+                set_mode(&target, 0o2640).expect("chmod");
+                verify_security(&f, &sec, 0o2640).expect("protection before bytes");
+                f.write_all(b"secret").expect("write");
+                set_mode(&target, 0o2640).expect("final chmod");
+                verify_security(&f, &sec, 0o2640).expect("final protection");
+                assert_eq!(acl(&target), wanted, "after chmod and write");
+                drop(f);
+                fs::remove_file(target).expect("cleanup");
+            }
+            fs::remove_dir_all(dir).expect("cleanup");
+        }
+    }
 }
 
 /// Whether any execute bit is set. Always an answer on Unix.
@@ -205,21 +871,160 @@ pub fn sweep_replaced(_dir: &Path) -> Vec<PathBuf> {
     Vec::new()
 }
 
-/// The spelling of `p` that is compared, printed and recorded: `p` itself. A Unix
-/// path has one spelling per name - no short names, no verbatim prefix - and case
-/// is the filesystem's business, not this program's.
+/// The spelling printed and recorded. Keep links and `..` intact: folding
+/// `alias/..` lexically can change the directory the kernel actually reaches.
+/// Management identity is a separate, fallible filesystem question below.
 pub fn normalize(p: &Path) -> PathBuf {
-    p.to_path_buf()
+    // Remove redundant separators and `.` (including a trailing `/.` which would
+    // make lstat follow a root symlink). Preserve every `..` for the kernel.
+    p.components().collect()
 }
 
-/// Whether `a` and `b` are the same path: component-wise equality.
-pub fn same_path(a: &Path, b: &Path) -> bool {
-    a == b
+/// A destination, including one not yet created. Only ENOENT from lstat removes
+/// a component; a dangling link, EACCES, ENOTDIR or ELOOP is an inspection failure.
+/// Containment requires a directory; equality can also identify a file that an
+/// old plugin link points at. Any missing suffix requires a directory ancestor.
+/// Callers must inspect the root link separately before writing or removing it.
+struct Destination {
+    existing: PathBuf,
+    id: FileId,
+    directory: bool,
+    missing: Vec<OsString>,
 }
 
-/// Whether `p` is `base` or lies beneath it: a component-prefix test, lexical.
-pub fn is_within(p: &Path, base: &Path) -> bool {
-    p == base || p.starts_with(base)
+fn destination(p: &Path) -> Result<Destination, String> {
+    let absolute = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(|e| e.to_string())?.join(p)
+    };
+    let mut at = absolute.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match fs::symlink_metadata(at) {
+            Ok(_) => {
+                let existing = fs::canonicalize(at)
+                    .map_err(|e| format!("cannot resolve {}: {}", at.display(), e))?;
+                let md = fs::metadata(&existing)
+                    .map_err(|e| format!("cannot inspect {}: {}", existing.display(), e))?;
+                if !md.is_dir() && !missing.is_empty() {
+                    return Err(format!("{} is not a directory", at.display()));
+                }
+                missing.reverse();
+                return Ok(Destination {
+                    existing,
+                    id: file_id(&md).unwrap(),
+                    directory: md.is_dir(),
+                    missing,
+                });
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // file_name deliberately refuses `..`: absent/../x cannot be
+                // resolved by the kernel, and must not be silently folded away.
+                match (at.parent(), at.file_name()) {
+                    (Some(parent), Some(name)) => {
+                        missing.push(name.to_os_string());
+                        at = parent;
+                    }
+                    _ => return Err(format!("cannot resolve {}: {}", at.display(), e)),
+                }
+            }
+            Err(e) => return Err(format!("cannot inspect {}: {}", at.display(), e)),
+        }
+    }
+}
+
+fn directory_destination(p: &Path) -> Result<Destination, String> {
+    let d = destination(p)?;
+    if !d.directory {
+        return Err(format!("{} is not a directory", p.display()));
+    }
+    Ok(d)
+}
+
+/// Physical ancestors of the destination, deepest existing directory first.
+/// Used by checkout guards, never by hook location or title formatting.
+pub fn destination_ancestors(p: &Path) -> Result<Vec<PathBuf>, String> {
+    Ok(directory_destination(p)?
+        .existing
+        .ancestors()
+        .map(Path::to_path_buf)
+        .collect())
+}
+
+/// Directory destination identity, following links. This does NOT establish
+/// ownership of the root link itself; lstat guards retain that responsibility.
+pub fn same_path(a: &Path, b: &Path) -> Result<bool, String> {
+    let (a, b) = (destination(a)?, destination(b)?);
+    if a.id != b.id || a.missing.len() != b.missing.len() {
+        return Ok(false);
+    }
+    same_missing(&a.existing, &a.missing, &b.missing)
+}
+
+/// Would a directory created at `p` land at or below `base`? Existing directories
+/// compare by device/inode, including case, normalisation and ancestor-link aliases.
+/// Missing components compare only with evidence from their existing ancestor.
+pub fn is_within(p: &Path, base: &Path) -> Result<bool, String> {
+    let (p, base) = (directory_destination(p)?, directory_destination(base)?);
+    if base.missing.is_empty() {
+        for at in p.existing.ancestors() {
+            let md =
+                fs::metadata(at).map_err(|e| format!("cannot inspect {}: {}", at.display(), e))?;
+            if file_id(&md) == Some(base.id) {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    // A genuinely absent component cannot alias an already existing directory.
+    // Thus two prospective destinations can intersect only at the same anchor.
+    if p.id != base.id || p.missing.len() < base.missing.len() {
+        return Ok(false);
+    }
+    same_missing(&p.existing, &p.missing[..base.missing.len()], &base.missing)
+}
+
+fn same_missing(ancestor: &Path, a: &[OsString], b: &[OsString]) -> Result<bool, String> {
+    for (a, b) in a.iter().zip(b) {
+        if a != b && !same_missing_name(ancestor, a, b)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn same_missing_name(_ancestor: &Path, a: &OsStr, b: &OsStr) -> Result<bool, String> {
+    Ok(a == b)
+}
+
+#[cfg(target_os = "macos")]
+#[path = "darwin_names.rs"]
+mod darwin_names;
+
+#[cfg(target_os = "macos")]
+fn same_missing_name(ancestor: &Path, a: &OsStr, b: &OsStr) -> Result<bool, String> {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if !a.is_ascii() || !b.is_ascii() {
+        return darwin_names::same_missing_name(ancestor, a, b);
+    }
+    let path = std::ffi::CString::new(ancestor.as_os_str().as_bytes())
+        .map_err(|e| format!("invalid directory path: {}", e))?;
+    // XNU bsd/sys/unistd.h and hfs/core/hfs_vnops.c: _PC_CASE_SENSITIVE
+    // returns 0 or 1. The locked libc supplies the constant and declaration.
+    // Unknown/unsupported answers remain errors, never evidence of separation.
+    // SAFETY: the NUL-terminated path outlives this read-only call.
+    let sensitive = unsafe { libc::pathconf(path.as_ptr(), libc::_PC_CASE_SENSITIVE) };
+    match sensitive {
+        0 => Ok(a.eq_ignore_ascii_case(b)),
+        1 => Ok(a == b),
+        _ => Err(format!(
+            "cannot establish case sensitivity beneath {} (pathconf returned {})",
+            ancestor.display(),
+            sensitive
+        )),
+    }
 }
 
 /// What follows `home` in `path`, when `path` is `home` or lies beneath it: empty for
@@ -253,37 +1058,208 @@ pub fn is_set_aside(_name: &str) -> bool {
 }
 
 /// Field 22 of `/proc/<pid>/stat`: the process start time, in clock ticks since
-/// boot. `None` when the process is gone - or on a Unix with no `/proc`.
-///
-/// Parsed after the LAST `") "`, never by splitting the whole line on spaces.
-/// Field 2 is the executable name in parentheses and may itself contain both -
-/// measured on this machine, `/proc/1259713/stat` holds `(npm exec chrome...)`, so
-/// the naive split reads the wrong field for exactly the processes a `claude`
-/// session spawns. The tail begins at field 3, so field 22 is its 20th word.
+/// boot. `None` when the process is gone. The read is the only part of this that
+/// is a system call; [`start_time_from_stat`] is the parse.
+#[cfg(not(target_os = "macos"))]
 pub fn process_start_time(pid: u32) -> Option<u64> {
-    let raw = fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
-    let w = raw.rsplit_once(") ")?.1.split(' ').nth(19)?;
+    start_time_from_stat(&fs::read(format!("/proc/{}/stat", pid)).ok()?)
+}
+
+/// That parse, as a pure function of the bytes the file holds - the same rule the
+/// rest of this page follows, and here it is what makes the non-UTF-8 case below
+/// reachable from a test at all.
+///
+/// Read after the LAST `") "`, never by splitting the whole line on spaces. Field 2
+/// is the executable name in parentheses and may itself contain both - measured on
+/// this machine, `/proc/1259713/stat` holds `(npm exec chrome...)`, so the naive
+/// split reads the wrong field for exactly the processes a `claude` session spawns.
+/// The tail begins at field 3, so field 22 is its 20th word.
+///
+/// BYTES, and no longer `read_to_string`: field 2 is `comm`, the first 15 bytes of
+/// the executable's name, which the kernel copies out unvalidated. `read_to_string`
+/// answers `Err` for a name that is not UTF-8, so a LIVE and fully readable process
+/// reported no start time - measured here by running a copy of `sleep` renamed with
+/// a `0xff` byte in it, whose `/proc/<pid>/stat` fails to decode while every field
+/// this reads is plain ASCII. `from_utf8_lossy` replaces bytes only INSIDE the
+/// parenthesised name, which the split below skips past, so the fields it reads are
+/// unchanged and a valid-UTF-8 `stat` parses byte for byte as it did.
+#[cfg(not(target_os = "macos"))]
+fn start_time_from_stat(raw: &[u8]) -> Option<u64> {
+    let text = String::from_utf8_lossy(raw);
+    let w = text.rsplit_once(") ")?.1.split(' ').nth(19)?;
     if w.is_empty() || w.len() > 20 || !w.bytes().all(|c| c.is_ascii_digit()) {
         return None;
     }
     w.parse().ok()
 }
 
-/// Whether `pid` names a running process: its `/proc` entry exists. On a Unix
-/// with no `/proc` this answers `Some(false)`, as the check always has there.
+/// Whether `pid` names a running process: its `/proc` entry exists.
+#[cfg(not(target_os = "macos"))]
 pub fn process_alive(pid: u32) -> Option<bool> {
     Some(Path::new(&format!("/proc/{}", pid)).exists())
 }
 
+/// The macOS start time: `proc_pidinfo`'s `PROC_PIDTBSDINFO`, whose
+/// `pbi_start_tvsec`/`pbi_start_tvusec` pair [`bsdinfo_start`] packs into the one
+/// number a record stores. `None` when the pid is gone, is not a pid this platform
+/// can name, or the kernel filled less than the whole struct.
+///
+/// `libc` declares both the call and `proc_bsdinfo`, so nothing here is a
+/// hand-written `#[repr(C)]` layout. The native process test checks the returned
+/// start time against the child's creation interval, as well as its stable identity;
+/// cross-checking a declaration alone cannot validate the kernel's answer.
+#[cfg(target_os = "macos")]
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    let pid = pid_to_ask_about(pid)?;
+    let want = std::mem::size_of::<libc::proc_bsdinfo>();
+    let size = i32::try_from(want).ok()?;
+    // SAFETY: `proc_bsdinfo` is plain integers and byte arrays, so all-zero is a
+    // valid value of it; nothing is read out of the buffer except through
+    // `bsdinfo_start`, which answers only when the kernel says it filled all of it.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    // SAFETY: the pointer and `size` describe that same live buffer exactly, so the
+    // call writes at most `size` bytes inside it; it keeps no pointer to it, and
+    // `info` outlives the call.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::from_mut(&mut info).cast(),
+            size,
+        )
+    };
+    bsdinfo_start(filled, want, info.pbi_start_tvsec, info.pbi_start_tvusec)
+}
+
+/// Whether `pid` names a running process, asked with `kill(pid, 0)`: signal 0 is
+/// the existence-and-permission question and DELIVERS NOTHING. [`liveness_from_kill`]
+/// decides what the answer means.
+#[cfg(target_os = "macos")]
+pub fn process_alive(pid: u32) -> Option<bool> {
+    let pid = pid_to_ask_about(pid)?;
+    // SAFETY: two integers to a libc wrapper round a syscall; it reads and writes
+    // no memory of ours, and signal 0 sends no signal to anything.
+    let rc = unsafe { libc::kill(pid, 0) };
+    // `last_os_error` is read unconditionally and is stale when `rc` is 0 - which
+    // is the one case the mapping decides without looking at it.
+    liveness_from_kill(rc, io::Error::last_os_error().raw_os_error().unwrap_or(0))
+}
+
+/// `pid` as the `pid_t` these two ASK ABOUT, or `None` when it is not one - the
+/// third decision on this page, and pure for the same reason the other two are.
+///
+/// `kill(2)` does not take a pid alone: it reads 0 as "every process in MY OWN
+/// process group" and a negative number as "the group whose id is -pid". Both
+/// SUCCEED, and `kill(0, 0)` succeeds always, because the caller is in its own
+/// group - so a record naming pid 0 would be answered `Some(true)`, a live process
+/// that does not exist, by the one function whose whole purpose is to answer only
+/// what it can prove. `i32::try_from` rules out the negatives already, since a
+/// `u32` above `i32::MAX` does not convert; 0 is what has to be named, and it is
+/// named HERE rather than in either body so that a Linux test runs it.
+///
+/// `None`, not `Some(false)`: this is a question that cannot be asked, and the
+/// invariant is that only evidence - `ESRCH` - claims a death. Linux answers
+/// `Some(false)` for the same pids because `/proc/0` genuinely is not there, which
+/// is evidence; macOS has none to offer and says so.
+#[cfg(any(target_os = "macos", test))]
+fn pid_to_ask_about(pid: u32) -> Option<i32> {
+    i32::try_from(pid).ok().filter(|p| *p > 0)
+}
+
+/// The two `errno` values the mapping below names. POSIX fixes both, and macOS and
+/// Linux agree on them; naming them here rather than reaching for `libc::ESRCH` is
+/// what lets a Linux `cargo test` run the decision. The macOS build checks them
+/// against the platform's own constants at compile time - see below - so a
+/// disagreement is a build failure on the Mac and never a wrong answer on one.
+#[cfg(any(target_os = "macos", test))]
+const EPERM: i32 = 1;
+#[cfg(any(target_os = "macos", test))]
+const ESRCH: i32 = 3;
+
+// The numbers above against the platform's own. `cargo check` for the Mac evaluates
+// this, so the one fact a Linux test cannot see is checked by the compiler instead.
+#[cfg(target_os = "macos")]
+const _: () = assert!(EPERM == libc::EPERM && ESRCH == libc::ESRCH);
+
+/// What a `kill(pid, 0)` outcome says about the process, as a pure function of the
+/// return value and `errno` - so the macOS body above is a call and not a branch,
+/// and this file's only liveness DECISION is one a Linux test runs.
+///
+/// `EPERM` is `Some(true)`: a process this user may not signal is a process that
+/// EXISTS, which is the whole of what the reaper asks. Anything else is `None`,
+/// "cannot tell", which [`same_process`] passes on and the reaper reads as "keep
+/// the record". `Some(false)` is a CLAIM OF DEATH and is made for `ESRCH` alone -
+/// this function's reason for existing is that the `/proc` body above used to make
+/// that claim for every live process on macOS.
+#[cfg(any(target_os = "macos", test))]
+fn liveness_from_kill(rc: i32, errno: i32) -> Option<bool> {
+    match (rc, errno) {
+        (0, _) => Some(true),
+        (_, ESRCH) => Some(false),
+        (_, EPERM) => Some(true),
+        _ => None,
+    }
+}
+
+/// The start time a macOS record stores: MICROSECONDS since the epoch, which is
+/// `proc_bsdinfo`'s seconds-and-microseconds pair as one number. A third encoding -
+/// hence a third [`ORIGIN_KEY`] - and one `u64` holds it until the year 586524.
+///
+/// `filled` is what `proc_pidinfo` RETURNED, which is the byte count it wrote and
+/// not a status: a dead pid fills 0, and a short fill would leave the fields this
+/// reads holding the zeros the buffer was created with - a start time of 0, which
+/// compares equal to the next short fill and would make a dead session's pid look
+/// like the same process forever. Only an exactly-full struct is an answer.
+///
+/// Saturating, not wrapping: the multiply cannot overflow for any real start time,
+/// and `panic = "abort"` means the debug-build check would be a crash in a hook
+/// rather than a test failure.
+#[cfg(any(target_os = "macos", test))]
+fn bsdinfo_start(filled: i32, want: usize, tvsec: u64, tvusec: u64) -> Option<u64> {
+    (usize::try_from(filled) == Ok(want))
+        .then(|| tvsec.saturating_mul(1_000_000).saturating_add(tvusec))
+}
+
 /// Whether the process that recorded `(pid, start)` is still that process:
 /// `Some(true)` it is, `Some(false)` provably not - gone, or the pid given to
-/// another - and `None` when that cannot be told. The same two `/proc` reads, in
-/// the same order, that the reaper has always made.
+/// another - and `None` when that cannot be told. The same two questions, in the
+/// same order, that the reaper has always asked; only whom they are put to differs.
 pub fn same_process(pid: u32, start: u64) -> Option<bool> {
-    if process_start_time(pid) == Some(start) {
-        Some(true)
-    } else {
-        process_alive(pid).map(|_| false)
+    same_as_recorded(process_start_time(pid), start, || process_alive(pid))
+}
+
+/// That decision, as a pure function of the two answers, with the second asked only
+/// when the first did not settle it - which is also what puts every combination,
+/// including ones this machine cannot stage, in front of a test.
+///
+/// A start time settles it either way: it is the process under that pid NOW. Without
+/// one, only a pid PROVEN not to exist says the record's process is gone. "Alive but
+/// unreadable" is `None`, and the reaper keeps the record.
+///
+/// The old shape was "alive, therefore some OTHER process has this pid", and it was
+/// safe only where that pair cannot arise. It arises immediately on macOS, where a
+/// process this user may not inspect answers `EPERM`: alive, with no start time.
+/// Reading that as a reused pid unlinks a LIVE session's record.
+///
+/// It is reachable on Linux too, which is worth saying plainly rather than claiming
+/// `/proc` makes it impossible. A `hidepid` mount is one way. The other was found
+/// here by measurement: `/proc/<pid>/stat` embeds `comm` verbatim, so a process
+/// whose executable name is not UTF-8 decoded as `Err` and reported no start time
+/// while being perfectly readable and alive. [`start_time_from_stat`] closes that
+/// one at the source by parsing bytes, but the pair itself is not hypothetical and
+/// this function is what makes it harmless either way.
+///
+/// Windows' backend has always had this shape - `Probe::Unknown` -> `None` - and
+/// this is the Unix side agreeing with it.
+fn same_as_recorded(
+    now: Option<u64>,
+    recorded: u64,
+    alive: impl FnOnce() -> Option<bool>,
+) -> Option<bool> {
+    match now {
+        Some(t) => Some(t == recorded),
+        None => alive().and_then(|a| (!a).then_some(false)),
     }
 }
 
@@ -292,22 +1268,273 @@ pub fn same_process(pid: u32, start: u64) -> Option<bool> {
 /// here; `CLAUDE_PID` is exported into every hook subprocess.
 ///
 /// THE HEADLESS GUARD: unless fd 1 of that pid resolves to a writable character
-/// device under /dev/pts or /dev/tty, do nothing rather than retitle an unrelated
-/// terminal - which covers a redirected `claude -p` and every platform with no
-/// /proc. `None` is therefore both "no tab to paint" and "fd 1 would not resolve",
-/// deliberately the same answer: painting on a guess is the one outcome that
-/// retitles somebody else's terminal.
+/// device under /dev/pts or /dev/tty, and the acquired descriptor is a character
+/// device and an actual terminal, do nothing rather than retitle an unrelated
+/// terminal - which covers a redirected `claude -p` and every platform where fd 1
+/// cannot be resolved at all. `None` is therefore both "no tab to paint" and "fd 1
+/// would not resolve", deliberately the same answer: painting on a guess is the one
+/// outcome that retitles somebody else's terminal.
+///
+/// Lookup, open and inspection failures all return `None`. The shared
+/// [`open_tty`] retains the acquired descriptor and requests `O_NOCTTY` on Darwin;
+/// hooks may themselves be detached session leaders without a controlling terminal.
 pub fn session_tty(claude_pid: &OsStr) -> Option<File> {
+    let target = fd1_path(claude_pid)?;
+    open_tty(&target).ok().flatten()
+}
+
+/// What fd 1 of `claude_pid` names, where a `/proc` says so: the symlink
+/// `/proc/<pid>/fd/1`, read as a path. The pid is pasted in as the bytes it arrived
+/// as and never parsed - a name that is not a live pid's fd is a `read_link` error,
+/// which is the same `None` a rejected parse would have produced. This is also the
+/// line `tests/oracle/tabstatus.sh` implements as `readlink "/proc/$CLAUDE_PID/fd/1"`,
+/// and the 312-case replay compares the two, so it stays a paste.
+///
+/// Measured while writing the macOS side, and left alone deliberately: because the
+/// bytes are pasted, a `$CLAUDE_PID` of `../../dev` makes `/proc/../../dev/fd/1`,
+/// and `/dev/fd` IS a symlink to `/proc/self/fd` - so that one name resolves, to
+/// THIS hook's own fd 1. It buys nothing: the guard downstream still demands a
+/// writable pty, so the worst it reaches is the terminal the hook is already
+/// running in, and `$CLAUDE_PID` comes from the process that spawned the hook.
+/// macOS cannot reach even that, for the unrelated reason that a system call takes
+/// a number and `parse_pid` is what produces one - which is a `cfg` away from here,
+/// so this sentence names it rather than linking it.
+#[cfg(not(target_os = "macos"))]
+fn fd1_path(claude_pid: &OsStr) -> Option<PathBuf> {
     let mut link = OsString::from("/proc/");
     link.push(claude_pid);
     link.push("/fd/1");
-    let target = fs::read_link(Path::new(&link)).ok()?;
-    if !is_tty_path(&target) || !is_char_device(&target.metadata().ok()?.file_type()) {
+    fs::read_link(Path::new(&link)).ok()
+}
+
+/// The same question where there is no `/proc`: `proc_pidfdinfo` with the
+/// `PROC_PIDFDVNODEPATHINFO` flavour, whose `vip_path` is the path fd 1's vnode
+/// hangs at. [`fd1_path_from_vnode`] turns the answer into a path, and everything
+/// after that is the shared guard above.
+///
+/// THE HEADLESS GUARD SURVIVES, which is the whole reason this route is usable:
+/// the kernel serves this flavour only for a vnode, so a PIPE OR SOCKET on fd 1 is
+/// `EBADF` and never a path, and an fd 1 redirected to a file yields that FILE's
+/// path, which [`is_tty_path`] rejects. Nothing here has to recognise a headless
+/// session; it falls out of what the call will and will not answer.
+///
+/// `e_tdev` from `proc_bsdinfo` - which [`process_start_time`] already reads, and
+/// which needs no new declaration at all - is deliberately NOT used: it is the
+/// CONTROLLING terminal, which a redirected `claude -p > file` still has, so it
+/// would name a terminal that is not this session's output. That is exactly the
+/// substitution the guard exists to refuse.
+#[cfg(target_os = "macos")]
+fn fd1_path(claude_pid: &OsStr) -> Option<PathBuf> {
+    let pid = pid_to_ask_about(parse_pid(claude_pid)?)?;
+    let want = std::mem::size_of::<abi::VnodeFdInfoWithPath>();
+    let size = i32::try_from(want).ok()?;
+    // SAFETY: every field of this struct, transitively, is an integer or an array
+    // of integers, so all-zero is a valid value of it. Nothing is read out of it
+    // except `pvip.vip_path`, and only after the byte count says the kernel filled
+    // the whole of it.
+    let mut info: abi::VnodeFdInfoWithPath = unsafe { std::mem::zeroed() };
+    // SAFETY: the pointer and `size` describe that same live buffer exactly, so the
+    // call writes at most `size` bytes inside it; it keeps no pointer to it, and
+    // `info` outlives the call. The kernel refuses a `size` below the flavour's own
+    // before it copies anything - see the declarations below - so the one way to
+    // get this wrong is an error return.
+    let nb = unsafe {
+        libc::proc_pidfdinfo(
+            pid,
+            1,
+            abi::PROC_PIDFDVNODEPATHINFO,
+            std::ptr::from_mut(&mut info).cast(),
+            size,
+        )
+    };
+    // `vip_path` is `[[c_char; 32]; 32]` because libc spells a 1024-byte array that
+    // way; flatten it into the bytes a path is made of. `as u8` is the identity on
+    // whichever sign the platform gives `c_char` and copies no other byte.
+    let raw: Vec<u8> = info.pvip.vip_path.iter().flatten().map(|&c| c as u8).collect();
+    fd1_path_from_vnode(nb, want, &raw)
+}
+
+/// The kernel's answer read as a path, as a pure function of the byte count it
+/// returned and the bytes it wrote - so the macOS body above is a call and a `?`,
+/// and every DECISION in it is one a Linux `cargo test` runs.
+///
+/// `nb` is a byte count, not a status: `nb <= 0` is the error return, and it does
+/// not convert. BOTH halves of that matter, because `libproc`'s userland wrapper
+/// and the system call under it do not agree on how a failure looks - one reports
+/// it as -1 and the other can surface 0. Requiring EXACTLY `want` refuses
+/// every value that is not a full struct, by construction, so the distinction has
+/// no way to matter here and no claim about it is relied on. `ENOENT` means the
+/// vnode was REVOKED - an fd whose terminal went away - and it is the same `None`
+/// as any other failure, because both mean there is no tab to paint.
+///
+/// A count that is not exactly `want` is a hard error and
+/// not a short read to tolerate: the fields this reads would be holding the zeros
+/// the buffer was created with, and a zero-length path is not a refusal this can
+/// tell apart from a real one. The taxonomy is lsof's technique - `nb <= 0`, the
+/// revoked vnode, a short count as an error - and none of its code.
+///
+/// It is also what makes a wrong `PROC_PIDFDVNODEPATHINFO` harmless: another
+/// flavour fills its own smaller struct and returns ITS size, which is not `want`.
+///
+/// Then the NUL. `vip_path` is a C string in a fixed array, so the path ends at the
+/// first zero byte and the rest is whatever was there. lsof forces a terminator
+/// into the last byte before calling `strlen`; a Rust slice cannot be walked off
+/// the end in the first place, so what is left is the policy, and the policy here
+/// is stricter: an array with NO zero in it is refused rather than truncated to its
+/// last byte. `MAXPATHLEN` counts the terminator, so a real path always has one,
+/// and a truncated path names a DIFFERENT file - which is the one thing the guard
+/// downstream cannot catch, since /dev/pts/12 truncated to /dev/pts/1 is also a
+/// writable character device, belonging to somebody else's terminal.
+///
+/// An empty path is `None` for the same reason it is not a path.
+///
+/// The bytes become an `OsString` unaltered: a path is bytes on Unix, and a
+/// filesystem that holds a name which is not UTF-8 still holds a name.
+#[cfg(any(target_os = "macos", test))]
+fn fd1_path_from_vnode(nb: i32, want: usize, raw: &[u8]) -> Option<PathBuf> {
+    if usize::try_from(nb) != Ok(want) {
         return None;
     }
-    // Asking whether it is writable and opening it are the same question; ask it
-    // once.
-    OpenOptions::new().write(true).open(&target).ok()
+    let end = raw.iter().position(|b| *b == 0)?;
+    let name = raw.get(..end)?;
+    if name.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(os_string_from_vec(name.to_vec())))
+}
+
+/// The macOS ABI: the two `proc_info.h` declarations `libc` does not carry, and
+/// the compile-time guards that pin their layout. ONE `cfg` for the whole
+/// module, because nothing in it has a Linux counterpart to sit beside.
+#[cfg(target_os = "macos")]
+mod abi {
+    /// The flavour that answers with a vnode's path. `libc` 0.2.189 declares neither
+    /// this nor the struct below - measured against the crate source, not assumed - so
+    /// both are written out here; see the declarations for what makes that sound.
+    pub(super) const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+
+    /// `struct proc_fileinfo`, and below it `struct vnode_fdinfowithpath`: the two
+    /// halves of what `proc_pidfdinfo`'s `PROC_PIDFDVNODEPATHINFO` copies out.
+    ///
+    /// WHAT THIS CONFORMS TO. The interface is `xnu`'s `bsd/sys/proc_info.h` - the field
+    /// order every caller of that flavour must match to interoperate at all. Nothing is
+    /// copied from it: no text, no comments, no transcription. Apple's source is APSL
+    /// 2.0 and this program is GPL-3.0-or-later, so an ABI is the only thing that may
+    /// cross, and an ABI is an interface rather than an expression of one.
+    ///
+    /// LAYOUT CHECKS ARE NOT RUNTIME VALIDATION. The `const _` block below fails
+    /// `cargo check` on both Apple ABIs unless the required sizes and offsets match
+    /// the header. Native arm64 CI separately links and exercises this call through
+    /// disposable PTYs and redirected stdout; see docs/architecture.md for execution
+    /// status and remaining limits. The nested types are libc's OWN
+    /// (`vinfo_stat`, `vnode_info`, `vnode_info_path`), and libc checks those against
+    /// Apple's real SDK on its own CI; what is added here is five scalars and two
+    /// fields, all of which the asserts pin.
+    ///
+    /// AND A WRONG SIZE WOULD NOT BE CORRUPTION ANYWAY. The kernel compares the
+    /// `buffersize` it was handed against this flavour's own size and returns `ENOMEM`
+    /// before it copies a byte, then copies out exactly that many. The direction is
+    /// kernel to user into a buffer we sized ourselves, so a mistake is an error
+    /// return that [`fd1_path_from_vnode`](super::fd1_path_from_vnode) reads as
+    /// `None` - never a write past the end of anything.
+    ///
+    /// WHO MAY ASK. The gate is the same-user check, not an entitlement: this asks
+    /// about `$CLAUDE_PID`, which is this user's own `claude`, and it works under SIP
+    /// with no privilege of any kind.
+    ///
+    /// The fields are named for the ABI and read through `pvip` alone; the rest are
+    /// here to occupy the bytes the kernel writes, which is what the asserts check.
+    #[allow(dead_code)]
+    #[repr(C)]
+    pub(super) struct ProcFileInfo {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: libc::off_t,
+        fi_type: i32,
+        fi_guardflags: u32,
+    }
+
+    #[allow(dead_code)]
+    #[repr(C)]
+    pub(super) struct VnodeFdInfoWithPath {
+        pfi: ProcFileInfo,
+        pub(super) pvip: libc::vnode_info_path,
+    }
+
+    // The layout, checked by the compiler that will build for the Mac. These numbers
+    // are the header's, and a build that disagrees with any one of them does not
+    // produce a binary - which is the whole of what stands in for running this
+    // anywhere. They are not vacuous: adding one spurious `u32` to `ProcFileInfo` here
+    // fails THREE of them - `ProcFileInfo`'s size, `VnodeFdInfoWithPath`'s size and
+    // `pvip`'s offset - identically on both Apple targets. Three failed asserts, and
+    // four lines beginning `error`, because cargo appends its own summary line. The
+    // number that means something is the three, and this comment said four until the
+    // control was re-run and counted.
+    //
+    // `vip_path`'s offset is asserted too, because the path is read by flattening that
+    // array: it must begin where the header puts it and run to the end of the struct,
+    // which is 1176 - 152 = 1024 bytes, `MAXPATHLEN`.
+    //
+    // WHAT THESE CANNOT CATCH, exactly rather than roughly, because a limit described
+    // loosely is worse than one described plainly. `ProcFileInfo` is four 32-bit fields
+    // and one `off_t`, and `off_t`'s 8-byte alignment pins it to offset 8 - so ANY
+    // permutation of `fi_openflags`, `fi_status`, `fi_type` and `fi_guardflags` leaves
+    // every size and offset here unchanged and every assert green. Measured rather than
+    // argued: `fi_type` and `fi_guardflags` transposed produced zero diagnostics on
+    // both Apple targets. That is survivable here and only here, because this reads
+    // NOTHING out of `proc_fileinfo` - a swapped pair inside it has no consequence at
+    // all. What it reads is `pvip`, whose offset is asserted, and inside it `vip_path`,
+    // whose offset is asserted, in a struct that is libc's own and is checked against
+    // Apple's real SDK on libc's CI.
+    //
+    // One struct up, that hazard is not hypothetical: `darwin-libproc-sys` 0.2.0
+    // declares `vnode_info` as `vi_stat, vi_type, vi_fsid, vi_pad` where the header has
+    // `vi_stat, vi_type, vi_pad, vi_fsid`. Same 152 bytes, different offset for
+    // `vi_fsid` - invisible to a size assert. It is one reason libc's declaration is
+    // the one used here and no `libproc` wrapper crate is.
+    //
+    // One item each, and not one block: a const block stops at its first failure, and
+    // what an operator on a Mac wants from a broken build is every number that moved.
+    const _: () = assert!(size_of::<ProcFileInfo>() == 24);
+    const _: () = assert!(size_of::<libc::vinfo_stat>() == 136);
+    const _: () = assert!(size_of::<libc::vnode_info>() == 152);
+    const _: () = assert!(size_of::<libc::vnode_info_path>() == 1176);
+    const _: () = assert!(size_of::<VnodeFdInfoWithPath>() == 1200);
+    const _: () = assert!(std::mem::offset_of!(VnodeFdInfoWithPath, pvip) == 24);
+    const _: () = assert!(std::mem::offset_of!(libc::vnode_info_path, vip_path) == 152);
+}
+
+/// `$CLAUDE_PID` as a pid: 1-10 ASCII digits, canonical, and nothing else. The
+/// `/proc` body needs no such thing - a bad name is a failed `read_link` - but a
+/// system call takes a number, so this is where the bytes stop being bytes.
+/// [`pid_to_ask_about`] then rules out the values that are not a `pid_t` at all.
+///
+/// NOT the same function as the Windows backend's `parse_pid`, and this comment
+/// used to claim it was. Three digit rules are shared - non-empty, at most ten, all
+/// ASCII digits - and two things differ. Windows ends in `.filter(|&p| p != 0)`;
+/// here 0 is passed on and [`pid_to_ask_about`] is what refuses it, which the test
+/// below pins for the pair rather than for either half. And leading zeros are
+/// refused here, which Windows accepts.
+///
+/// THE LEADING ZERO IS NOT FUSSINESS, it is the one place these two Unixes could
+/// have disagreed about the same string. Linux never parses at all: `/proc/007`
+/// does not exist, because `/proc` spells its pids canonically, so `007` is a
+/// failed `read_link` and no tab. Accepting it here would have made `007` resolve
+/// pid 7's fd 1 on macOS and nothing on Linux - a split in a function whose whole
+/// design is that only the system call differs. Unreachable from a real
+/// `$CLAUDE_PID`, which Claude Code writes canonically; refused anyway, because
+/// "unreachable" is a claim about today's caller and this is a claim about the
+/// function.
+#[cfg(any(target_os = "macos", test))]
+fn parse_pid(raw: &OsStr) -> Option<u32> {
+    let b = raw.as_bytes();
+    if b.is_empty() || b.len() > 10 || !b.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    if b.len() > 1 && b.first() == Some(&b'0') {
+        return None;
+    }
+    std::str::from_utf8(b).ok()?.parse().ok()
 }
 
 /// The console route to the session's title, which Unix does not have: `Ok(false)`,
@@ -319,18 +1546,46 @@ pub fn set_session_title(_claude_pid: &OsStr, _title: &str) -> io::Result<bool> 
 
 /// Write to a pty NAMED BY tmux - an attached client's terminal - under the same
 /// guard [`session_tty`] applies to fd 1: under /dev/pts or /dev/tty, a character
-/// device, and writable. A failure is nothing to report: the client may have
-/// detached between the listing and the write.
-pub fn write_tty(path: &Path, bytes: &[u8]) {
+/// device, and writable, with the opened descriptor checked too.
+/// `Ok(false)` is a refused/unresolvable destination (including a non-terminal
+/// descriptor or a failed `IsTerminal` check);
+/// `Ok(true)` is a completed write, not terminal acknowledgement. An open/write
+/// or descriptor-metadata error is returned; a write error may follow a partial
+/// write. Path-metadata failures remain refusals. The client may have detached
+/// between the listing and the write. No outcome changes restore obligations.
+pub fn write_tty(path: &Path, bytes: &[u8]) -> io::Result<bool> {
+    let Some(mut f) = open_tty(path)? else { return Ok(false) };
+    f.write_all(bytes).map(|()| true)
+}
+
+/// Keep the pathname restrictions and supplement them with descriptor checks.
+/// The same File is inspected and delivered; rejected Files are dropped here.
+/// This does not bind the terminal to the process queried by `fd1_path`, or
+/// eliminate pathname races. OpenOptions retains std's close-on-exec behaviour.
+fn open_tty(path: &Path) -> io::Result<Option<File>> {
     if !is_tty_path(path) {
-        return;
+        return Ok(None);
     }
     if !path.metadata().is_ok_and(|m| is_char_device(&m.file_type())) {
-        return;
+        return Ok(None);
     }
-    if let Ok(mut f) = OpenOptions::new().write(true).open(path) {
-        let _ = f.write_all(bytes);
+    let mut opts = OpenOptions::new();
+    opts.write(true);
+    // Darwin's existing libc dependency supplies the platform's declaration.
+    // Linux retains its open flags and dependency graph; descriptor validation
+    // below intentionally tightens both Unix routes on both platforms.
+    #[cfg(target_os = "macos")]
+    opts.custom_flags(libc::O_NOCTTY);
+    let f = opts.open(path)?;
+    let metadata = f.metadata();
+    checked_tty(f, metadata)
+}
+
+fn checked_tty(f: File, metadata: io::Result<Metadata>) -> io::Result<Option<File>> {
+    if !is_char_device(&metadata?.file_type()) || !f.is_terminal() {
+        return Ok(None);
     }
+    Ok(Some(f))
 }
 
 /// A byte prefix, not `Path::starts_with`: /dev/ttyS0 is a single component, so
@@ -342,4 +1597,349 @@ fn is_tty_path(p: &Path) -> bool {
 
 fn is_char_device(ft: &FileType) -> bool {
     ft.is_char_device()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_hostname_requires_success_nonempty_and_termination() {
+        assert_eq!(
+            hostname_from_native(0, b"host.example\0ignored"),
+            Some(b"host.example".to_vec())
+        );
+        assert_eq!(hostname_from_native(-1, b"host\0"), None);
+        assert_eq!(hostname_from_native(1, b"host\0"), None);
+        for name in [&b""[..], &b"\0ignored"[..], &b"unterminated"[..]] {
+            assert_eq!(hostname_from_native(0, name), None);
+        }
+        // The sentinel cannot supply a terminator after a partial native write.
+        let mut name = [0xff; DARWIN_HOSTNAME_CAPACITY];
+        name[..4].copy_from_slice(b"host");
+        assert_eq!(hostname_from_native(0, &name), None);
+    }
+
+    #[test]
+    fn native_hostname_boundary_and_display_bytes_are_preserved() {
+        let mut name = [b'x'; DARWIN_HOSTNAME_CAPACITY];
+        assert_eq!(hostname_from_native(0, &name), None);
+        name[DARWIN_HOSTNAME_CAPACITY - 1] = 0;
+        assert_eq!(
+            hostname_from_native(0, &name),
+            Some(vec![b'x'; DARWIN_HOSTNAME_CAPACITY - 1])
+        );
+        let raw = hostname_from_native(0, b"s\xffv\xe2\x82\0").unwrap();
+        assert_eq!(raw, b"s\xffv\xe2\x82");
+        assert_eq!(crate::text::repair(&raw), "s\u{fffd}v\u{fffd}\u{fffd}");
+        assert_eq!(
+            hostname_from_native(0, "hôte.example\0".as_bytes()),
+            Some("hôte.example".as_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn opened_descriptor_guards_refuse_files_null_and_inspection_errors() {
+        let path = std::env::temp_dir().join(format!("cctab-tty-guard-{}", std::process::id()));
+        let f = OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        let metadata = f.metadata();
+        let rejected = checked_tty(f, metadata).unwrap().is_none();
+        let untouched = fs::read(&path).unwrap().is_empty();
+        fs::remove_file(&path).unwrap();
+        assert!(rejected && untouched);
+
+        let f = OpenOptions::new().write(true).open("/dev/null").unwrap();
+        let metadata = f.metadata();
+        assert!(is_char_device(&metadata.as_ref().unwrap().file_type()));
+        assert!(!f.is_terminal());
+        assert!(checked_tty(f, metadata).unwrap().is_none());
+
+        let f = File::open("/dev/null").unwrap();
+        let error = checked_tty(f, Err(io::Error::other("injected descriptor inspection failure")));
+        assert_eq!(error.unwrap_err().to_string(), "injected descriptor inspection failure");
+        // Path refusals retain write_tty's existing Ok(false) contract.
+        assert!(!write_tty(Path::new("/dev/null"), b"unused").unwrap());
+        assert!(!write_tty(Path::new("/dev/tty-cctab-missing"), b"unused").unwrap());
+    }
+
+    #[test]
+    fn native_process_identity_and_headless_guard_follow_a_real_child() {
+        use std::process::{Command, Stdio};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let before = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros();
+        // cat waits for EOF on our pipe. Its stdout is /dev/null, so this test
+        // cannot target the developer's terminal even when cargo is interactive.
+        let mut child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start a disposable process");
+        let pid = child.id();
+        let start = process_start_time(pid);
+        let again = process_start_time(pid);
+        let alive = process_alive(pid);
+        let same = start.and_then(|s| same_process(pid, s));
+        let different = start.and_then(|s| same_process(pid, s + 1));
+        let tty = session_tty(OsStr::new(&pid.to_string()));
+        let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros();
+        // Finish the child before assertions, including on a failing OS query.
+        drop(child.stdin.take());
+        assert!(child.wait().expect("reap the child").success());
+
+        let start = start.expect("the kernel supplies a real process start time");
+        assert!(start > 0);
+        assert_eq!(again, Some(start));
+        assert_eq!(alive, Some(true));
+        assert_eq!(same, Some(true));
+        assert_eq!(different, Some(false), "a changed start time is a different identity");
+        assert!(tty.is_none(), "a character device alone is not a terminal");
+        if cfg!(target_os = "macos") {
+            assert!((before..=after).contains(&u128::from(start)), "epoch microseconds: {start}");
+        }
+        assert_eq!(process_start_time(pid), None);
+        assert_eq!(process_alive(pid), Some(false));
+        assert_eq!(same_process(pid, start), Some(false));
+    }
+
+    /// The reaper's liveness question, decided here so that the macOS body is a
+    /// call and not a branch, and tested on Linux as well as native macOS.
+    ///
+    /// `EPERM` is the one that matters: a process this user may not signal exists,
+    /// and calling it dead would unlink a live session's record. `Some(false)` is a
+    /// claim, and `ESRCH` is the only evidence for it.
+    #[test]
+    fn a_signal_probe_claims_death_only_for_esrch() {
+        assert_eq!(liveness_from_kill(0, ESRCH), Some(true), "a stale errno is not read");
+        assert_eq!(liveness_from_kill(-1, ESRCH), Some(false));
+        assert_eq!(liveness_from_kill(-1, EPERM), Some(true), "may not signal, but exists");
+        // Everything else is "cannot tell", which the caller reads as "keep the
+        // record" - never the confident wrong answer /proc gave here before.
+        for errno in [0, 4, 9, 14, 22, 1000] {
+            assert_eq!(liveness_from_kill(-1, errno), None, "errno {errno}");
+        }
+    }
+
+    /// The pid a liveness question may be ASKED about. `kill(2)` answers a
+    /// different question for 0 - "may I signal my own process group", which always
+    /// succeeds - so letting 0 through would have `process_alive` report a live
+    /// process for a pid nothing has: the exact mirror of the confident wrong
+    /// `Some(false)` this whole change exists to remove.
+    #[test]
+    fn a_liveness_question_is_asked_only_about_a_pid_kill_reads_as_a_pid() {
+        assert_eq!(pid_to_ask_about(0), None, "kill(0, 0) asks about MY process group");
+        assert_eq!(pid_to_ask_about(1), Some(1));
+        assert_eq!(pid_to_ask_about(99_999), Some(99_999));
+        let top = u32::try_from(i32::MAX).expect("i32::MAX is a u32");
+        assert_eq!(pid_to_ask_about(top), Some(i32::MAX));
+        // Above `pid_t` nothing converts, so no `u32` can reach `kill` as the
+        // negative number that would name a process GROUP.
+        assert_eq!(pid_to_ask_about(top + 1), None);
+        assert_eq!(pid_to_ask_about(u32::MAX), None);
+    }
+
+    /// `proc_pidinfo` returns the byte count it filled, so a partial fill is a
+    /// buffer still holding its own zeros - and a start time of 0 would compare
+    /// equal to the next one, which is a dead pid reading as the same process.
+    #[test]
+    fn a_start_time_is_read_only_from_a_completely_filled_struct() {
+        // Any size stands in for `size_of::<proc_bsdinfo>()`: what is under test is
+        // the comparison, which is all the macOS body delegates.
+        let want: usize = 136;
+        let full = |sec, usec| bsdinfo_start(136, want, sec, usec);
+        assert_eq!(full(1_790_380_620, 123_456), Some(1_790_380_620_123_456));
+        assert_eq!(full(0, 0), Some(0), "the epoch itself is still an answer");
+        assert_eq!(bsdinfo_start(0, want, 1, 2), None, "a dead pid fills nothing");
+        assert_eq!(bsdinfo_start(135, want, 1, 2), None, "a short fill");
+        assert_eq!(bsdinfo_start(137, want, 1, 2), None, "more than we asked for");
+        assert_eq!(bsdinfo_start(-1, want, 1, 2), None, "an error is not a length");
+        // Never wraps: `panic = "abort"` makes an overflow check a crash in a hook.
+        assert_eq!(full(u64::MAX, u64::MAX), Some(u64::MAX));
+        // And what it produces is a number a record can carry back: `state::digits`
+        // parses at most twenty ASCII digits, which is every `u64`.
+        assert!(u64::MAX.to_string().len() <= 20);
+    }
+
+    /// Three encodings, three keys. A reader meeting a key it does not know skips
+    /// it like any unknown field, so another platform's origin is ABSENT here and
+    /// never a pid of ours - which is what makes a state directory shared between
+    /// two of them safe.
+    #[test]
+    fn each_start_time_encoding_has_its_own_origin_key() {
+        let mine = if cfg!(target_os = "macos") { "r" } else { "p" };
+        assert_eq!(ORIGIN_KEY, mine);
+        assert_ne!(ORIGIN_KEY, "q", "the Windows FILETIME key");
+    }
+
+    /// The reaper's other decision, including the awkward pair: no start time and a
+    /// process that is ALIVE. Reading that as "a different process has the pid" is
+    /// what would unlink a live session's record on macOS, where a process this user
+    /// may not inspect answers exactly that way - and on Linux under `hidepid`.
+    #[test]
+    fn a_missing_start_time_is_a_different_process_only_for_a_pid_proven_gone() {
+        let unasked = || unreachable!("a start time settles it without a second call");
+        assert_eq!(same_as_recorded(Some(7), 7, unasked), Some(true));
+        assert_eq!(same_as_recorded(Some(8), 7, unasked), Some(false), "the pid was reused");
+        assert_eq!(same_as_recorded(None, 7, || Some(false)), Some(false), "gone");
+        assert_eq!(same_as_recorded(None, 7, || Some(true)), None, "alive, unreadable");
+        assert_eq!(same_as_recorded(None, 7, || None), None, "nothing could be asked");
+    }
+
+    /// The `/proc` parse, on the bytes the kernel actually writes. The last two
+    /// cases are why it takes bytes: `comm` is copied out unvalidated, so a live
+    /// process whose executable name is not UTF-8 used to report NO start time,
+    /// which is the "alive, but no start time" pair [`same_as_recorded`] is careful
+    /// about - reached on an ordinary unprivileged process, with no `hidepid`.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn a_start_time_is_the_word_after_the_last_paren_whatever_the_name_holds() {
+        let line = |comm: &[u8]| {
+            let mut v = b"4242 (".to_vec();
+            v.extend_from_slice(comm);
+            v.extend_from_slice(b") S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 ");
+            v.extend_from_slice(b"907861 19 20\n");
+            v
+        };
+        assert_eq!(start_time_from_stat(&line(b"sleep")), Some(907_861));
+        // The name that broke the naive split: it holds both a space and a `)`.
+        assert_eq!(start_time_from_stat(&line(b"npm exec chrome)")), Some(907_861));
+        // The name that broke `read_to_string`: one byte that is not UTF-8.
+        assert_eq!(start_time_from_stat(&line(b"sl\xffeep")), Some(907_861));
+        assert_eq!(start_time_from_stat(&line(b"\xff\xfe\xfd")), Some(907_861));
+        // And the refusals, unchanged: nothing, no paren, and a field that is not
+        // twenty digits of ASCII.
+        assert_eq!(start_time_from_stat(b""), None);
+        assert_eq!(start_time_from_stat(b"4242 sleep S 1 2 3"), None);
+        assert_eq!(start_time_from_stat(&line(b"x")[..30]), None);
+    }
+
+    /// `doctor` prints [`NO_STATE_DIR`] when there is nowhere to write, and the
+    /// operator's next move is to set the variable it names. The two are one fact.
+    #[test]
+    fn the_refusal_names_the_state_directory_variable() {
+        assert!(NO_STATE_DIR.ends_with(RUNTIME_DIR_VAR), "{NO_STATE_DIR}");
+    }
+
+    /// The macOS fd-1 lookup's whole decision, run where this project can run
+    /// anything. `proc_pidfdinfo` answers with a BYTE COUNT and a C string inside a
+    /// fixed array, so every way either can be wrong is staged here - including the
+    /// two the kernel is not supposed to produce, because "not supposed to" is not
+    /// a guarantee the caller gets to rely on.
+    #[test]
+    fn an_fd_path_needs_the_whole_struct_and_ends_at_the_first_nul() {
+        const WANT: usize = 1200;
+        // `vip_path` as the kernel leaves it: the path, a terminator, and then
+        // whatever the array held - here, deliberately, another path.
+        let arr = |s: &[u8]| {
+            let mut v = s.to_vec();
+            v.resize(1024, 0);
+            v.splice(600..612, *b"/dev/ttys999");
+            v
+        };
+        let read = |nb: i32, s: &[u8]| fd1_path_from_vnode(nb, WANT, &arr(s));
+        assert_eq!(read(1200, b"/dev/ttys004"), Some(PathBuf::from("/dev/ttys004")));
+        // A byte count, not a status. BOTH spellings of failure are staged, and on
+        // purpose: `libproc`'s wrapper and the call under it do not agree on whether
+        // a failure arrives as -1 or as 0, and nothing here can run either to find
+        // out. Requiring exactly `want` makes the question moot, and these two lines
+        // are what says so. Either way it is the same `None` as a revoked vnode's
+        // `ENOENT`, because all three mean no tab.
+        assert_eq!(read(-1, b"/dev/ttys004"), None, "an error is not a length");
+        assert_eq!(read(0, b"/dev/ttys004"), None, "nothing was filled");
+        // A short count would leave the path holding the zeros the buffer was made
+        // with, which is an empty path this cannot tell from a real refusal. And a
+        // longer one is a struct that is not the one asked for - which is also what
+        // a wrong flavour constant would return.
+        assert_eq!(read(1199, b"/dev/ttys004"), None, "a short fill");
+        assert_eq!(read(1201, b"/dev/ttys004"), None, "not the struct we asked for");
+        // No terminator anywhere: refused, never truncated. /dev/ttys004 cut to
+        // /dev/ttys00 is another writable character device, so nothing downstream
+        // would catch it.
+        assert_eq!(fd1_path_from_vnode(1200, WANT, &[b'/'; 1024]), None, "unterminated");
+        assert_eq!(fd1_path_from_vnode(1200, WANT, &[0u8; 1024]), None, "empty");
+        assert_eq!(fd1_path_from_vnode(1200, WANT, &[]), None, "no path at all");
+        // A path is bytes here, and a name that is not UTF-8 is still a name: the
+        // bytes come back as they went in, undecoded.
+        let odd = read(1200, b"/dev/tty\xff\xfe");
+        assert_eq!(odd.as_deref().map(|p| p.as_os_str().as_bytes()), Some(&b"/dev/tty\xff\xfe"[..]));
+        // What the shared guard does with the answers: the pty passes the prefix
+        // test, the redirected `claude -p > out.txt` does not - which is the whole
+        // reason this flavour is safe to ask for. A pipe or socket on fd 1 never
+        // reaches here at all; the kernel answers EBADF for a non-vnode.
+        assert!(is_tty_path(&read(1200, b"/dev/ttys004").expect("a pty path")));
+        assert!(is_tty_path(&read(1200, b"/dev/tty").expect("a tty path")));
+        assert!(!is_tty_path(&read(1200, b"/Users/me/out.txt").expect("a file path")));
+        assert!(!is_tty_path(&read(1200, b"/dev/null").expect("a device path")));
+    }
+
+    /// `$CLAUDE_PID` as a number, which only the macOS body needs - `/proc` takes
+    /// the bytes and lets `read_link` refuse them. Ten digits is `u32`'s width; the
+    /// values that are not a `pid_t` are [`pid_to_ask_about`]'s business, and 0 is
+    /// rejected there, so this accepts it and the caller does not.
+    #[test]
+    fn a_claude_pid_is_decimal_digits_and_nothing_else() {
+        assert_eq!(parse_pid(OsStr::new("4242")), Some(4242));
+        assert_eq!(parse_pid(OsStr::new("0")), Some(0), "pid_to_ask_about refuses it");
+        assert_eq!(parse_pid(OsStr::new("")), None);
+        assert_eq!(parse_pid(OsStr::new(" 42")), None);
+        assert_eq!(parse_pid(OsStr::new("42\n")), None);
+        assert_eq!(parse_pid(OsStr::new("-42")), None);
+        assert_eq!(parse_pid(OsStr::new("4294967295")), Some(u32::MAX));
+        assert_eq!(parse_pid(OsStr::new("4294967296")), None, "past a u32");
+        assert_eq!(parse_pid(OsStr::new("00000000004")), None, "eleven digits");
+        // A LEADING ZERO IS NOT A PID HERE, and the reason is the other kernel:
+        // `/proc/007` does not exist, so Linux answers `None` for these and macOS
+        // would otherwise have resolved pid 7's fd 1. The two Unixes give one
+        // answer for one string, which is the whole premise of this file.
+        assert_eq!(parse_pid(OsStr::new("007")), None, "Linux has no /proc/007");
+        assert_eq!(parse_pid(OsStr::new("0042")), None);
+        assert_eq!(parse_pid(OsStr::new("00")), None, "not even zero twice");
+        // Not a path, not a number, and never pasted into a system call.
+        assert_eq!(parse_pid(OsStr::new("../../etc/passwd")), None);
+        assert_eq!(parse_pid(os_str_from_bytes(b"4\xff2").as_ref()), None);
+        // And what the two of them together let through is exactly a pid.
+        let ask = |s: &str| parse_pid(OsStr::new(s)).and_then(pid_to_ask_about);
+        assert_eq!(ask("4242"), Some(4242));
+        assert_eq!(ask("0"), None);
+        assert_eq!(ask("4294967295"), None);
+    }
+
+    /// The leading-zero rule is only worth anything if Linux really does refuse
+    /// what it is imitating, so ask Linux rather than assert what it would say.
+    /// `/proc/<pid>` is canonical decimal: this process's own pid resolves and the
+    /// same number with a zero in front does not, which is exactly the pair
+    /// [`parse_pid`] now answers the same way on both kernels.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn proc_spells_a_pid_canonically_which_is_why_a_leading_zero_is_refused() {
+        let me = std::process::id();
+        assert!(fd1_path(&OsString::from(me.to_string())).is_some(), "own fd 1");
+        assert_eq!(fd1_path(&OsString::from(format!("0{me}"))), None, "/proc/0{me}");
+        assert_eq!(parse_pid(OsStr::new(&format!("0{me}"))), None, "and so does this");
+    }
+
+    /// The headless guard over a REAL fd 1, on the Unix that can stage one: this
+    /// process's own. Under `cargo test` fd 1 is a captured pipe, which `/proc`
+    /// spells `pipe:[...]` - not a path at all, and the same shape a redirected
+    /// `claude -p > out.txt` produces. Whatever it is, the guard paints only a pty.
+    ///
+    /// The other half - fd 1 IS a pty and the guard opens it - is what every tmux
+    /// case in `tests/run.sh` exercises against real terminals, which is where it
+    /// belongs; a unit test cannot count on having one.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn the_guard_refuses_a_real_fd_1_that_is_not_a_terminal() {
+        let me = OsString::from(std::process::id().to_string());
+        let target = fd1_path(&me).expect("/proc names this process's own fd 1");
+        if !is_tty_path(&target) {
+            assert!(session_tty(&me).is_none(), "fd 1 is {}", target.display());
+        }
+        // And a name that is not a pid resolves to nothing without ever being
+        // parsed - `read_link` refuses it, which is the whole of the Linux route's
+        // validation and is what the oracle does too.
+        assert_eq!(fd1_path(OsStr::new("not-a-pid")), None);
+        assert_eq!(fd1_path(OsStr::new("")), None);
+        assert_eq!(fd1_path(OsStr::new("0")), None, "a pid nothing has");
+    }
 }
