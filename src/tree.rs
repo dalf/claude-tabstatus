@@ -207,17 +207,41 @@ pub fn default_tree() -> Result<PathBuf, String> {
 /// specifically, not for any `.git` at all: plenty of people keep `$HOME` itself in
 /// git, and the default tree lives three levels under it.
 ///
-/// "Under `<config>/skills`" is asked through `sys::is_within`: a component prefix on
-/// Unix, and on Windows where the directory would really land - NTFS takes
-/// `<config>\SKILLS`, a short name and a `\\?\` prefix to the same place, and the
-/// install that walked past this refusal wrote the tree AT the link path, set the env
-/// key, and only then found it could not make the link.
+/// Containment asks where the directory would actually land, including ancestor
+/// links and filesystem name equivalence, even when either destination is absent.
+/// Uncertain inspection is a refusal, before the marker or any installation writes.
 pub fn refuse_target(tree: &Path, skills: &Path) -> Option<String> {
-    if sys::is_within(tree, skills) {
+    // Inspect the root itself before any destination resolution can hide its link.
+    match fs::symlink_metadata(tree) {
+        Ok(md) if md.file_type().is_symlink() => {
+            let t = fs::read_link(tree).unwrap_or_else(|_| PathBuf::from("?"));
+            return Some(format!(
+                "{} is a symlink (-> {}), not a directory. Pass the directory itself. \
+                 Nothing has been changed.", tree.display(), t.display()
+            ));
+        }
+        Ok(md) if !md.is_dir() => {
+            return Some(format!(
+                "{} already exists and is not a directory, so a plugin tree cannot be \
+                 written there. Pass a different directory. Nothing has been changed.",
+                tree.display()
+            ));
+        }
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Some(format!("cannot inspect {}: {}. Nothing has been changed.", tree.display(), e));
+        }
+        _ => {}
+    }
+    let within = match sys::is_within(tree, skills) {
+        Ok(v) => v,
+        Err(e) => return Some(format!("cannot establish a safe tree destination: {}. Nothing has been changed.", e)),
+    };
+    if within {
         return Some(format!(
             "{} is under {}, which is where install puts the {} TO the tree. \
              A tree there would make install {} a directory to itself. Pick \
-             somewhere else, or pass no directory at all for the default.",
+             somewhere else, or pass no directory at all for the default. Nothing has \
+             been changed.",
             tree.display(),
             skills.display(),
             sys::DIR_LINK,
@@ -233,7 +257,11 @@ pub fn refuse_target(tree: &Path, skills: &Path) -> Option<String> {
             tree.display()
         ));
     }
-    if let Some(co) = checkout_above(tree) {
+    let checkout = match checkout_above(tree) {
+        Ok(co) => co,
+        Err(e) => return Some(format!("cannot inspect checkout containment: {}. Nothing has been changed.", e)),
+    };
+    if let Some(co) = checkout {
         return Some(format!(
             "{} is inside the claude-tabstatus checkout at {}. The plugin tree is \
              BUILD OUTPUT and must not live in the source tree - that is the wiring \
@@ -242,27 +270,6 @@ pub fn refuse_target(tree: &Path, skills: &Path) -> Option<String> {
             tree.display(),
             co.display()
         ));
-    }
-    // A SYMLINK, asked about before `fs::metadata` follows it. Two reasons, and the
-    // first is the errno this whole block exists to replace: a DANGLING link answers
-    // NotFound to `fs::metadata`, reads as "absent, go ahead", and then
-    // `create_dir_all` fails EEXIST - after the header has already announced the
-    // repoint, so the operator is told the live link "will ->" somewhere it never
-    // went. The second is a link to an EMPTY directory, which the old code accepted:
-    // the tree lands in the link's target, the plugin link points at the link, and
-    // `in_tree` then refuses to remove anything under it, so `uninstall` can never
-    // take it down. Neither is wanted; both are one refusal.
-    if let Ok(md) = fs::symlink_metadata(tree) {
-        if md.file_type().is_symlink() {
-            let t = fs::read_link(tree).unwrap_or_else(|_| PathBuf::from("?"));
-            return Some(format!(
-                "{} is a symlink (-> {}), not a directory. The tree is written and \
-                 removed file by file, and nothing reached through a link is provably \
-                 inside it - so pass the directory itself. Nothing has been changed.",
-                tree.display(),
-                t.display()
-            ));
-        }
     }
     // Absent is exactly what we want. Anything else that is not a READABLE
     // DIRECTORY is a named refusal here rather than an errno from create_dir_all
@@ -337,18 +344,38 @@ fn safe_to_suggest_removing(tree: &Path) -> bool {
 }
 
 /// A claude-tabstatus checkout at or above `from`: a `.git` beside a
-/// `.claude-plugin/plugin.json`. Bounded, and it never answers for `from` itself -
-/// `refuse_target` checks that case separately and with its own wording.
-fn checkout_above(from: &Path) -> Option<PathBuf> {
-    let mut dir = from.parent().map(|p| p.to_path_buf());
-    for _ in 0..24 {
-        let d = dir?;
-        if d.join(".git").exists() && d.join(".claude-plugin/plugin.json").is_file() {
-            return Some(d);
+/// `.claude-plugin/plugin.json`. Inspect both the spelled ancestors and the
+/// physical ones: an ancestor link into a nested checkout must not bypass it.
+/// An unrelated HOME repository alone still does not block the default tree.
+fn checkout_above(from: &Path) -> Result<Option<PathBuf>, String> {
+    let mut ancestors = sys::destination_ancestors(from)?;
+    ancestors.extend(from.ancestors().skip(1).map(Path::to_path_buf));
+    for d in ancestors {
+        let git = d.join(".git");
+        match fs::symlink_metadata(&git) {
+            Ok(_) => {
+                let plugin = d.join(".claude-plugin/plugin.json");
+                match fs::metadata(&plugin) {
+                    Ok(m) if m.is_file() => return Ok(Some(d)),
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(format!("cannot inspect {}: {}", plugin.display(), e)),
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot inspect {}: {}", git.display(), e)),
         }
-        dir = d.parent().map(|p| p.to_path_buf());
     }
-    None
+    Ok(None)
+}
+
+/// Check the directory components this install will use before its first write.
+/// The checks in `in_tree` are repeated at each write; this is no race guarantee.
+pub fn preflight_components(tree: &Path) -> Result<(), String> {
+    for rel in generated_paths() {
+        in_tree(tree, rel.as_bytes(), false)?;
+    }
+    Ok(())
 }
 
 // --- materialising -----------------------------------------------------------
@@ -654,9 +681,10 @@ fn in_tree(tree: &Path, rel: &[u8], create: bool) -> Result<PathBuf, String> {
                 ))
             }
             // Absent: `create` makes it, and a removal has nothing to take down there.
-            Err(_) if !create => continue,
-            Err(_) => fs::create_dir(&at)
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&at)
                 .map_err(|e| format!("cannot create {}: {}", at.display(), e))?,
+            Err(e) => return Err(format!("cannot inspect {}: {}", at.display(), e)),
         }
     }
     Ok(at)

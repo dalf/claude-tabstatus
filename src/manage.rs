@@ -59,7 +59,7 @@ use crate::{json, location, render, state, sys};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 const KEY: &str = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE";
 const PLUGIN: &str = "claude-tabstatus";
@@ -525,7 +525,7 @@ fn config_dir() -> Result<PathBuf, String> {
     }
 }
 
-/// A path made absolute and lexically normalised, ONCE, before anything looks at it.
+/// A path made absolute before anything looks at it.
 ///
 /// Everything downstream compares these paths, writes through them and RECORDS them,
 /// and a raw `--tree` string defeated all three. `--tree skills/claude-tabstatus` run
@@ -537,14 +537,9 @@ fn config_dir() -> Result<PathBuf, String> {
 /// later `uninstall` from a different directory removed files from whatever else
 /// happened to be named that.
 ///
-/// `fs::canonicalize` is the wrong tool: it resolves symlinks - which is what makes it
-/// right for settings.json and wrong here - and it FAILS on a path that does not exist
-/// yet, which the tree usually does not. So `..` and `.` are folded textually.
-///
-/// Before that, `sys::normalize` picks the ONE spelling this path is compared,
-/// printed and recorded by. Nothing on Unix; on Windows, where `\\?\C:\x`,
-/// `C:\X` and `C:\PROGRA~1`-style short names all name one directory, it is what keeps
-/// a re-install from reading its own live tree as an orphan.
+/// Keep the final root link visible to lstat and allow missing destinations.
+/// Unix keeps `..` for kernel resolution, including `alias/..`; Windows retains
+/// its existing spelling normalisation. Identity is asked separately through sys.
 fn absolute(p: &Path) -> Result<PathBuf, String> {
     let abs = if p.is_absolute() {
         p.to_path_buf()
@@ -560,19 +555,7 @@ fn absolute(p: &Path) -> Result<PathBuf, String> {
             })?
             .join(p)
     };
-    let abs = sys::normalize(&abs);
-    let mut out = PathBuf::new();
-    for c in abs.components() {
-        match c {
-            Component::CurDir => {}
-            // At the root `..` is the root, which is what `pop` returning false means.
-            Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    Ok(if out.as_os_str().is_empty() { PathBuf::from("/") } else { out })
+    Ok(sys::normalize(&abs))
 }
 
 impl Ctx {
@@ -586,6 +569,7 @@ impl Ctx {
     /// Everything in `new` except finding the plugin directory, so `install` can work
     /// on the tree it RESOLVED rather than one it had to discover.
     fn at(tree: PathBuf, tree_from: TreeFrom) -> Result<Ctx, String> {
+        let tree = absolute(&tree)?;
         let config = config_dir()?;
         let skills = config.join("skills");
         let link = skills.join(PLUGIN);
@@ -668,7 +652,7 @@ fn live_tree(config: &Path) -> Result<(PathBuf, TreeFrom), String> {
     if let Some(t) = recorded_tree(config) {
         return Ok((t, TreeFrom::Record));
     }
-    Ok((tree::default_tree()?, TreeFrom::Default))
+    Ok((absolute(&tree::default_tree()?)?, TreeFrom::Default))
 }
 
 /// The tree the state record says this install owns, as install wrote it.
@@ -1041,14 +1025,19 @@ enum LinkState {
     Link(PathBuf, bool),
     Dir,
     Other,
+    Unreadable(String),
 }
 
 fn link_state(p: &Path) -> LinkState {
     match fs::symlink_metadata(p) {
-        Err(_) => LinkState::Absent,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => LinkState::Absent,
+        Err(e) => LinkState::Unreadable(format!("cannot inspect {}: {}", p.display(), e)),
         Ok(md) => {
             if md.file_type().is_symlink() {
-                let t = fs::read_link(p).unwrap_or_default();
+                let t = match fs::read_link(p) {
+                    Ok(t) => t,
+                    Err(e) => return LinkState::Unreadable(format!("cannot read {}: {}", p.display(), e)),
+                };
                 LinkState::Link(t, fs::metadata(p).is_ok())
             } else if md.is_dir() {
                 LinkState::Dir
@@ -1057,6 +1046,17 @@ fn link_state(p: &Path) -> LinkState {
             }
         }
     }
+}
+
+/// read_link's relative target is relative to the link's parent, never our cwd.
+/// Keep the raw spelling in LinkState for the write-once restoration record.
+fn same_link_target(c: &Ctx, target: &Path) -> Result<bool, String> {
+    let target = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        c.skills.join(target)
+    };
+    sys::same_path(&target, &c.tree)
 }
 
 /// The refusal both writers share for a settings.json symlink that does not
@@ -1201,7 +1201,7 @@ fn resolve_tree(dir: Option<OsString>, config: &Path) -> Result<(PathBuf, TreeFr
             return Ok((t, TreeFrom::Link));
         }
     }
-    Ok((tree::default_tree()?, TreeFrom::Default))
+    Ok((absolute(&tree::default_tree()?)?, TreeFrom::Default))
 }
 
 /// Four writes, in the order the module header explains, with every refusal decided
@@ -1276,6 +1276,8 @@ fn install_preflight(c: &Ctx, force: bool) -> Result<(Option<Vec<u8>>, Option<St
     if let Some(why) = tree::refuse_target(&c.tree, &c.skills) {
         return Err(why);
     }
+    tree::preflight_components(&c.tree)
+        .map_err(|e| format!("{}. Nothing has been changed.", e))?;
     if let Some(d) = nearest_existing(&c.tree) {
         if !d.is_dir() {
             return Err(format!(
@@ -1296,6 +1298,10 @@ fn install_preflight(c: &Ctx, force: bool) -> Result<(Option<Vec<u8>>, Option<St
     match link_state(&c.link) {
         LinkState::Dir => return Err(refuse_link(&c.link, &format!("a real directory, not a {}", sys::DIR_LINK))),
         LinkState::Other => return Err(refuse_link(&c.link, &format!("not a {}", sys::DIR_LINK))),
+        LinkState::Unreadable(e) => return Err(format!("{}. Nothing has been changed.", e)),
+        LinkState::Link(t, _) => {
+            same_link_target(c, &t).map_err(|e| format!("cannot compare the plugin target: {}. Nothing has been changed.", e))?;
+        }
         _ => {}
     }
     // `<config>/skills` itself, which the last step has to create or write into.
@@ -1439,7 +1445,7 @@ fn install_header(c: &Ctx, exe: &Path) {
 /// the first write, that a directory they have been editing stops being the plugin.
 fn repoint_warning(c: &Ctx) {
     let LinkState::Link(t, _) = link_state(&c.link) else { return };
-    if sys::same_path(&t, &c.tree) {
+    if same_link_target(c, &t) != Ok(false) {
         return;
     }
     say(&format!("plugin:   {}", c.link.display()));
@@ -1633,7 +1639,7 @@ fn link_the_plugin(c: &Ctx, promise: &RecordedPrior) -> Result<(), String> {
             say(&format!("{}created", link_label()));
             say(&format!("          {} -> {}", c.link.display(), c.tree.display()));
         }
-        LinkState::Link(t, resolves) if sys::same_path(&t, &c.tree) => {
+        LinkState::Link(t, resolves) if same_link_target(c, &t)? => {
             if resolves {
                 say(&format!("{}already correct", link_label()));
                 say(&format!("          {} -> {}", c.link.display(), c.tree.display()));
@@ -1709,6 +1715,7 @@ fn link_the_plugin(c: &Ctx, promise: &RecordedPrior) -> Result<(), String> {
         }
         LinkState::Dir => return Err(refuse_link(&c.link, &format!("a real directory, not a {}", sys::DIR_LINK))),
         LinkState::Other => return Err(refuse_link(&c.link, &format!("not a {}", sys::DIR_LINK))),
+        LinkState::Unreadable(e) => return Err(e),
     }
     Ok(())
 }
@@ -2216,8 +2223,14 @@ fn uninstall_preflight(c: &Ctx, force: bool, restore_backup: bool, keep_tree: bo
     match link_state(&c.link) {
         LinkState::Dir => return Err(refuse_link(&c.link, &format!("a real directory, not a {}", sys::DIR_LINK))),
         LinkState::Other => return Err(refuse_link(&c.link, &format!("not a {}", sys::DIR_LINK))),
+        LinkState::Unreadable(e) => return Err(format!("{}. Nothing has been changed.", e)),
         _ => {}
     }
+    // Failure to identify the tree must not turn into permission to delete it.
+    sys::destination_ancestors(&c.tree)
+        .map_err(|e| format!("cannot inspect the live tree: {}. Nothing has been changed.", e))?;
+    sys::destination_ancestors(&c.skills)
+        .map_err(|e| format!("cannot inspect the plugin directory: {}. Nothing has been changed.", e))?;
     // The tree goes LAST and holds the binary. Where a running program's file cannot
     // be deleted (Windows), an uninstall run BY that binary would undo everything else
     // and then fail to remove it - a half-removed tree reported as removed - so that
@@ -2504,6 +2517,7 @@ fn unlink_the_plugin(c: &Ctx, prior: &Prior) -> Result<(), String> {
         LinkState::Absent => say(&format!("{}not present - nothing to remove", link_label())),
         LinkState::Dir => return Err(refuse_link(&c.link, &format!("a real directory, not a {}", sys::DIR_LINK))),
         LinkState::Other => return Err(refuse_link(&c.link, &format!("not a {}", sys::DIR_LINK))),
+        LinkState::Unreadable(e) => return Err(e),
     }
     Ok(())
 }
@@ -2642,13 +2656,21 @@ fn report_tree(c: &Ctx) {
 /// path.
 fn orphan_trees(c: &Ctx) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    for cand in [recorded_tree(&c.config), tree::default_tree().ok()].into_iter().flatten() {
-        if !sys::same_path(&cand, &c.tree)
-            && !out.iter().any(|o| sys::same_path(o, &cand))
-            && tree::is_generated(&cand)
-        {
-            out.push(cand);
+    'candidate: for cand in [recorded_tree(&c.config), tree::default_tree().ok()].into_iter().flatten() {
+        if !tree::is_generated(&cand) {
+            continue;
         }
+        for other in std::iter::once(&c.tree).chain(out.iter()) {
+            match sys::same_path(&cand, other) {
+                Ok(true) => continue 'candidate,
+                Ok(false) => {}
+                Err(e) => {
+                    say(&format!("tree:      WARN cannot identify {} as an orphan: {}. Left alone.", cand.display(), e));
+                    continue 'candidate;
+                }
+            }
+        }
+        out.push(cand);
     }
     out
 }
@@ -2801,24 +2823,24 @@ fn report_plugin(c: &Ctx) {
             "plugin:    FAIL not linked. Run `tabstatus install`. ({})",
             c.link.display()
         )),
-        LinkState::Link(t, true) if sys::same_path(&t, &c.tree) && is_checkout(&t) => {
-            say(&format!(
-                "plugin:    WARN {} points at a CHECKOUT, not at a generated tree:",
-                c.link.display()
-            ));
-            say(&format!("           {}", t.display()));
-            say("           That is the wiring from before the plugin directory became build");
-            say("           output - a `git checkout` there changes what every running session");
-            say("           runs. `tabstatus install` repoints it at a generated tree.");
-        }
-        LinkState::Link(t, true) if sys::same_path(&t, &c.tree) => {
-            say(&format!("plugin:    OK   linked, {} -> {}", c.link.display(), t.display()))
-        }
-        LinkState::Link(t, true) => say(&format!(
-            "plugin:    WARN {} points at {}, not at the tree above",
-            c.link.display(),
-            t.display()
-        )),
+        LinkState::Link(t, true) => match same_link_target(c, &t) {
+            Err(e) => say(&format!("plugin:    WARN cannot identify the plugin target: {}", e)),
+            Ok(true) if is_checkout(&c.skills.join(&t)) => {
+                say(&format!(
+                    "plugin:    WARN {} points at a CHECKOUT, not at a generated tree:",
+                    c.link.display()
+                ));
+                say(&format!("           {}", t.display()));
+                say("           That is the wiring from before the plugin directory became build");
+                say("           output - a `git checkout` there changes what every running session");
+                say("           runs. `tabstatus install` repoints it at a generated tree.");
+            }
+            Ok(true) => say(&format!("plugin:    OK   linked, {} -> {}", c.link.display(), t.display())),
+            Ok(false) => say(&format!(
+                "plugin:    WARN {} points at {}, not at the tree above",
+                c.link.display(), t.display()
+            )),
+        },
         LinkState::Link(t, false) => say(&format!(
             "plugin:    FAIL {} is a broken {} to {}",
             c.link.display(),
@@ -2829,6 +2851,7 @@ fn report_plugin(c: &Ctx) {
             "plugin:    WARN {} is a real directory, not a link to the plugin tree",
             c.link.display()
         )),
+        LinkState::Unreadable(e) => say(&format!("plugin:    WARN {}", e)),
         LinkState::Other => {
             say(&format!("plugin:    WARN {} exists and is not a {}", c.link.display(), sys::DIR_LINK))
         }

@@ -157,6 +157,7 @@ when they agree.
 | direct MCP elicitation | `python3 tests/test_elicitation.py` | Linux, Windows, macOS |
 | persistence and concurrency | `python3 tests/test_state_guarantees.py` | Linux, macOS (`fcntl`; strace fault injection Linux-only) |
 | direct Unix delivery | `python3 tests/test_unix_delivery.py -v` | Linux, macOS (disposable PTYs) |
+| installer path identity and containment | `python3 tests/test_install_paths.py` | Linux; native macOS with mandatory APFS/APFSX fixtures |
 | settings ACLs, ownership and backup metadata | `python3 tests/test_macos_acl.py` | native macOS (chmod/ls/stat, SDK fault interposition) |
 | tmux window status | `python3 tests/test_tmux_status.py` | Linux (tmux) |
 | corpus fixture helpers | `python3 -m unittest discover -s tests/corpus -p 'test_*.py' -v` | Linux |
@@ -409,13 +410,15 @@ branch push, pull request, manual dispatch, and as a reusable workflow.
   for both Linux targets; `sh scripts/build.sh --all`; the corpus fixture unit
   tests and subprocess-checker tests; then, for **each** Linux binary, the required
   subprocess/delivery gate, all six existing Python suites, the Unix delivery suite,
-  `tests/run.sh` and the golden corpus. Uploads both binaries and their `SHA256SUMS` as the
-  `linux-binaries` artifact.
+  the installer path suite, `tests/run.sh` and the golden corpus. Uploads both binaries
+  and their `SHA256SUMS` as the `linux-binaries` artifact.
 - *macOS* (`macos-15`, arm64 / `aarch64-apple-darwin`): links and executes
   `cargo test --locked --all-targets`, builds a native validation binary, and runs
   the payload, state-contract, background, elicitation, state-guarantees and Unix
-  delivery suites, plus the native settings ACL suite. No artifacts are uploaded. Both Apple ABI cross-checks remain
-  in the Linux job, including Intel. Native arm64 execution has passed;
+  delivery suites, plus the native settings ACL suite and installer path suite with
+  mandatory disposable case-insensitive APFS and case-sensitive APFSX volumes
+  (lookup semantics verified). No artifacts are uploaded. Both Apple ABI cross-checks
+  remain in the Linux job, including Intel. Native arm64 execution has passed;
   [evidence, scope and limits](docs/architecture.md#macos-validation).
 - *Windows* (`windows-2025`, steps under Git Bash): `cargo test --locked
   --all-targets` (including the ConPTY, lock and junction tests);

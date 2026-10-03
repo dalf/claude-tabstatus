@@ -22,12 +22,14 @@
 //! brief window documented where it is implemented; [`sweep_replaced`] collects what
 //! that sequence could not delete at the time.
 //!
-//! And PATH IDENTITY: [`normalize`], [`same_path`] and [`is_within`]. On Unix a path
-//! is its bytes and all three are the plain comparison. On Windows one directory has
-//! many spellings - any letter case, an 8.3 short name, a `\\?\` prefix - and every
-//! refusal, "already correct" and "orphan" decision install makes compares paths, so
-//! they have to agree on what "the same directory" means. [`strip_home_prefix`] is
-//! the same comparison for the tab title's `~`, by spelling alone, with no filesystem
+//! And MANAGEMENT PATH IDENTITY: [`normalize`] preserves root-link inspection;
+//! [`same_path`] and [`is_within`] return errors when identity or destination
+//! containment cannot be established. Unix identifies existing directories by
+//! device/inode, following permitted ancestor links; Darwin asks the filesystem
+//! about missing ASCII names and retains uncertainty for missing Unicode aliases.
+//! Windows retains its distinction between link spelling and resolved destination.
+//! [`destination_ancestors`] supplies the physical checkout-containment walk.
+//! [`strip_home_prefix`] is separate: the tab title's `~` uses spelling alone, with no filesystem
 //! call: on Windows letter case, `/` or `\` and a `\\?\` prefix still do not matter,
 //! but an 8.3 short name - which only the disk can expand - does.
 //!
@@ -70,7 +72,7 @@ mod windows;
 use windows as imp;
 
 pub use imp::{
-    copy_secured, create_private_dir, create_secured, display_bytes, file_id, file_id_at, file_id_of,
+    destination_ancestors, copy_secured, create_private_dir, create_secured, display_bytes, file_id, file_id_at, file_id_of,
     gitpath_allowed, home_fallback,
     is_executable, is_line_end, is_set_aside, is_within, kernel_hostname_file, link_dir, lock_exclusive, mode,
     normalize, os_str_from_bytes, os_string_from_vec, probe_dir_link, process_alive,

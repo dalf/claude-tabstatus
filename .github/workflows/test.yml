@@ -75,6 +75,7 @@ jobs:
             CCTAB_TEST_BIN="$binary" python3 tests/test_unix_delivery.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_elicitation.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_tmux_status.py
+            CCTAB_TEST_BIN="$binary" python3 tests/test_install_paths.py
             CCTAB_TEST_BIN="$binary" sh tests/run.sh
             sh tests/corpus/replay.sh "$binary"
           done
@@ -125,6 +126,13 @@ jobs:
           CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
           CCTAB_TEST_REQUIRE_SUDO: '1'
         run: python3 tests/test_macos_acl.py
+
+      # Both disposable volumes are required. The suite proves lookup semantics
+      # before testing; failure to create APFS/APFSX is a failed job, not a skip.
+      - name: Require filesystem-aware installation on case-insensitive APFS and case-sensitive APFSX
+        env:
+          CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
+        run: python3 tests/test_install_paths.py
 
       - name: Run native state and disposable PTY tests
         env:

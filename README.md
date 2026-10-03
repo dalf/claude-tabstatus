@@ -217,6 +217,14 @@ keeps no ACL, such as a symlink into a WSL share: edit it from the system it
 lives on, or pass `--force` to `install` or `uninstall` to write it anyway. The
 details are in [docs/architecture.md](docs/architecture.md).
 
+The tree must be outside `<config>/skills` and the source checkout, including
+paths reached through ancestor symlinks. On macOS the guards recognise existing
+case and Unicode-normalisation aliases and respect case-sensitive volumes.
+The tree root itself must be a directory, and its generated directory components
+must not be symlinks. Unresolvable paths are refused before installation writes.
+If missing names cannot be compared safely, create the intended ancestor directory
+first so the filesystem can identify it, then run `install` again.
+
 ## When each colour appears
 
 | You see | When |

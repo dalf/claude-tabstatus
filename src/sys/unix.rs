@@ -788,21 +788,160 @@ pub fn sweep_replaced(_dir: &Path) -> Vec<PathBuf> {
     Vec::new()
 }
 
-/// The spelling of `p` that is compared, printed and recorded: `p` itself. A Unix
-/// path has one spelling per name - no short names, no verbatim prefix - and case
-/// is the filesystem's business, not this program's.
+/// The spelling printed and recorded. Keep links and `..` intact: folding
+/// `alias/..` lexically can change the directory the kernel actually reaches.
+/// Management identity is a separate, fallible filesystem question below.
 pub fn normalize(p: &Path) -> PathBuf {
-    p.to_path_buf()
+    // Remove redundant separators and `.` (including a trailing `/.` which would
+    // make lstat follow a root symlink). Preserve every `..` for the kernel.
+    p.components().collect()
 }
 
-/// Whether `a` and `b` are the same path: component-wise equality.
-pub fn same_path(a: &Path, b: &Path) -> bool {
-    a == b
+/// A destination, including one not yet created. Only ENOENT from lstat removes
+/// a component; a dangling link, EACCES, ENOTDIR or ELOOP is an inspection failure.
+/// Containment requires a directory; equality can also identify a file that an
+/// old plugin link points at. Any missing suffix requires a directory ancestor.
+/// Callers must inspect the root link separately before writing or removing it.
+struct Destination {
+    existing: PathBuf,
+    id: FileId,
+    directory: bool,
+    missing: Vec<OsString>,
 }
 
-/// Whether `p` is `base` or lies beneath it: a component-prefix test, lexical.
-pub fn is_within(p: &Path, base: &Path) -> bool {
-    p == base || p.starts_with(base)
+fn destination(p: &Path) -> Result<Destination, String> {
+    let absolute = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(|e| e.to_string())?.join(p)
+    };
+    let mut at = absolute.as_path();
+    let mut missing = Vec::new();
+    loop {
+        match fs::symlink_metadata(at) {
+            Ok(_) => {
+                let existing = fs::canonicalize(at)
+                    .map_err(|e| format!("cannot resolve {}: {}", at.display(), e))?;
+                let md = fs::metadata(&existing)
+                    .map_err(|e| format!("cannot inspect {}: {}", existing.display(), e))?;
+                if !md.is_dir() && !missing.is_empty() {
+                    return Err(format!("{} is not a directory", at.display()));
+                }
+                missing.reverse();
+                return Ok(Destination {
+                    existing,
+                    id: file_id(&md).unwrap(),
+                    directory: md.is_dir(),
+                    missing,
+                });
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // file_name deliberately refuses `..`: absent/../x cannot be
+                // resolved by the kernel, and must not be silently folded away.
+                match (at.parent(), at.file_name()) {
+                    (Some(parent), Some(name)) => {
+                        missing.push(name.to_os_string());
+                        at = parent;
+                    }
+                    _ => return Err(format!("cannot resolve {}: {}", at.display(), e)),
+                }
+            }
+            Err(e) => return Err(format!("cannot inspect {}: {}", at.display(), e)),
+        }
+    }
+}
+
+fn directory_destination(p: &Path) -> Result<Destination, String> {
+    let d = destination(p)?;
+    if !d.directory {
+        return Err(format!("{} is not a directory", p.display()));
+    }
+    Ok(d)
+}
+
+/// Physical ancestors of the destination, deepest existing directory first.
+/// Used by checkout guards, never by hook location or title formatting.
+pub fn destination_ancestors(p: &Path) -> Result<Vec<PathBuf>, String> {
+    Ok(directory_destination(p)?
+        .existing
+        .ancestors()
+        .map(Path::to_path_buf)
+        .collect())
+}
+
+/// Directory destination identity, following links. This does NOT establish
+/// ownership of the root link itself; lstat guards retain that responsibility.
+pub fn same_path(a: &Path, b: &Path) -> Result<bool, String> {
+    let (a, b) = (destination(a)?, destination(b)?);
+    if a.id != b.id || a.missing.len() != b.missing.len() {
+        return Ok(false);
+    }
+    same_missing(&a.existing, &a.missing, &b.missing)
+}
+
+/// Would a directory created at `p` land at or below `base`? Existing directories
+/// compare by device/inode, including case, normalisation and ancestor-link aliases.
+/// Missing components compare only with evidence from their existing ancestor.
+pub fn is_within(p: &Path, base: &Path) -> Result<bool, String> {
+    let (p, base) = (directory_destination(p)?, directory_destination(base)?);
+    if base.missing.is_empty() {
+        for at in p.existing.ancestors() {
+            let md =
+                fs::metadata(at).map_err(|e| format!("cannot inspect {}: {}", at.display(), e))?;
+            if file_id(&md) == Some(base.id) {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+    // A genuinely absent component cannot alias an already existing directory.
+    // Thus two prospective destinations can intersect only at the same anchor.
+    if p.id != base.id || p.missing.len() < base.missing.len() {
+        return Ok(false);
+    }
+    same_missing(&p.existing, &p.missing[..base.missing.len()], &base.missing)
+}
+
+fn same_missing(ancestor: &Path, a: &[OsString], b: &[OsString]) -> Result<bool, String> {
+    for (a, b) in a.iter().zip(b) {
+        if a != b && !same_missing_name(ancestor, a, b)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn same_missing_name(_ancestor: &Path, a: &OsStr, b: &OsStr) -> Result<bool, String> {
+    Ok(a == b)
+}
+
+#[cfg(target_os = "macos")]
+fn same_missing_name(ancestor: &Path, a: &OsStr, b: &OsStr) -> Result<bool, String> {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if !a.is_ascii() || !b.is_ascii() {
+        return Err(format!(
+            "cannot establish filesystem equivalence of missing names beneath {}: \
+             create the intended ancestor directory first so it can be identified",
+            ancestor.display()
+        ));
+    }
+    let path = std::ffi::CString::new(ancestor.as_os_str().as_bytes())
+        .map_err(|e| format!("invalid directory path: {}", e))?;
+    // XNU bsd/sys/unistd.h and hfs/core/hfs_vnops.c: _PC_CASE_SENSITIVE
+    // returns 0 or 1. The locked libc supplies the constant and declaration.
+    // Unknown/unsupported answers remain errors, never evidence of separation.
+    // SAFETY: the NUL-terminated path outlives this read-only call.
+    let sensitive = unsafe { libc::pathconf(path.as_ptr(), libc::_PC_CASE_SENSITIVE) };
+    match sensitive {
+        0 => Ok(a.eq_ignore_ascii_case(b)),
+        1 => Ok(a == b),
+        _ => Err(format!(
+            "cannot establish case sensitivity beneath {} (pathconf returned {})",
+            ancestor.display(),
+            sensitive
+        )),
+    }
 }
 
 /// What follows `home` in `path`, when `path` is `home` or lies beneath it: empty for

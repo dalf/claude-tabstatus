@@ -1318,38 +1318,63 @@ pub fn strip_home_prefix(path: &Path, home: &Path) -> Option<OsString> {
 /// Whether `a` and `b` name the same directory by their spelling: equal once both
 /// are [`normalize`]d and case is set aside. Links are NOT followed - a junction and
 /// the directory it names are two different paths, as they are to `install`.
-pub fn same_path(a: &Path, b: &Path) -> bool {
-    a == b || folded(&normalize(a)) == folded(&normalize(b))
+pub fn same_path(a: &Path, b: &Path) -> Result<bool, String> {
+    Ok(a == b || folded(&normalize(a)) == folded(&normalize(b)))
 }
 
 /// Whether `p` is `base` or lies beneath it, WHEREVER the two really are: the part of
 /// each that exists is resolved through `fs::canonicalize` - links, short names and
 /// case included - and the rest is compared without regard to case. It answers the
 /// question the refusal asks: would a directory written at `p` land inside `base`?
-pub fn is_within(p: &Path, base: &Path) -> bool {
-    let (p, base) = (folded(&resolved(p)), folded(&resolved(base)));
-    p.len() >= base.len() && p[..base.len()] == base[..]
+pub fn is_within(p: &Path, base: &Path) -> Result<bool, String> {
+    let (p, base) = (folded(&resolved(p)?), folded(&resolved(base)?));
+    Ok(p.len() >= base.len() && p[..base.len()] == base[..])
 }
 
 /// `p` with its deepest existing ancestor replaced by where that really is.
-fn resolved(p: &Path) -> PathBuf {
+/// Only genuinely missing components are peeled away; failed inspection is not
+/// evidence that a destination is outside a protected directory.
+fn resolved(p: &Path) -> Result<PathBuf, String> {
     let p = normalize(p);
     let mut tail: Vec<&OsStr> = Vec::new();
     let mut at = p.as_path();
     loop {
-        if let Ok(real) = fs::canonicalize(at) {
-            let mut out = strip_verbatim(&real);
-            out.extend(tail.iter().rev());
-            return out;
-        }
-        match (at.parent(), at.file_name()) {
-            (Some(parent), Some(name)) => {
-                tail.push(name);
-                at = parent;
+        match fs::symlink_metadata(at) {
+            Ok(_) => {
+                let real = fs::canonicalize(at)
+                    .map_err(|e| format!("cannot resolve {}: {}", at.display(), e))?;
+                if !real.is_dir() {
+                    return Err(format!("{} is not a directory", at.display()));
+                }
+                let mut out = strip_verbatim(&real);
+                out.extend(tail.iter().rev());
+                return Ok(out);
             }
-            _ => return p.clone(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => match (at.parent(), at.file_name()) {
+                (Some(parent), Some(name)) => {
+                    tail.push(name);
+                    at = parent;
+                }
+                _ => return Err(format!("cannot resolve {}: {}", at.display(), e)),
+            },
+            Err(e) => return Err(format!("cannot inspect {}: {}", at.display(), e)),
         }
     }
+}
+
+/// Physical ancestors for the management checkout guard. Root-link ownership
+/// remains a separate lstat question, as it does on Unix.
+pub fn destination_ancestors(p: &Path) -> Result<Vec<PathBuf>, String> {
+    let p = resolved(p)?;
+    let mut out = Vec::new();
+    for at in p.ancestors() {
+        match fs::metadata(at) {
+            Ok(_) => out.push(at.to_path_buf()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("cannot inspect {}: {}", at.display(), e)),
+        }
+    }
+    Ok(out)
 }
 
 /// Whether a resolved gitdir, `GIT_DIR` or `HEAD` path at `p` may be handed to the
@@ -2567,8 +2592,8 @@ mod tests {
         if short.is_dir() {
             assert_eq!(normalize(&short), stored.join("LongDirectoryName"), "8.3 short name");
         }
-        assert!(same_path(&lower.join("notyet"), &stored.join("NotYet")));
-        assert!(!same_path(&stored, &stored.join("LongDirectoryName")));
+        assert!(same_path(&lower.join("notyet"), &stored.join("NotYet")).unwrap());
+        assert!(!same_path(&stored, &stored.join("LongDirectoryName")).unwrap());
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -2581,16 +2606,16 @@ mod tests {
         let skills = d.join("cfg").join("skills");
         fs::create_dir_all(&skills).expect("mkdir");
         let upper = PathBuf::from(skills.to_string_lossy().to_uppercase());
-        assert!(is_within(&upper.join("claude-tabstatus"), &skills), "case, unwritten tail");
-        assert!(is_within(&upper, &skills), "the directory itself");
+        assert!(is_within(&upper.join("claude-tabstatus"), &skills).unwrap(), "case, unwritten tail");
+        assert!(is_within(&upper, &skills).unwrap(), "the directory itself");
         let mut verbatim = OsString::from(r"\\?\");
         verbatim.push(skills.join("foo"));
-        assert!(is_within(Path::new(&verbatim), &skills), "\\\\?\\ prefix");
+        assert!(is_within(Path::new(&verbatim), &skills).unwrap(), "\\\\?\\ prefix");
         let via = d.join("via");
         link_dir(&skills, &via).expect("junction");
-        assert!(is_within(&via.join("foo"), &skills), "through a junction");
-        assert!(!is_within(&d.join("cfg").join("skills2").join("x"), &skills), "a sibling");
-        assert!(!is_within(&d.join("cfg"), &skills), "the parent");
+        assert!(is_within(&via.join("foo"), &skills).unwrap(), "through a junction");
+        assert!(!is_within(&d.join("cfg").join("skills2").join("x"), &skills).unwrap(), "a sibling");
+        assert!(!is_within(&d.join("cfg"), &skills).unwrap(), "the parent");
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -2677,16 +2702,16 @@ mod tests {
             fs::create_dir(x).expect("mkdir");
         }
         assert_eq!(fs::read_dir(&d).expect("list").count(), 3, "three names on disk");
-        assert!(!same_path(&a, &b) && !same_path(&a, &r) && !same_path(&b, &r));
+        assert!(!same_path(&a, &b).unwrap() && !same_path(&a, &r).unwrap() && !same_path(&b, &r).unwrap());
         let upper = named(&[0x41, 0xD800]);
         let mut verbatim = OsString::from(r"\\?\");
         verbatim.push(&a);
         for v in [&a, &upper, Path::new(&verbatim)] {
-            assert!(same_path(v, &a), "{}", v.display());
-            assert!(is_within(&v.join("new"), &a), "{}", v.display());
+            assert!(same_path(v, &a).unwrap(), "{}", v.display());
+            assert!(is_within(&v.join("new"), &a).unwrap(), "{}", v.display());
         }
-        assert!(!is_within(&b.join("x"), &a) && !is_within(&r.join("x"), &a));
-        assert!(!is_within(&a.join("x"), &r));
+        assert!(!is_within(&b.join("x"), &a).unwrap() && !is_within(&r.join("x"), &a).unwrap());
+        assert!(!is_within(&a.join("x"), &r).unwrap());
         let _ = fs::remove_dir_all(&d);
     }
 

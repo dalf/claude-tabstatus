@@ -870,19 +870,68 @@ Further refusals close the remaining doors:
   preflight, so a failure lands before the marker exists rather than half way
   through.
 
-**`--tree` is made absolute and lexically normalised once, before anything looks at
-it.** Everything downstream compares that path, writes through it and *records* it,
-and a raw argument defeated all three. `--tree skills/claude-tabstatus` run from
-`<config>` walked straight past the refusal whose job is to keep the tree out of
-`skills/`, because that test is a component-prefix test on the string; the symlink
-then got the relative string as its target, which resolves against the *link's*
-directory rather than the shell's, so the link dangled while the env key was set and
-`install` said "Done."; and the record kept the relative string, so a later
-`uninstall` run from somewhere else removed files from whatever happened to be named
-that there. `fs::canonicalize` is the wrong tool - it resolves symlinks, and it fails
-on a path that does not exist yet, which the tree usually does not - so `.` and `..`
-are folded textually. A `tree` field in the record that is not absolute can only
-come from a hand edit and is ignored rather than resolved.
+**Management paths are absolute; spelling, link identity and destination identity
+are separate questions.** Relative `--tree`, config and default/environment paths
+are anchored before they are recorded. Unix removes redundant separators and `.`
+but leaves `..` for the kernel: `alias/..` can name a different directory from its
+lexical parent. Windows keeps its existing stored-spelling, short-name and verbatim
+prefix normalisation. A relative `tree` field in an installation record is ignored.
+
+`sys::same_path` and `sys::is_within` return `Result<bool, String>`; inspection
+failure is neither “different” nor “outside”. On Unix, existing directory identity
+is device/inode. For an absent destination, lstat peels genuinely missing components
+until the deepest existing directory, then resolves that directory. Permission
+errors, non-directory ancestors, symlink loops and dangling ancestor links are
+errors. Containment of an existing base checks identities along the physical
+ancestor chain. Two missing destinations can intersect only if their existing
+anchors have the same identity; their remaining components are compared with
+component boundaries intact (`skills2` stays outside `skills`).
+
+Darwin compares differing missing ASCII names using `pathconf(_PC_CASE_SENSITIVE)`
+on that existing ancestor. Both the [current XNU selector declaration](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/unistd.h)
+and [Apple's HFS implementation](https://github.com/apple-oss-distributions/hfs/blob/main/core/hfs_vnops.c)
+were checked against the locked libc bindings: 0 means insensitive, 1 sensitive,
+and other answers retain uncertainty. Existing Unicode-normalisation aliases use
+filesystem identity directly. Differing missing non-ASCII names retain uncertainty;
+there is no Unicode folding algorithm or probing directory creation. This matters
+because [APFS preserves spelling but supports normalisation-insensitive lookup and
+both case variants](https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/APFS_Guide/FAQ/FAQ.html).
+Create the intended ancestor first when a comparison lacks sufficient evidence.
+Linux keeps byte comparison for missing names. Windows keeps spelling identity for
+links, including its system case table, and resolves destination containment; its
+resolution now also propagates inspection failures instead of peeling them away.
+
+The requested tree root is inspected without following its final link **before**
+resolution; existing and dangling root symlinks remain refused. Every generated
+directory component is inspected without following links, during preflight and
+again at each write/removal. Ancestor symlinks remain permitted, with guards applied
+to the destinations they reach. Checkout protection walks physical ancestors as
+well as spelled ones, without the old 24-directory bound. It still requires a
+`.git` beside `.claude-plugin/plugin.json` above the target, so an unrelated HOME
+repository alone does not block the default. settings.json keeps its separate
+symlink-target policy. Display paths and `strip_home_prefix` are unchanged.
+
+Reinstall and doctor recognise equivalent live generated-tree destinations.
+Orphan detection requires proven difference from the live tree and previously
+identified candidates; uncertainty names the inspection failure and skips the
+candidate. Uninstall checks that its live destination can be inspected before any
+writes, and retains the root/component link guards for deletion. These are
+filesystem observations at inspection time, **not protection against concurrent
+filesystem replacement**. No handle-relative mutation transaction is introduced.
+
+`tests/test_install_paths.py --reproduce-old` is a native, isolated reproducer:
+first prove case-insensitive lookup, then request `config/SKILLS/claude-tabstatus`
+with `config/skills` already present. The baseline is expected to fail only after
+writing the tree, record and settings. Normal suite execution requires the same
+case to refuse with every fixture unchanged, including file identities, bytes,
+mode, owner/group and native ACL entries. Its native classes create disposable
+APFS and APFSX images with hdiutil and prove the lookup semantics; failure to create
+either volume fails CI. Coverage includes missing config/skills, Unicode aliases,
+`/var` and `/private/var`, ancestor links, checkout guards, inspection failures,
+reinstall/doctor/uninstall identity, root/component symlinks and case-sensitive
+siblings. The previous native ACL/ownership suite remains required. At this change,
+native execution of the path suite and the original APFS reproducer is **pending**:
+local Linux tests and both Apple cross-checks cannot establish filesystem behaviour.
 
 **The marker is written first, before the binary and before either manifest.** It
 is the only evidence of ownership the refusal accepts, so a run killed in that
@@ -1026,14 +1075,14 @@ symlink is reported as broken and replaced, and a real directory is refused outr
 Both halves preflight every refusal - the tree's ownership and writability, the
 `skills` directory and its writability, `settings.json`'s shape, mode and parent, a
 `settings.json` symlink that does not resolve, and whether there is a state record
-proving the key is ours - so nothing between the writes can decide to stop, and every
-refusal still honestly ends **"Nothing has been changed."** A `settings.json` with
+proving the key is ours - so detected unsafe paths are refused before installation
+writes, and every preflight refusal still honestly ends **"Nothing has been changed."** A `settings.json` with
 duplicate members at the top level or inside `env` is refused too: this tool resolves
 first-wins and `JSON.parse` resolves last-wins, so editing it could set a key Claude
 Code never reads.
 
-What is preflighted cannot fail between the writes; what is left is a full disk or a
-tampered tree, and both land at the **first** write - directly under a header that
+A successful preflight does not prevent later filesystem replacement or I/O
+failure. An early materialisation error is reported directly under a header that
 may have just announced that the live plugin link "will ->" somewhere new. The bare
 OS error alone leaves the only question that matters unanswered, so the failure
 answers it:

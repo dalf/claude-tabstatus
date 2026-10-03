@@ -1814,7 +1814,7 @@ check 'install --tree: a plain git repo above is not a reason to refuse' 'yes' \
        [ -x "$_sadots/.local/share/claude-tabstatus/bin/tabstatus" ] && printf yes)"
 # Under <config>/skills, install would be asked to symlink a directory to itself.
 check 'install --tree: refuses a target under the skills directory' 'yes' \
-    "$(_sa install --tree "$_sacfg/skills/claude-tabstatus" | grep -q 'symlink a directory to itself' && printf yes)"
+    "$(_sa install --tree "$_sacfg/skills/another-tree" | grep -q 'symlink a directory to itself' && printf yes)"
 # A target that exists and is NOT a directory. This used to reach create_dir_all and
 # print `cannot create <path>: File exists (os error 17)` - which reads like a bug and
 # lacks the closing sentence every real refusal ends with.
@@ -1857,18 +1857,19 @@ printf 'theirs\n' >"$_bdvictim/tabstatus"
 # The WRITE side: <tree>/hooks replaced by a link out of the tree.
 rm -f "$_bdtree/hooks/hooks.json"; rmdir "$_bdtree/hooks"
 ln -s "$_bdvictim" "$_bdtree/hooks"
+_bdbefore=$(cksum "$_bdtree/.tabstatus-generated" "$_bdcfg/settings.json" "$_bdcfg/claude-tabstatus.state" "$_bdtree/bin/tabstatus")
 _bdout=$(_bd install)
 check 'install: refuses to write through a symlinked component, and names it' 'yes' \
     "$(printf '%s' "$_bdout" \
        | grep -q "$_bdtree/hooks is not a directory, so hooks/hooks.json is not provably inside" \
        && printf yes)"
 check 'install: and the file outside the tree is untouched' 'theirs' "$(cat "$_bdvictim/hooks.json")"
-# That failure is the FIRST write, and it lands under a header that may just have
-# announced a repoint - so it has to say the live wiring did not move.
-check 'install: a failure in the tree says the symlink and settings were not touched' 'yes' \
-    "$(printf '%s' "$_bdout" | grep -q 'was NOT touched, and neither were settings.json or the' && printf yes)"
-check 'install: and says a re-run resumes rather than refusing' 'yes' \
-    "$(printf '%s' "$_bdout" | grep -q 'so a re-run resumes into it' && printf yes)"
+# Existing unsafe components are refused during preflight, before any generated
+# file, settings or installation record can be rewritten.
+check 'install: the preflight refusal says nothing has changed' 'yes' \
+    "$(printf '%s' "$_bdout" | grep -q 'Nothing has been changed.' && printf yes)"
+check 'install: marker, binary, settings and record are unchanged' "$_bdbefore" \
+    "$(cksum "$_bdtree/.tabstatus-generated" "$_bdcfg/settings.json" "$_bdcfg/claude-tabstatus.state" "$_bdtree/bin/tabstatus")"
 check 'install: and the plugin link really is still where it was' "$_bdtree" \
     "$(readlink "$_bdcfg/skills/claude-tabstatus")"
 rm -f "$_bdtree/hooks"; mkdir -p "$_bdtree/hooks"
@@ -1904,7 +1905,9 @@ check 'install --tree: and no real directory was created at the link path' '' \
     "$(ls -d "$_nmcfg/skills/claude-tabstatus" 2>/dev/null)"
 check 'install --tree: and settings.json was not created either' '' \
     "$(ls "$_nmcfg/settings.json" 2>/dev/null)"
-check 'install --tree: .. is folded before any check runs' 'yes' \
+# The component before .. must exist; the kernel resolves it, including links.
+mkdir -p "$_nmdata"
+check 'install --tree: existing .. resolves before containment checks' 'yes' \
     "$(_nm "$tmp" install --tree "$_nmdata/../nm-config/skills/claude-tabstatus" \
        | grep -q 'symlink a directory to itself' && printf yes)"
 # A DANGLING --tree used to answer NotFound to fs::metadata, read as "absent, go ahead",
