@@ -365,13 +365,15 @@ limitation it closes; the pre-fix freeze is kept as `cases.jsonl.before-fixes`.
 - `test_macos_acl.py`: isolated installer lifecycles, explicit and inherited ACLs,
   no ACL in an inheriting directory, symlink targets, restrictive umasks, backup
   metadata, owner/group preservation and native inspection/application/verification
-  faults. Uses `chmod`, `ls` and `stat` plus a separate native text observer
-  independently of production helpers. The group fixture differs from the parent
+  faults. Uses `chmod`, `ls`, `stat` and Darwin's `xattr` tool plus a separate native
+  text observer independently of production helpers. The group fixture differs from the parent
   directory, and passwordless `sudo` exercises foreign owners with and without
   privileges. CI sets `CCTAB_TEST_REQUIRE_SUDO=1` to require these fixtures; local
   runs skip the privileged cases if unavailable. Privileged installer runs receive
-  only isolated HOME/config/data/state locations. Its SDK-built dyld interposer
-  observes private, empty staging files through `fstatx_np`; a Rust test separately
+  only isolated HOME/config/data/state locations. Lifecycle cases use umasks 022
+  and 077 so installer directories remain traversable; fixture edits restore any
+  set-ID mode bits they clear before the next preservation check. Its SDK-built
+  dyld interposer observes private, empty staging files through `fstatx_np`; a Rust test separately
   observes the intended staging ACL and ownership before writing bytes. Apple
   cross-checks compile that Rust test but cannot establish native preservation.
 - macOS terminal applications and tmux, Intel macOS runtime behaviour and older

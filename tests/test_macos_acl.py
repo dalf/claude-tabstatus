@@ -44,6 +44,16 @@ def add(path, entry):
     tool("/bin/chmod", "+a", entry, str(path))
 
 
+def set_xattr(path, value):
+    # Python's os.*xattr APIs are Linux-only. Hex handles arbitrary bytes through
+    # Darwin's native tool and provides an observer independent of fcopyfile.
+    tool("/usr/bin/xattr", "-wx", "user.cctab-test", value.hex(), str(path))
+
+
+def get_xattr(path):
+    return bytes.fromhex(tool("/usr/bin/xattr", "-px", "user.cctab-test", str(path)))
+
+
 @unittest.skipUnless(sys.platform == "darwin", "requires native Darwin ACLs")
 class DarwinACL(unittest.TestCase):
     @classmethod
@@ -159,6 +169,10 @@ class DarwinACL(unittest.TestCase):
         # A refresh, including a real rewrite after the key was removed externally.
         self.run_cli("install", umask=umask)
         self.settings.write_bytes(ORIGINAL)
+        # This fixture edit itself can clear set-ID bits. Restore the input mode
+        # before asking the installer to preserve it, and observe the whole input.
+        os.chmod(self.settings, wanted[0])
+        self.assertEqual(protection(self.settings), wanted)
         self.run_cli("install", umask=umask)
         self.assertEqual(protection(self.settings), wanted)
         self.assertEqual(protection(backup), wanted)
@@ -192,7 +206,9 @@ class DarwinACL(unittest.TestCase):
 
     def test_explicit_acl_and_modes_through_every_settings_operation(self):
         self.explicit()
-        for umask, mode in ((0o022, 0o640), (0o777, 0o600)):
+        # 077 narrows file modes while allowing new installer directories to be
+        # traversed. 777 prevents tree creation before a settings rewrite is reached.
+        for umask, mode in ((0o022, 0o640), (0o077, 0o600)):
             with self.subTest(umask=umask, mode=mode):
                 self.settings.write_bytes(ORIGINAL)
                 self.explicit()
@@ -207,7 +223,7 @@ class DarwinACL(unittest.TestCase):
         control.touch()
         self.assertNotEqual(control.stat().st_gid, self.settings.stat().st_gid)
         control.unlink()
-        for umask in (0o022, 0o777):
+        for umask in (0o022, 0o077):
             with self.subTest(umask=umask):
                 self.settings.write_bytes(ORIGINAL)
                 self.explicit()
@@ -240,7 +256,7 @@ class DarwinACL(unittest.TestCase):
         tool("/bin/chmod", "-N", str(self.settings))
         os.chown(self.settings, -1, self.alternate_group(optional=True))
         self.assertEqual(acl(self.settings), ())
-        self.lifecycle(0o777)
+        self.lifecycle(0o077)
 
     def test_missing_settings_takes_normal_directory_inheritance(self):
         self.inherit_directory()
@@ -267,21 +283,22 @@ class DarwinACL(unittest.TestCase):
 
     def test_backups_retain_non_acl_metadata(self):
         self.explicit()
-        os.setxattr(self.settings, "user.cctab-test", b"metadata")
+        metadata = b"metadata\x00\xff"
+        set_xattr(self.settings, metadata)
         os.utime(self.settings, ns=(1_600_000_000_000_000_000,) * 2)
         original_stat = self.settings.stat()
         self.run_cli("install")
         backup = Path(str(self.settings) + ".cctab-preinstall")
-        self.assertEqual(os.getxattr(backup, "user.cctab-test"), b"metadata")
+        self.assertEqual(get_xattr(backup), metadata)
         self.assertEqual(backup.stat().st_mtime_ns, original_stat.st_mtime_ns)
         self.assertEqual(backup.stat().st_birthtime, original_stat.st_birthtime)
         # The byte rewrite's xattr policy is unchanged. Give the live file an
         # attribute and check that the pre-uninstall copy also retains it.
-        os.setxattr(self.settings, "user.cctab-test", b"safety")
+        set_xattr(self.settings, b"safety")
         live_stat = self.settings.stat()
         self.run_cli("uninstall")
         safety = Path(str(self.settings) + ".cctab-preuninstall")
-        self.assertEqual(os.getxattr(safety, "user.cctab-test"), b"safety")
+        self.assertEqual(get_xattr(safety), b"safety")
         self.assertEqual(safety.stat().st_mtime_ns, live_stat.st_mtime_ns)
         self.assertEqual(safety.stat().st_birthtime, live_stat.st_birthtime)
 
