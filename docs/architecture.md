@@ -630,6 +630,15 @@ File, pipe and `/dev/null` redirections retain a real controlling terminal: the
 suite checks that neither that terminal nor the redirected output receives a title.
 Every subprocess and state directory is disposable; no user terminal is a target.
 
+`tests/test_terminal_detection.py` adds compiled-binary configuration tests for
+doctor's selected family and evidence, ordinary title protocol bytes, exact vendor
+values, conflicts, overrides and multiplexer vetoes. Its macOS-specific cases run
+in the native job; cross-platform pure tests exercise every candidate table on
+each host. Native execution of these new detection cases is pending: the recorded
+successful run above predates them. Captured protocol output does not establish
+visible behaviour in Terminal.app or iTerm2. The ACL/ownership and APFS/APFSX
+installation-path suites remain required in the native job.
+
 The native job also runs payload, semantic state, background, elicitation and
 persistence suites. The latter's strace fault injection remains Linux-only;
 its other delivery and locking tests run on both Unixes. Linux-specific `/proc`
@@ -1595,8 +1604,13 @@ Entries without a recorded floor retain their existing catalogue verdict; this
 change does not claim to have surveyed version floors for all terminal families.
 
 The reporting resolver is absent from `Config`, title composition, arming and
-routing. Family detection remains presence-only, so even malformed version text
-continues to select the same title and arming behaviour. No attention or colour
+routing. Konsole family detection retains non-empty presence matching, so even
+malformed Konsole version text selects the same title and arming behaviour.
+macOS shared-variable probes use exact vendor values, as documented in the
+[automatic probe policy](research/terminal-capability-matrix.md#automatic-probe-policy).
+Doctor prints the recognised value for these probes, while Linux and Windows
+presence-evidence output is unchanged. Family matching does not establish a
+version or change uncertain capability verdicts. No attention or colour
 emission is implemented, and the shared tmux arming ownership fix is unchanged.
 
 ## Konsole arming

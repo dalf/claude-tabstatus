@@ -76,6 +76,7 @@ jobs:
             CCTAB_TEST_BIN="$binary" python3 tests/test_elicitation.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_tmux_status.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_install_paths.py
+            CCTAB_TEST_BIN="$binary" python3 tests/test_terminal_detection.py
             CCTAB_TEST_BIN="$binary" sh tests/run.sh
             sh tests/corpus/replay.sh "$binary"
           done
@@ -120,6 +121,11 @@ jobs:
 
       - name: Build native validation binary
         run: sh scripts/build.sh
+
+      - name: Require native terminal detection, doctor evidence and title protocol tests
+        env:
+          CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
+        run: python3 tests/test_terminal_detection.py
 
       - name: Require native settings ACL and ownership preservation and failure tests
         env:
@@ -218,6 +224,7 @@ jobs:
           CCTAB_TEST_BIN="$binary" python tests/test_state_contract.py
           CCTAB_TEST_BIN="$binary" python tests/test_background.py
           CCTAB_TEST_BIN="$binary" python tests/test_elicitation.py
+          CCTAB_TEST_BIN="$binary" python tests/test_terminal_detection.py
 
       # --text so the line reads "<hash>  name" like the Linux ones in the merged
       # release SHA256SUMS; Git Bash defaults to "<hash> *name". The digest is the

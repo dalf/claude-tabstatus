@@ -42,6 +42,7 @@ trap 'cleanup; exit 130' HUP INT TERM
 # every assertion below would flip. Neutralise the detection here; the
 # glyph-position section sets these explicitly, per case.
 unset KONSOLE_VERSION KONSOLE_DBUS_SESSION TMUX STY CCTAB_GLYPH_POS
+unset CCTAB_TERMINAL ITERM_SESSION_ID LC_TERMINAL TERM_PROGRAM WT_SESSION CCTAB_NO_TMUX
 # And XDG_DATA_HOME, which is NEW here and the one that now decides where a real
 # plugin tree lands: `install` materialises one, so an install section with only HOME
 # and CLAUDE_CONFIG_DIR redirected would write 680 KB into the RUNNER'S OWN

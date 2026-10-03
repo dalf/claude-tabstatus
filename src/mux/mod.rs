@@ -280,6 +280,9 @@ pub struct Stack {
     /// cause - the distinction [`Support::Disabled`] exists for, kept instead of
     /// being flattened away by `ok().flatten()`.
     pub disabled_by: Option<&'static str>,
+    /// The oracle's answer, retained so doctor honours rung 2 even when a lower
+    /// environment probe also matches. NoOracle supplies None and executes nothing.
+    pub leaf_hint: Option<Surface>,
     pub leaf: Surface,
     /// Derived from `leaf` LAST, in [`resolve`], so a leaf verdict that arrives
     /// from the multiplexer cannot leave the layout computed against a different
@@ -333,6 +336,7 @@ pub fn resolve<O: MuxOracle>(ask: &mut O) -> Stack {
         mux: env.mux.ok().flatten(),
         claimed: env.claimed,
         disabled_by,
+        leaf_hint: hint,
         leaf,
         elide: leaf.caps().elide,
     }
@@ -484,6 +488,7 @@ mod tests {
             claimed: mux.as_ref().map(Mux::kind),
             mux,
             disabled_by: None,
+            leaf_hint: None,
             leaf,
             elide: leaf.caps().elide,
         }

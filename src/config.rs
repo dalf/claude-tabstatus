@@ -206,6 +206,7 @@ impl Config {
         Config {
             dry_run: false,
             stack: Stack {
+                leaf_hint: None,
                 mux: None,
                 claimed: None,
                 disabled_by: None,

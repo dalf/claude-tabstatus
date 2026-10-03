@@ -11,11 +11,11 @@
 //!
 //! EVERY variant compiles in EVERY build, and only the detection CANDIDATE LIST
 //! is cfg-selected - and that list is DATA, not code ([`probe`]). Two facts force
-//! it. `CCTAB_TERMINAL` exists because ssh destroys the environment evidence, so
+//! it. `CCTAB_TERMINAL` exists because ssh can lose the environment evidence, so
 //! a Linux binary has to be able to be TOLD it is talking to iTerm2 or to Windows
 //! Terminal. And a cfg-gated variant would put its capability row and its
-//! grammars out of reach of the Linux `cargo test` that is the only place tests
-//! ever run.
+//! grammars out of reach of cross-platform table tests. Native CI also tests
+//! platform configuration and execution.
 //!
 //! What a row may CLAIM is bounded. A const row can only ever say `Available`,
 //! `Unsupported` or `Unverifiable`: `Disabled` names a knob of OURS and is
@@ -34,7 +34,7 @@ pub mod compose;
 mod probe;
 mod rows;
 
-pub use probe::{by_name, evidence, resolve_leaf, version_evidence, VersionEvidence};
+pub use probe::{by_name, evidence, resolve_leaf, version_evidence, Evidence, VersionEvidence};
 
 use crate::support::{Presence, Support};
 

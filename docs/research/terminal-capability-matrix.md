@@ -257,6 +257,8 @@ not BEL, if it wants VTE.
 | `KONSOLE_VERSION`, `KONSOLE_DBUS_SESSION`, `KONSOLE_DBUS_SERVICE`, `KONSOLE_DBUS_WINDOW` | Konsole | **yes, into everything** | no (not in `SendEnv`) | **yes, and worse: the tmux *server* inherits them from its first client and hands them to every pane of every session forever** (`update-environment` has no `KONSOLE_*`) | V |
 | `VTE_VERSION` | VTE ≥ 0.34 (GNOME Terminal, Tilix, Terminator, Ptyxis, …) — **not** a specific app | yes | no | yes (frozen at server start) | V |
 | `TERM_PROGRAM` / `TERM_PROGRAM_VERSION` | iTerm2 / Apple_Terminal / vscode / WezTerm / ghostty / tmux(!) — a *shared* namespace with no registry | yes | **sometimes yes**: Ghostty's `ssh --forward-env` explicitly requests `SendEnv` of `COLORTERM,TERM_PROGRAM,TERM_PROGRAM_VERSION` (ghostty src/cli/ssh.zig) → **a remote host can see a local terminal's identity and then be wrong about everything else** | yes, frozen | V |
+| `ITERM_SESSION_ID` | iTerm2, non-empty dedicated session hint | yes | only if configured | yes, inherited | V ([iTerm2 source](https://github.com/gnachman/iTerm2/blob/v3.5.0/sources/PTYSession.m#L2471)) |
+| `LC_TERMINAL=iTerm2` | iTerm2, exact value; other values do not identify iTerm2 | yes | only if configured on both ends; `LC_*` forwarding is not guaranteed | yes, inherited | V ([iTerm2 source](https://github.com/gnachman/iTerm2/blob/v3.5.0/sources/PTYSession.m#L2451)) |
 | `KITTY_PID`, `KITTY_WINDOW_ID`, `KITTY_LISTEN_ON`, `KITTY_INSTALLATION_DIR`, `KITTY_PUBLIC_KEY` | kitty | yes | no | yes, frozen — and `KITTY_LISTEN_ON` will point at a socket that is no longer the right window | V |
 | `WEZTERM_PANE`, `WEZTERM_UNIX_SOCKET`, `WEZTERM_EXECUTABLE` | WezTerm | yes | no | yes, and `WEZTERM_PANE` becomes **wrong**, not merely stale | I (env names), V (prefix list below) |
 | `ALACRITTY_WINDOW_ID`, `ALACRITTY_SOCKET`, `ALACRITTY_LOG` | Alacritty | yes (`builder.env("ALACRITTY_WINDOW_ID", …)`, alacritty_terminal/src/tty/unix.rs) | no | yes, stale | V |
@@ -268,6 +270,43 @@ not BEL, if it wants VTE.
 | `STY`, `WINDOW` | inside GNU screen | yes | no | — | V |
 | `SSH_TTY`, `SSH_CONNECTION`, `SSH_CLIENT` | this shell came in over ssh | yes | — | **refreshed on reattach** (`SSH_CONNECTION` *is* on `update-environment`) but only for processes started after the reattach | V |
 | XTVERSION reply `DCS > | <name> <version> ST` | the actual terminal, authoritatively | — | — | — | V |
+
+### Automatic probe policy
+
+The implemented probe tables are narrower than the survey above. Linux retains
+non-empty `KONSOLE_VERSION` then `KONSOLE_DBUS_SESSION`; Windows retains non-empty
+`WT_SESSION`. macOS uses this ordered table:
+
+| Variable | Rule | Family | Primary evidence |
+|---|---|---|---|
+| `ITERM_SESSION_ID` | non-empty | iTerm2 | [iTerm2 v3.5.0 session environment](https://github.com/gnachman/iTerm2/blob/v3.5.0/sources/PTYSession.m#L2471) |
+| `LC_TERMINAL` | exactly `iTerm2` | iTerm2 | [iTerm2 v3.5.0 environment assignment](https://github.com/gnachman/iTerm2/blob/v3.5.0/sources/PTYSession.m#L2451) |
+| `TERM_PROGRAM` | exactly `iTerm.app` | iTerm2 | [iTerm2 v3.5.0 environment assignment](https://github.com/gnachman/iTerm2/blob/v3.5.0/sources/PTYSession.m#L2474) |
+| `TERM_PROGRAM` | exactly `Apple_Terminal` | Terminal.app | [Apple-distributed ncurses terminal description](https://github.com/apple-oss-distributions/ncurses/blob/main/ncurses/misc/terminfo.src#L978) documents the exported value |
+
+Value matching is case-sensitive byte equality against these bounded literals,
+not the project's surface names. No trimming, substring matching, Unicode case
+folding or string repair is performed. Other `LC_TERMINAL` values, including
+`WezTerm`, are not mapped here; no verified vendor assignment is recorded for
+them. Other `TERM_PROGRAM` values, including `tmux`, are ineligible in this table.
+An ineligible value does not prevent a later eligible probe from answering.
+Dedicated session ID evidence keeps its existing precedence when hints disagree;
+`LC_TERMINAL` keeps its earlier priority ahead of the new `TERM_PROGRAM` fallback.
+
+The resolution ladder is explicit non-empty override, mux hint, eligible probes,
+then Unknown. Override names alone use ASCII case-insensitive matching; unknown
+non-empty overrides stop the ladder and empty overrides do not. Non-empty `TMUX`
+or `STY` veto all inherited macOS and Linux probes, including malformed or disabled
+tmux. Windows' existing `WT_SESSION` eligibility is unchanged.
+
+Doctor uses the same matching walk and ladder. Presence evidence keeps its
+`$VARIABLE` spelling; value evidence includes the matched literal, for example
+`$LC_TERMINAL=iTerm2`. These are family hints, not running-version evidence or
+confirmation that a sequence was applied. Capabilities and version verdicts are
+unchanged. SSH is not a detection veto: forwarding requires appropriate client
+[SendEnv](https://man.openbsd.org/ssh_config#SendEnv) and server
+[AcceptEnv](https://man.openbsd.org/sshd_config#AcceptEnv) configuration; a missing
+variable does not identify the local terminal.
 
 **The asymmetry that makes env detection unsound.** Only one terminal cleans up after the
 others. GNOME Terminal scrubs, before spawning, the exact prefixes
@@ -360,4 +399,3 @@ These are the concrete rows that break each model.
 7. **Notification grammars are 3-way and non-overlapping** (kitty: 9+777+99; iTerm2: 9 only;
    Konsole: 777+99 but *not* 9; VS Code: 99 only; VTE: none). A single boolean
    `can_notify` loses the information needed to actually emit anything.
-

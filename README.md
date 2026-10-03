@@ -288,6 +288,36 @@ same informative tail. See [Location tuning](#location-tuning).
 
 ## Terminal setup
 
+### Automatic terminal detection
+
+The terminal family is selected in this order: a non-empty `CCTAB_TERMINAL`, a
+multiplexer hint when available, eligible environment signals, then `unknown`.
+The current multiplexer integration supplies no family hint.
+
+| Build | Automatic signals, highest priority first |
+|---|---|
+| Linux | non-empty `KONSOLE_VERSION`, then non-empty `KONSOLE_DBUS_SESSION` → Konsole |
+| macOS source build | non-empty `ITERM_SESSION_ID` → iTerm2; `LC_TERMINAL=iTerm2` → iTerm2; `TERM_PROGRAM=iTerm.app` → iTerm2 or `TERM_PROGRAM=Apple_Terminal` → Terminal.app |
+| Windows | non-empty `WT_SESSION` → Windows Terminal |
+
+The macOS shared-variable values must match exactly, including case. Whitespace,
+prefixes, suffixes and other values do not match; an unknown earlier value lets
+later signals be checked. For example, `LC_TERMINAL=some-other-terminal` with
+`TERM_PROGRAM=Apple_Terminal` selects Terminal.app.
+
+Non-empty `TMUX` or `STY` suppress inherited Linux and macOS family signals,
+including malformed `TMUX` and tmux disabled through `CCTAB_NO_TMUX`.
+An explicit override still works. Recognised override names such as `konsole`,
+`iterm2` and `apple-terminal` match ASCII case-insensitively; any unrecognised
+non-empty override selects `unknown` and stops automatic detection. An empty
+override is unset. Use `tabstatus doctor` to see the family and matched evidence.
+
+Environment signals are hints: they can be inherited or configured remotely.
+SSH forwarding depends on client and server configuration. Family detection
+establishes neither a terminal version nor that a terminal applied a sequence.
+The macOS validation and support limits in [Supported platforms](#supported-platforms)
+still apply.
+
 ### Windows Terminal
 
 Nothing to configure, and the same goes for any terminal that honours a plain
@@ -325,9 +355,9 @@ to each attached client's terminal, and a detach-and-reattach re-arms the tab
 automatically. The tab stays armed until the last Claude pane in that tmux session
 ends, even when other panes start with a different `CCTAB_TERMINAL` value.
 
-`CCTAB_TERMINAL` set to anything else says explicitly that the terminal is
-**not** Konsole, which is how you turn off a false detection (an xterm launched
-from a Konsole shell inherits `KONSOLE_*`).
+`CCTAB_TERMINAL=unknown` turns off a false Konsole detection (an xterm launched
+from a Konsole shell inherits `KONSOLE_*`). Other recognised override names
+select their own terminal family; see [automatic detection](#automatic-terminal-detection).
 
 ### tmux
 
@@ -502,7 +532,7 @@ host prefix; `CCTAB_ELLIPSIS` and `CCTAB_HOST` change the marker and the prefix.
 | `CCTAB_MAX_HOST` | `16` | characters for the ssh host prefix; `0` = no limit |
 | `CCTAB_ELLIPSIS` | `…` | the elision marker; `...` for an ASCII-only terminal |
 | `CCTAB_HOST` | this machine's hostname | the ssh prefix |
-| `CCTAB_TERMINAL` | unset | `konsole` (any case) arms Konsole's per-tab format even over ssh or inside tmux, and puts the glyph or strip on the end Konsole does not elide; any other value says explicitly NOT Konsole. The one knob here that changes what paints outside tmux as well as in |
+| `CCTAB_TERMINAL` | unset | terminal-family override; recognised names match in any ASCII case, unrecognised non-empty values select `unknown`, empty is unset. `konsole` also arms Konsole's per-tab format and changes glyph placement; see [automatic detection](#automatic-terminal-detection) |
 | `CCTAB_TTL_WORKING` | `1200` | seconds before 🔵 decays to ⚪ (🟣 while background work is known) in a tmux tab; `0` = never |
 | `CCTAB_TTL_WAITING` | `900` | seconds before 🟠 decays to ⚪ (🟣 while background work is known) in a tmux tab, **and** before an outstanding wait expires (applied at the next hook); `0` = never |
 | `CCTAB_TTL_GONE` | `3600` | seconds before a cell leaves the tmux strip; `0` = never |

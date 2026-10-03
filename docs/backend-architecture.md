@@ -249,19 +249,27 @@ also rejects process creation and execution attempts in the documented Linux
 configurations, with controls for each syscall name.
 
 **I6 — Environment evidence is per-signal, and a multiplexer vetoes the signals that
-leak.** Each probe carries `survives_mux` and `survives_ssh`. `KONSOLE_VERSION`,
-`KONSOLE_DBUS_SESSION`, `ITERM_SESSION_ID` and `LC_TERMINAL` are `survives_mux:
-false`; `LC_TERMINAL` is `survives_ssh: true`, being the one signal engineered to
-cross the hop. This single flag *is* today's `!flag("TMUX") && !flag("STY")`
+leak.** Each probe carries a typed `NonEmpty` or `Exact` matching rule,
+`survives_mux` eligibility and `locale_forwarding` metadata. `KONSOLE_VERSION`,
+`KONSOLE_DBUS_SESSION`, `ITERM_SESSION_ID`, `LC_TERMINAL` and `TERM_PROGRAM` are
+`survives_mux: false`. Locale forwarding marks `LC_TERMINAL` as a candidate for
+configured SSH forwarding; it guarantees no hop and is not a veto. The mux flag
+*is* today's `!flag("TMUX") && !flag("STY")`
 conjunction, lifted out of each terminal's detector — and it fixes the same bug on
 macOS before it ships, where a stale `ITERM_SESSION_ID` inside tmux would otherwise
 reproduce #18's defect on the other platform.
 
-**ssh is evidence, not a layer.** It interposes no renderer; it *destroys* the
-environment evidence. It is `Surface::Unknown`, whose `arming` is `None`, so no
-appearance bytes are written to a terminal that cannot be named. `CCTAB_TERMINAL` is
-the only way a leaf is knowable in that topology — which is why the override must
-match every variant's name, not merely the ones this build probes.
+The bounded vendor values and precedence are recorded in the
+[automatic probe policy](research/terminal-capability-matrix.md#automatic-probe-policy).
+Detection and doctor share one matching walk; doctor prints matched values and
+retains the mux oracle's hint so it outranks lower environment evidence even when
+both name the same family. The current `NoOracle` supplies no hint.
+
+**ssh is evidence, not a layer.** It interposes no renderer. It may lose the
+environment evidence or carry hints according to client and server configuration.
+Without an eligible hint the family is `Surface::Unknown`, whose `arming` is
+`None`. `CCTAB_TERMINAL` can supply a missing family hint, including a terminal on
+another operating system, so the override matches every variant's name.
 
 ## The armed record
 

@@ -159,6 +159,7 @@ when they agree.
 | direct Unix delivery | `python3 tests/test_unix_delivery.py -v` | Linux, macOS (disposable PTYs) |
 | installer path identity, containment and missing Unicode probes | `python3 tests/test_install_paths.py` | Linux; native macOS with mandatory APFS/APFSX fixtures |
 | settings ACLs, ownership and backup metadata | `python3 tests/test_macos_acl.py` | native macOS (chmod/ls/stat, SDK fault interposition) |
+| terminal-family detection, doctor evidence and title protocol | `python3 tests/test_terminal_detection.py` | Linux, Windows; macOS-specific cases require native macOS |
 | tmux window status | `python3 tests/test_tmux_status.py` | Linux (tmux) |
 | corpus fixture helpers | `python3 -m unittest discover -s tests/corpus -p 'test_*.py' -v` | Linux |
 | golden corpus | `sh tests/corpus/replay.sh bin/tabstatus` | Linux |
@@ -418,8 +419,8 @@ branch push, pull request, manual dispatch, and as a reusable workflow.
 - *macOS* (`macos-15`, arm64 / `aarch64-apple-darwin`): links and executes
   `cargo test --locked --all-targets`, builds a native validation binary, and runs
   the payload, state-contract, background, elicitation, state-guarantees and Unix
-  delivery suites, plus the native settings ACL suite and installer path suite with
-  mandatory disposable case-insensitive APFS and case-sensitive APFSX volumes
+  delivery suites, the terminal-detection suite, plus the native settings ACL and
+  installer path suites with mandatory disposable case-insensitive APFS and case-sensitive APFSX volumes
   (lookup semantics verified). No artifacts are uploaded. Both Apple ABI cross-checks
   remain in the Linux job, including Intel. Native arm64 execution has passed;
   [evidence, scope and limits](docs/architecture.md#macos-validation).

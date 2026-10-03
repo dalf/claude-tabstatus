@@ -3150,27 +3150,33 @@ fn report_stack(cfg: &Config) {
 /// multiplexer swallowed - have different remedies.
 fn leaf_evidence(cfg: &Config) -> Support<String> {
     let in_mux = cfg.stack.claimed.is_some();
-    match (
-        config::var_nonempty("CCTAB_TERMINAL"),
+    leaf_evidence_in(
+        config::var_nonempty("CCTAB_TERMINAL").as_deref(),
+        cfg.stack.leaf_hint,
         surface::evidence(in_mux),
-    ) {
-        (Some(v), _) => Support::Available(format!(
+        in_mux,
+    )
+}
+
+fn leaf_evidence_in(
+    override_: Option<&std::ffi::OsStr>,
+    hint: Option<Surface>,
+    evidence: Option<surface::Evidence>,
+    in_mux: bool,
+) -> Support<String> {
+    match (override_.filter(|v| !v.is_empty()), hint, evidence) {
+        (Some(v), _, _) => Support::Available(format!(
             "CCTAB_TERMINAL={}",
             String::from_utf8_lossy(v.as_encoded_bytes())
         )),
-        (None, Some(var)) => Support::Available(format!("${var}")),
-        // Rung 2 of the ladder: nothing in the environment named it and it is named
-        // anyway, so the multiplexer did. Unreachable while doctor asks `NoOracle` -
-        // and it is here rather than in #18's commit because a report that answered
-        // "nothing named it" beside a named leaf would be the same staleness that
-        // issue is about.
-        (None, None) if cfg.stack.leaf != Surface::Unknown => {
-            Support::Available("the multiplexer".to_owned())
-        }
-        (None, None) if in_mux => {
+        // A mux hint outranks probes even if both name the same family or the
+        // hint names Unknown. NoOracle supplies None in the current doctor path.
+        (None, Some(_), _) => Support::Available("the multiplexer".to_owned()),
+        (None, None, Some(evidence)) => Support::Available(evidence.to_string()),
+        (None, None, None) if in_mux => {
             Support::Unsupported("a multiplexer swallowed the environment's evidence")
         }
-        (None, None) => Support::Unsupported("nothing in the environment named it"),
+        (None, None, None) => Support::Unsupported("nothing in the environment named it"),
     }
 }
 
@@ -3520,6 +3526,37 @@ fn report_title(cfg: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leaf_evidence_honours_the_same_override_hint_probe_ladder() {
+        for hint in [None, Some(Surface::WezTerm), Some(Surface::WindowsTerminal),
+                     Some(Surface::Unknown)] {
+            for in_mux in [false, true] {
+                for (raw, expected) in [
+                    (Some("ITeRm2"), "CCTAB_TERMINAL=ITeRm2"),
+                    (Some("unsupported"), "CCTAB_TERMINAL=unsupported"),
+                    (Some(""), if hint.is_some() { "the multiplexer" } else { "$WT_SESSION" }),
+                    (None, if hint.is_some() { "the multiplexer" } else { "$WT_SESSION" }),
+                ] {
+                    let reported = leaf_evidence_in(raw.map(std::ffi::OsStr::new), hint,
+                        Some(surface::Evidence { var: "WT_SESSION", value: None }), in_mux);
+                    assert_eq!(reported.ok().as_deref(), Some(expected));
+                }
+            }
+        }
+        let reported = leaf_evidence_in(None, None,
+            Some(surface::Evidence { var: "LC_TERMINAL", value: Some("iTerm2") }), false);
+        assert_eq!(reported.ok().as_deref(), Some("$LC_TERMINAL=iTerm2"));
+        for in_mux in [false, true] {
+            let absent = leaf_evidence_in(None, None, None, in_mux);
+            assert_eq!(absent.label(), "n/a");
+            assert_eq!(absent.reason().as_deref(), Some(if in_mux {
+                "a multiplexer swallowed the environment's evidence"
+            } else {
+                "nothing in the environment named it"
+            }));
+        }
+    }
 
     fn parse(words: &[&str]) -> Subcommand {
         let all: Vec<OsString> = words.iter().map(OsString::from).collect();
