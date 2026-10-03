@@ -698,7 +698,12 @@ the pseudo console under Windows Terminal forwards that as an OSC 0. The headles
 guard is three proofs, and any "no" paints nothing: `$CLAUDE_PID` is a running
 ancestor of the hook; its current stdout, read out of its PEB, is a character
 device (refusing `> file` and `| jq`); and, once attached, that handle is a screen
-buffer of that console (refusing `> NUL`). The console part is abandoned after
+buffer of that console (refusing `> NUL`). Only once the walk has found it is
+`$CLAUDE_PID` opened for more than a query, once, and that handle - kept only if
+its process was created when the one the walk found was - serves the PEB read and
+is held until the attach is over: Windows does not reissue a pid while its process
+has an open handle, so a Claude that exits mid-hook cannot have its pid, and the
+attach with it, land on another console. The console part is abandoned after
 **250ms**, and a console call it left in flight is cancelled (within another
 50ms) so the hook can exit, so a terminal that has stopped reading output cannot
 hold a hook past `SessionEnd`'s 1s budget. A Ctrl+C in Claude's console while a
@@ -2125,8 +2130,12 @@ that spawn the real binary as Claude Code does: through Git Bash
 (`CCTAB_TEST_GIT_BASH` overrides its path), `CREATE_NO_WINDOW`, stdio on pipes. It
 asserts the exact titles reaching the pseudo console's output - the idle title,
 identical to the `terminalSequence` one for the same directory, then an empty one,
-and no OSC 50 - and none for a stand-in redirected to a file or to `NUL`, or for a
-`CLAUDE_PID` on the same console that is not the hook's ancestor.
+and no OSC 50 - and none for a stand-in redirected to a file or to `NUL`, for a
+`CLAUDE_PID` on the same console that is not the hook's ancestor, or for a relay
+claude that exits before its hook reads the payload (painted when it stays). That
+last is Claude exiting before the hook looks; its pid being reissued *between* the
+hook's checks cannot be forced, and is closed by the held handle, whose creation
+time must be the one the walk read (a unit test forges a different one).
 `CCTAB_TEST_CONPTY_SHOW=1` with `--nocapture` prints each stream. The developer's
 own tab is never a target: the stand-in starts from an environment without the
 ambient `CLAUDE_PID`, and no test calls `set_session_title` with an ancestor of the
