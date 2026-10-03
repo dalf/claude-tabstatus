@@ -58,6 +58,16 @@ class DetectionFixture(unittest.TestCase):
         self.assertEqual(label, "evidence")
         self.assertEqual((verdict, reason), evidence, output)
 
+    def surface_report(self, values):
+        # Platform diagnostics include this subprocess's PID and start time.
+        # Keep the selected family, evidence and every surface capability row.
+        lines = self.run_binary(values=values).splitlines(keepends=True)
+        start = next(i for i, line in enumerate(lines) if line.startswith(b"surface "))
+        end = next(i for i, line in enumerate(lines)
+                   if i > start and line.startswith(b"multiplexer "))
+        self.assertTrue(any(line.startswith(b"  evidence ") for line in lines[start:end]))
+        return b"".join(lines[start:end])
+
 
 class TerminalDetectionTests(DetectionFixture):
     def test_override_stops_automatic_detection_including_unknown(self):
@@ -93,6 +103,21 @@ class TerminalDetectionTests(DetectionFixture):
                 with self.subTest(mux=mux, value=value):
                     self.assert_detection({**mux, "CCTAB_TERMINAL": value}, family,
                                           ("ok", "CCTAB_TERMINAL=" + value))
+
+    def test_family_hints_and_vendor_version_variables_do_not_promote_capabilities(self):
+        for values, family in [({"LC_TERMINAL": "iTerm2"}, "iterm2"),
+                               ({"TERM_PROGRAM": "iTerm.app"}, "iterm2"),
+                               ({"TERM_PROGRAM": "Apple_Terminal"}, "apple-terminal")]:
+            # macOS exercises automatic detection; other hosts reach the same
+            # capability rows through overrides and check report stability too.
+            if sys.platform != "darwin":
+                values = {**values, "CCTAB_TERMINAL": family}
+            baseline = self.surface_report(values)
+            for version in ["999999", "3.5.0", "invalid"]:
+                with self.subTest(values=values, version=version):
+                    reported = self.surface_report({**values, "LC_TERMINAL_VERSION": version,
+                                                    "TERM_PROGRAM_VERSION": version})
+                    self.assertEqual(reported, baseline)
 
 
 @unittest.skipUnless(sys.platform == "darwin", "requires native macOS binary execution")
@@ -162,14 +187,6 @@ class MacTerminalDetectionTests(DetectionFixture):
                 protocol = self.run_binary("working", {**values, "CCTAB_DRY_RUN": ""})
                 self.assertEqual(json.loads(protocol), {
                     "terminalSequence": "\x1b]0;WORK ~/project\x07", "suppressOutput": True})
-
-    def test_family_hints_and_vendor_version_variables_do_not_promote_capabilities(self):
-        for values in [{"LC_TERMINAL": "iTerm2"}, {"TERM_PROGRAM": "iTerm.app"},
-                       {"TERM_PROGRAM": "Apple_Terminal"}]:
-            baseline = self.run_binary(values=values)
-            for version in ["999999", "3.5.0", "invalid"]:
-                self.assertEqual(self.run_binary(values={**values, "LC_TERMINAL_VERSION": version,
-                    "TERM_PROGRAM_VERSION": version}), baseline)
 
 
 if __name__ == "__main__":
