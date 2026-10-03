@@ -35,6 +35,23 @@ sys.stdin.buffer.read()
 """
 
 
+def compile_helper(command):
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode:
+        raise RuntimeError(f"helper compilation failed (exit {result.returncode}):\n"
+                           f"{result.stdout}{result.stderr}")
+
+
+def compile_contract_probe(target, library, output, source=ROOT / "tests/fixtures/unix_tty_contract.rs",
+                           compiler="rustc"):
+    # Release libc is built with panic=abort. A default unwind consumer cannot
+    # link it; an abort consumer can also use the debug library. Match the
+    # production strategy regardless of which existing artefact was selected.
+    compile_helper([compiler, "--edition=2021", "--target", target, "-C", "panic=abort",
+                    str(source), "--extern", f"libc={library}",
+                    "-L", f"dependency={library.parent}", "-o", str(output)])
+
+
 class UnixDeliveryFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="cctab-unix-delivery-")
@@ -201,8 +218,8 @@ class DarwinTerminalOpenTests(UnixDeliveryFixture):
         source = str(ROOT / "tests/fixtures/darwin_tty_observer.c")
         for flags, output in ((["-dynamiclib"], cls.dylib),
                               (["-DOBSERVER_CONTROL"], cls.control)):
-            subprocess.run(["cc", "-Wall", "-Wextra", "-Werror", *flags,
-                            source, "-o", str(output)], check=True, capture_output=True)
+            compile_helper(["cc", "-Wall", "-Wextra", "-Werror", *flags,
+                            source, "-o", str(output)])
         # The native CI job has already built the locked libc dependency. Reuse
         # it to expose API results under faults, without a production test switch.
         target = "aarch64-apple-darwin" if os.uname().machine == "arm64" else "x86_64-apple-darwin"
@@ -214,10 +231,7 @@ class DarwinTerminalOpenTests(UnixDeliveryFixture):
             raise RuntimeError("build the native Rust target before testing the API contract")
         library = max(libraries, key=lambda p: p.stat().st_mtime_ns)
         cls.probe = Path(cls.native.name) / "contract"
-        subprocess.run(["rustc", "--edition=2021", "--target", target,
-                        str(ROOT / "tests/fixtures/unix_tty_contract.rs"),
-                        "--extern", f"libc={library}", "-L", f"dependency={library.parent}",
-                        "-o", str(cls.probe)], check=True, capture_output=True)
+        compile_contract_probe(target, library, cls.probe)
 
     def observed(self, command, process=None, fault="", binary=BIN, expected_stdout=b""):
         log = self.root / "open.jsonl"

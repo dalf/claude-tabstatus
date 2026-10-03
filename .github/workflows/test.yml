@@ -57,6 +57,9 @@ jobs:
       - name: Test corpus fixtures
         run: python3 -m unittest discover -s tests/corpus -p 'test_*.py' -v
 
+      - name: Test Unix delivery helper compilation and failure diagnostics
+        run: python3 tests/test_unix_delivery_helpers.py -v
+
       - name: Require Linux hot-edge subprocess and delivery checks
         run: |
           python3 -m unittest discover -s tests -p 'test_hot_subprocesses.py' -v
@@ -121,6 +124,9 @@ jobs:
 
       - name: Build native validation binary
         run: sh scripts/build.sh
+
+      - name: Test Unix delivery helper compilation and failure diagnostics
+        run: python3 tests/test_unix_delivery_helpers.py -v
 
       - name: Require native terminal detection, doctor evidence and title protocol tests
         env:

@@ -647,12 +647,20 @@ are written and the rejected descriptor is closed. Open/write failures and parti
 writes retain recorded restoration policy. A test-only Rust probe compiles the
 production Unix backend against the existing native libc build artefact and checks
 the actual `session_tty`/`write_tty` return values, including inspection-error mapping;
-the real CLI deliberately hides these outcomes. Missing open observations and a native
+the real CLI deliberately hides these outcomes. The probe uses `panic=abort` to
+link a release libc artefact; portable compiler tests exercise both abort and unwind
+libraries, with an incompatible consumer as a negative control. Helper build failures
+include the compiler diagnostics. Missing open observations and a native
 control that deliberately omits `O_NOCTTY` must fail the flag check. The control
 reports its observed controlling-terminal state; acquiring one is not a required
 negative control on a kernel where an ordinary PTY open does not acquire it.
 Native execution of this hardening and its observer is **pending**; the recorded
-successful run above predates them. Cross-checks do not prove runtime open flags or
+successful run above predates them. The
+[first hardening job at f8710ca](https://github.com/dalf/claude-tabstatus/actions/runs/37145349648/job/111268023048)
+passed the ordinary PTY cases but failed while compiling the API probe, before the
+observer tests ran. Its command selected a release libc artefact without matching
+that artefact's abort panic strategy; the corrected build still needs a native rerun.
+Cross-checks do not prove runtime open flags or
 controlling-terminal behaviour. ACL, path and detection suites remain required.
 
 `tests/test_terminal_detection.py` adds compiled-binary configuration tests for
