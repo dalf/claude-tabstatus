@@ -605,7 +605,7 @@ Three kinds of evidence must stay separate:
 |---|---|---|
 | Cross-checking on Linux | `cargo check --all-targets` for `aarch64-apple-darwin` and `x86_64-apple-darwin`; pure decision tests and ABI size/offset assertions | Available locally; does not link or execute Apple calls |
 | Native automated validation | `macos-15`, Apple Silicon (`aarch64-apple-darwin`), explicitly checked with `uname -m`; linked Rust tests, release-mode validation build, state suites, disposable PTY delivery and terminal-open observation | Passed on 2026-10-03 at `b43225be85ace4a9aff85d10bbe5553e43704e72`, macOS 15.7.9 (24G830), Rust 1.99.0: [native job](https://github.com/dalf/claude-tabstatus/actions/runs/37146656917/job/111271890833) |
-| Native tmux acceptance | Real compiled hooks, private servers and attached PTY clients on the same arm64 job | Newly required; native execution pending |
+| Native tmux acceptance | Real compiled hooks, private servers and attached PTY clients on the same arm64 job | Passed on 2026-10-03 at `bf7e910ba46fd11794782765268084032851ebae`, macOS 15.7.9 (24G830), arm64, tmux 3.7c, Rust 1.99.0; all 40 tests without skips: [native tmux job](https://github.com/dalf/claude-tabstatus/actions/runs/37151659979/job/111286629516) |
 | Terminal-application testing | Terminal.app, iTerm2, Ghostty, Konsole and Claude Code's live hook integration | Not performed on macOS; a PTY byte capture cannot show how a terminal applies an OSC |
 
 The runner label's architecture follows [GitHub's runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
@@ -742,7 +742,14 @@ Forced Konsole/WezTerm rows are protocol tests, not real terminal applications.
 Exact title-setting and window-format restoration covers uninstall after the
 last owner, inherited/explicit/empty formats, literals and surviving user edits.
 Invalid, exited and file/pipe/null stdout owners leave pane and client titles
-unchanged. Native execution of these tmux scenarios is pending.
+unchanged. All 40 tmux tests passed without skips in the native tmux job above,
+including the read-only-record case and every observer control. No production
+change was needed. The existing hostname, ACL/ownership, APFS/APFSX, terminal
+detection and Unix-open suites also passed in that job. The installation-path
+suite retained two skips for case-sensitive scenarios on case-insensitive
+fixtures; those scenarios ran on its required APFSX fixture. Persistence
+retained its Linux-only strace fault-injection skip. The Linux and Windows jobs
+for the same commit passed as well.
 
 The native job also runs payload, semantic state, background, elicitation and
 persistence suites. The latter's strace fault injection remains Linux-only;
@@ -753,7 +760,8 @@ Linux assertions. The Linux golden corpus remains a Linux specification and is
 not replayed as a macOS acceptance suite.
 
 The successful native run establishes only the tested architecture, OS image
-and scenarios. Native tmux execution of the expanded acceptance suite is pending.
+and scenarios. PTY observations establish transport and tmux behaviour for
+the tested configuration, not how a terminal application applies the resulting title.
 Terminal application behaviour, real Claude Code sessions, Intel runtime behaviour,
 older macOS versions and untested tmux versions remain unvalidated.
 Forced PID reuse during terminal lookup/write and kernel permission-denied queries
@@ -1823,8 +1831,8 @@ tmux, while known background stays visible.
 
 All tmux paints write raw OSC directly to the pane's verified terminal - Claude
 Code's pty, through `/proc/$CLAUDE_PID/fd/1` on Linux and `proc_pidfdinfo` on
-macOS - so tmux integration is Unix-only; required native macOS acceptance is
-pending. Claude Code 2.1.274
+macOS - so tmux integration is Unix-only. Native macOS 15 arm64 acceptance
+with tmux 3.7c passed; see [evidence and limits](#macos-validation). Claude Code 2.1.274
 wraps hook `terminalSequence` OSCs in tmux passthrough, which bypasses `pane_title`;
 using that JSON delivery path would leave the startup idle record unchanged. A
 missing or redirected terminal is a silent no-op. The non-tmux JSON delivery path is

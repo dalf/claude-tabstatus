@@ -173,9 +173,11 @@ The missing Unicode probes, corrected case-sensitive path fixtures and fault-mes
 assertions have also passed natively. See the recorded results and remaining
 coverage in the validation document. These suites do not establish behaviour in
 a terminal application.
-The hostname suite passed at `6d4bfa8`; native tmux acceptance is newly required
-and execution is pending. SDK compilation, recording controls, PTY attachment
-and required observations fail when unavailable; tmux absence fails in CI.
+The hostname suite passed at `6d4bfa8`; required native tmux acceptance passed
+all 40 tests without skips at `bf7e910` on macOS 15.7.9 arm64, tmux 3.7c:
+see the recorded [native job](https://github.com/dalf/claude-tabstatus/actions/runs/37151659979/job/111286629516).
+SDK compilation, recording controls, PTY attachment and required observations
+fail when unavailable; tmux absence fails in CI.
 
 The in-crate unit tests are not replaced by the shell and Python harnesses: they
 check argv and environment parsing, the location walk, the length cap and its
@@ -344,7 +346,9 @@ the test process. Keep it that way in any new test.
   arming in both exit orders, detach/reattach, exact uninstall restoration and
   headless refusals. Missing delivery, a broken carrier and OSC-only text are
   negative observer controls. Forced Konsole/WezTerm selections are protocol
-  tests, not terminal-application evidence. Native execution is pending.
+  tests, not terminal-application evidence. All 40 tests passed natively without
+  skips; local root runs skip only the read-only-record case because root
+  bypasses mode-bit permissions.
 
 ### The golden corpus
 
@@ -402,8 +406,8 @@ limitation it closes; the pre-fix freeze is kept as `cases.jsonl.before-fixes`.
   observes the intended staging ACL and ownership before writing bytes. Apple
   cross-checks compile that Rust test but cannot establish native preservation.
 - macOS terminal applications, Intel macOS runtime behaviour, older macOS
-  versions and untested tmux versions. Native tmux acceptance is pending.
-  Native arm64 CI covers the documented process, state and PTY scenarios.
+  versions and untested tmux versions. Native arm64 CI covers the documented
+  process, state, PTY and real-server tmux scenarios.
 
 ## Benchmarking
 
@@ -517,7 +521,7 @@ Rules:
 
 - **macOS** ([issue #1](https://github.com/dalf/claude-tabstatus/issues/1)):
   native source builds and arm64 automated validation have passed CI. Native
-  tmux acceptance is required, with execution pending. Terminal applications,
+  tmux acceptance has passed on macOS 15 arm64 with tmux 3.7c. Terminal applications,
   live Claude Code integration, Intel runtime behaviour and older macOS remain
   unvalidated. No release asset or product support claim is added; see
   [validation scope](docs/architecture.md#macos-validation).

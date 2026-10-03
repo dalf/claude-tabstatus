@@ -39,7 +39,7 @@ work cannot be remembered between hooks. The full policy is in
 |---|---|---|
 | Linux x86_64 | supported; the musl build is static and recommended - it runs on any x86_64 Linux whatever its glibc | `tabstatus-x86_64-unknown-linux-musl` (or `-linux-gnu`) |
 | Windows x86_64, native | supported; needs Git Bash, which Claude Code itself requires on Windows and runs hooks through | `tabstatus-x86_64-pc-windows-msvc.exe` |
-| macOS | **experimental; native arm64 CI validated**. Native builds, process/state checks and disposable PTY delivery passed on macOS 15 arm64; Intel runtime behaviour remains unvalidated. Automated PTY tests do not establish behaviour in Terminal.app, iTerm2 or other terminal applications; see [issue #1](https://github.com/dalf/claude-tabstatus/issues/1). | none |
+| macOS | **experimental; native arm64 CI validated**. Native builds, process/state checks, disposable PTY delivery and tmux 3.7c acceptance passed on macOS 15 arm64; Intel runtime behaviour remains unvalidated. Automated PTY tests do not establish behaviour in Terminal.app, iTerm2 or other terminal applications; see [issue #1](https://github.com/dalf/claude-tabstatus/issues/1). | none |
 | Linux aarch64 / ARM | no build; an x86_64 binary fails with *Exec format error*. Check `uname -m` on a remote VM first | none |
 
 | Terminal | What you get |
@@ -47,8 +47,14 @@ work cannot be remembered between hooks. The full policy is in
 | Windows Terminal, and any terminal that honours a plain OSC 0 title | works with no configuration |
 | Konsole | works; the tab is switched to show the title automatically ([Konsole](#konsole)) |
 | Konsole, then ssh to a Linux host | set one variable on the remote side ([Konsole over ssh](#konsole-over-ssh)) |
-| tmux (Linux; native macOS acceptance pending) | one indicator per Claude pane, decaying over time ([tmux](#tmux)) |
+| tmux (Linux; experimental on macOS, tested with 3.7c on macOS 15 arm64) | one indicator per Claude pane, decaying over time ([tmux](#tmux)) |
 | GNU screen | no indicator; tmux running inside screen works |
+
+macOS tmux validation uses disposable PTY clients. Real Terminal.app/iTerm2
+behaviour and live Claude Code integration, Intel runtime behaviour, older macOS
+versions and other tmux versions remain unvalidated. PTY observations establish
+transport and tmux behaviour for that configuration; they do not show how a
+terminal application applies the title.
 
 Direct MCP elicitation tracking relies on two hook events found in the Claude
 Code 2.1.274 executable; earlier versions and live interactive delivery have not
