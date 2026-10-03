@@ -604,7 +604,7 @@ Three kinds of evidence must stay separate:
 | Validation | Scope | Evidence at this change |
 |---|---|---|
 | Cross-checking on Linux | `cargo check --all-targets` for `aarch64-apple-darwin` and `x86_64-apple-darwin`; pure decision tests and ABI size/offset assertions | Available locally; does not link or execute Apple calls |
-| Native automated validation | `macos-15`, Apple Silicon (`aarch64-apple-darwin`), explicitly checked with `uname -m`; linked Rust tests, release-mode validation build, state suites and disposable PTY delivery | Passed on 2026-10-03 at `078c5476c685e66de27a434314ee53bc696840d5`: [native job](https://github.com/dalf/claude-tabstatus/actions/runs/37120757414/job/111196233507) |
+| Native automated validation | `macos-15`, Apple Silicon (`aarch64-apple-darwin`), explicitly checked with `uname -m`; linked Rust tests, release-mode validation build, state suites, disposable PTY delivery and terminal-open observation | Passed on 2026-10-03 at `b43225be85ace4a9aff85d10bbe5553e43704e72`, macOS 15.7.9 (24G830), Rust 1.99.0: [native job](https://github.com/dalf/claude-tabstatus/actions/runs/37146656917/job/111271890833) |
 | Terminal-application testing | Terminal.app, iTerm2, Ghostty, Konsole and Claude Code's live hook integration | Not performed on macOS; a PTY byte capture cannot show how a terminal applies an OSC |
 
 The runner label's architecture follows [GitHub's runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
@@ -658,8 +658,18 @@ include the compiler diagnostics. Missing open observations and a native
 control that deliberately omits `O_NOCTTY` must fail the flag check. The control
 reports its observed controlling-terminal state; acquiring one is not a required
 negative control on a kernel where an ordinary PTY open does not acquire it.
-Native execution of this hardening and its observer is **pending**; the recorded
-successful run above predates them. The
+The recorded native job passed all ten Unix delivery tests, including all five
+Darwin observer tests without skips. It observed `O_NOCTTY` and close-on-exec on
+both production delivery paths, zero controlling-terminal flags before and after
+their opens and at exit, and the expected bytes. Descriptor refusal, inspection
+and transport faults, partial writes, restore obligations and the observer's
+missing-observation/missing-flag controls all passed. The ordinary-open control
+on an unowned PTY changed its masked `PROC_FLAG_CTTY | PROC_FLAG_CONTROLT` value
+from `0` to `192`. This is evidence for that synthetic detached child on this
+runner, not a claim that every Darwin PTY open acquires a controlling terminal or
+that a live Claude hook failure has been reproduced.
+
+The
 [first hardening job at f8710ca](https://github.com/dalf/claude-tabstatus/actions/runs/37145349648/job/111268023048)
 passed the ordinary PTY cases but failed while compiling the API probe, before the
 observer tests ran. Its command selected a release libc artefact without matching
@@ -667,16 +677,20 @@ that artefact's abort panic strategy. The
 [follow-up job at 1954602](https://github.com/dalf/claude-tabstatus/actions/runs/37146032618/job/111270045915)
 reached the linker after correcting the panic strategy, but failed because Apple's
 LLVM 17 linker could not read the Rust LLVM 23 release bitcode. Neither failed job
-ran the observer tests. The Rust LTO correction still needs a native rerun.
-Cross-checks do not prove runtime open flags or
-controlling-terminal behaviour. ACL, path and detection suites remain required.
+ran the observer tests. The successful native rerun above includes the Rust LTO
+correction. Cross-checks alone do not prove runtime open flags or controlling-terminal
+behaviour. The same workflow passed both Linux binaries' actual-delivery subprocess
+gates, shell suites (843 assertions each) and golden corpus (312 cases each), both
+Apple ABI cross-checks and the Windows job. Descriptor inspection still adds syscalls;
+the zero-subprocess result is not a latency measurement.
 
 `tests/test_terminal_detection.py` adds compiled-binary configuration tests for
 doctor's selected family and evidence, ordinary title protocol bytes, exact vendor
 values, conflicts, overrides and multiplexer vetoes. Its macOS-specific cases run
 in the native job; cross-platform pure tests exercise every candidate table on
-each host. Native execution of these new detection cases is pending: the recorded
-successful run above predates them. Captured protocol output does not establish
+each host. All eleven detection tests passed in the recorded native run, along
+with all seventeen ACL/ownership tests and the APFS/APFSX installation suite
+(82 cases, two conditional skips). Captured protocol output does not establish
 visible behaviour in Terminal.app or iTerm2. The ACL/ownership and APFS/APFSX
 installation-path suites remain required in the native job.
 
@@ -732,7 +746,7 @@ transport. Rejected Files are dropped, and no outcome cancels recorded restorati
 policy or prevents attempts to other tmux clients. Ordinary `terminalSequence`
 delivery and the title, arm and restore byte sequences are unchanged.
 
-This is hardening, not a reproduced macOS controlling-terminal acquisition failure.
+No controlling-terminal acquisition failure has been reproduced in a live Claude hook.
 [POSIX leaves acquisition without O_NOCTTY implementation-defined](https://pubs.opengroup.org/onlinepubs/9799919799/functions/open.html).
 [Darwin's open manual](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/open.2)
 documents the flag, while the current
@@ -1053,10 +1067,12 @@ executed both APFS variants and the Unicode scenarios, and passed all 17 ACL/own
 tests. Its eight failures were fault-message assertions for child creation and
 lookup: each installation had refused with the fixture unchanged, then the test
 required the word "probe" in a "cannot inspect missing Unicode names" message.
-The assertions now require each fault's failure stage and injected errno instead;
-their native rerun is pending. The later native state/PTY step was skipped after
-the failed path step. Local Linux tests and Apple cross-checks cannot establish
-filesystem behaviour. The suite uses APFS volumes; the HFS probe path also lacks
+The assertions now require each fault's failure stage and injected errno instead.
+The [native job at `b43225b`](https://github.com/dalf/claude-tabstatus/actions/runs/37146656917/job/111271890833)
+passed the corrected suite on both APFS variants (82 cases, two conditional skips),
+all 17 ACL/ownership tests and the later state/PTY step. Local Linux tests and Apple
+cross-checks cannot establish filesystem behaviour. The suite uses APFS volumes;
+the HFS probe path also lacks
 native runtime coverage.
 `--reproduce-missing-unicode` separately runs against the pre-probe `f4b9fff` binary:
 it proves Unicode lookup equivalence, then requires refusal of the safe

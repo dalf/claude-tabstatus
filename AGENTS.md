@@ -165,12 +165,13 @@ when they agree.
 | golden corpus | `sh tests/corpus/replay.sh bin/tabstatus` | Linux |
 | ConPTY end to end | part of `cargo test` (`tests/conpty.rs`) | Windows |
 
-The previously recorded macOS suites have passed in native arm64 CI; see
+The macOS suites, including the native terminal-open observer, have passed in
+arm64 CI; see
 [macOS validation](docs/architecture.md#macos-validation) for the recorded run.
-The missing Unicode probes and corrected case-sensitive path fixtures have run
-natively; their fault-message assertion correction awaits a native rerun. See the
-recorded results and remaining coverage in the validation document. These suites
-do not establish behaviour in a terminal application.
+The missing Unicode probes, corrected case-sensitive path fixtures and fault-message
+assertions have also passed natively. See the recorded results and remaining
+coverage in the validation document. These suites do not establish behaviour in
+a terminal application.
 
 The in-crate unit tests are not replaced by the shell and Python harnesses: they
 check argv and environment parsing, the location walk, the length cap and its
