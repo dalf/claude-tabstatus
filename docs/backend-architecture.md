@@ -348,11 +348,15 @@ The measured facts that shape it are in
 - **A backend that needs a daemon must say so** as a first-class property, and stay
   opt-in. The pinned iTerm2 prior art is the worked example of what forces one.
 
-`Transition { Entered, Remained, Left, Unknown }` is threaded through the seam and
-**consumed by nothing**. Today `Paint` carries a state, so the first and the
-fiftieth waiting edge are byte-identical and no backend can alert once. Landing the
-fact inert keeps output byte-identical and the corpus green while making #14 a
-backend to write rather than a re-plumbing of the crate.
+`Resolved` carries an optional paint and
+`Transition { Entered, Remained, Left, Unknown }` independently. The
+[logical attention contract](state-contract.md#logical-attention-transitions)
+defines the comparison, including expiry, silent events, reset and teardown.
+`main` retains the decision before filtering out absent paints; a future attention
+consumer belongs before that filter. Transitions are **consumed by nothing**
+today. They do not guarantee persistence or delivery and cannot by themselves
+provide exactly-once alerts. Direct Rust assertions exercise this dormant API;
+the golden corpus separately checks that title output has not changed.
 
 ## Dependencies
 

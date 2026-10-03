@@ -72,71 +72,40 @@ impl Paint {
 }
 
 
-/// Whether this run ENTERED, REMAINED IN or LEFT the state that asks for your
-/// attention - the waiting glyph, the one a dialog puts up.
-///
-/// A [`Paint`] cannot answer that question, which is why this type exists: the
-/// first waiting edge of a turn and the fiftieth produce byte-identical paints,
-/// so a bell driven off the paint rings on every `PostToolUse` that follows a
-/// dialog and an indicator driven off it never learns the dialog closed.
-///
-/// `Unknown` is the STATELESS fallback and it is not a defect. [`Edge::resolve`]
-/// is reached whenever a missing session id or an absent state directory
-/// "select the stateless resolver", and `docs/state-contract.md` already says
-/// what that resolver gives up in the same breath: it "cannot protect
-/// overlapping owners", because a run with no record has nothing to compare
-/// itself against. No memory, no transition, and saying so is the same
-/// degradation the contract already accepts for wait ownership.
-///
-/// It is a VALUE and not an `Option<Transition>` because the absence has to be
-/// unignorable: three variants would force the stateless path to invent
-/// `Entered` - ringing on every repeated edge, the storm #14 exists to prevent -
-/// or `Remained`, which never rings at all. Both are wrong answers wearing the
-/// clothes of facts.
+/// Net change in logical attention, independent of title painting or delivery.
+/// See `docs/state-contract.md#logical-attention-transitions`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Transition {
     Entered,
+    /// Both waiting states, or both non-waiting states, compare equal.
     Remained,
     Left,
+    /// No recognised prior record was observed; never assume prior idle.
     Unknown,
 }
 
-/// What to paint, and what painting it changed.
+/// An evaluated decision. A silent paint can still carry a known transition.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Resolved {
-    pub paint: Paint,
-    /// Read by NOTHING on the paint path yet, deliberately: this seam landed inert
-    /// so that the 312-case corpus proves the output did not move, and #14 is the
-    /// first thing that will ring on `Transition::Entered`.
-    ///
-    /// It carries no `#[allow(dead_code)]`, and that is checked rather than
-    /// assumed: the derived `Debug` above counts as a read of every field, so an
-    /// attribute here would suppress nothing today and would silently absorb the
-    /// day this really does die.
+    pub paint: Option<Paint>,
+    /// Describes the logical decision, not persistence or delivery success.
+    /// No delivery consumer uses this yet.
     pub transition: Transition,
 }
 
 impl Resolved {
-    /// The answer of a run with no record behind THIS answer: the stateless
-    /// resolver, and equally the stateful paths that could not take the lock or
-    /// that read nothing at all. What they have in common is the only thing that
-    /// matters here - no previous state was seen, so no comparison was made.
     pub fn stateless(paint: Paint) -> Resolved {
-        Resolved { paint, transition: Transition::Unknown }
+        Resolved { paint: Some(paint), transition: Transition::Unknown }
     }
 
-    /// The answer of a run that read a record. The caller passes the one bit it
-    /// alone knows - whether the session was ALREADY asking for attention - and
-    /// must read that bit before it mutates the record, because every stateful
-    /// path mutates the live record in place.
-    pub fn stateful(was_waiting: bool, paint: Paint) -> Resolved {
-        let transition = match (was_waiting, paint.glyph() == Some(Glyph::Waiting)) {
-            (false, true) => Transition::Entered,
-            (true, false) => Transition::Left,
-            // Both the repeated dialog edge that must not ring twice and the
-            // ordinary working edge that never rang: neither one changes whether
-            // the session is asking for you.
-            (true, true) | (false, false) => Transition::Remained,
+    /// Compare the stored state BEFORE expiry with the decision AFTER expiry
+    /// and the event. The optional paint must not determine either state.
+    pub fn stateful(before: Option<bool>, after: bool, paint: Option<Paint>) -> Resolved {
+        let transition = match (before, after) {
+            (Some(false), true) => Transition::Entered,
+            (Some(true), false) => Transition::Left,
+            (Some(_), _) => Transition::Remained,
+            (None, _) => Transition::Unknown,
         };
         Resolved { paint, transition }
     }
@@ -154,7 +123,7 @@ pub(crate) trait JustPaint {
 #[cfg(test)]
 impl JustPaint for Option<Resolved> {
     fn paint(self) -> Option<Paint> {
-        self.map(|r| r.paint)
+        self.and_then(|r| r.paint)
     }
 }
 impl Edge {
@@ -449,9 +418,8 @@ mod tests {
 
     /// The other half of #14's seam: a run with no record cannot compare, and
     /// `Unknown` is that answer rather than a guess at one. Every stateless edge
-    /// that paints reports it, including the two the state layer hands back
-    /// unchanged when it has read nothing - `session-end`, which deletes the
-    /// record, and an edge word this version does not know.
+    /// that paints reports it, including session end without a record and an edge word this version
+    /// does not know.
     #[test]
     fn the_stateless_path_reports_an_unknown_transition() {
         let p = Payload::empty();

@@ -694,14 +694,10 @@ impl Record {
         s
     }
 
-    /// Whether a tab standing on this record is showing the waiting glyph.
-    ///
-    /// ONE spelling, because six paths capture it and a `Transition` is only as
-    /// honest as their agreement: every path that paints orange has a wait
-    /// outstanding, and every path that stops painting orange has just retired the
-    /// last one, so "is a wait held" is exactly "is this session asking for you".
+    /// Logical attention, including the legacy waiting base. This says nothing
+    /// about which title was painted or delivered.
     fn asking(&self) -> bool {
-        !self.waits.is_empty()
+        !self.waits.is_empty() || self.base == Glyph::Waiting
     }
 
     fn paint(&self, glyph: Glyph) -> Paint {
@@ -899,18 +895,22 @@ impl Session {
         })
     }
 
-    /// The record on disk, and the record after expiry. BOTH, because an expiry is
+    /// The record on disk, its expired copy, and the known prior attention bit.
+    /// Keep absence separate from the fresh fallback. BOTH records, because expiry is
     /// itself a transition: handing `write_if_changed` the already-expired record
     /// as `was` made the two compare equal, so the dead `w` line survived for the
     /// life of the session and a later `CCTAB_TTL_WAITING` could resurrect it.
-    fn load(&self) -> (Record, Record) {
-        let on_disk = match stored_at(&self.path) {
-            Stored::Ours(r) => r,
-            _ => Record::fresh(),
+    fn load(&self) -> (Record, Record, Option<bool>) {
+        let (on_disk, before) = match stored_at(&self.path) {
+            Stored::Ours(r) => {
+                let before = Some(r.asking());
+                (r, before)
+            }
+            _ => (Record::fresh(), None),
         };
         let mut live = on_disk.clone();
         live.expire(self.now, self.ttl);
-        (on_disk, live)
+        (on_disk, live, before)
     }
 
     /// An exclusive advisory lock on this session's own record, held for a whole
@@ -1060,7 +1060,7 @@ impl Session {
     /// default can stand in for.
     pub fn note_armed(&self, surface: Surface) {
         let Some(_lock) = self.lock(true) else { return };
-        let (was, mut now) = self.load();
+        let (was, mut now, _) = self.load();
         now.armed = Some(surface.caps().name);
         self.write_if_changed(&was, &mut now);
     }
@@ -1090,7 +1090,7 @@ impl Session {
         }
     }
 
-    /// The paint for this edge, having consulted and updated the record.
+    /// The logical decision and independent paint, having consulted state.
     ///
     /// The edges the state layer has nothing to say about defer to
     /// [`Edge::resolve`], so there is exactly one place each of those decisions
@@ -1102,30 +1102,34 @@ impl Session {
             // dialog on screen. A mid-turn compaction re-fire is filtered by
             // `Edge::resolve` BEFORE this, and so resets nothing.
             Edge::SessionStart => {
-                let paint = edge.resolve(p)?.paint;
+                let paint = edge.resolve(p)?.paint?;
                 let mut claimed = Record::claimed();
                 let Some(lock) = self.lock(claimed.origin.is_some()) else {
                     self.reap();
                     return Some(Resolved::stateless(paint));
                 };
-                let (was, live) = self.load();
-                // Starting over drops every wait, so a record still holding a live
-                // one is a tab going from orange back to white.
-                let waiting = live.asking();
+                let (was, _, before) = self.load();
                 self.write_if_changed(&was, &mut claimed);
                 // Released before the scan: the reaper never touches our own file,
                 // so holding it across a 256-entry walk would only delay the
                 // session's own next hook.
                 drop(lock);
                 self.reap();
-                Some(Resolved::stateful(waiting, paint))
+                Some(Resolved::stateful(before, claimed.asking(), Some(paint)))
             }
             Edge::SessionEnd => {
-                let paint = edge.resolve(p)?.paint;
+                let paint = edge.resolve(p)?.paint?;
+                // Teardown remains unlocked and requires lifecycle quiescence.
+                // Refuse special paths as evidence, without changing deletion.
+                let before = match fs::symlink_metadata(&self.path) {
+                    Ok(m) if m.is_file() => match stored_at(&self.path) {
+                        Stored::Ours(r) => Some(r.asking()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 self.remove();
-                // This edge reads no record - it deletes the file - and an unpaint
-                // is not the path to add a read to for a fact nothing consumes.
-                Some(Resolved::stateless(paint))
+                Some(Resolved::stateful(before, false, Some(paint)))
             }
             Edge::Working => self.progress(Owner::of(p), p),
             Edge::Waiting => {
@@ -1165,8 +1169,7 @@ impl Session {
             return None;
         }
         let _lock = self.lock(o == Owner::Main)?;
-        let (was, mut now) = self.load();
-        let waiting = now.asking();
+        let (was, mut now, before) = self.load();
         match &o {
             Owner::Agent(_) => {
                 // THE FIX. A subagent's tool call paints nothing - that filter is
@@ -1181,7 +1184,7 @@ impl Session {
                     // not be the one that starts writing records, which is what
                     // keeps a background subagent's tool call free of any write.
                     self.write_if_changed(&was, &mut now);
-                    return None;
+                    return Some(Resolved::stateful(before, now.asking(), None));
                 }
                 // It says nothing about the main loop, so the base is untouched.
             }
@@ -1226,7 +1229,8 @@ impl Session {
         // A wait somebody else still holds keeps the tab: this is the second half
         // of the fix, and the half that matters most. Stateless, a main-thread
         // PostToolUse repainted blue over a subagent's open dialog.
-        now.waits.is_empty().then(|| Resolved::stateful(waiting, now.paint(now.base)))
+        Some(Resolved::stateful(before, now.asking(),
+            now.waits.is_empty().then(|| now.paint(now.base))))
     }
 
     /// `PermissionRequest`, `PreToolUse` on the two tools that always block, and
@@ -1235,8 +1239,7 @@ impl Session {
         let Some(_lock) = self.lock(true) else {
             return Some(Resolved::stateless(self.unpersisted_wait()));
         };
-        let (was, mut now) = self.load();
-        let waiting = now.asking();
+        let (was, mut now, before) = self.load();
         // The backstop fires ~6s after the dialog for a PermissionRequest already
         // reported - capture: PermissionRequest(aec99e) at 69.960, then
         // Notification permission_prompt at 75.983 for the SAME dialog. Adding an
@@ -1258,7 +1261,7 @@ impl Session {
         self.write_if_changed(&was, &mut now);
         // Always orange, whatever the base: a dialog on screen is the truth, and
         // repainting refreshes the tmux carrier's epoch, which restarts the decay.
-        Some(Resolved::stateful(waiting, now.paint(Glyph::Waiting)))
+        Some(Resolved::stateful(before, now.asking(), Some(now.paint(Glyph::Waiting))))
     }
 
     /// A failed write lock still permits a conservative orange paint. Preserve
@@ -1286,8 +1289,7 @@ impl Session {
             return matches!(fs::symlink_metadata(&self.path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
                 .then(|| Resolved::stateless(Paint::Line(if snapshot == Some(false) { Glyph::Background } else { Glyph::Idle })));
         };
-        let (was, mut now) = self.load();
-        let waiting = now.asking();
+        let (was, mut now, before) = self.load();
         now.base = Glyph::Idle;
         match snapshot {
             Some(false) => now.background = Some(self.now),
@@ -1316,13 +1318,13 @@ impl Session {
         // Never paint idle over an outstanding dialog. A changed background
         // fact may need an orange refresh so tmux retains the correct fallback.
         if now.waits.is_empty() {
-            Some(Resolved::stateful(waiting, now.paint(Glyph::Idle)))
+            Some(Resolved::stateful(before, now.asking(), Some(now.paint(Glyph::Idle))))
         } else if was.background.is_some() != now.background.is_some() {
             // Keep orange while updating tmux's fallback when this snapshot
             // first discovers background work, or proves it has ended.
-            Some(Resolved::stateful(waiting, now.paint(Glyph::Waiting)))
+            Some(Resolved::stateful(before, now.asking(), Some(now.paint(Glyph::Waiting))))
         } else {
-            None
+            Some(Resolved::stateful(before, now.asking(), None))
         }
     }
 
@@ -1339,14 +1341,14 @@ impl Session {
             return None;
         };
         let _lock = self.lock(false)?;
-        let (was, mut now) = self.load();
-        let waiting = now.asking();
+        let (was, mut now, before) = self.load();
         if !now.clear(&o) {
             self.write_if_changed(&was, &mut now);
-            return None;
+            return Some(Resolved::stateful(before, now.asking(), None));
         }
         self.write_if_changed(&was, &mut now);
-        now.waits.is_empty().then(|| Resolved::stateful(waiting, now.paint(now.base)))
+        Some(Resolved::stateful(before, now.asking(),
+            now.waits.is_empty().then(|| now.paint(now.base))))
     }
 
     /// Direct starts and identified notification backstops share one exact key.
@@ -1366,11 +1368,10 @@ impl Session {
             // without persistence is not, so results below instead stay silent.
             return Some(Resolved::stateless(self.unpersisted_wait()));
         };
-        let (was, mut now) = self.load();
-        let waiting = now.asking();
+        let (was, mut now, before) = self.load();
         if now.completed.iter().any(|w| w.who == owner) {
             self.write_if_changed(&was, &mut now);
-            return None;
+            return Some(Resolved::stateful(before, now.asking(), None));
         }
         // Replayed direct starts do not extend a wait's TTL, including the
         // anonymous aggregate. Legacy notification-only waits retain refreshes.
@@ -1378,7 +1379,7 @@ impl Session {
             now.raise(owner, self.now);
         }
         self.write_if_changed(&was, &mut now);
-        Some(Resolved::stateful(waiting, now.paint(Glyph::Waiting)))
+        Some(Resolved::stateful(before, now.asking(), Some(now.paint(Glyph::Waiting))))
     }
 
     fn elicitation_result(&self, p: &Payload) -> Option<Resolved> {
@@ -1390,13 +1391,12 @@ impl Session {
         let owner = elicitation_key(p)?;
         // A failed lock must never lead to an unlocked removal or tombstone.
         let _lock = self.lock(true)?;
-        let (was, mut now) = self.load();
-        let waiting = now.asking();
+        let (was, mut now, before) = self.load();
         let cleared = now.clear(&owner);
         now.complete(owner, self.now);
         self.write_if_changed(&was, &mut now);
-        (cleared && now.waits.is_empty())
-            .then(|| Resolved::stateful(waiting, now.paint(now.base)))
+        Some(Resolved::stateful(before, now.asking(),
+            (cleared && now.waits.is_empty()).then(|| now.paint(now.base))))
     }
 }
 
@@ -2032,10 +2032,10 @@ mod tests {
                 assert_eq!(f.session(&request).resolve(Edge::Elicitation, &request).paint(), Some(Paint::Line(Glyph::Waiting)));
             }
             let first = elicitation("one", "A", Some(action));
-            assert_eq!(f.session(&first).resolve(Edge::ElicitationResult, &first), None);
+            assert_eq!(f.session(&first).resolve(Edge::ElicitationResult, &first).paint(), None);
             assert_eq!(Record::parse(&f.record()).unwrap().waits.len(), 2);
             let second = elicitation("one", "B", Some(action));
-            assert_eq!(f.session(&second).resolve(Edge::ElicitationResult, &second), None);
+            assert_eq!(f.session(&second).resolve(Edge::ElicitationResult, &second).paint(), None);
             let third = elicitation("two", "A", Some(action));
             assert_eq!(f.session(&third).resolve(Edge::ElicitationResult, &third).paint(), Some(Paint::Line(Glyph::Working)));
             assert_eq!(Record::parse(&f.record()).unwrap().completed.len(), 3);
@@ -2057,11 +2057,11 @@ mod tests {
             (Edge::Idle, quiet_stop()),
             (Edge::ElicitationResult, payload(r#"{"session_id":"s1","hook_event_name":"ElicitationResult","mcp_server_name":"server","action":"accept"}"#)),
         ] {
-            assert_eq!(f.session(&event).resolve(edge, &event), None);
+            assert_eq!(f.session(&event).resolve(edge, &event).paint(), None);
             assert_eq!(Record::parse(&f.record()).unwrap().waits.len(), 2);
         }
         let result = elicitation("server", "A", Some("cancel"));
-        assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result), None);
+        assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result).paint(), None);
         assert_eq!(Record::parse(&f.record()).unwrap().waits[0].who, Owner::AnonymousElicitation);
         let prompt = user_prompt();
         assert_eq!(f.session(&prompt).resolve(Edge::Working, &prompt).paint(), Some(Paint::Line(Glyph::Working)));
@@ -2072,12 +2072,12 @@ mod tests {
     fn completion_tombstones_handle_out_of_order_replays_without_refreshing() {
         let f = Fixture::new("direct-replay");
         let result = elicitation("server", "A", Some("accept"));
-        assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result), None);
+        assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result).paint(), None);
         let completed = f.record();
         std::env::set_var("CCTAB_NOW", "1000002");
         let request = elicitation("server", "A", None);
-        assert_eq!(f.session(&request).resolve(Edge::Elicitation, &request), None);
-        assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result), None);
+        assert_eq!(f.session(&request).resolve(Edge::Elicitation, &request).paint(), None);
+        assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result).paint(), None);
         assert_eq!(f.record(), completed);
         std::env::set_var("CCTAB_NOW", "1000901");
         assert_eq!(f.session(&request).resolve(Edge::Elicitation, &request).paint(), Some(Paint::Line(Glyph::Waiting)));
@@ -2097,7 +2097,7 @@ mod tests {
         assert_eq!(Record::parse(&f.record()).unwrap().waits.len(), 1);
         let result = elicitation("server", "A", Some("decline"));
         assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result).paint(), Some(Paint::Line(Glyph::Idle)));
-        assert_eq!(f.session(&identified).resolve(Edge::Notify, &identified), None);
+        assert_eq!(f.session(&identified).resolve(Edge::Notify, &identified).paint(), None);
         let unidentified = notify("elicitation_url_dialog");
         assert_eq!(f.session(&unidentified).resolve(Edge::Notify, &unidentified).paint(), Some(Paint::Line(Glyph::Waiting)));
         let record = Record::parse(&f.record()).unwrap();
@@ -2157,7 +2157,7 @@ mod tests {
         assert_eq!(f.record(), held);
         // 98.459 the GHOST SubagentStop, for an agent that owns nothing.
         let ghost = agent_stop("a8e90c10430da8891");
-        assert_eq!(f.session(&ghost).resolve(Edge::SubagentStop, &ghost), None);
+        assert_eq!(f.session(&ghost).resolve(Edge::SubagentStop, &ghost).paint(), None);
         assert_eq!(f.record(), held);
         // 107.496 you approved: the subagent's own PostToolUse restores the base.
         assert_eq!(
@@ -2173,7 +2173,7 @@ mod tests {
         let agent = agent_ev("aaa");
         // Nothing is waiting, so this is the ORIGINAL filter, unchanged - and it
         // writes nothing at all, which is what keeps the hot edge a read.
-        assert_eq!(f.session(&agent).resolve(Edge::Working, &agent), None);
+        assert_eq!(f.session(&agent).resolve(Edge::Working, &agent).paint(), None);
         assert_eq!(f.record(), "");
         assert!(!f.dir.join("s1").exists());
     }
@@ -2186,7 +2186,7 @@ mod tests {
         f.session(&agent).resolve(Edge::Waiting, &agent);
         // The base is still updated - main IS working - but the tab keeps the
         // dialog. Stateless, this painted blue over an open dialog.
-        assert_eq!(f.session(&main).resolve(Edge::Working, &main), None);
+        assert_eq!(f.session(&main).resolve(Edge::Working, &main).paint(), None);
         assert_eq!(
             f.record(),
             format!("cts5\nb w\n{}w aaa:1000000\n", f.origin_line())
@@ -2214,7 +2214,7 @@ mod tests {
         // stays orange. A single owner slot would have got this wrong whichever
         // one it kept.
         let mainwork = main_tool();
-        assert_eq!(f.session(&mainwork).resolve(Edge::Working, &mainwork), None);
+        assert_eq!(f.session(&mainwork).resolve(Edge::Working, &mainwork).paint(), None);
         assert_eq!(
             f.session(&agent).resolve(Edge::Working, &agent).paint(),
             Some(Paint::Line(Glyph::Working))
@@ -2233,7 +2233,7 @@ mod tests {
         // payload carries no `background_tasks` at all, so it cannot retire
         // anything either.
         let nudge = notify("idle_prompt");
-        assert_eq!(f.session(&nudge).resolve(Edge::Notify, &nudge), None);
+        assert_eq!(f.session(&nudge).resolve(Edge::Notify, &nudge).paint(), None);
     }
 
     #[test]
@@ -2280,12 +2280,12 @@ mod tests {
         f.session(&agent).resolve(Edge::Waiting, &agent);
         // A main-thread TOOL call says nothing about somebody else's dialog.
         let tool = main_tool();
-        assert_eq!(f.session(&tool).resolve(Edge::Working, &tool), None);
+        assert_eq!(f.session(&tool).resolve(Edge::Working, &tool).paint(), None);
         // Nor does the `UserPromptSubmit` the PRODUCT injects when an async agent
         // finishes: with two agents running, the first one's completion would
         // otherwise retire the second one's live dialog. Capture s4, 110.251.
         let injected = task_notification();
-        assert_eq!(f.session(&injected).resolve(Edge::Working, &injected), None);
+        assert_eq!(f.session(&injected).resolve(Edge::Working, &injected).paint(), None);
         assert_eq!(
             f.record(),
             format!("cts5\nb w\n{}w aaa:1000000\n", f.origin_line())
@@ -2343,9 +2343,9 @@ mod tests {
                 Some(Paint::Line(Glyph::Waiting)));
             assert_eq!(f.record(), format!("cts5\nb i\n{}w ?p:1000000\n", f.origin_line()));
             let stop = payload(r#"{"session_id":"s1","hook_event_name":"Stop"}"#);
-            assert_eq!(f.session(&stop).resolve(Edge::Idle, &stop), None);
+            assert_eq!(f.session(&stop).resolve(Edge::Idle, &stop).paint(), None);
             let unrelated = agent_stop("other");
-            assert_eq!(f.session(&unrelated).resolve(Edge::SubagentStop, &unrelated), None);
+            assert_eq!(f.session(&unrelated).resolve(Edge::SubagentStop, &unrelated).paint(), None);
             let human = user_prompt();
             assert_eq!(f.session(&human).resolve(Edge::Working, &human).paint(),
                 Some(Paint::Line(Glyph::Working)));
@@ -2371,7 +2371,7 @@ mod tests {
         // No evidence connects this agent to the notification's unknown owner.
         let agent = agent_ev("aaa");
         let held = f.record();
-        assert_eq!(f.session(&agent).resolve(Edge::Working, &agent), None);
+        assert_eq!(f.session(&agent).resolve(Edge::Working, &agent).paint(), None);
         assert_eq!(f.record(), held);
         let quiet = quiet_stop();
         assert_eq!(
@@ -2453,7 +2453,7 @@ mod tests {
         f.session(&backstop).resolve(Edge::Notify, &backstop);
         let stop = agent_stop("aaa");
         let held = f.record();
-        assert_eq!(f.session(&stop).resolve(Edge::SubagentStop, &stop), None);
+        assert_eq!(f.session(&stop).resolve(Edge::SubagentStop, &stop).paint(), None);
         assert_eq!(f.record(), held);
     }
 
@@ -2475,7 +2475,7 @@ mod tests {
                 (Edge::Working, payload(r#"{"session_id":"s1","agent_id":"-","hook_event_name":"PostToolUse"}"#)),
                 (Edge::Working, payload(r#"{"session_id":"s1","agent_id":"unrelated","hook_event_name":"PostToolUseFailure"}"#)),
             ] {
-                assert_eq!(f.session(&event).resolve(edge, &event), None, "{kind}");
+                assert_eq!(f.session(&event).resolve(edge, &event).paint(), None, "{kind}");
                 assert_eq!(f.record(), held, "{kind}");
             }
             assert_eq!(f.session(&prompt).resolve(Edge::Working, &prompt).paint(), Some(Paint::Line(Glyph::Working)));
@@ -2498,7 +2498,7 @@ mod tests {
                 f.session(event).resolve(edge, event);
             }
             assert_eq!(Record::parse(&f.record()).unwrap().waits.len(), 2);
-            assert_eq!(f.session(&permission).resolve(Edge::Working, &permission), None);
+            assert_eq!(f.session(&permission).resolve(Edge::Working, &permission).paint(), None);
             assert_eq!(f.record(), format!("cts5\nb i\n{}w ?!:1000000\n", f.origin_line()));
         }
     }
@@ -2517,7 +2517,7 @@ mod tests {
             let owner = agent_ev("aaa");
             f.session(&owner).resolve(Edge::Waiting, &owner);
             assert_eq!(f.record(), format!("cts5\nb i\n{}w ?!:1000000 aaa:1000000\n", f.origin_line()));
-            assert_eq!(f.session(&owner).resolve(Edge::Working, &owner), None);
+            assert_eq!(f.session(&owner).resolve(Edge::Working, &owner).paint(), None);
             assert_eq!(f.record(), format!("cts5\nb i\n{}w ?!:1000000\n", f.origin_line()));
         }
     }
@@ -2531,7 +2531,7 @@ mod tests {
             if expire {
                 std::env::set_var("CCTAB_NOW", "1000901");
                 let unrelated = agent_ev("aaa");
-                assert_eq!(f.session(&unrelated).resolve(Edge::Working, &unrelated), None);
+                assert_eq!(f.session(&unrelated).resolve(Edge::Working, &unrelated).paint(), None);
             } else {
                 let main = main_tool();
                 assert_eq!(f.session(&main).resolve(Edge::Working, &main).paint(), Some(Paint::Line(Glyph::Working)));
@@ -2547,7 +2547,7 @@ mod tests {
         let legacy = "cts1\nb w\nw ?:1000000\n";
         fs::write(f.dir.join("s1"), legacy).unwrap();
         for (edge, event) in [(Edge::Working, agent_ev("aaa")), (Edge::SubagentStop, agent_stop("aaa"))] {
-            assert_eq!(f.session(&event).resolve(edge, &event), None);
+            assert_eq!(f.session(&event).resolve(edge, &event).paint(), None);
             assert_eq!(f.record(), legacy);
         }
         let prompt = user_prompt();
@@ -2691,7 +2691,7 @@ mod tests {
         );
         let start =
             payload(r#"{"session_id":"s1","hook_event_name":"SessionStart","source":"compact"}"#);
-        assert_eq!(f.session(&start).resolve(Edge::SessionStart, &start), None);
+        assert_eq!(f.session(&start).resolve(Edge::SessionStart, &start).paint(), None);
         assert_eq!(f.record(), before);
     }
 
@@ -3462,7 +3462,7 @@ mod tests {
         let path = f.dir.join("s1");
         let queued = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
         let old = s.lock(false).expect("lockable");
-        let (was, mut now) = s.load();
+        let (was, mut now, _) = s.load();
         now.base = Glyph::Idle;
         s.write_if_changed(&was, &mut now);
         assert_eq!(f.record(), format!("cts5\nb i\n{}", f.origin_line()), "replaced while held");
@@ -3643,10 +3643,10 @@ mod tests {
         let f = Fixture::new("transition-waiting");
         let work = main_tool();
         let ask = payload(r#"{"session_id":"s1","hook_event_name":"PermissionRequest"}"#);
-        // Working over working: nothing a bell would fire for.
+        // No record yet: the first decision cannot establish prior idle.
         assert_eq!(
             f.session(&work).resolve(Edge::Working, &work).map(|r| r.transition),
-            Some(Transition::Remained)
+            Some(Transition::Unknown)
         );
         let up = f.session(&ask).resolve(Edge::Waiting, &ask);
         let still_up = f.session(&ask).resolve(Edge::Waiting, &ask);
@@ -3661,4 +3661,219 @@ mod tests {
         assert_eq!(gone.paint(), Some(Paint::Line(Glyph::Idle)));
         assert_eq!(gone.map(|r| r.transition), Some(Transition::Left));
     }
+
+    fn assert_decision(f: &Fixture, edge: Edge, p: &Payload, paint: Option<Paint>, transition: Transition) {
+        assert_eq!(f.session(p).resolve(edge, p), Some(Resolved { paint, transition }), "{edge:?}");
+    }
+
+    #[test]
+    fn attention_expiry_is_observed_even_without_a_paint() {
+        let f = Fixture::new("attention-expiry");
+        // Cover every branch which can apply expiry, including a result for a
+        // different request: it writes a tombstone but must not paint.
+        for (edge, event, paint) in [
+            (Edge::Idle, quiet_stop(), Some(Paint::Line(Glyph::Idle))),
+            (Edge::Notify, notify("idle_prompt"), Some(Paint::Line(Glyph::Idle))),
+            (Edge::Working, main_tool(), Some(Paint::Line(Glyph::Working))),
+            (Edge::Working, agent_ev("unrelated"), None),
+            (Edge::SubagentStop, agent_stop("unrelated"), None),
+            (Edge::ElicitationResult, elicitation("server", "other", Some("accept")), None),
+        ] {
+            let session = f.session(&event);
+            fs::write(&session.path, "cts5\nb i\nw aaa:999000\n").unwrap();
+            assert_decision(&f, edge, &event, paint, Transition::Left);
+            assert!(!Record::parse(&f.record()).unwrap().asking());
+            // The persisted expiry is not reported again.
+            assert_decision(&f, edge, &event, paint, Transition::Remained);
+        }
+        // A replay suppressed by a still-live tombstone can expire another wait.
+        let request = elicitation("server", "done", None);
+        let session = f.session(&request);
+        let mut old = Record::fresh();
+        old.raise(Owner::Main, 999000);
+        old.complete(elicitation_key(&request).unwrap(), 999900);
+        fs::write(&session.path, old.render()).unwrap();
+        assert_decision(&f, Edge::Elicitation, &request, None, Transition::Left);
+        assert_eq!(Record::parse(&f.record()).unwrap().completed, old.completed);
+    }
+
+    #[test]
+    fn attention_expiry_then_new_wait_is_one_net_comparison() {
+        let f = Fixture::new("attention-replacement");
+        for (edge, event) in [
+            (Edge::Waiting, agent_ev("new")),
+            (Edge::Notify, notify("permission_prompt")),
+            (Edge::Notify, notify("elicitation_dialog")),
+            (Edge::Elicitation, elicitation("server", "new", None)),
+        ] {
+            let session = f.session(&event);
+            fs::write(&session.path, "cts5\nb i\nw old:999000\n").unwrap();
+            assert_decision(&f, edge, &event, Some(Paint::Line(Glyph::Waiting)), Transition::Remained);
+            let record = Record::parse(&f.record()).unwrap();
+            assert_eq!(record.waits.len(), 1);
+            assert_eq!(record.waits[0].raised, 1000000);
+            assert_ne!(record.waits[0].who, Owner::Agent("old".into()));
+        }
+        // The exact TTL boundary and clock rollback do not expire; zero disables it.
+        for (now, ttl) in [(1000900, "900"), (999999, "900"), (2000000, "0")] {
+            let event = agent_stop("unrelated");
+            std::env::set_var("CCTAB_TTL_WAITING", ttl);
+            let mut session = f.session(&event);
+            session.now = now;
+            fs::write(&session.path, "cts5\nb i\nw old:1000000\n").unwrap();
+            assert_eq!(session.resolve(Edge::SubagentStop, &event),
+                Some(Resolved { paint: None, transition: Transition::Remained }));
+            assert_eq!(f.record(), "cts5\nb i\nw old:1000000\n");
+        }
+    }
+
+    #[test]
+    fn attention_clearance_waits_for_the_last_owner() {
+        let f = Fixture::new("attention-overlap");
+        let work = main_tool();
+        f.session(&work).resolve(Edge::Working, &work);
+        let agent = agent_ev("aaa");
+        let request = elicitation("server", "A", None);
+        assert_decision(&f, Edge::Waiting, &agent, Some(Paint::Line(Glyph::Waiting)), Transition::Entered);
+        assert_decision(&f, Edge::Elicitation, &request, Some(Paint::Line(Glyph::Waiting)), Transition::Remained);
+        // Base updates and unrelated completions do not lower attention.
+        assert_decision(&f, Edge::Working, &work, None, Transition::Remained);
+        assert_decision(&f, Edge::SubagentStop, &agent_stop("other"), None, Transition::Remained);
+        assert_decision(&f, Edge::SubagentStop, &agent_stop("aaa"), None, Transition::Remained);
+        let done = elicitation("server", "A", Some("accept"));
+        assert_decision(&f, Edge::ElicitationResult, &done, Some(Paint::Line(Glyph::Working)), Transition::Left);
+        assert_decision(&f, Edge::ElicitationResult, &done, None, Transition::Remained);
+        // Reverse completion order: removing the direct wait is also silent.
+        f.session(&agent).resolve(Edge::Waiting, &agent);
+        let second = elicitation("server", "B", None);
+        f.session(&second).resolve(Edge::Elicitation, &second);
+        let done = elicitation("server", "B", Some("cancel"));
+        assert_decision(&f, Edge::ElicitationResult, &done, None, Transition::Remained);
+        assert_decision(&f, Edge::Working, &agent, Some(Paint::Line(Glyph::Working)), Transition::Left);
+        // One expired owner alongside one live owner is still attention.
+        fs::write(f.dir.join("s1"), "cts5\nb i\nw old:999000 live:1000000\n").unwrap();
+        assert_decision(&f, Edge::SubagentStop, &agent_stop("old"), None, Transition::Remained);
+        assert_decision(&f, Edge::Idle, &quiet_stop(), Some(Paint::Line(Glyph::Idle)), Transition::Left);
+    }
+
+    #[test]
+    fn attention_reset_and_end_compare_the_stored_state() {
+        let f = Fixture::new("attention-lifecycle");
+        for source in ["startup", "resume", "clear", "fork"] {
+            let start = payload(&format!(r#"{{"session_id":"s1","source":"{source}"}}"#));
+            let session = f.session(&start);
+            for (record, expected) in [
+                ("cts5\nb i\nw aaa:1000000\n", Transition::Left),
+                ("cts5\nb i\nw aaa:999000\n", Transition::Left),
+                ("cts5\nb w\n", Transition::Remained),
+            ] {
+                fs::write(&session.path, record).unwrap();
+                assert_decision(&f, Edge::SessionStart, &start, Some(Paint::SessionStart), expected);
+                assert!(!Record::parse(&f.record()).unwrap().asking());
+                fs::write(&session.path, record).unwrap();
+                assert_decision(&f, Edge::SessionEnd, &start, Some(Paint::SessionEnd), expected);
+                assert!(!session.path.exists());
+                assert_decision(&f, Edge::SessionEnd, &start, Some(Paint::SessionEnd), Transition::Unknown);
+            }
+            assert_decision(&f, Edge::SessionStart, &start, Some(Paint::SessionStart), Transition::Unknown);
+            assert_decision(&f, Edge::SessionStart, &start, Some(Paint::SessionStart), Transition::Remained);
+        }
+    }
+
+    #[test]
+    fn attention_filtered_events_do_not_observe_or_expire_state() {
+        let f = Fixture::new("attention-filtered");
+        for (edge, event) in [
+            (Edge::SessionStart, payload(r#"{"session_id":"s1","source":"compact"}"#)),
+            (Edge::Notify, notify("agent_completed")),
+            (Edge::Working, agent_ev("invalid/id")),
+            (Edge::SubagentStop, main_tool()),
+            (Edge::Elicitation, payload(r#"{"session_id":"s1","hook_event_name":"Other"}"#)),
+            (Edge::ElicitationResult, elicitation("server", "A", Some("unsupported"))),
+            (Edge::ElicitationResult, payload(r#"{"session_id":"s1","hook_event_name":"ElicitationResult","action":"accept"}"#)),
+        ] {
+            let session = f.session(&event);
+            let old = "cts5\nb i\nw aaa:999000\n";
+            fs::write(&session.path, old).unwrap();
+            assert_eq!(session.resolve(edge, &event), None, "{edge:?}");
+            assert_eq!(f.record(), old);
+        }
+    }
+
+    #[test]
+    fn attention_requires_a_recognised_prior_record() {
+        let f = Fixture::new("attention-unknown");
+        let event = main_tool();
+        let session = f.session(&event);
+        for record in ["", "foreign\nb i\n", "cts99\nb i\n", &"x".repeat(MAX_RECORD + 1)] {
+            for (edge, paint) in [
+                (Edge::Waiting, Paint::Line(Glyph::Waiting)),
+                (Edge::Elicitation, Paint::Line(Glyph::Waiting)),
+                (Edge::SessionStart, Paint::SessionStart),
+                (Edge::SessionEnd, Paint::SessionEnd),
+            ] {
+                fs::write(&session.path, record).unwrap();
+                let event = elicitation("server", "A", None);
+                assert_decision(&f, edge, &event, Some(paint), Transition::Unknown);
+            }
+        }
+        // A missing record must not turn the lock's empty placeholder into idle.
+        assert!(!session.path.exists());
+        assert_decision(&f, Edge::Waiting, &event, Some(Paint::Line(Glyph::Waiting)), Transition::Unknown);
+        session.remove();
+        let result = elicitation("server", "A", Some("accept"));
+        assert_decision(&f, Edge::ElicitationResult, &result, None, Transition::Unknown);
+        session.remove();
+        fs::create_dir(&session.path).unwrap();
+        assert_decision(&f, Edge::Waiting, &event, Some(Paint::Line(Glyph::Waiting)), Transition::Unknown);
+        assert_eq!(session.resolve(Edge::Working, &event), None);
+        assert_decision(&f, Edge::SessionEnd, &event, Some(Paint::SessionEnd), Transition::Unknown);
+        assert!(session.path.is_dir(), "failed deletion does not change the logical decision");
+        // A file where the directory should be disables state and selects the
+        // stateless resolver, whose explicit Unknown is tested in edge.rs.
+        let blocked = f.dir.join("blocked");
+        fs::write(&blocked, "file").unwrap();
+        assert!(Session::open(Some(blocked.join("child")), &event).is_none());
+        assert!(Session::open(Some(f.dir.clone()), &Payload::empty()).is_none());
+        assert!(Session::open(None, &event).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attention_unreadable_records_do_not_supply_a_prior_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new("attention-unreadable");
+        let event = main_tool();
+        let session = f.session(&event);
+        fs::write(&session.path, "cts5\nb i\nw aaa:1000000\n").unwrap();
+        fs::set_permissions(&session.path, fs::Permissions::from_mode(0o400)).unwrap();
+        if fs::OpenOptions::new().write(true).open(&session.path).is_ok() {
+            eprintln!("skipped: this user can write mode-400 files");
+            return;
+        }
+        // Readable evidence does not authorise a transition without the lock.
+        assert!(matches!(stored_at(&session.path), Stored::Ours(_)));
+        assert_decision(&f, Edge::Waiting, &event, Some(Paint::Line(Glyph::Waiting)), Transition::Unknown);
+        assert_eq!(session.resolve(Edge::Working, &event), None);
+        fs::set_permissions(&session.path, fs::Permissions::from_mode(0)).unwrap();
+        if fs::read(&session.path).is_ok() {
+            eprintln!("skipped: this user can read mode-000 files");
+            return;
+        }
+        assert_decision(&f, Edge::Waiting, &event, Some(Paint::Line(Glyph::Waiting)), Transition::Unknown);
+        assert_eq!(session.resolve(Edge::Working, &event), None);
+        assert_decision(&f, Edge::SessionStart, &event, Some(Paint::SessionStart), Transition::Unknown);
+        assert_decision(&f, Edge::SessionEnd, &event, Some(Paint::SessionEnd), Transition::Unknown);
+    }
+
+    #[test]
+    fn attention_legacy_waiting_base_is_logical_state() {
+        let f = Fixture::new("attention-legacy-base");
+        let event = agent_ev("other");
+        let session = f.session(&event);
+        fs::write(&session.path, "cts1\nb a\n").unwrap();
+        assert_decision(&f, Edge::Working, &event, None, Transition::Remained);
+        assert_decision(&f, Edge::Idle, &quiet_stop(), Some(Paint::Line(Glyph::Idle)), Transition::Left);
+    }
+
 }

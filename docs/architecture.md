@@ -104,6 +104,11 @@ Live waits take precedence over everything in the right-hand column, and idle
 transitions preserve known background work; the exact rules are the
 [transitions table](state-contract.md#transitions-and-retirement).
 
+The resolver also carries dormant attention metadata independently of its optional
+title paint. Its [logical comparison contract](state-contract.md#logical-attention-transitions)
+is tested directly in `src/state.rs`, including events that change state silently.
+This metadata is not a delivery acknowledgement; no attention effect is emitted.
+
 The `SessionStart` and `PreToolUse` scopes are hook *matchers*, so those hooks do
 not even run outside them. The `Notification` kinds and the `compact` source are
 read from parsed top-level metadata inside the binary, so those hooks run and then

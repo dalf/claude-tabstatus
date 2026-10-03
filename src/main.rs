@@ -128,11 +128,10 @@ fn paint(edge: Edge) -> io::Result<()> {
         Some(s) => s.resolve(edge, &payload),
         None => edge.resolve(&payload),
     };
-    // The transition the stateful path computed is CARRIED here and read by
-    // nothing: #14's backends are what will ring on `Entered` and coalesce
-    // `Remained`, and landing the seam inert is what lets the 312-case corpus
-    // prove that threading it changed no byte of output.
-    let Some(Resolved { paint, .. }) = resolved else {
+    // A future attention consumer must inspect `resolved` here, before the
+    // paint filter: an eligible silent event can still report a transition.
+    // Logical transitions guarantee neither persistence nor terminal delivery.
+    let Some(Resolved { paint: Some(paint), .. }) = resolved else {
         return Ok(());
     };
 
