@@ -1307,10 +1307,10 @@ additional dependency.
 The reason for the last two is the half-state between them: the env key switches
 Claude Code's own title painting off and the plugin paints the replacement, so "key
 set, plugin gone" is the one combination that paints **no tab title at all**. The
-tree goes before both because it is **inert until the link points at it**, so an
-abort anywhere before that last step leaves a first-time user exactly as they were.
-And the link swap is the only irreversible step - it is the one write that changes
-what code a running session executes - so it goes last *and* after the copy in the
+tree goes before both because it is **inert until the link points at it**. Settings
+can already have changed when a later step fails; an abort before linking is not a
+complete no-op. The link swap changes what code a running session executes, so it
+goes last *and* after the copy in the
 tree has been exec'd, which is what proves the new target works.
 
 The link is repointed with a temp link and `rename(2)`, not `unlink` then `symlink`:
@@ -1325,7 +1325,7 @@ symlink is reported as broken and replaced, and a real directory is refused outr
 Both halves preflight every refusal - the tree's ownership and writability, the
 `skills` directory and its writability, `settings.json`'s shape, mode and parent, a
 `settings.json` symlink that does not resolve, and whether there is a state record
-proving the key is ours - so detected unsafe paths are refused before installation
+and its ownership status - so detected unsafe paths are refused before installation
 writes, and every preflight refusal leaves installation files unchanged. Temporary
 Unicode probes have the directory timestamp and interruption limits described above.
 A `settings.json` with
@@ -1357,9 +1357,87 @@ mean "install anyway, I am about to build"; it means only "write settings.json
 even where its Windows permissions cannot be kept" (see the settings.json notes
 below).
 
-`~/.claude/claude-tabstatus.state` is a small JSON record in two halves: what was
-there before (written once, never rewritten) and which tree this install owns
-(rewritten every install, because `--tree` moves it). `uninstall` removes it.
+`~/.claude/claude-tabstatus.state` is a small JSON record. Its original key spelling,
+whether `env` existed, and original link target survive reinstalls; its current
+generated tree is updated when `--tree` moves it. **Restoration history is separate
+from evidence that a settings operation completed.** In state_version 4:
+
+1. A first install atomically saves the narrow restoration history with
+   `settings_ownership: "pending"` before attempting the settings change.
+2. It performs the existing protected text splice and settings replacement, or
+   recognises a pre-existing `"1"` without rewriting settings or taking a backup.
+3. Only after that operation returns successfully does it atomically write
+   `settings_ownership: "confirmed"`, before linking the plugin. A failure to write
+   this receipt is an install failure, with the pending history retained.
+
+A process killed before settings replacement leaves pending history without
+ownership. A process killed after replacement but before the receipt leaves the
+same pending history, including any original raw value. Neither a matching
+settings path nor a current value of `"1"` resolves that ambiguity. Ordinary
+uninstall and reinstall refuse before changing settings, the link or the tree;
+`--force` does not confirm an incomplete record. Recovery instructions name the
+settings and record: inspect them, restore only the key manually if appropriate,
+then move the record aside before running the desired management command. The
+existing no-record `uninstall --force` remains explicit key removal. A requested
+`uninstall --restore-backup` can instead restore the whole backup, when one exists;
+it can overwrite unrelated edits and is never selected automatically. A missing
+or blank original settings file and a pre-existing `"1"` may have no backup.
+
+A refresh with an earlier confirmed receipt retains that receipt and the original
+restoration history, including when settings replacement fails or the process is
+killed. Updating the tracked tree does not replace either with values left by the
+first install. New metadata has a strict version, phase, key, settings path and
+history schema; missing fields, duplicate members, mismatches and invalid raw
+values refuse rather than defaulting to ownership.
+
+Versions 1–3 have no settings receipt. Compatibility relies on the old installers'
+settings-before-link ordering: a live link to their recorded `tree` (or `repo`)
+that differs from the recorded original link witnesses reaching the last step.
+Normal linked legacy installations still restore their original values, including
+version 1's JSON `value`. Reinstall records this historical witness separately as
+`legacy_completion_link`, with `settings_ownership: "legacy"`; it does **not**
+claim a confirmed settings write. That witness survives failed refreshes and tree
+moves. An orphan, missing installed target, or unchanged pre-existing link is
+ambiguous and requires the explicit recovery above. This compatibility inference
+assumes the old record and wiring have not been independently recreated by hand;
+legacy files cannot provide the new write receipt.
+
+Installation and uninstallation hold an exclusive OS lock on the stable empty
+`<config>/claude-tabstatus.lock` anchor before re-reading ownership and making
+changes. Install first checks its preflight, then locks, resolves the tree again
+and repeats preflight. Uninstall resolves its context again under the lock.
+Different config directories are independent. The anchor is retained after
+uninstall and refusals: deleting it could let queued operations lock different
+inodes. It holds no settings data. The kernel releases the lock on process exit,
+including abrupt termination; a suspended holder keeps later management commands
+waiting. Hooks and read-only diagnostics do not acquire it. External editors and
+older management binaries do not participate; the settings byte-comparison guard
+continues to detect edits in its existing window, rather than making all external
+filesystem changes transactional.
+
+Each settings/record staging file is synced before its atomic rename. This covers
+ordinary errors and process interruption, **not power-loss durability across the
+settings and record renames**: their parent directories are not synchronised as a
+transaction, and a symlink target may be on another filesystem. No power-loss
+ordering or whole-install rollback is claimed. The journal stores only the
+original title-disable value and link information, with the record's existing
+0600 Unix mode or directory-inherited Windows DACL; no whole settings document or
+unrelated secrets are added. Settings, backup and restoration protection still
+use their existing source-specific writers. `uninstall` removes the record after
+restoring settings and the prior link.
+
+`tests/test_install_ownership.py` observes the actual candidate binary and these
+production paths. Bounded opt-in `CCTAB_TEST_MANAGE_DIR` /
+`CCTAB_TEST_MANAGE_POINT` barriers require a reached file and a release; missing
+observation fails. Tests kill processes on both sides of settings replacement and
+remove closed settings/receipt staging files to force real rename failures.
+The principal regression makes a valid external edit after history is saved,
+requires the real concurrent-edit refusal, then supplies a user-owned key and
+asserts that ordinary uninstall preserves it. It fails at that preservation
+assertion on `b38e5fd` rebuilt with only the history-saved barrier added; the
+uninstrumented freshly built binary also reproduced the original timing-window
+defect. The suite runs for both Linux binaries and natively on Windows and macOS
+arm64 in required CI. It does not establish behaviour in a terminal application.
 
 ### The settings.json splice
 
@@ -1555,7 +1633,8 @@ left an empty `old/` that no later marker lists, so `remove` never took it and t
 tree could never come down.
 
 **Uninstall is an undo, not a delete**: it puts back whatever
-`claude-tabstatus.state` says was there before. If you had already set
+the confirmed or historically witnessed restoration record says was there before.
+Pending or ambiguous legacy history is refused before automatic removal. If you had already set
 `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` yourself, your value comes back byte for byte -
 the state file records the value's original *text*. If that record is missing and
 the key is present, the key is left alone unless you pass `--force`, because there is

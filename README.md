@@ -174,6 +174,18 @@ set, or in your `--tree` directory; `doctor` prints the live tree.
 | `--restore-backup` | roll `settings.json` back wholesale to `settings.json.cctab-preinstall` |
 | `--force` | remove the env key even when there is no state record proving it is ours; on Windows, also write a `settings.json` whose filesystem keeps no ACL (see below) |
 
+After an interrupted or failed first install, the record may hold original values
+without confirmation that settings were updated. Reinstall and ordinary uninstall
+then refuse automatic recovery and leave your settings in place. Some older
+records are also ambiguous, particularly if the plugin link is missing or already
+pointed at the recorded target before installation. `--force` does not confirm
+these records. Follow the printed paths: inspect the original key value in the
+record and your current settings, restore only that key manually if appropriate,
+then move the record aside and re-run the desired command. After moving it aside,
+`uninstall --force` explicitly removes the key instead of restoring its original
+value. `--restore-backup` requests whole-file restoration when a backup exists;
+it overwrites unrelated later edits too. Invalid records must first be moved aside.
+
 On Windows a running program's file cannot be deleted, so an `uninstall` run by
 the installed tree's own `bin\tabstatus.exe` is refused with nothing changed:
 run it from another copy, or pass `--keep-tree`. Removal hints there are given as
@@ -202,7 +214,8 @@ Uninstall is an undo, not a delete:
 | the generated plugin tree (manifests and a copy of the binary, `bin/tabstatus`; `bin\tabstatus.exe` on Windows) | `$XDG_DATA_HOME/claude-tabstatus`, default `~/.local/share/claude-tabstatus` (Windows: `%USERPROFILE%\.local\share\claude-tabstatus`); `install --tree <dir>` puts it elsewhere |
 | one settings key | `env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE = "1"` in `~/.claude/settings.json` |
 | the plugin link | `~/.claude/skills/claude-tabstatus` → the tree: a symlink on Linux, a junction on Windows |
-| the install record | `~/.claude/claude-tabstatus.state`: what was there before, and which tree this install owns |
+| the install record | `~/.claude/claude-tabstatus.state`: original values, settings completion and the current generated tree |
+| management lock | `~/.claude/claude-tabstatus.lock`: an empty coordination file, retained after uninstall |
 | per-session records, written by the running plugin | `$XDG_RUNTIME_DIR/claude-tabstatus` on Linux, emptied at logout; `$TMPDIR/claude-tabstatus` on macOS; `%LOCALAPPDATA%\claude-tabstatus` on Windows, which only `uninstall` empties |
 
 The settings key is not optional: Claude Code repaints its own title about once
@@ -216,9 +229,11 @@ kept at `settings.json.cctab-preinstall`. Settings rewrites and backups refuse a
 they cannot read or preserve. On macOS, filesystems without ACL support and
 operations whose owner or group cannot be preserved with the current privileges
 are also refused; `--force` does not bypass these refusals. A restore keeps the
-live file's protection, or the backup's when the live file is missing. When `install`
-cannot proceed safely, it refuses, and every refusal ends with **"Nothing has
-been changed."** On Windows that includes a `settings.json` on a filesystem that
+live file's protection, or the backup's when the live file is missing. Preflight
+refusals leave installation files unchanged; later I/O errors or interruption can
+leave a partial installation with its recovery record. An empty management lock
+file may remain after a refusal or uninstall. On Windows preflight also refuses a
+`settings.json` on a filesystem that
 keeps no ACL, such as a symlink into a WSL share: edit it from the system it
 lives on, or pass `--force` to `install` or `uninstall` to write it anyway. The
 details are in [docs/architecture.md](docs/architecture.md).
@@ -675,10 +690,7 @@ does is in
   network share other than the one the session is on is not followed (touching
   it would send your NTLM credentials to that server), and the tab shows the
   plain path instead of `repo@branch`.
-- **Known bugs:** `doctor` exits 1 without a report if `settings.json` is a
-  directory. After an install that aborted half way, `uninstall` can remove a
-  `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` you set yourself afterwards; a
-  `settings.json.cctab-preuninstall` backup is kept.
+- **Known bug:** `doctor` exits 1 without a report if `settings.json` is a directory.
 
 ## For contributors
 

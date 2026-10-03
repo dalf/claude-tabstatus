@@ -158,6 +158,7 @@ when they agree.
 | persistence and concurrency | `python3 tests/test_state_guarantees.py` | Linux, macOS (`fcntl`; strace fault injection Linux-only) |
 | direct Unix delivery | `python3 tests/test_unix_delivery.py -v` | Linux, macOS (disposable PTYs) |
 | installer path identity, containment and missing Unicode probes | `python3 tests/test_install_paths.py` | Linux; native macOS with mandatory APFS/APFSX fixtures |
+| installer ownership, interruption and recovery | `python3 tests/test_install_ownership.py -v` | Linux (both binaries), Windows, native macOS arm64 |
 | settings ACLs, ownership and backup metadata | `python3 tests/test_macos_acl.py` | native macOS (chmod/ls/stat, SDK fault interposition) |
 | SSH hostname precedence, native lookup, bypasses and failures | `python3 tests/test_macos_hostname.py` | native macOS (SDK kernel observer and dyld faults; dry-run rendering) |
 | terminal-family detection, doctor evidence and title protocol | `python3 tests/test_terminal_detection.py` | Linux, Windows; macOS-specific cases require native macOS |
@@ -331,6 +332,14 @@ the test process. Keep it that way in any new test.
   compiled-binary precedence, lazy lookup, repair/rendering and doctor checks,
   with SDK-built dyld faults and validated recording fixtures. Dry-run output
   only, fresh environments and isolated directories; no hostname changes.
+- `test_install_ownership.py`: actual-binary management lifecycles with verified,
+  bounded filesystem barriers. Covers failed install followed by a user-owned
+  key, concurrent edits, abrupt interruption before/after settings replacement,
+  real settings/receipt rename failures, retained refresh ownership/history, tree
+  moves, legacy compatibility/ambiguity and explicit force/backup recovery. Required
+  CI runs it on both Linux binaries, Windows and native macOS arm64. The principal
+  preservation assertion fails on `b38e5fd` with only its test barrier added;
+  the freshly built uninstrumented pre-fix binary reproduced the original defect.
 - `test_state_guarantees.py`: persistence and concurrency guarantees beyond the
   traces.
 - `test_tmux_status.py`: window-list rendering, split panes, background windows,
@@ -563,6 +572,12 @@ Rules:
   state-contract decisions in
   [issue #10](https://github.com/dalf/claude-tabstatus/issues/10) are unchanged).
 
+The inherited P2 installer ownership defect is corrected: state_version 4 separates
+pending restoration history from a settings receipt, preserves established receipts
+on failed refreshes, and serialises management operations. Incomplete installs and
+ambiguous legacy records refuse automatic restoration. See
+[ownership and recovery](docs/architecture.md#install-and-uninstall-are-ordered-both-ways).
+
 ### Known defects, reproduced and deferred
 
 - **`doctor` aborts when `settings.json` is a directory.** The read error in the
@@ -571,15 +586,6 @@ Rules:
   unparseable, an array, missing, a dangling symlink) is reported and exits 0.
   Reproduce with `mkdir <config>/settings.json && tabstatus doctor`. Fix: report the
   I/O error as one more `env key: FAIL` line and let the rest of the report run.
-- **`install` writes its record before it edits `settings.json`.** An install that
-  aborts between the two (the concurrent-modification guard is one reachable way)
-  leaves a record saying `env_had: false` with no key written. If the user then
-  sets `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` themselves, `uninstall` reads that
-  orphan, concludes the key is ours and removes it; the refusal meant to prevent
-  this fires only when there is no record at all. Recoverable from the
-  `.cctab-preuninstall` copy, which is written first. Fix: write the record only
-  after `settings.json` has actually changed, or cross-check the recorded
-  `settings_path` before editing.
 
 ### Deliberately not built
 

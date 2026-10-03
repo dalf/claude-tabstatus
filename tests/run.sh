@@ -1233,11 +1233,13 @@ check 'uninstall: an env the installer created is removed' '' \
     "$(diff "$tmp/settings.noenv" "$_cfg/settings.json")"
 # A state file written by the SHELL installer (state_version 1) still restores a
 # value the user had set themselves: it recorded the value under a different name,
-# and its source text is what gets spliced back.
+# and its source text is what gets spliced back. A linked installation witnesses
+# the old installer reaching its final step; an orphan record is ambiguous.
 rm -rf "$_cfg"
 mkdir -p "$_cfg"
 printf '{\n  "env": {\n    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1",\n    "X": "y"\n  }\n}\n' >"$_cfg/settings.json"
-printf '{"state_version":1,"written_by":"claude-tabstatus install.sh","env_key":"CLAUDE_CODE_DISABLE_TERMINAL_TITLE","env_key_before":{"had":true,"value":"0"},"symlink_before":{"had":false,"target":null}}\n' >"$_cfg/claude-tabstatus.state"
+_ins install >/dev/null
+printf '{"state_version":1,"repo":"%s","written_by":"claude-tabstatus install.sh","env_key":"CLAUDE_CODE_DISABLE_TERMINAL_TITLE","env_key_before":{"had":true,"value":"0"},"symlink_before":{"had":false,"target":null}}\n' "$_itree" >"$_cfg/claude-tabstatus.state"
 _ins uninstall >/dev/null
 check 'uninstall: a state_version 1 record still restores the old value' \
     '{
@@ -1550,7 +1552,7 @@ _sa install >/dev/null
 
 # THE MIGRATION. The live wiring before this change was
 # <config>/skills/claude-tabstatus -> the CHECKOUT, with a state_version 2 record whose
-# symlink_before.target is that same checkout. Both halves of that matter, and the
+# symlink_before.target is an earlier checkout. Both halves of that matter, and the
 # second one is invisible from the code: restoring the recorded target on a later
 # uninstall would rebuild the exact wiring this change exists to abolish.
 _mghome=$tmp/mg-home
@@ -1558,9 +1560,13 @@ _mgcfg=$tmp/mg-config
 _mgdata=$tmp/mg-data
 _mgtree=$_mgdata/claude-tabstatus
 _mgco=$tmp/mg-checkout
+_mgprior=$tmp/mg-prior-checkout
 mkdir -p "$_mghome" "$tmp/mg-state" "$_mgcfg/skills" "$_mgco/.claude-plugin" "$_mgco/hooks" "$_mgco/.git"
 cp "$repo/.claude-plugin/plugin.json" "$_mgco/.claude-plugin/plugin.json"
 cp "$repo/hooks/hooks.json" "$_mgco/hooks/hooks.json"
+mkdir -p "$_mgprior/.claude-plugin" "$_mgprior/hooks"
+cp "$repo/.claude-plugin/plugin.json" "$_mgprior/.claude-plugin/plugin.json"
+cp "$repo/hooks/hooks.json" "$_mgprior/hooks/hooks.json"
 _mg() {
     ( HOME=$_mghome CLAUDE_CONFIG_DIR=$_mgcfg XDG_DATA_HOME=$_mgdata \
       CCTAB_STATE_DIR=$tmp/mg-state "$_sabin" "$@" </dev/null 2>&1 )
@@ -1569,7 +1575,7 @@ printf 'migration section: checkout %s -> tree %s\n' "$_mgco" "$_mgtree"
 ln -s "$_mgco" "$_mgcfg/skills/claude-tabstatus"
 printf '{\n  "env": {\n    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"\n  }\n}\n' >"$_mgcfg/settings.json"
 printf '{"state_version":2,"written_by":"tabstatus install","repo":"%s","settings_path":"%s","env_key":"CLAUDE_CODE_DISABLE_TERMINAL_TITLE","env_object_before":{"had":false},"env_key_before":{"had":false,"raw":null},"symlink_before":{"had":true,"target":"%s"}}\n' \
-    "$_mgco" "$_mgcfg/settings.json" "$_mgco" >"$_mgcfg/claude-tabstatus.state"
+    "$_mgco" "$_mgcfg/settings.json" "$_mgprior" >"$_mgcfg/claude-tabstatus.state"
 # doctor FIRST, because doctor is what somebody runs when a tab misbehaves, and it is
 # therefore how the migration gets discovered.
 _mgdoc=$(_mg doctor)
@@ -1600,9 +1606,9 @@ check 'install: the checkout gained no marker, no bin/ - nothing at all' '.claud
 hooks/hooks.json' \
     "$(cd -- "$_mgco" && find . -mindepth 1 -type f | sed 's|^\./||' | LC_ALL=C sort)"
 check 'install: upgraded the v2 record and said so' 'yes' \
-    "$(printf '%s' "$_mgout" | grep -q 'state:    upgraded the record to state_version 3' && printf yes)"
+    "$(printf '%s' "$_mgout" | grep -q 'state:    upgraded the record to state_version 4' && printf yes)"
 check 'install: the record keeps the prior state write-once' 'yes' \
-    "$(grep -q "\"symlink_before\": {\"had\": true, \"target\": \"$_mgco\"}" "$_mgcfg/claude-tabstatus.state" && printf yes)"
+    "$(grep -q "\"symlink_before\": {\"had\": true, \"target\": \"$_mgprior\"}" "$_mgcfg/claude-tabstatus.state" && printf yes)"
 check 'install: and now names the tree it owns' 'yes' \
     "$(grep -q "\"tree\": \"$_mgtree\"" "$_mgcfg/claude-tabstatus.state" && printf yes)"
 check 'install: closes by saying which tree live sessions paint through' 'yes' \
@@ -1611,7 +1617,7 @@ check 'install: closes by saying which tree live sessions paint through' 'yes' \
 # putting it back would rebuild the wiring this change abolishes. Declined, and said.
 _mgun=$(_mg uninstall)
 check 'uninstall: declines to restore a recorded prior target that is a checkout' 'yes' \
-    "$(printf '%s' "$_mgun" | grep -q "the recorded prior target was the checkout at $_mgco" && printf yes)"
+    "$(printf '%s' "$_mgun" | grep -q "the recorded prior target was the checkout at $_mgprior" && printf yes)"
 check 'uninstall: so the link is removed rather than pointed back at it' '' \
     "$(ls -d "$_mgcfg/skills/claude-tabstatus" 2>/dev/null)"
 check 'uninstall: and the checkout itself is untouched' 'yes' \

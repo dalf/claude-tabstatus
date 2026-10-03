@@ -122,6 +122,15 @@ class DarwinACL(unittest.TestCase):
         self.assertFalse(list(self.root.rglob("*.cctab-owner-probe.*")), "ownership probe left behind")
         return result
 
+    def assert_only_settings_and_lock(self):
+        # The stable, empty anchor survives refusals and uninstall. It contains
+        # no settings bytes; every other unexpected file remains a test failure.
+        anchor = self.config / "claude-tabstatus.lock"
+        if anchor.exists():
+            self.assertFalse(anchor.is_symlink())
+            self.assertEqual(anchor.read_bytes(), b"")
+        self.assertEqual(set(p.name for p in self.config.iterdir()) - {anchor.name}, {"settings.json"})
+
     def alternate_group(self, optional=False):
         current = self.config.stat().st_gid
         groups = [gid for gid in os.getgroups() if gid != current]
@@ -314,7 +323,7 @@ class DarwinACL(unittest.TestCase):
                         self.assertIn("Nothing has been changed", result.stderr)
                         self.assertEqual(self.settings.read_bytes(), ORIGINAL)
                         self.assertEqual(protection(self.settings), wanted)
-                        self.assertEqual(set(p.name for p in self.config.iterdir()), {"settings.json"})
+                        self.assert_only_settings_and_lock()
                         self.assertEqual(list(self.data.iterdir()), [])
 
     def test_application_and_verification_failures_keep_original_and_cleanup(self):
@@ -356,7 +365,7 @@ class DarwinACL(unittest.TestCase):
                         self.assertIn("Nothing has been changed", result.stderr)
                         self.assertEqual(self.settings.read_bytes(), ORIGINAL)
                         self.assertEqual(protection(self.settings), wanted)
-                        self.assertEqual(set(p.name for p in self.config.iterdir()), {"settings.json"})
+                        self.assert_only_settings_and_lock()
                         self.assertEqual(list(self.data.iterdir()), [])
         self.assertIn("private empty staging", (self.root / "fault.log").read_text())
 
@@ -399,7 +408,7 @@ class DarwinACL(unittest.TestCase):
                 self.assertIn("Nothing has been changed", result.stderr)
                 self.assertEqual(self.settings.read_bytes(), ORIGINAL)
                 self.assertEqual(protection(self.settings), wanted)
-                self.assertEqual(set(p.name for p in self.config.iterdir()), {"settings.json"})
+                self.assert_only_settings_and_lock()
                 self.assertEqual(list(self.data.iterdir()), [])
 
     def test_privileged_writer_preserves_a_different_owner(self):

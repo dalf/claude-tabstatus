@@ -30,10 +30,13 @@
 //! is unchanged: the env key switches Claude Code's own title painting off and the
 //! plugin paints the replacement, so "key set, plugin gone" is the one combination
 //! that paints NO title at all. The tree goes before both because it is INERT until
-//! the symlink points at it - so an abort anywhere before that last step leaves a
-//! first-time user exactly as they were. `uninstall` mirrors it: settings first, the
-//! link next, the tree last. Both halves preflight every refusal, so the window
-//! between the writes holds nothing that can decide to stop.
+//! the symlink points at it. Settings can already have changed when a later step
+//! fails. Saved restoration history precedes the settings write; a separate
+//! ownership receipt follows it. An interrupted first install remains pending,
+//! with automatic recovery refused rather than inferred from the current key.
+//! `uninstall` mirrors it: settings first, the link next, the tree last. Preflight
+//! catches known refusals, but later I/O errors and concurrent edits can still stop
+//! either command. Management operations share an OS lock; hooks never take it.
 //!
 //! And the symlink is repointed with rename(2), not unlink-then-symlink. Hooks fire
 //! constantly; a path that resolves to nothing for even a moment is a hook exec'ing a
@@ -63,7 +66,7 @@ use std::path::{Path, PathBuf};
 
 const KEY: &str = "CLAUDE_CODE_DISABLE_TERMINAL_TITLE";
 const PLUGIN: &str = "claude-tabstatus";
-const STATE_VERSION: i32 = 3;
+const STATE_VERSION: i32 = 4;
 
 /// One of this half's options. Spelled here and nowhere else; which subcommand
 /// accepts which is [`Subcommand::parse`]'s business.
@@ -195,7 +198,10 @@ impl Subcommand {
                 force,
                 restore_backup,
                 keep_tree,
-            } => with_ctx(|c| uninstall(c, force, restore_backup, keep_tree)),
+            } => with_ctx(|_| {
+                let _lock = management_lock(&config_dir()?)?;
+                uninstall(&Ctx::new()?, force, restore_backup, keep_tree)
+            }),
             Subcommand::Doctor { surface: None } => with_ctx(doctor),
             Subcommand::Doctor { surface: Some(name) } => surface_table(&name),
             Subcommand::StandaloneGone => {
@@ -623,6 +629,61 @@ fn with_suffix(p: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// A stable, empty anchor, never renamed, swept or deleted on uninstall. All
+/// management readers that mutate installation files hold it through retirement.
+/// Kernel release on exit handles interrupted owners without PID lock stealing.
+fn management_lock(config: &Path) -> Result<fs::File, String> {
+    fs::create_dir_all(config).map_err(|e| could_not_write(config, &e))?;
+    let anchor = config.join("claude-tabstatus.lock");
+    let acquire = || -> std::io::Result<fs::File> {
+        match fs::symlink_metadata(&anchor) {
+            Ok(m) if !m.is_file() => return Err(std::io::Error::other("invalid management lock anchor")),
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        let file = sys::with_mode(&mut options, 0o600).open(&anchor)?;
+        if std::env::var("CCTAB_TEST_MANAGE_POINT").ok().as_deref() == Some("lock-acquired") {
+            if let Some(dir) = std::env::var_os("CCTAB_TEST_MANAGE_DIR") {
+                fs::write(PathBuf::from(dir).join("requested"), b"lock")?;
+            }
+        }
+        sys::lock_exclusive(&file)?;
+        let meta = fs::symlink_metadata(&anchor)?;
+        let id = sys::file_id_of(&file).ok_or_else(|| std::io::Error::other("unknown lock identity"))?;
+        if !meta.is_file() || Some(id) != sys::file_id_at(&anchor, &meta) {
+            return Err(std::io::Error::other("management lock anchor changed"));
+        }
+        management_checkpoint("lock-acquired", None)?;
+        Ok(file)
+    };
+    acquire().map_err(|e| format!("cannot lock management operations at {}: {}", anchor.display(), e))
+}
+
+/// Opt-in, bounded filesystem barriers for the actual candidate binary's cold
+/// management tests. A missing observation/release is an error, never a passing
+/// control. With no test directory there is no extra filesystem work.
+fn management_checkpoint(point: &str, staged: Option<&Path>) -> std::io::Result<()> {
+    let Some(dir) = std::env::var_os("CCTAB_TEST_MANAGE_DIR") else { return Ok(()) };
+    if std::env::var("CCTAB_TEST_MANAGE_POINT").ok().as_deref() != Some(point) {
+        return Ok(());
+    }
+    let dir = PathBuf::from(dir);
+    fs::write(dir.join("reached"), staged.map(|p| p.as_os_str().as_encoded_bytes()).unwrap_or(point.as_bytes()))?;
+    let start = std::time::Instant::now();
+    while !dir.join("release").is_file() {
+        if start.elapsed() > std::time::Duration::from_secs(20) {
+            return Err(std::io::Error::other(format!("management checkpoint {point} timed out")));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    if fs::read(dir.join("release"))? == b"fail" {
+        return Err(std::io::Error::other(format!("management checkpoint {point} failed")));
+    }
+    Ok(())
+}
+
 /// Where the plugin directory IS, for the two commands that have to work on whatever
 /// is already there.
 ///
@@ -766,7 +827,8 @@ fn write_settings(path: &Path, bytes: &[u8], mode: u32, like: &Path, allow_no_ac
         Err(e) if allow_no_acl && no_acl_here(&e) => None,
         Err(e) => return Err(acl_unreadable(like, &e, &format!("{} was not changed", path.display()))),
     };
-    write_atomic_as(path, bytes, mode, keep.as_ref()).map_err(|e| could_not_write(path, &e))
+    atomic_as_at(path, mode, keep.as_ref(), Some("settings-staged"), |f| f.write_all(bytes))
+        .map_err(|e| could_not_write(path, &e))
 }
 
 /// The one refusal `--force` lifts: a filesystem with no Windows ACL to carry.
@@ -849,6 +911,11 @@ fn write_atomic_as(path: &Path, bytes: &[u8], mode: u32, keep: Option<&sys::Secu
 
 fn atomic_as<F>(path: &Path, mode: u32, keep: Option<&sys::Security>, write: F) -> std::io::Result<()>
 where F: FnOnce(&mut fs::File) -> std::io::Result<()> {
+    atomic_as_at(path, mode, keep, None, write)
+}
+
+fn atomic_as_at<F>(path: &Path, mode: u32, keep: Option<&sys::Security>, checkpoint: Option<&str>, write: F) -> std::io::Result<()>
+where F: FnOnce(&mut fs::File) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let name = path.file_name().map(|n| n.as_encoded_bytes().to_vec()).unwrap_or_default();
     let mut tmp_name = b".".to_vec();
@@ -877,6 +944,9 @@ where F: FnOnce(&mut fs::File) -> std::io::Result<()> {
         }
         f.sync_all()?;
         drop(f);
+        if let Some(point) = checkpoint {
+            management_checkpoint(point, Some(&tmp))?;
+        }
         fs::rename(&tmp, path)
     })();
     if res.is_err() {
@@ -913,8 +983,12 @@ fn dir_writable(p: &Path) -> bool {
 /// not record the state the first one left. "Which tree this install OWNS" is
 /// rewritten every time, because `install --tree <somewhere else>` moves it and a
 /// record naming the old one would leave the new tree unfindable and the old one an
-/// orphan. Splitting them is what made this state_version 3.
+/// orphan. Splitting them made state_version 3. Version 4 separates these from
+/// settings completion and retains legacy link-witness provenance explicitly.
 struct State {
+    ownership: Ownership,
+    legacy_tree: Option<PathBuf>,
+    legacy_witness_saved: bool,
     env_had: bool,
     env_raw: Option<Vec<u8>>,
     /// Whether the `env` OBJECT was already in the file. Without this, uninstall
@@ -925,11 +999,38 @@ struct State {
     link_target: Option<Vec<u8>>,
 }
 
+/// Restoration history is not a receipt. A pending first install may have
+/// stopped on either side of the settings rename. Legacy receipts are deliberately
+/// never promoted just by rewriting their record.
+#[derive(Clone, Copy, PartialEq)]
+enum Ownership {
+    Pending,
+    Confirmed,
+    Legacy,
+}
+
+impl Ownership {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Confirmed => "confirmed",
+            Self::Legacy => "legacy",
+        }
+    }
+}
+
 fn state_text(c: &Ctx, s: &State) -> Vec<u8> {
     let mut out = String::new();
     out.push_str("{\n");
     out.push_str(&format!("  \"state_version\": {},\n", STATE_VERSION));
     out.push_str("  \"written_by\": \"tabstatus install\",\n");
+    out.push_str(&format!("  \"settings_ownership\": {},\n", json::quote(s.ownership.name().as_bytes())));
+    if s.ownership == Ownership::Legacy {
+        if let Some(witness) = &s.legacy_tree {
+            out.push_str(&format!("  \"legacy_completion_link\": {},\n",
+                json::quote(witness.as_os_str().as_encoded_bytes())));
+        }
+    }
     // The tree this install owns. The v2 field here was called "repo" and was never
     // read back by anything, which is why renaming it costs nothing - and it has to
     // be READ back now, because it is how `uninstall` finds the tree when the link no
@@ -970,7 +1071,7 @@ fn read_state(c: &Ctx) -> Result<Option<State>, String> {
     let raw = read_file(&c.state)?;
     let v = json::parse(&raw).map_err(|e| {
         format!(
-            "{} is not valid JSON ({}). Delete it and re-run with --force to \
+            "{} is not valid JSON ({}). Move it aside and re-run with --force to \
              uninstall anyway.",
             c.state.display(),
             e
@@ -979,6 +1080,55 @@ fn read_state(c: &Ctx) -> Result<Option<State>, String> {
     let root = v
         .as_obj()
         .ok_or_else(|| format!("{} is not a JSON object", c.state.display()))?;
+    let invalid = || format!("{}. Nothing has been changed.",
+        recovery_needed(c, "the installation record is incomplete or mismatched"));
+    if record_duplicates(&v) {
+        return Err(invalid());
+    }
+    let version = match root.get("state_version").map(|m| &m.val) {
+        Some(json::J::Num(n)) => n.as_slice(),
+        _ => return Err(invalid()),
+    };
+    let ownership = match (version, root.get("settings_ownership")) {
+        (b"4", Some(m)) => match m.val.as_str() {
+            Some(b"pending") => Ownership::Pending,
+            Some(b"confirmed") => Ownership::Confirmed,
+            Some(b"legacy") => Ownership::Legacy,
+            _ => return Err(invalid()),
+        },
+        (b"1" | b"2" | b"3", None) => Ownership::Legacy,
+        _ => return Err(invalid()),
+    };
+    if root.get("env_key").and_then(|m| m.val.as_str()) != Some(KEY.as_bytes()) {
+        return Err(invalid());
+    }
+    if version == b"4" || root.get("settings_path").is_some() {
+        // Keep byte-repaired path spellings compatible, and accept aliases only
+        // with filesystem evidence. A path match is a guard, never a receipt.
+        let path = json::parse(json::quote(c.settings.as_os_str().as_encoded_bytes()).as_bytes())?;
+        let recorded = root.get("settings_path").and_then(|m| m.val.as_str());
+        if recorded != path.as_str() && !recorded.is_some_and(|p| {
+            sys::same_path(&PathBuf::from(sys::os_string_from_vec(p.to_vec())), &c.settings) == Ok(true)
+        }) {
+            return Err(invalid());
+        }
+    }
+    if version == b"4" {
+        if root.get("written_by").and_then(|m| m.val.as_str()) != Some(b"tabstatus install")
+            || root.get("tree").and_then(|m| m.val.as_str()).is_none_or(|p| {
+                !PathBuf::from(sys::os_string_from_vec(p.to_vec())).is_absolute()
+            })
+        {
+            return Err(invalid());
+        }
+        for name in ["env_key_before", "env_object_before", "symlink_before"] {
+            if root.get(name).and_then(|m| m.val.as_obj())
+                .and_then(|o| o.get("had")).and_then(|m| m.val.as_bool()).is_none()
+            {
+                return Err(invalid());
+            }
+        }
+    }
     let (mut env_had, mut env_raw) = (false, None);
     if let Some(m) = root.get("env_key_before") {
         if let Some(o) = m.val.as_obj() {
@@ -991,7 +1141,7 @@ fn read_state(c: &Ctx) -> Result<Option<State>, String> {
                 // span, so a state file from before this binary existed still
                 // restores a value the user had set themselves.
                 if let Some(v) = o.get("value") {
-                    if !matches!(v.val, json::J::Null) {
+                    if env_had {
                         env_raw = Some(raw[v.val_start..v.end].to_vec());
                     }
                 }
@@ -1014,7 +1164,96 @@ fn read_state(c: &Ctx) -> Result<Option<State>, String> {
             link_target = o.get("target").and_then(|x| x.val.as_str()).map(|s| s.to_vec());
         }
     }
-    Ok(Some(State { env_had, env_raw, env_object_had, link_had, link_target }))
+    if version == b"4" {
+        let before = root.get("env_key_before").unwrap().val.as_obj().unwrap();
+        let link = root.get("symlink_before").unwrap().val.as_obj().unwrap();
+        let raw_valid = match before.get("raw").map(|m| &m.val) {
+            Some(json::J::Null) => !env_had,
+            Some(json::J::Str(raw)) => env_had && json::parse(raw).is_ok(),
+            _ => false,
+        };
+        let link_valid = match link.get("target").map(|m| &m.val) {
+            Some(json::J::Null) => !link_had,
+            Some(json::J::Str(t)) => link_had && !t.is_empty(),
+            _ => false,
+        };
+        if !raw_valid || !link_valid || (env_had && !env_object_had && ownership != Ownership::Legacy) {
+            return Err(invalid());
+        }
+    } else {
+        for name in ["env_key_before", "symlink_before"] {
+            if root.get(name).and_then(|m| m.val.as_obj())
+                .and_then(|o| o.get("had")).and_then(|m| m.val.as_bool()).is_none() {
+                return Err(invalid());
+            }
+        }
+        if env_had != env_raw.is_some() || link_had != link_target.is_some()
+            || env_raw.as_ref().is_some_and(|raw| json::parse(raw).is_err()) {
+            return Err(invalid());
+        }
+    }
+    let legacy_witness_saved = version == b"4" && ownership == Ownership::Legacy;
+    let legacy_tree = if legacy_witness_saved {
+        root.get("legacy_completion_link")
+    } else { root.get("tree").or_else(|| root.get("repo")) }
+        .and_then(|m| m.val.as_str())
+        .map(|p| PathBuf::from(sys::os_string_from_vec(p.to_vec())))
+        .filter(|p| p.is_absolute());
+    if version == b"4" && (legacy_witness_saved != root.get("legacy_completion_link").is_some()
+        || (legacy_witness_saved && legacy_tree.is_none())) {
+        return Err(invalid());
+    }
+    Ok(Some(State { ownership, legacy_tree, legacy_witness_saved, env_had, env_raw, env_object_had, link_had, link_target }))
+}
+
+fn record_duplicates(v: &json::J) -> bool {
+    match v {
+        json::J::Obj(o) => o.members.iter().enumerate().any(|(i, m)| {
+            o.members[..i].iter().any(|n| n.key == m.key) || record_duplicates(&m.val)
+        }),
+        json::J::Arr(a) => a.iter().any(record_duplicates),
+        _ => false,
+    }
+}
+
+fn recovery_needed(c: &Ctx, why: &str) -> String {
+    format!("{}: {}. Saved restoration history does not prove a completed settings update. \
+             Automatic restoration is refused. Review env.{} in {} and the original \
+             value in {}; restore only that key manually if appropriate, then move the record \
+             aside and re-run. uninstall --restore-backup requests whole-file recovery from \
+             the pre-install backup, including unrelated settings; invalid records must first \
+             be moved aside. --force does not \
+             confirm an incomplete record.",
+            c.state.display(), why, KEY, c.settings.display(), c.state.display())
+}
+
+fn require_ownership(c: &Ctx, s: &State) -> Result<(), String> {
+    match s.ownership {
+        Ownership::Confirmed => Ok(()),
+        Ownership::Pending => Err(format!("{}. Nothing has been changed.",
+            recovery_needed(c, "settings ownership is pending after an incomplete install"))),
+        Ownership::Legacy => {
+            // Old installers linked LAST. A link moved from its recorded original
+            // target to the recorded installation is a historical completion
+            // witness. An unchanged/pre-existing link is ambiguous; neither a
+            // marker nor the current value "1" supplies the missing evidence.
+            let Some(installed) = &s.legacy_tree else {
+                return Err(format!("{}. Nothing has been changed.", recovery_needed(c, "legacy settings ownership is ambiguous")));
+            };
+            let live = link_target(&c.link);
+            let original = s.link_target.as_ref().map(|t| {
+                let p = PathBuf::from(sys::os_string_from_vec(t.clone()));
+                if p.is_absolute() { p } else { c.skills.join(p) }
+            });
+            let moved = !s.link_had || original.as_ref()
+                .is_some_and(|p| sys::same_path(p, installed) == Ok(false));
+            if moved && (s.legacy_witness_saved || live.as_ref().is_some_and(|p| sys::same_path(p, installed) == Ok(true))) {
+                Ok(())
+            } else {
+                Err(format!("{}. Nothing has been changed.", recovery_needed(c, "legacy settings ownership is ambiguous")))
+            }
+        }
+    }
 }
 
 // --- the skills symlink -----------------------------------------------------
@@ -1204,20 +1443,30 @@ fn resolve_tree(dir: Option<OsString>, config: &Path) -> Result<(PathBuf, TreeFr
     Ok((absolute(&tree::default_tree()?)?, TreeFrom::Default))
 }
 
-/// Four writes, in the order the module header explains, with every refusal decided
-/// before the first of them.
+/// The writes follow the module header's order. Known refusals are preflighted;
+/// later failure leaves history and its ownership status available for recovery.
 ///
 /// It resolves its own tree rather than being handed one by `with_ctx`, because
 /// install is the command that DECIDES where the plugin directory is. Everything else
 /// discovers it.
 fn install(dir: Option<OsString>, force: bool) -> Result<(), String> {
     let config = config_dir()?;
+    let (tree, from) = resolve_tree(dir.clone(), &config)?;
+    let c = Ctx::at(tree, from)?;
+    // Keep ordinary preflight refusals free of installation writes. Once this
+    // passes, lock before deciding ownership, then resolve and preflight again:
+    // a competing install/uninstall may have changed the link or settings.
+    install_preflight(&c, force)?;
+    let _lock = management_lock(&config)?;
     let (tree, from) = resolve_tree(dir, &config)?;
     let c = Ctx::at(tree, from)?;
     let exe = std::env::current_exe()
         .map_err(|e| format!("cannot find my own path ({}), so there is nothing to copy", e))?;
 
     let (existing, prior) = install_preflight(&c, force)?;
+    if let Some(s) = &prior {
+        require_ownership(&c, s)?;
+    }
     install_header(&c, &exe);
     // Clear this tool's own scratch files left by a killed run, in the directories it
     // is about to write.
@@ -1234,8 +1483,21 @@ fn install(dir: Option<OsString>, force: bool) -> Result<(), String> {
     for line in lines {
         say(&line);
     }
-    record_state(&c, prior, existing.as_deref())?;
-    write_env_key(&c, existing, force)?;
+    let mut saved = record_state(&c, prior, existing.as_deref())?;
+    management_checkpoint("history-saved", None).map_err(|e| e.to_string())?;
+    write_env_key(&c, existing, force).map_err(|e| {
+        if saved.ownership == Ownership::Pending {
+            format!("{}\n{}", e, recovery_needed(&c, "settings ownership remains pending"))
+        } else { e }
+    })?;
+    management_checkpoint("settings-written", None).map_err(|e| e.to_string())?;
+    if saved.ownership == Ownership::Pending {
+        saved.ownership = Ownership::Confirmed;
+        atomic_as_at(&c.state, 0o600, None, Some("ownership-staged"), |f| {
+            f.write_all(&state_text(&c, &saved))
+        }).map_err(|e| format!("{}. {}", could_not_write(&c.state, &e),
+            recovery_needed(&c, "settings were updated but ownership could not be finalised")))?;
+    }
     link_the_plugin(&c, &promise)?;
 
     say("");
@@ -1475,7 +1737,7 @@ fn is_checkout(p: &Path) -> bool {
 /// A v2 record is upgraded IN PLACE rather than replaced, because its first half -
 /// what settings.json and the symlink looked like before any of this - is unrecoverable
 /// once it is lost, and it is the only thing `uninstall` has to go on.
-fn record_state(c: &Ctx, prior: Option<State>, existing: Option<&[u8]>) -> Result<(), String> {
+fn record_state(c: &Ctx, prior: Option<State>, existing: Option<&[u8]>) -> Result<State, String> {
     match prior {
         Some(prior) => {
             // The prior half, re-emitted verbatim, with this install's tree beside it.
@@ -1498,6 +1760,7 @@ fn record_state(c: &Ctx, prior: Option<State>, existing: Option<&[u8]>) -> Resul
                     )),
                 }
             }
+            Ok(prior)
         }
         None => {
             let (link_had, link_target) = match link_state(&c.link) {
@@ -1513,6 +1776,9 @@ fn record_state(c: &Ctx, prior: Option<State>, existing: Option<&[u8]>) -> Resul
                 None => false,
             };
             let s = State {
+                ownership: Ownership::Pending,
+                legacy_tree: None,
+                legacy_witness_saved: false,
                 env_had: env_raw.is_some(),
                 env_raw,
                 env_object_had,
@@ -1521,9 +1787,9 @@ fn record_state(c: &Ctx, prior: Option<State>, existing: Option<&[u8]>) -> Resul
             };
             write_atomic(&c.state, &state_text(c, &s), 0o600)?;
             say(&format!("state:    recorded the prior state in {}", c.state.display()));
+            Ok(s)
         }
     }
-    Ok(())
 }
 
 /// Which version the record on disk claims, as its source text, so an upgrade can say
@@ -1565,8 +1831,8 @@ fn write_env_key(c: &Ctx, existing: Option<Vec<u8>>, force: bool) -> Result<(), 
                 if now != doc {
                     return Err(format!(
                         "{} changed while this installer was running (another \
-                         Claude Code session writing it, most likely). Nothing \
-                         was changed; the backup is at {}.",
+                         Claude Code session writing it, most likely). The installer \
+                         has not replaced settings.json; the backup is at {}.",
                         c.settings.display(),
                         c.backup.display()
                     ));
@@ -1586,10 +1852,9 @@ fn write_env_key(c: &Ctx, existing: Option<Vec<u8>>, force: bool) -> Result<(), 
     Ok(())
 }
 
-/// The LAST step, and the only irreversible one: it is the one write that changes what
-/// code a running session executes, so an abort at any earlier point is a complete
-/// no-op for a first-time user - the tree is inert until this link points at it, and
-/// settings.json is recoverable from its backup and the record.
+/// The LAST step changes what code a running session executes. Settings have
+/// already changed; their receipt and original narrow restoration history are
+/// recorded before this step, so a later ordinary uninstall can undo them.
 ///
 /// It comes after `verify` inside the tree write, because that is what proves the new
 /// target works, and after settings.json, because "env key set + plugin gone" is the
@@ -2278,6 +2543,11 @@ fn uninstall_preflight(c: &Ctx, force: bool, restore_backup: bool, keep_tree: bo
         refuse_unreadable_acl(&c.backup, force)?;
     }
     let state = read_state(c)?;
+    if !restore_backup {
+        if let Some(s) = &state {
+            require_ownership(c, s)?;
+        }
+    }
 
     // The put-back, asked before anything changes, as install asks about its link:
     // `unlink_the_plugin` removes the current link BEFORE it makes the recorded one,
@@ -3813,6 +4083,9 @@ mod tests {
     #[test]
     fn the_state_record_is_json_and_round_trips_what_uninstall_reads() {
         let s = State {
+            ownership: Ownership::Confirmed,
+            legacy_tree: None,
+            legacy_witness_saved: false,
             env_had: true,
             // The value's original SOURCE text, quotes included.
             env_raw: Some(b"\"0\"".to_vec()),
@@ -3847,6 +4120,9 @@ mod tests {
     #[test]
     fn a_record_with_nothing_recorded_writes_explicit_nulls() {
         let s = State {
+            ownership: Ownership::Pending,
+            legacy_tree: None,
+            legacy_witness_saved: false,
             env_had: false,
             env_raw: None,
             env_object_had: false,
@@ -3870,6 +4146,9 @@ mod tests {
         let mut c = ctx();
         c.tree = PathBuf::from(sys::os_string_from_vec(b"/tree/tr\xf0\x9f\x98x".to_vec()));
         let raw = state_text(&c, &State {
+            ownership: Ownership::Pending,
+            legacy_tree: None,
+            legacy_witness_saved: false,
             env_had: false,
             env_raw: None,
             env_object_had: false,
