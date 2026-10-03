@@ -23,8 +23,8 @@ Native Apple Silicon validation, including hostname lookup and required tmux
 acceptance, passed at the reviewed head. Intel remains compile-only, and real
 terminal applications and live Claude Code remain unvalidated on macOS; see
 [validation scope](architecture.md#macos-validation). The consolidated review
-also reproduced a shared tmux start/teardown race: the sequential ownership fix
-is incomplete. See [known weaknesses](#known-weaknesses).
+also reproduced a shared tmux start/teardown race, now closed by cold lifecycle
+coordination and explicit membership. See [the armed record](#the-armed-record).
 
 `9bfd987` (PR #20, the #17 doctor-over-ssh remedy) is **not** in this base, so no
 claim here rests on a string it introduced.
@@ -298,8 +298,9 @@ bytes. Missing or unreadable stores fall through to the next rung. Rung 3 preser
 the historical behaviour exercised by the stateless golden corpus; it cannot
 recover a startup surface that the end hook's environment no longer names.
 
-**Ordering and partial writes.** `SessionStart` resolves state and routing first.
-Inside tmux it then attempts to install the shared policy and reattachment hook,
+**Ordering and partial writes.** `SessionStart` resolves logical state first.
+Inside tmux it acquires the actual session's lifecycle lock and registers ownership
+before it attempts to install the shared policy and reattachment hook,
 and attempts client arming. Next it writes the optional session `s` line, before
 the direct startup write. That direct write combines arming (when routed directly)
 and title bytes in one ordered buffer and one guarded terminal acquisition;
@@ -316,11 +317,13 @@ hook applies that policy to later attaching clients. A non-arming start uses
 outstanding obligation or reattachment hook. The last Claude pane attempts the
 restore, even if another pane selected the arming surface. Teardown removes the
 policy and hook after the attempt, including when detached or when delivery
-fails, so later attaches do not arm after the last owner has left. This describes
-the tested sequential lifecycle: the last-owner query and retirement are not
-serialised against a new start. The demonstrated concurrent exception is recorded
-under [known weaknesses](#known-weaknesses), rather than treated as a permitted
-ownership transition.
+fails, so later attaches do not arm after the last owner has left. The shared
+lifecycle lock covers registration, policy selection/installation, client arming,
+carrier publication, retirement, carrier clearing and final restore/removal.
+A new start waits until an old final teardown finishes; its legitimate arm then
+follows the restore, before publishing its carrier. See
+[lifecycle coordination](architecture.md#tmux-lifecycle-coordination) for membership,
+duplicate events, interruption recovery and the legacy-carrier fallback.
 
 **Delivery outcomes.** Direct and client writes return `io::Result<bool>`:
 `Ok(false)` means delivery was skipped, `Ok(true)` means the write or console API
@@ -358,7 +361,8 @@ The client-writer unit test proves that an error does not stop later clients.
 `tests/test_state_guarantees.py` checks headless obligations, real disposable-PTY
 startup/restore bytes, and a syscall-injected startup write failure whose record
 still drives restoration. `tests/test_tmux_status.py` covers attached and detached
-shared ownership, reattachment and final cleanup on private servers. These tests
+shared ownership, reattachment, lifecycle overlap, concurrent final exits,
+interruption recovery and final cleanup on private servers. These tests
 observe bytes and policy, not terminal application.
 
 ## Attention (#14)
@@ -671,28 +675,16 @@ user instead.
    stock formats and may replace custom formats; the record does not establish
    what the terminal applied. See the [arming contract](#the-armed-record) for
    the stable-topology and best-effort limits.
-2. **Shared tmux teardown can retire a newly started owner.** Demonstrated at
-   `67a0823` with the actual musl binary, tmux 3.7c, real pane processes and an
-   attached disposable PTY: A's `SessionEnd` clears its carrier and queries other
-   owners; the real query returns `0`. B then completes `SessionStart` in another
-   pane, installs `@cctab_armed=konsole` and `client-attached[1971]`, and publishes
-   its idle carrier. When A resumes, it writes Konsole restore bytes and removes
-   B's shared policy and hook. B's carrier remains. Its title can become hidden
-   under stock formats, and later attachment cannot rearm it.
-
-   `src/mux/tmux.rs:666`–`684` separates the ownership query, client restore and
-   disarm; startup registration is at lines 389–408. The reproduction delayed
-   the return of an actual completed query, without substituting ownership data.
-   The parent reviewer independently reproduced it. The race structure predates
-   this PR, but the shared-ownership fix remains incomplete. Sequential exit
-   orders and detached reattachment pass; their tests do not cover this overlap.
-
-   Correction requires serialised membership and retirement for the actual tmux
-   session, covering registration, arm/carrier publication and final restoration.
-   An extra check alone leaves another check/write gap. Crash/interruption recovery
-   must not strand a lifecycle lock. Regression coverage should pause last-owner
-   teardown, complete a new real start, then require intact arming, policy and
-   reattachment until the successor's final exit. Also cover concurrent exits.
+2. **The demonstrated shared tmux start/teardown race is resolved.** The review
+   reproduced it at `67a0823`: a real last-owner query returned `0`, a successor
+   completed startup, then the old teardown restored Konsole and deleted the
+   successor's policy. Cold lifecycle operations now share an OS lock for the
+   actual tmux session and explicit membership, independent of asynchronous pane
+   titles. Deterministic private-server tests cover both ordering and successor
+   restoration, concurrent exits, interrupted startup/retirement and isolation.
+   Older binaries do not participate in this protocol; overlapping lifecycle
+   hooks from mixed versions remain outside the guarantee. See
+   [coordination and recovery](architecture.md#tmux-lifecycle-coordination).
 3. **Thirteen capability rows lack measurements in running terminal applications.**
    One row is measured (Konsole), eleven derive from vendor source and two are inferred.
    A test can prove a row is well-*formed*; it cannot prove it is *true*. The row

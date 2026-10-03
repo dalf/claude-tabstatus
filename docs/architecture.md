@@ -1896,6 +1896,7 @@ set -s @cctab_title                      the generated strip-and-label format
 set -s @cctab_string                     the set-titles-string we installed
 set -s @cctab_window_strip               the generated strip for one window
 set -s @cctab_window_color               one status color for a themed window cap
+set -t <our session> @cctab_members      explicit lifecycle ownership and retirement
 set -t <our session> @cctab_armed        the surface this session armed, or `-`
 set -g set-titles on
 set -g set-titles-string '#{s|^ ||:#{T:@cctab_title}}'
@@ -1912,8 +1913,8 @@ set-hook -t <our session> 'client-attached[1971]' \
     'run-shell -b "'\''#{@cctab_exe}'\''  tmux-arm '\''#{client_tty}'\''"'
 ```
 
-`@cctab_armed` is the odd one out, and deliberately: it is a **session** option
-rather than a server one. Every other option feeds `set-titles-string`, which is
+`@cctab_armed` and `@cctab_members` are **session** options. The rendering options
+feed `set-titles-string`, which is
 server-wide and genuinely is "the last `SessionStart` wins". An arming is not - it
 goes to the ptys of the clients attached to *one* session, so two tmux sessions on
 one server are two different outer tabs, and a server-wide record would let either
@@ -1929,13 +1930,71 @@ The [arming contract](backend-architecture.md#the-armed-record) states the curre
 and best-effort restoration limits. A value naming no surface this build knows reads as **absent**,
 never as a different terminal. `tabstatus uninstall` removes it with the hook.
 
-The last-owner query and restoration are separate operations. A new start can
-register and publish its carrier between them, after which the old teardown
-restores the tab and removes the new policy. The consolidated review reproduced
-this at `67a0823`; shared ownership is correct for the tested sequential exit
-orders but remains incomplete for overlapping lifecycle operations. See
-[backend weaknesses](backend-architecture.md#known-weaknesses) for the focused fix
-and required regression.
+### Tmux lifecycle coordination
+
+`src/mux/tmux/lifecycle.rs` coordinates cold startup and teardown for the actual
+session returned by tmux, using its `socket_path` and `session_id`. An exclusive
+OS file lock on `<socket>.cctab-<session-number>.lock` beside the socket is held
+from before membership and restore-policy selection until all carrier/client
+writes and final policy removal finish. Different state directories, installed
+binary paths and `$TMUX` session-number hints cannot split the lock domain.
+Different tmux sessions have separate locks. The anchor is never replaced or
+unlinked, including at uninstall, because queued hooks must continue to lock the
+same inode. Creating the anchor requires a writable socket directory. Its empty
+file can outlive the session; it holds no persistent lock or ownership. Failure to establish coordination for a live server suppresses
+lifecycle delivery rather than proceeding unlocked. An absent server preserves
+the historical direct-only fallback.
+
+The session-scoped `@cctab_members` is a versioned JSON register. Each pane maps
+to `[pid, process-start-time, session-id, active]`; there is at most one entry per
+pane. Startup registers before shared arming-policy installation, client arming
+and real carrier publication. Teardown marks its entry retired before clearing
+the carrier and selecting the last owner. Active membership therefore does not
+wait for tmux's title parser. Retired entries are retained while their pane
+exists so an uncleared or unparsed old carrier cannot become an owner again.
+Unregistered panes with recognised carriers remain conservative legacy owners.
+Unknown or corrupt register shapes fail closed, preserving existing policy.
+
+Repeated starts replace their pane's entry without adding an owner. Repeated
+ends after successful policy removal do not fall through to an assumed restore;
+a repeated end with policy still present can finish interrupted cleanup. An end
+with a different known PID or supplied session ID cannot retire a replacement
+in the same pane. Without identifying metadata, distinct sessions using the same
+process cannot be distinguished. This does not change the per-Claude state
+record's separate quiescent-teardown requirement.
+
+**Interruption recovery.** The kernel releases the lock when its last descriptor
+closes, including process death. Mutating tmux children inherit the same locked
+file as stdin, so killing a hook cannot let a successor overtake an in-flight
+mutation; the child retains the lock until it exits. Killing the whole hook group
+also releases it. There is no persistent `wait-for -L` lock. Later lifecycle hooks
+remove entries for vanished panes and retire owners whose native PID/start-time
+identity proves death or reuse. Unverifiable identity retains the obligation;
+without a usable `CLAUDE_PID`, the actual pane process supplies the lifetime.
+An interrupted start whose Claude process still lives remains an owner until
+its end or a repeated start. An interrupted retired owner does not block the
+successor's final restore, even if its old carrier survives. Recovery occurs on
+another lifecycle hook, not a timer or acknowledgement/retry queue.
+
+The review's real-query race at `67a0823` is closed: when old teardown holds the
+lock, a new start waits; restore/removal completes before the successor registers,
+arms and publishes. If startup acquires the lock first, its registered ownership
+prevents old teardown from restoring. Concurrent final exits similarly elect
+one final owner without depending on carrier-clear parsing. Deterministic tests
+use actual candidate hooks, real pane processes, private servers and attached
+PTYs, delaying completed real tmux commands. They check client byte ordering,
+policy/hook state, eventual successor restore, duplicate ends, surviving child
+locks, interruption/dead-owner recovery and session isolation. Mixed old/new
+binaries and topology changes remain outside this coordination guarantee.
+
+Local Linux validation of this fix passed the 46-test tmux suite on both freshly
+built musl and GNU binaries, 310 Rust tests per target, the required actual-delivery
+and zero-subprocess gates, state/delivery/install suites, 843 shell assertions and
+the unchanged 312-case corpus. Both source digests matched; both Apple ABI and
+Windows MSVC compile checks passed. These are separate from the historical native
+macOS evidence above. The exact pushed-head CI evidence is recorded in PR #21;
+macOS remains experimental with native arm64 automated validation. The separately
+recorded `refresh-client -S` redraw-observer false failure is unchanged by this fix.
 
 `@cctab_window_color` returns the highest-priority visible state across all Claude
 panes in the window (orange > blue > purple > white), sharing the strip's carrier
@@ -1952,8 +2011,8 @@ is not a command-execution vector: tmux defangs it to `_(` when it *stores* the
 title. (`select-pane -T`, which this plugin never uses, expands its argument at set
 time and must never carry a location.)
 
-**The hot path execs nothing.** Only `SessionStart` runs `tmux`, and `SessionEnd`
-only in Konsole mode; ordinary paints write the pane carrier without invoking `tmux`.
+**The hot path execs nothing.** Only `SessionStart` and `SessionEnd` run `tmux`;
+ordinary paints write the pane carrier without invoking `tmux`.
 
 **What is deliberately not set.** `SessionStart` does not turn on `status`, set
 `status-interval`, or add terminal features, although decay depends on the first two.
@@ -2053,8 +2112,9 @@ space arrived byte for byte. A path holding a single quote has no representation
 inside the hook's shell quoting and drops the re-arm, keeping everything else.
 
 The restore is sent only when no *other* claude pane is left in the session, because
-the arming is per tab and inside tmux one tab holds every window. Our own pane is
-excluded from that count rather than relied on to have been cleared already.
+the arming is per tab and inside tmux one tab holds every window. Registered
+ownership is retired under the shared lock before clearing the carrier; it does
+not wait for tmux's asynchronous title parser.
 
 ### screen and nested tmux
 

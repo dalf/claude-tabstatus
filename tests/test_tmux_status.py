@@ -18,6 +18,7 @@ from pathlib import Path
 import pty
 import re
 import select
+import signal
 import shutil
 import struct
 import subprocess
@@ -45,6 +46,8 @@ MARKED_PILL_FORMATS = tuple(fmt.replace("#I:#W", "#{T:@cctab_window_strip} #I:#W
 SAVED = ("@cctab_window_format_saved", "@cctab_prev_window_format",
          "@cctab_prev_window_format_local", "@cctab_window_current_saved",
          "@cctab_prev_window_current", "@cctab_prev_window_current_local")
+ARM = b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07"
+RESTORE = b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07"
 
 
 def terminal_text_and_backgrounds(data, foreground=False):
@@ -612,6 +615,242 @@ class TmuxStatusTests(unittest.TestCase):
                     self.assertEqual({pane: self.formats(pane) for pane in panes}, original_formats)
                     self.assertEqual(tuple(self.tm("show-options", "-gv", name)
                                            for name in ("set-titles", "set-titles-string")), original_titles)
+
+    def lifecycle_env(self, pane, terminal="konsole"):
+        return {"CLAUDE_PID": self.tm("display-message", "-p", "-t", pane, "#{pane_pid}"),
+                "CCTAB_TERMINAL": terminal, "CCTAB_STATE_DIR": str(self.root / "state")}
+
+    def policy(self, pane=None):
+        return tuple(self.tm("display-message", "-p", "-t", pane or self.pane, "#{" + name + "}")
+                     for name in ("@cctab_armed", "client-attached[1971]"))
+
+    def spawn_hook(self, edge, pane, extra_env, session):
+        env = dict(self.env, TMUX=f"{self.socket},1,0", TMUX_PANE=pane,
+                   CCTAB_TERMINAL="other", CCTAB_GLYPH_POS="prefix")
+        env.update(extra_env)
+        process = subprocess.Popen([str(BIN), edge], env=env, cwd=self.root,
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+        process.stdin.write(json.dumps({"session_id": session}).encode())
+        process.stdin.close()
+        process.stdin = None
+
+        def cleanup():
+            # Only this disposable hook group, including a barrier child.
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate(timeout=3)
+        self.addCleanup(cleanup)
+        return process
+
+    def finish_hook(self, process):
+        out, err = process.communicate(timeout=8)
+        self.assertEqual((process.returncode, out, err), (0, b"", b""))
+
+    def lifecycle_barrier(self, stage):
+        """Delay RETURN of a completed real command, never fabricate its result.
+
+        Registration/retirement is already in tmux before ready appears. The
+        child inherits the candidate's lock on stdin. A second wrapper records
+        its completed target query so we can launch a contender deterministically
+        without requiring it to finish while the first hook holds the lock.
+        """
+        proxy = self.root / ("proxy-" + stage)
+        proxy.mkdir()
+        marker = self.root / ("barrier-" + stage)
+        wrapper = proxy / "tmux"
+        wrapper.write_text(
+            "#!" + sys.executable + "\n"
+            "import os,sys,subprocess,pathlib,time\n"
+            "args=sys.argv[1:]\n"
+            "r=subprocess.run([" + repr(self.tmux) + "]+args,capture_output=True)\n"
+            "p=pathlib.Path(os.environ['CCTAB_BARRIER'])\n"
+            "mode=os.environ['CCTAB_BARRIER_MODE']\n"
+            "target=args[0]=='display-message' and '#{socket_path}' in args[-1]\n"
+            "member=args[0]=='set-option' and '@cctab_members' in args\n"
+            "hold=(mode=='member' and member) or (mode=='clients' and args[0]=='list-clients')\n"
+            "if mode=='contender' and target: p.with_suffix('.attempt').touch()\n"
+            "if hold:\n"
+            " p.with_suffix('.result').write_bytes(r.stdout)\n"
+            " p.with_suffix('.ready').touch()\n"
+            " deadline=time.monotonic()+8\n"
+            " while not p.with_suffix('.release').exists():\n"
+            "  if time.monotonic()>deadline: sys.exit(97)\n"
+            "  time.sleep(.005)\n"
+            "sys.stdout.buffer.write(r.stdout)\n"
+            "sys.stderr.buffer.write(r.stderr)\n"
+            "sys.exit(r.returncode)\n")
+        wrapper.chmod(0o755)
+        return marker, {"PATH": str(proxy) + ":" + self.env["PATH"],
+                        "CCTAB_BARRIER": str(marker), "CCTAB_BARRIER_MODE": "member"}
+
+    def wait_marker(self, marker, suffix):
+        self.wait_for(lambda: marker.with_suffix(suffix).exists(), True)
+
+    def test_old_final_exit_serialises_new_start_and_successor_restores(self):
+        other = self.new_window("successor")
+        envs = [self.lifecycle_env(pane) for pane in (self.pane, other)]
+        marker, barrier = self.lifecycle_barrier("overlap")
+        with self.attached_client() as client:
+            self.hook("session-start", self.pane, envs[0], {"session_id": "old"})
+            self.assertTrue(client.saw(ARM))
+            client.clear()
+            old = self.spawn_hook("session-end", self.pane, dict(envs[0], **barrier), "old")
+            self.wait_marker(marker, ".ready")
+            members = json.loads(self.tm("display-message", "-p", "-t", self.pane, "#{@cctab_members}"))
+            self.assertFalse(members["panes"][self.pane][3], "old owner was not retired")
+            self.assertEqual(self.policy()[0], "konsole")
+            new = self.spawn_hook("session-start", other,
+                                  dict(envs[1], **dict(barrier, CCTAB_BARRIER_MODE="contender")), "new")
+            self.wait_marker(marker, ".attempt")
+            # The completed real identity query precedes acquisition of the
+            # shared lock; startup must wait rather than publish into retirement.
+            time.sleep(.1)
+            self.assertIsNone(new.poll())
+            marker.with_suffix(".release").touch()
+            self.finish_hook(old)
+            self.finish_hook(new)
+            self.wait_for(lambda: self.tm("display-message", "-p", "-t", other,
+                                          "#{pane_title}").split()[-2:-1], ["i"])
+            self.assertTrue(client.saw(ARM))
+            self.assertTrue(client.saw(RESTORE))
+            self.assertLess(client.captured.rindex(RESTORE), client.captured.rindex(ARM))
+            self.assertEqual(self.policy()[0], "konsole")
+            self.assertIn("tmux-arm", self.policy()[1])
+            client.clear()
+            self.hook("session-end", self.pane, envs[0], {"session_id": "old"})
+            self.assertFalse(client.saw(RESTORE, timeout=.2), "duplicate old exit restored successor")
+            self.hook("session-end", other, envs[1], {"session_id": "new"})
+            self.assertTrue(client.saw(RESTORE))
+            self.assertEqual(client.captured.count(RESTORE), 1)
+            self.assertEqual(self.policy(), ("", ""))
+            client.clear()
+            self.hook("session-end", other, envs[1], {"session_id": "new"})
+            self.assertFalse(client.saw(RESTORE, timeout=.2), "duplicate final exit restored twice")
+
+    def test_concurrent_final_exits_restore_once_despite_unparsed_carriers(self):
+        other = self.new_window("second")
+        panes = (self.pane, other)
+        envs = [self.lifecycle_env(pane) for pane in panes]
+        marker, barrier = self.lifecycle_barrier("exits")
+        with self.attached_client() as client:
+            for index, pane in enumerate(panes):
+                self.hook("session-start", pane, envs[index], {"session_id": f"s{index}"})
+            self.assertTrue(client.saw(ARM))
+            client.clear()
+            first = self.spawn_hook("session-end", self.pane, dict(envs[0], **barrier), "s0")
+            self.wait_marker(marker, ".ready")
+            second = self.spawn_hook("session-end", other,
+                                     dict(envs[1], **dict(barrier, CCTAB_BARRIER_MODE="contender")), "s1")
+            self.wait_marker(marker, ".attempt")
+            self.assertIsNone(second.poll())
+            marker.with_suffix(".release").touch()
+            self.finish_hook(first)
+            self.finish_hook(second)
+            self.assertTrue(client.saw(RESTORE))
+            self.assertEqual(client.captured.count(RESTORE), 1)
+            self.assertEqual(self.policy(), ("", ""))
+            for pane in panes:
+                self.wait_for(lambda: self.tm("display-message", "-p", "-t", pane, "#{pane_title}"), "")
+
+    def test_duplicate_start_and_old_end_cannot_retire_same_pane_replacement(self):
+        env = self.lifecycle_env(self.pane)
+        with self.attached_client() as client:
+            for session in ("old", "new", "new"):
+                self.hook("session-start", self.pane, env, {"session_id": session})
+            self.assertTrue(client.saw(ARM))
+            members = json.loads(self.tm("display-message", "-p", "-t", self.pane,
+                                         "#{@cctab_members}"))
+            self.assertEqual(len(members["panes"]), 1)
+            self.assertEqual(members["panes"][self.pane][2:], ["new", True])
+            self.wait_for(lambda: self.tm("display-message", "-p", "-t", self.pane,
+                                          "#{pane_title}").split()[-2:-1], ["i"])
+            carrier = self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}")
+            client.clear()
+            self.hook("session-end", self.pane, env, {"session_id": "old"})
+            self.assertFalse(client.saw(RESTORE, timeout=.2))
+            self.assertEqual(self.policy()[0], "konsole")
+            self.assertEqual(self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}"), carrier)
+            self.hook("session-end", self.pane, env, {"session_id": "new"})
+            self.assertTrue(client.saw(RESTORE))
+            self.assertEqual(self.policy(), ("", ""))
+
+    def test_interrupted_retirement_keeps_child_lock_then_successor_recovers(self):
+        other = self.new_window("successor")
+        envs = [self.lifecycle_env(pane) for pane in (self.pane, other)]
+        marker, barrier = self.lifecycle_barrier("interrupted-end")
+        with self.attached_client() as client:
+            self.hook("session-start", self.pane, envs[0], {"session_id": "old"})
+            self.assertTrue(client.saw(ARM))
+            old = self.spawn_hook("session-end", self.pane, dict(envs[0], **barrier), "old")
+            self.wait_marker(marker, ".ready")
+            old.kill()  # Leave its in-flight wrapper alive, with inherited lock.
+            old.wait(timeout=3)
+            new = self.spawn_hook("session-start", other,
+                                  dict(envs[1], **dict(barrier, CCTAB_BARRIER_MODE="contender")), "new")
+            self.wait_marker(marker, ".attempt")
+            time.sleep(.1)
+            self.assertIsNone(new.poll(), "successor overtook the surviving lifecycle child")
+            marker.with_suffix(".release").touch()
+            self.finish_hook(new)
+            self.assertEqual(self.policy()[0], "konsole")
+            self.assertIn("tmux-arm", self.policy()[1])
+            client.clear()
+            # The interrupted end never cleared its old carrier. Membership,
+            # rather than that asynchronous title, still permits final restore.
+            self.hook("session-end", other, envs[1], {"session_id": "new"})
+            self.assertTrue(client.saw(RESTORE))
+            self.assertEqual(self.policy(), ("", ""))
+
+    def test_interrupted_start_recovers_and_dead_owner_does_not_strand_policy(self):
+        other = self.new_window("successor")
+        env = self.lifecycle_env(self.pane)
+        marker, barrier = self.lifecycle_barrier("interrupted-start")
+        barrier["CCTAB_BARRIER_MODE"] = "clients"
+        with self.attached_client() as client:
+            start = self.spawn_hook("session-start", self.pane, dict(env, **barrier), "old")
+            self.wait_marker(marker, ".ready")
+            self.assertEqual(self.policy()[0], "konsole")
+            os.killpg(start.pid, signal.SIGKILL)
+            start.communicate(timeout=3)
+            # Repeat the actual interrupted startup, then publish a real carrier.
+            self.hook("session-start", self.pane, env, {"session_id": "old"})
+            self.assertTrue(client.saw(ARM))
+            self.wait_for(lambda: self.tm("display-message", "-p", "-t", self.pane,
+                                          "#{pane_title}").split()[-2:-1], ["i"])
+            # Replace the pane's real shell process without a SessionEnd. Its
+            # stale title may survive; native process identity retires the owner.
+            self.tm("respawn-pane", "-k", "-t", self.pane, "/bin/sh")
+            successor_env = self.lifecycle_env(other, "wezterm")
+            self.hook("session-start", other, successor_env, {"session_id": "new"})
+            self.assertEqual(self.policy()[0], "konsole")
+            client.clear()
+            self.hook("session-end", other, successor_env, {"session_id": "new"})
+            self.assertTrue(client.saw(RESTORE))
+            self.assertEqual(self.policy(), ("", ""))
+
+    def test_retiring_one_tmux_session_does_not_block_another_session(self):
+        other = self.tm("new-session", "-d", "-s", "beta", "-P", "-F", "#{pane_id}", "/bin/sh")
+        env = self.lifecycle_env(self.pane)
+        marker, barrier = self.lifecycle_barrier("isolation")
+        with self.attached_client() as alpha, self.attached_client("beta") as beta:
+            self.hook("session-start", self.pane, env, {"session_id": "old"})
+            self.assertTrue(alpha.saw(ARM))
+            old = self.spawn_hook("session-end", self.pane, dict(env, **barrier), "old")
+            self.wait_marker(marker, ".ready")
+            other_env = self.lifecycle_env(other)
+            self.hook("session-start", other, other_env, {"session_id": "other"})
+            self.assertTrue(beta.saw(ARM))
+            marker.with_suffix(".release").touch()
+            self.finish_hook(old)
+            self.assertTrue(alpha.saw(RESTORE))
+            self.assertFalse(beta.saw(RESTORE, timeout=.2))
+            self.assertEqual(self.policy(other)[0], "konsole")
+            self.hook("session-end", other, other_env, {"session_id": "other"})
+            self.assertTrue(beta.saw(RESTORE))
+            self.assertEqual(self.policy(other), ("", ""))
 
     def test_detached_policy_survives_other_start_and_reattach_until_last_owner(self):
         """Forced terminal rows observe protocol bytes on disposable clients."""

@@ -145,6 +145,17 @@ fn paint(edge: Edge) -> io::Result<()> {
         return emit::dry_run(&composed.title);
     }
 
+    // Cold lifecycle operations share the ACTUAL tmux session's lock, not the
+    // per-Claude state lock. Register/retire before appearance selection and
+    // keep the guard through client writes and asynchronous carrier publication.
+    let lifecycle = match paint {
+        Paint::SessionStart | Paint::SessionEnd => tmux::Lifecycle::begin(&cfg, &payload, paint)?,
+        _ => None,
+    };
+    if lifecycle.as_ref().is_some_and(|l| !l.eligible()) {
+        return Ok(());
+    }
+
     // The planned surface at start; at end, the retained restore obligation or
     // legacy assumption. Neither a record nor a completed write acknowledges
     // terminal application. The destination still comes from this hook's stack.
@@ -180,8 +191,10 @@ fn paint(edge: Edge) -> io::Result<()> {
         Paint::SessionStart => {
             // Before the first title lands, for the same reason the Konsole
             // arming precedes it: a tab painted before it can show the paint.
-            tmux::session_start(&cfg, route);
-            let clients = tmux::arm_konsole(&cfg, route);
+            if lifecycle.is_some() {
+                tmux::session_start(&cfg, route);
+            }
+            let clients = if lifecycle.is_some() { tmux::arm_konsole(&cfg, route) } else { Ok(false) };
             // RUNG 2 is a conservative restore obligation, recorded before the
             // combined direct arm/title write. Keep it on skips and errors: an
             // aggregate error can follow a complete arm and a partial title.
@@ -196,7 +209,10 @@ fn paint(edge: Edge) -> io::Result<()> {
         }
         Paint::SessionEnd => {
             let r = emit::session_end(&cfg, route);
-            let clients = tmux::session_end(&cfg, route);
+            let clients = match &lifecycle {
+                Some(lifecycle) => tmux::session_end(&cfg, route, lifecycle),
+                None => Ok(false),
+            };
             r.and(clients).map(drop)
         }
         Paint::Line(_) | Paint::LineWithBackground(_) => match route.title {

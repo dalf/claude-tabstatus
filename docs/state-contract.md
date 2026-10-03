@@ -308,6 +308,13 @@ the record, so no ordering guarantee is made across teardown. Reaping on startup
 and explicit uninstall are also separate from the ordinary update guards.
 This is an existing lifecycle limitation, not an ownership-retirement rule.
 
+Shared tmux appearance ownership uses a separate cold lifecycle lock and explicit
+membership for the actual tmux session. It serialises different Claude sessions'
+startup/teardown delivery and policy retirement independently of pane-title
+parsing. It does not change the unlocked per-Claude deletion rule above or
+serialise ordinary hot paints. See
+[tmux lifecycle coordination](architecture.md#tmux-lifecycle-coordination).
+
 The wire writer emits `cts5`, preserving both anonymous permission provenance
 (`?p`) and known background (`g <epoch>`). The optional `s <surface>` line records
 a conservative restore obligation when startup routing selects appearance bytes.

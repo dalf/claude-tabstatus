@@ -25,7 +25,7 @@ carries the management verbs (`install`, `uninstall`, `doctor`, `version`,
 | `src/emit.rs` | delivery: `terminalSequence` JSON, raw OSC to a pane pty, or a console title |
 | `src/support.rs` | one vocabulary for absence: `Support<T>` says available, unsupported, disabled by a knob of ours, unverifiable or failed, each with the reason a user can act on |
 | `src/surface/` | the leaf terminal, chosen at runtime and dispatched statically: `probe.rs` the detection table and the `CCTAB_TERMINAL` override, `rows.rs` the fourteen capability rows as `const` data with their provenance, `compose.rs` the bytes a row spells |
-| `src/mux/` | the multiplexer axis: `mod.rs` detects tmux or screen and `route`s who owns the title and which channel the leaf's bytes ride; `tmux.rs` the tmux integration: the record, `set-titles-string`, window-status formats, restore |
+| `src/mux/` | the multiplexer axis: `mod.rs` detects tmux or screen and `route`s who owns the title and which channel the leaf's bytes ride; `tmux.rs` the tmux integration: the record, `set-titles-string`, window-status formats, restore; `tmux/lifecycle.rs` serialises cold lifecycle membership and delivery |
 | `src/clock.rs` | the one clock (`CCTAB_NOW` pins it) and the one TTL grammar, shared by the state record's expiry and the tmux carrier |
 | `src/armed.rs` | restore obligations and their provenance, read by `SessionEnd`: tmux's `@cctab_armed`, then the record's `s` line, then the old assumption under its own name |
 | `src/manage.rs` | all management verbs: `install`, `uninstall`, `doctor`, `version`, `tmux-format`, `tmux-arm`, `print-embedded`, `help` |
@@ -345,10 +345,14 @@ the test process. Keep it that way in any new test.
   observations keep the same suite portable. It checks real hook carriers,
   attached working/waiting/idle/background status and clock-only decay, shared
   arming in both exit orders, detach/reattach, exact uninstall restoration and
-  headless refusals. Missing delivery, a broken carrier and OSC-only text are
+  headless refusals. Deterministic cold lifecycle barriers cover old-end/new-start
+  overlap, concurrent final exits, duplicate/replacement events, interrupted hooks
+  and surviving children, dead-owner recovery and session isolation. Missing
+  delivery, a broken carrier and OSC-only text are
   negative observer controls. Forced Konsole/WezTerm selections are protocol
-  tests, not terminal-application evidence. All 40 tests passed natively without
-  skips; local root runs skip only the read-only-record case because root
+  tests, not terminal-application evidence. The reviewed 40-test suite passed
+  natively without skips; six lifecycle regressions bring the current suite to 46.
+  Local root runs skip only the read-only-record case because root
   bypasses mode-bit permissions.
 
 ### The golden corpus
@@ -561,12 +565,6 @@ Rules:
 
 ### Known defects, reproduced and deferred
 
-- **Shared tmux arming races with a new session start.** At `67a0823`, an ending
-  hook can observe no other owner, then restore and disarm after another pane's
-  start has installed its policy and carrier. Sequential exit orders pass, but
-  overlapping lifecycle operations are not serialised. This remains an unresolved
-  P2 in PR #21's ownership fix; see the mechanism and regression requirement in
-  [backend weaknesses](docs/backend-architecture.md#known-weaknesses).
 - **`doctor` aborts when `settings.json` is a directory.** The read error in the
   env-key report propagates, so the env-key, settings, state, terminal, glyph, pty
   and title lines never print. Every other broken shape (empty, whitespace,

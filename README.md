@@ -417,6 +417,9 @@ tmux:      OK   tmux 3.7c on /tmp/tmux-1000/default, pane %3
            ttl: working 1200s, waiting 900s, gone 3600s (0 = never)
 ```
 
+Overlapping Claude starts and exits share ownership of the tmux session's arming.
+The last owner restores Konsole; a new start waits for that teardown before arming.
+
 In Konsole mode it also reports the re-arm hook, and warns when the strip on the
 server is on the other end from the one this session would install:
 
@@ -642,10 +645,6 @@ does is in
 - **No notification when background work finishes**; purple just turns white.
 - **Konsole repaints the tab on a ~2s tick**, so the dot trails the real state by
   up to about two seconds.
-- **Overlapping starts and exits in tmux can restore Konsole too early.** An
-  exiting session can remove the arming needed by a session starting in another
-  pane, hiding its title and preventing rearming on attachment. Restart the
-  affected Claude session after the other session has exited to arm it again.
 - **The Konsole restore puts back Konsole's stock formats** (`%d : %n` and
   `(%u) %H`), not a customised profile's. Restoration is best effort: it remembers
   the terminal type, not the original terminal destination. Keep the session's
