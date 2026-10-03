@@ -383,8 +383,8 @@ pub fn materialise(tree: &Path, exe: &Path, version: &str, target: &str) -> Resu
     //
     // ONE write, not a claim and a later correction: the list cannot change between
     // here and the end, because every step below returns Err rather than carrying
-    // on, and a single write leaves the marker provably older than the files it
-    // vouches for - which is the ordering, testable from outside.
+    // on. The marker already exists if the following binary copy fails; copied
+    // file timestamps need not reflect this operation order.
     let now = generated_paths();
     // `in_tree` even for a root-level file: it is the one place that proves the tree
     // itself is a real directory rather than a link to one, and it runs before the
@@ -1216,16 +1216,21 @@ mod tests {
             assert_eq!(fs::read(tree.join(rel)).expect("written"), text.as_bytes());
         }
 
-        // And the ordering itself: no marker, both manifests, is the shape that used
-        // to wedge the tool. It cannot arise from a successful run any more, so the
-        // assertion is on the ordering - the marker is written before the binary.
+        // Force failure at the binary copy and observe the marker already there.
+        // File mtimes cannot prove this order: a copy can preserve its source's
+        // timestamp. The partial tree must remain owned and resumable.
         let fresh = d.join("fresh");
-        materialise(&fresh, &exe, "0.1.0", "t").expect("materialised");
-        let marker_first = fs::metadata(marker_path(&fresh)).expect("marker").modified();
-        let bin_at = fs::metadata(fresh.join(BIN)).expect("bin").modified();
-        if let (Ok(a), Ok(b)) = (marker_first, bin_at) {
-            assert!(a <= b, "the marker must not be newer than the binary it claims");
+        let missing = d.join("missing-exe");
+        let error = materialise(&fresh, &missing, "0.1.0", "t").expect_err("copy fails");
+        assert!(error.contains("cannot copy"), "{}", error);
+        assert!(read_marker(&fresh).expect("marker before copy").is_ok());
+        assert!(!fresh.join(BIN).exists());
+        for (rel, _) in crate::embedded::MANIFESTS {
+            assert!(!fresh.join(rel).exists());
         }
+        assert!(refuse_target(&fresh, &skills).is_none());
+        materialise(&fresh, &exe, "0.1.0", "t").expect("resumed after copy failure");
+        verify(&fresh.join(BIN), "0.1.0").expect("resumed binary runs");
 
         let _ = fs::remove_dir_all(&d);
     }
@@ -1391,7 +1396,10 @@ mod tests {
         // current_exe, so it is always this machine's architecture, and an aarch64 VM
         // never reaches a line of this program.
         let cant = d.join("cant");
-        fs::write(&cant, b"\x7fELF not really\n").expect("write");
+        // An invalid executable format can fall back to a shell on some Unixes.
+        // A shebang naming a missing interpreter must fail at process launch.
+        let missing_interpreter = d.join("missing-interpreter");
+        fs::write(&cant, format!("#!{}\n", missing_interpreter.display())).expect("write");
         let e = materialise(&d.join("nx"), &cant, "9.9.9", "t").expect_err("refused");
         assert!(e.contains("will not run"), "{}", e);
         assert!(e.contains("noexec"), "{}", e);
