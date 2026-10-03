@@ -1438,10 +1438,13 @@ rather than a server one. Every other option feeds `set-titles-string`, which is
 server-wide and genuinely is "the last `SessionStart` wins". An arming is not - it
 goes to the ptys of the clients attached to *one* session, so two tmux sessions on
 one server are two different outer tabs, and a server-wide record would let either
-one's `SessionEnd` erase the other's. It holds the surface's name, or `-` when that
-`SessionStart` armed nothing, and `SessionEnd` reads it back instead of guessing
-from its own environment - so a `CCTAB_TERMINAL` that changes mid-session no longer
-loses the restore. A value naming no surface this build knows reads as **absent**,
+one's `SessionEnd` erase the other's. Within a tmux session it is a shared restore
+obligation: an arming start records the surface's name; a non-arming start uses
+tmux's `set -o` to initialise `-` only if no record exists. It preserves both an
+outstanding arm and its reattach hook. The last Claude pane restores the tab and
+removes both, regardless of which pane armed it. `SessionEnd` reads it back instead
+of guessing from its own environment - so a `CCTAB_TERMINAL` that changes
+mid-session no longer loses the restore. A value naming no surface this build knows reads as **absent**,
 never as a different terminal. `tabstatus uninstall` removes it with the hook.
 
 `@cctab_window_color` returns the highest-priority visible state across all Claude

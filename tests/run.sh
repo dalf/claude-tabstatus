@@ -3282,11 +3282,10 @@ else
             || echo "[$(tm display-message -p '#{@cctab_exe}')]")"
     check 'the hook is scoped to our session, not the server' '' \
         "$(tm show-hooks -g | grep 'client-attached\[1971\]')"
-    # Not Konsole takes it back off: the layout and the TTLs are already
-    # last-SessionStart-wins, and an arming in force while the strip moved back to
-    # the end Konsole elides is worse than either.
+    # A plain start shares the tab: it cannot revoke another Claude's re-arm.
     tsession_start "$tmp/code/one"
-    check 'a later plain session-start removes the hook again' '' \
+    check 'a later plain session-start preserves the shared re-arm hook' \
+        "run-shell -b \"'#{@cctab_exe}' tmux-arm '#{client_tty}'\"" \
         "$(tm display-message -p -t t:w0.0 '#{client-attached[1971]}')"
     # A user's own hooks live in the same array, and a BARE `set-hook -g
     # client-attached` replaces the WHOLE of it - measured. Ours is one index.
@@ -3507,7 +3506,7 @@ else
 
     tsession_start "$tmp/code/one" CCTAB_TERMINAL=konsole
     check 'session-start records the surface it armed' 'konsole' "$(tarmed)"
-    check 'and a session-start that arms nothing records that instead' '-' \
+    check 'and a session-start that arms nothing preserves the shared obligation' 'konsole' \
         "$(tsession_start "$tmp/code/one" CCTAB_TERMINAL=wezterm; tarmed)"
     # THE CASE THIS COMMIT EXISTS FOR. Armed as Konsole; CCTAB_TERMINAL is something
     # else by the time the session ends. Before the record, the end hook re-derived

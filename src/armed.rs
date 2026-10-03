@@ -27,8 +27,10 @@
 //! corpus case takes rung 3, and rung 3 is the predicate that was already there.
 //!
 //! THE STORES ARE ASYMMETRIC, and the asymmetry is deliberate. Rung 1 can say
-//! "nothing armed" (`-`), because tmux's store is written by every SessionStart
-//! whether it armed or not, at no cost. Rung 2 cannot: a record line written on
+//! "nothing armed" (`-`), initialised by a non-arming SessionStart only if no
+//! shared record exists. A later non-arming start preserves an outstanding arm;
+//! the last Claude pane restores it, even if that pane did not arm it. Rung 2
+//! cannot record a negative: a record line written on
 //! every session would change the bytes of every state record on disk, and the
 //! record format's own rule is that an update never changes what it did not mean
 //! to. So rung 2 answers only "this surface armed", and its silence falls through
@@ -77,7 +79,7 @@ impl ArmSource {
     }
 }
 
-/// What this session armed, and which rung said so.
+/// What remains armed (shared across Claude panes in tmux), and which rung said so.
 ///
 /// `surface` is `None` for "nothing was armed", which is a real answer and not an
 /// absence: rung 1 can state it. The absences all live in the `Support` values

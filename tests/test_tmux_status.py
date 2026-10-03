@@ -426,9 +426,8 @@ class TmuxStatusTests(unittest.TestCase):
         back. What is armed is now RECORDED in `@cctab_armed`, and the restore is
         driven by the record.
 
-        This is the only place in the suite where the arming BYTES are observed:
-        they go to the ptys `list-clients` names, so seeing them needs a real
-        client attached to a real pty. tests/run.sh asserts the decision and the
+        The arming bytes go to the ptys `list-clients` names, so seeing them needs
+        a real client attached to a real pty. tests/run.sh asserts the decision and the
         record; this asserts what actually reaches the terminal.
         """
         arm = b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07"
@@ -444,6 +443,56 @@ class TmuxStatusTests(unittest.TestCase):
             self.assertTrue(client.saw(restore), "the restore was lost with CCTAB_TERMINAL")
             self.assertEqual(self.tm("display-message", "-p", "-t", self.pane,
                                      "#{@cctab_armed}"), "")
+
+    def test_shared_arming_survives_other_starts_and_either_exit_order(self):
+        arm = b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07"
+        restore = b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07"
+        other = self.new_window("second")
+        panes = (self.pane, other)
+
+        def option(name):
+            return self.tm("display-message", "-p", "-t", self.pane, "#{" + name + "}")
+
+        for state_record in (False, True):
+            for second_terminal in ("wezterm", "konsole"):
+                for first_end in (0, 1):
+                    with self.subTest(state_record=state_record, second_terminal=second_terminal,
+                                      first_end=first_end), self.attached_client() as client:
+                        envs = [{"CLAUDE_PID": self.tm("display-message", "-p", "-t", pane,
+                                                       "#{pane_pid}"),
+                                 "CCTAB_TERMINAL": terminal}
+                                for pane, terminal in zip(panes, ("konsole", second_terminal))]
+                        if state_record:
+                            for env in envs:
+                                env["CCTAB_STATE_DIR"] = str(self.root / "state")
+                        for index, (pane, env) in enumerate(zip(panes, envs)):
+                            self.hook("session-start", pane, env,
+                                      {"session_id": f"s{index}", "source": "startup"})
+                            # Real carriers make the other-pane lifetime check observable.
+                            self.wait_for(lambda: self.tm("display-message", "-p", "-t", pane,
+                                                          "#{pane_title}").split()[-2:-1], ["i"])
+                            self.assertTrue(client.saw(arm))
+                            self.assertEqual(option("@cctab_armed"), "konsole")
+                        if state_record:
+                            self.assertIn("s konsole", (self.root / "state" / "s0").read_text().splitlines())
+                        rearm = option("client-attached[1971]")
+                        self.assertIn("tmux-arm", rearm)
+                        for step, index in enumerate((first_end, 1 - first_end)):
+                            # Neither end hook can guess Konsole from its environment.
+                            self.hook("session-end", panes[index],
+                                      dict(envs[index], CCTAB_TERMINAL="wezterm"),
+                                      {"session_id": f"s{index}"})
+                            self.wait_for(lambda: self.tm("display-message", "-p", "-t", panes[index],
+                                                          "#{pane_title}"), "")
+                            if step == 0:
+                                self.assertFalse(client.saw(restore, timeout=0.5), "restored too early")
+                                self.assertEqual(option("@cctab_armed"), "konsole")
+                                self.assertEqual(option("client-attached[1971]"), rearm)
+                            else:
+                                self.assertTrue(client.saw(restore), "lost the shared restore")
+                                self.assertEqual(client.captured.count(restore), 1)
+                                self.assertEqual(option("@cctab_armed"), "")
+                                self.assertEqual(option("client-attached[1971]"), "")
 
     def test_a_session_that_armed_nothing_is_not_restored_by_a_late_terminal(self):
         """The other half of the same defect, and the reason `-` is a value.

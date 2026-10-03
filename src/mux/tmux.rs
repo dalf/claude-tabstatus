@@ -116,9 +116,8 @@ const WINDOW_FORMATS: [WindowFormat; 2] = [
 /// layer of quoting; see [`ARM_HOOK`].
 const OPT_EXE: &str = "@cctab_exe";
 
-/// THE ARMED RECORD - rung 1 of [`crate::armed`]. The surface SessionStart armed
-/// the outer tab for, written where the END hook can read it back instead of
-/// re-deriving it from its own environment.
+/// THE ARMED RECORD - rung 1 of [`crate::armed`]. The shared restore obligation
+/// for this tmux session's outer tab, retained until the last Claude pane ends.
 ///
 /// It is the only option in this file set at SESSION scope rather than server
 /// scope, and that is deliberate: every other option feeds `set-titles-string`,
@@ -131,7 +130,7 @@ const OPT_EXE: &str = "@cctab_exe";
 /// record" rather than as "nothing was armed".
 const OPT_ARMED: &str = "@cctab_armed";
 
-/// What [`OPT_ARMED`] holds when SessionStart armed NOTHING.
+/// What [`OPT_ARMED`] holds when no SessionStart has armed the shared tab.
 ///
 /// A sentinel rather than an empty value, because the two are different answers
 /// and the empty one has to keep meaning "no record here". Without it, every tmux
@@ -387,13 +386,11 @@ pub fn session_start(cfg: &Config, route: Route) {
     ));
     c.arg(";").arg("set").arg("-g").arg("set-titles").arg("on");
     c.arg(";").arg("set").arg("-g").arg("set-titles-string").arg(sts);
-    // THE ARMED RECORD, written in the SAME batch as the arming it describes, so
-    // that a tmux that accepted the options accepted the record too. It is written
-    // on every SessionStart, including the ones that arm nothing - that is what
-    // makes `-` a statement rather than a silence, and it is the only reason
-    // SessionEnd can decline to restore a tab nobody armed.
+    // The obligation belongs to the shared tab, not to the latest Claude start.
+    // A non-arming start may initialise `-`, but cannot erase an earlier arm.
+    // tmux's set -o checks and writes on the server, without a read/write race.
     let armed = route.arms(Channel::Clients);
-    set_session(&mut c, t, OPT_ARMED, armed.map_or(ARMED_NONE, |s| s.caps().name));
+    remember_armed(&mut c, t, armed);
     // LAST in the batch, deliberately: `client-attached[N]` is an array option,
     // which a tmux older than 3.0 has no syntax for, and measured, a command that
     // fails at the END of a `;`-chained batch leaves every command before it
@@ -411,16 +408,9 @@ pub fn session_start(cfg: &Config, route: Route) {
             t.target(&mut c);
             c.arg(HOOK).arg(ARM_HOOK);
         }
-        // Not Konsole: take any hook of ours back off. The layout and the TTLs are
-        // already "the last SessionStart on this server wins", and leaving the
-        // arming in force while the strip moved back to the end Konsole elides is
-        // the one combination that is worse than either. doctor's `arm: WARN` then
-        // names /clear as the way back.
-        _ => {
-            c.arg(";").arg("set-hook").arg("-u");
-            t.target(&mut c);
-            c.arg(HOOK);
-        }
+        // Another Claude may still need the existing re-arm hook. Only the
+        // final SessionEnd (or uninstall) releases this shared obligation.
+        _ => {}
     }
     run(c);
     install_window_status(t);
@@ -492,16 +482,17 @@ fn set(c: &mut Command, name: &str, value: &str) {
     c.arg("set").arg("-s").arg("--").arg(name).arg(value);
 }
 
-/// `; set -t <our pane> -- <name> <value>`: a SESSION option, for the one option
-/// whose scope is a session and not the server. See [`OPT_ARMED`] for why that is
-/// not a detail, and [`set`] for why the `--` is load-bearing.
-fn set_session(c: &mut Command, t: &Tmux, name: &str, value: &str) {
+/// Record an arm at SESSION scope, or initialise a never-armed session.
+fn remember_armed(c: &mut Command, t: &Tmux, armed: Option<Surface>) {
     if c.get_args().next().is_some() {
         c.arg(";");
     }
     c.arg("set");
+    if armed.is_none() {
+        c.arg("-o");
+    }
     t.target(c);
-    c.arg("--").arg(name).arg(value);
+    c.arg("--").arg(OPT_ARMED).arg(armed.map_or(ARMED_NONE, |s| s.caps().name));
 }
 
 /// The array index our `client-attached` hook occupies.

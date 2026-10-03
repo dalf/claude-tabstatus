@@ -305,7 +305,8 @@ enough, with or without tmux on the remote side: it switches the tab to show the
 title and puts the glyph - or, in tmux, the strip - on the end Konsole does not
 elide. You do not need `CCTAB_GLYPH_POS` as well. Inside tmux the switch is sent
 to each attached client's terminal, and a detach-and-reattach re-arms the tab
-automatically.
+automatically. The tab stays armed until the last Claude pane in that tmux session
+ends, even when other panes start with a different `CCTAB_TERMINAL` value.
 
 `CCTAB_TERMINAL` set to anything else says explicitly that the terminal is
 **not** Konsole, which is how you turn off a false detection (an xterm launched
