@@ -10,14 +10,21 @@ Design for [#14](https://github.com/dalf/claude-tabstatus/issues/14), and the se
 land against. The evidence every claim here rests on is in
 [backend-scouting.md](backend-scouting.md); this file does not repeat it.
 
-Base commit: **`a1e4153`**, the head of
+Historical design baseline: **`a1e4153`**, the head of
 [#28](https://github.com/dalf/claude-tabstatus/pull/28)'s `windows-port`. This
-document was first written against `9bfd987` and has been re-checked line by line
-against this base; where a claim was true then and is not true now it is corrected
-here rather than carried. Two things in particular moved under it, and both are
-corrected below: **#28 owns the platform axis outright**, so the `src/sys/` layout
-sketched here is not what landed, and **Windows genuinely works** - it is not the
-`Unsupported` stub an earlier draft of this file described.
+document was first written against `9bfd987`; migration tables and measurements
+below preserve that history. The final PR implementation was reviewed at
+`67a0823`, based on `main` at `1487afa`. **#28 supplied the platform seam**;
+this branch extends it for Darwin and filesystem protection rather than adding
+the earlier proposed platform hierarchy. **Windows has native CI**, rather than
+the `Unsupported` stubs described in the first proposal.
+
+Native Apple Silicon validation, including hostname lookup and required tmux
+acceptance, passed at the reviewed head. Intel remains compile-only, and real
+terminal applications and live Claude Code remain unvalidated on macOS; see
+[validation scope](architecture.md#macos-validation). The consolidated review
+also reproduced a shared tmux start/teardown race: the sequential ownership fix
+is incomplete. See [known weaknesses](#known-weaknesses).
 
 `9bfd987` (PR #20, the #17 doctor-over-ssh remedy) is **not** in this base, so no
 claim here rests on a string it introduced.
@@ -115,9 +122,10 @@ surface — it already looks like one — and the 312-case corpus becomes per-ba
 
 ## One vocabulary for absence
 
-Every capability query in the crate answers with the same type, and `doctor` prints
-it. Today there are five unrelated tri-states and **none of them can say "you turned
-it off"**.
+Capability data and reporting share `Support`, which `doctor` formats. The
+preceding design had several unrelated absence conventions and could not name
+an explicit disable consistently; native operation results retain their own
+types at the platform seam.
 
 ```rust
 pub enum Support<T = ()> {
@@ -192,12 +200,11 @@ tmux carrier instead.
 
 **I2 — Leaf appearance bytes ride the outermost layer's channel, and the leaf never
 learns it is stacked.** `SurfaceCaps::arming` is two byte strings with no opinion
-about where they go. Today the routing decision is spread across two complementary
-predicates in two files — `emit.rs` asks `Konsole && tmux.is_none()`,
-`tmux::arm_konsole` asks `terminal != Konsole` and relies on a guard inside
-`to_clients`. **Split those into two backend objects without a composition rule and
-you get a double arm, or an arm with no restore** — the project's named recurring
-defect. They collapse into one total condition in one place.
+about where they go. The preceding implementation split the routing decision
+between complementary predicates in `emit.rs` and `tmux::arm_konsole`, with part
+of the guard inside `to_clients`. The final `mux::route` resolves appearance to
+one surface/channel pair, preventing the callers from independently selecting
+conflicting routes.
 
 **I3 — Delivery is a property of the *message*, not of the stack.** What landed is
 `Channel::carries_raw()`: `Channel::Protocol` (the hook's `terminalSequence`
@@ -309,7 +316,11 @@ hook applies that policy to later attaching clients. A non-arming start uses
 outstanding obligation or reattachment hook. The last Claude pane attempts the
 restore, even if another pane selected the arming surface. Teardown removes the
 policy and hook after the attempt, including when detached or when delivery
-fails, so later attaches do not arm after the last owner has left.
+fails, so later attaches do not arm after the last owner has left. This describes
+the tested sequential lifecycle: the last-owner query and retirement are not
+serialised against a new start. The demonstrated concurrent exception is recorded
+under [known weaknesses](#known-weaknesses), rather than treated as a permitted
+ownership transition.
 
 **Delivery outcomes.** Direct and client writes return `io::Result<bool>`:
 `Ok(false)` means delivery was skipped, `Ok(true)` means the write or console API
@@ -388,13 +399,13 @@ the golden corpus separately checks that title output has not changed.
 
 ## Dependencies
 
-The gate, and the verdicts, are in
-[backend-scouting.md §5](backend-scouting.md). Net effect: **two target-gated
-first-party binding crates, neither on any hot path, and no change to the default
-Linux build's dependency tree.** Notifications are hand-rolled on Linux — one
-`org.freedesktop.Notifications.Notify` call over a `UnixStream`, measured at 255 µs
-— or a subprocess elsewhere. zbus was rejected at 49 required transitive crates and
-an async runtime, for one method call.
+The dependency survey is in [backend-scouting.md §5](backend-scouting.md).
+`windows-sys` and `libc` are target-gated native binding crates; Linux uses
+neither. They support production native operations, including delivery, and are
+not confined to management paths. Serde and serde_json remain shared parser
+dependencies. No attention effects are implemented: the hand-written D-Bus call
+in `docs/research/dbus_notify.rs` was a measurement fixture, and the survey's
+notification alternatives remain proposals.
 
 > **BOTH ARE TAKEN NOW, and this is no longer a projection.** `Cargo.toml` carries
 > `windows-sys` behind `cfg(windows)` and `libc = "0.2"` behind
@@ -433,12 +444,12 @@ It is **re-landed here as a curated subset** on top of
 | from the old branch | why it is not here |
 |---|---|
 | `src/rawpath.rs` (`e7096d5`) | #28 answers the same question with `sys::os_str_from_bytes` and `sys::os_string_from_vec`, which return `Cow<'_, OsStr>` — correct, because reconstructing an `OsStr` from arbitrary bytes on Windows can allocate, and a borrowed-only newtype cannot say so. Everything else reads bytes through `OsStr::as_encoded_bytes`. |
-| `src/sys/{mod,linux,macos,posix,windows,fileid,stamp}.rs` (`2c2e6e0`, `be83e6a`) | #28's `src/sys/{mod,unix,windows}.rs` is the platform axis, built and tested on a real Windows runner. Nothing in this branch adds a line to `src/sys/`. |
+| `src/sys/{mod,linux,macos,posix,windows,fileid,stamp}.rs` (`2c2e6e0`, `be83e6a`) | The proposed hierarchy was dropped in favour of #28's flat `src/sys/{mod,unix,windows}.rs`. Later commits extend that seam for Darwin operations and filesystem guards, including `sys/darwin_names.rs`. |
 | `sys::STAMP_KIND` / `StampKind::describe` | part of the superseded `src/sys/stamp.rs`. doctor's platform line names #28's `sys::ORIGIN_KEY` instead — the same fact one layer out, and the one a reader of a state directory shared between WSL and native Windows actually needs. |
 | `scripts/manifest-sources.sh` (`ea473d2`) | #28 reached the same fix independently; see below. |
 | the `[lib]` target (`ea473d2`) | this tree has no `src/lib.rs`; the binding the old branch made in `lib.rs::paint` is made in `src/main.rs::paint`. |
 
-**Measured here, on this branch's HEAD.** `cargo test --locked --offline --target
+**Historical migration measurements, before the later review fixes.** `cargo test --locked --offline --target
 x86_64-unknown-linux-musl` 244 passed 0 failed 4 ignored; `sh tests/run.sh` 806
 passed 0 failed; `sh tests/corpus/replay.sh` 312 passed 0 failed 0 diverged, with
 `tests/corpus/cases.jsonl` unchanged through all four commits; corpus unittest 2 OK;
@@ -475,7 +486,7 @@ claim. On this base the number is 0 before the first of these commits and 0 afte
 the last, so it is not a per-commit column any more; it is a baseline every
 commit here re-measured and did not move, and every commit message says so.
 
-**macOS is still unported**, and is still the case worth understanding: it compiles,
+**At the Windows-port baseline, macOS was unported**: it compiled,
 because it takes the `unix` backend, and then five `/proc` reads mean nothing there
 at runtime. #28's `src/sys/unix.rs` documents that per function — `process_start_time`
 says "or on a Unix with no `/proc`", `session_tty` resolves through `/proc` — so the
@@ -496,10 +507,11 @@ degradation is written down rather than silent, but it is a degradation.
 > uses. Only the lookups are `cfg`-selected; every decision downstream of them is a
 > pure function the Linux `cargo test` runs.
 >
-> Native arm64 CI now links and exercises process identity, reaping, locks and
-> disposable PTY delivery. **Native arm64 execution passed at `078c547`**; the
-> recorded run establishes the tested OS calls and scenarios. Intel remains cross-checked only;
-> terminal applications and macOS tmux remain unvalidated. See
+> Native arm64 CI links and exercises process identity, reaping, locks, disposable
+> PTY delivery, protection/path guards, hostname lookup and real-server tmux.
+> **All required jobs passed at reviewed head `67a0823`**, including all 40 native
+> tmux tests without skips. Intel remains cross-checked only; terminal applications
+> and live Claude Code remain unvalidated. See
 > [macOS validation](architecture.md#macos-validation) for the evidence boundary.
 > [#1](https://github.com/dalf/claude-tabstatus/issues/1) remains open.
 
@@ -587,7 +599,7 @@ existing `tests/run.sh` assertion changed; the 35 added are purely additive.
 
 | # | why it is not here |
 |---|---|
-| macOS | #28 ported Windows, not macOS. [#1](https://github.com/dalf/claude-tabstatus/issues/1). **Largely here since, at the `sys` layer**: `libc` is a `cfg(target_os = "macos")` dependency with zero transitive deps, and every `/proc` read in `src/` is now inside `cfg(not(target_os = "macos"))` with a macOS answer beside it — start time (`proc_pidinfo`), liveness (`kill(pid, 0)`), state directory (`TMPDIR`), host name (non-empty `$HOSTNAME`, then native `gethostname`), origin key (`r`), and the session terminal (`proc_pidfdinfo`), so `sys::HAS_SESSION_TTY` is `true` and session-start and session-end paint. Native builds and arm64 CI **passed at `078c547`**. Intel retains cross-checks only, the corpus remains a Linux specification, and the terminal rows remain source-derived rather than tested in macOS applications. See [validation scope](architecture.md#macos-validation), including pending hostname validation. |
+| macOS | Experimental Darwin operations are implemented in `sys`, including native process/terminal and hostname lookup, ACL/ownership preservation and filesystem-aware guards. Native arm64 validation at `67a0823` passed, including required tmux acceptance. Intel retains compile checks; terminal applications and live Claude Code remain unvalidated. No release asset or broader support claim is added. See [validation scope](architecture.md#macos-validation). |
 | the tier-3 restore rule | a **behaviour change**, so it needs its own commit with newly recorded corpus cases, and an owner's decision this branch did not have |
 | an attention channel | this branch builds the seam [#14](https://github.com/dalf/claude-tabstatus/issues/14) needs and stops there. The recommended first channel and its policy table are in [backend-scouting.md §4](backend-scouting.md) |
 | the Windows state layer's file identity | #28 landed it (`8c878bb`); nothing here touches it |
@@ -659,52 +671,52 @@ user instead.
    stock formats and may replace custom formats; the record does not establish
    what the terminal applied. See the [arming contract](#the-armed-record) for
    the stable-topology and best-effort limits.
-2. **Six of the capability rows were written from vendor source, not from a running
-   terminal** (Windows Terminal, conhost, iTerm2, Terminal.app, Ghostty, VS Code).
+2. **Shared tmux teardown can retire a newly started owner.** Demonstrated at
+   `67a0823` with the actual musl binary, tmux 3.7c, real pane processes and an
+   attached disposable PTY: A's `SessionEnd` clears its carrier and queries other
+   owners; the real query returns `0`. B then completes `SessionStart` in another
+   pane, installs `@cctab_armed=konsole` and `client-attached[1971]`, and publishes
+   its idle carrier. When A resumes, it writes Konsole restore bytes and removes
+   B's shared policy and hook. B's carrier remains. Its title can become hidden
+   under stock formats, and later attachment cannot rearm it.
+
+   `src/mux/tmux.rs:666`–`684` separates the ownership query, client restore and
+   disarm; startup registration is at lines 389–408. The reproduction delayed
+   the return of an actual completed query, without substituting ownership data.
+   The parent reviewer independently reproduced it. The race structure predates
+   this PR, but the shared-ownership fix remains incomplete. Sequential exit
+   orders and detached reattachment pass; their tests do not cover this overlap.
+
+   Correction requires serialised membership and retirement for the actual tmux
+   session, covering registration, arm/carrier publication and final restoration.
+   An extra check alone leaves another check/write gap. Crash/interruption recovery
+   must not strand a lifecycle lock. Regression coverage should pause last-owner
+   teardown, complete a new real start, then require intact arming, policy and
+   reattachment until the successor's final exit. Also cover concurrent exits.
+3. **Thirteen capability rows lack measurements in running terminal applications.**
+   One row is measured (Konsole), eleven derive from vendor source and two are inferred.
    A test can prove a row is well-*formed*; it cannot prove it is *true*. The row
    records its own provenance and `doctor` prints it, but a wrong row still ships —
-   on exactly the surfaces where nobody has ever delivered a byte.
-3. **The surface commit is a large diff across three files with no split that leaves
+   native PTY transport does not establish a terminal application's behaviour.
+4. **The historical surface commit was a large diff across three files with no split that left
    both halves compiling**, because the moment `Terminal` becomes `Surface` every
    call site must move. That is `aaba975` here, and it landed that way. The 312
    replay says whether a byte changed; bisecting inside it is not pleasant.
-4. **Fake backends and cross-checks cannot validate OS calls.** Windows has a
-   native runner. macOS now has an arm64 job that links and executes tests,
-   including real processes and disposable PTYs, and **passed at `078c547`**.
-   The Intel target has only cross-checks. Runtime evidence remains limited to
-   the executed architecture, OS image and scenarios; see
-   [macOS validation](architecture.md#macos-validation).
-5. **Generic code with zero instantiations is type-checked but never
-   monomorphised.** A bound only codegen would reject is not caught on Linux. The
-   safety net is the fake staying a *complete* impl; if it drifts, the net thins
-   silently.
-6. **Hand-declared `extern` blocks are the one thing neither a test nor
-   `cargo check` can validate** — `cargo check` does not link, and a wrong
-   `#[repr(C)]` layout is accepted silently on Linux and fails at runtime on the
-   target. Taking no dependency is what makes an offline migration landable; this is
-   its price.
-
-   > **THE LAYOUT HALF OF THIS IS FALSE, and was falsified deliberately.**
-   > `src/sys/unix.rs`'s two hand-written macOS structs carry seven
-   > `const _: () = assert!(…)` items pinning `size_of` and `offset_of`, and
-   > `cargo check --target aarch64-apple-darwin` / `x86_64-apple-darwin` — run in
-   > CI, not only locally — evaluates every one of them. A wrong `#[repr(C)]` is
-   > therefore **not** accepted silently: it fails the build for the target it
-   > would have broken. Negative controls re-run against this tree: a spurious
-   > `u32` fails three of the seven, an `off_t` written as `i32` fails one.
-   >
-   > **Two parts survive, and they are what a future backend should copy the
-   > caution from.** First, cross-checks do not link: the successful native arm64
-   > run supplies `proc_pidfdinfo` linking and execution evidence for that target
-   > only; Intel remains cross-checked. Second, a
-   > size assert cannot see two same-width fields transposed — measured, not
-   > argued: `fi_type` and `fi_guardflags` swapped compiles clean on both Apple
-   > targets with all seven asserts green. That is survivable in this one case only
-   > because nothing is read out of that struct. It is not survivable in general:
-   > `darwin-libproc-sys` 0.2.0 declares `vnode_info` with `vi_fsid` and `vi_pad`
-   > in the other order from the header — same size, different offset — which is
-   > precisely the error class the asserts are blind to, and one reason libc's own
-   > declarations carry everything nested here.
+5. **Native validation covers only the executed platforms and scenarios.**
+   Windows has native CI; macOS arm64 passed at `67a0823`, including hostname,
+   terminal-open and real-server tmux acceptance. Intel macOS remains compile-only.
+   Terminal applications, live Claude Code and older macOS versions remain
+   unvalidated. See [macOS validation](architecture.md#macos-validation).
+6. **ABI assertions constrain layouts without proving every declaration.**
+   Both Apple compile checks evaluate seven size/offset assertions for the added
+   structs; native arm64 tests separately exercise the calls. Historical negative
+   controls rejected a spurious `u32` and a narrowed `off_t`. Same-width field
+   permutations can still pass: swapping `fi_type` and `fi_guardflags` did so on
+   both Apple targets. The nested declarations come from libc; see
+   [attribution](research/attribution.md) for the same-size ordering error that
+   ruled out the alternative wrapper crate. The earlier generic raw-backend/fake
+   proposal did not land, so its zero-instantiation weakness does not describe
+   the final implementation.
 7. ~~**`RawPath`'s soundness rests on a std *doc* guarantee**~~ — **superseded by
    [#28](https://github.com/dalf/claude-tabstatus/pull/28) and not ported.** There is
    no `RawPath` in this tree. Bytes come out of an `OsStr` through

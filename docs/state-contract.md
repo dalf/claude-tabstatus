@@ -262,8 +262,9 @@ display decay is described above.
 
 Persistence requires a valid session ID and either the dedicated
 `CCTAB_STATE_DIR` override or `$XDG_RUNTIME_DIR/claude-tabstatus`
-(`%LOCALAPPDATA%\claude-tabstatus` on Windows); there is no HOME fallback. On
-Windows the directory must be on a volume with POSIX rename semantics (NTFS, not
+(`$TMPDIR/claude-tabstatus` on macOS, `%LOCALAPPDATA%\claude-tabstatus` on Windows);
+there is no HOME fallback. On Windows the directory must be on a volume with
+POSIX rename semantics (NTFS, not
 FAT, exFAT or WSL's 9P share), because every write replaces a file its writer
 holds open. Missing/invalid session IDs, no configured directory, a directory
 without that capability, or failure to create the directory select the stateless
@@ -327,9 +328,10 @@ path checks do not promise resistance to malicious concurrent filesystem changes
 
 Startup examines at most 256 directory entries for stale records. Known records
 with a stored process ID/start-time pair can be reaped when that origin no longer
-matches. The pair is stored under a per-platform key (`p` on Unix, `q` with the
-process creation time on Windows); a record carrying the other platform's key reads
-as having no origin. Records without origin, future-version records and recognized temporary
+matches. The pair is stored under a per-platform key (`p` with Linux start-time
+clock ticks, `r` with Darwin epoch microseconds, `q` with Windows creation FILETIME);
+a record carrying another platform's key reads as having no origin. Records
+without origin, future-version records and recognised temporary
 files (`<id>.<pid>.<16 lowercase hex>.tmp`, and the older `<id>.<pid>.tmp`) use a 24-hour mtime recovery rule; future mtimes count as stale. Recognized
 background records without origin are exempt: missing process metadata cannot
 prove their work ended. Alien record

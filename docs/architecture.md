@@ -604,9 +604,17 @@ Three kinds of evidence must stay separate:
 | Validation | Scope | Evidence at this change |
 |---|---|---|
 | Cross-checking on Linux | `cargo check --all-targets` for `aarch64-apple-darwin` and `x86_64-apple-darwin`; pure decision tests and ABI size/offset assertions | Available locally; does not link or execute Apple calls |
-| Native automated validation | `macos-15`, Apple Silicon (`aarch64-apple-darwin`), explicitly checked with `uname -m`; linked Rust tests, release-mode validation build, state suites, disposable PTY delivery and terminal-open observation | Passed on 2026-10-03 at `b43225be85ace4a9aff85d10bbe5553e43704e72`, macOS 15.7.9 (24G830), Rust 1.99.0: [native job](https://github.com/dalf/claude-tabstatus/actions/runs/37146656917/job/111271890833) |
-| Native tmux acceptance | Real compiled hooks, private servers and attached PTY clients on the same arm64 job | Passed on 2026-10-03 at `bf7e910ba46fd11794782765268084032851ebae`, macOS 15.7.9 (24G830), arm64, tmux 3.7c, Rust 1.99.0; all 40 tests without skips: [native tmux job](https://github.com/dalf/claude-tabstatus/actions/runs/37151659979/job/111286629516) |
+| Native automated validation | `macos-15`, Apple Silicon (`aarch64-apple-darwin`), explicitly checked with `uname -m`; linked Rust tests, release-mode validation build, state suites, disposable PTY delivery and terminal-open observation | Passed on 2026-10-03 at reviewed head `67a08236d2579548c02bcc0fa335b498a6a781ac`, macOS 15.7.9 (24G830), Rust 1.99.0: [native job](https://github.com/dalf/claude-tabstatus/actions/runs/37151974515/job/111287539736) |
+| Native tmux acceptance | Real compiled hooks, private servers and attached PTY clients on the same arm64 job | Passed at the same reviewed head and OS image, arm64, tmux 3.7c; all 40 tests without skips: [native tmux job](https://github.com/dalf/claude-tabstatus/actions/runs/37151974515/job/111287539736) |
 | Terminal-application testing | Terminal.app, iTerm2, Ghostty, Konsole and Claude Code's live hook integration | Not performed on macOS; a PTY byte capture cannot show how a terminal applies an OSC |
+
+Earlier milestones were the terminal-open run at `b43225b`, hostname acceptance
+at `6d4bfa8`, and the first required tmux acceptance at `bf7e910`:
+[earlier tmux job](https://github.com/dalf/claude-tabstatus/actions/runs/37151659979/job/111286629516).
+The table records the later exact-head rerun, rather than treating those earlier
+successes as evidence for an untested head. Successful acceptance covers the
+authored scenarios; the subsequent consolidated review reproduced the concurrent
+start/teardown defect described in [backend weaknesses](backend-architecture.md#known-weaknesses).
 
 The runner label's architecture follows [GitHub's runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 Intel macOS retains its cross-check; it has no native execution coverage here.
@@ -1417,7 +1425,9 @@ inheritance pass filters inherited source entries. Ownership changes precede the
 final `chmod`, since `chown` can clear set-ID bits. The intended ownership, mode
 and ACL are verified before configuration bytes; after writing, the mode is set again (writes
 can clear special mode bits), and all are verified before sync and atomic rename.
-Any failure removes the staging file and leaves the original file unchanged.
+A write or preservation failure leaves the destination unchanged and attempts to
+remove the staging file. Persistent cleanup failure or interruption can leave
+scratch files.
 Settings symlinks and byte-based concurrent-modification guards retain their
 existing behaviour; this is not a transaction across all installer steps.
 
@@ -1432,9 +1442,9 @@ metadata retains copyfile's existing flags and timestamp semantics. Ownership is
 now strict: final verification catches even a successful copy that changed UID/GID.
 Both backups use their source's protection. A restore over a live file uses the
 live file's owner/group, mode and ACL; a missing live file takes the backup's.
-Byte-based settings rewrites still do not copy extended attributes or timestamps,
-as before. Linux's existing mode/copy policy and Windows' best-effort ownership
-policy are unchanged. This change adds no hook calls or dependencies.
+Byte-based settings rewrites still do not copy extended attributes, timestamps or
+BSD file flags, as before. Linux's existing mode/copy policy and Windows'
+best-effort ownership policy are unchanged. This change adds no hook calls or dependencies.
 
 API/provenance checks use Apple's current
 [ACL header](https://github.com/apple-oss-distributions/Libc/blob/main/include/sys/acl.h),
@@ -1804,9 +1814,10 @@ format to `%w`, and on `SessionEnd` sets both formats back to Konsole's defaults
 in memory, and never inherits them into new tabs or writes them to disk. OSC 50
 means "set font" in xterm, so it is sent only when Konsole is detected
 (`KONSOLE_VERSION` or `KONSOLE_DBUS_SESSION`, outside tmux and screen) or
-`CCTAB_TERMINAL=konsole` says so. Konsole arming is Unix-only, and on macOS
-untested: Windows has no console form of it. The user-facing rules, including the
-ssh case, are in the README.
+`CCTAB_TERMINAL=konsole` says so. Konsole arming is Unix-only. Its forced protocol
+bytes passed native macOS PTY and tmux tests; no real Konsole application was
+tested there. Windows has no console form of it. The user-facing rules, including
+the ssh case, are in the README.
 
 Konsole's elide direction is not configurable: it is
 `QTabBar::setElideMode(Qt::ElideLeft)` at one hardcoded call site, with no config key
@@ -1917,6 +1928,14 @@ before client delivery, including detached starts; it proves no terminal applica
 The [arming contract](backend-architecture.md#the-armed-record) states the current-destination
 and best-effort restoration limits. A value naming no surface this build knows reads as **absent**,
 never as a different terminal. `tabstatus uninstall` removes it with the hook.
+
+The last-owner query and restoration are separate operations. A new start can
+register and publish its carrier between them, after which the old teardown
+restores the tab and removes the new policy. The consolidated review reproduced
+this at `67a0823`; shared ownership is correct for the tested sequential exit
+orders but remains incomplete for overlapping lifecycle operations. See
+[backend weaknesses](backend-architecture.md#known-weaknesses) for the focused fix
+and required regression.
 
 `@cctab_window_color` returns the highest-priority visible state across all Claude
 panes in the window (orange > blue > purple > white), sharing the strip's carrier

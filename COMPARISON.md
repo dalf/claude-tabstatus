@@ -1,6 +1,7 @@
 # Comparing claude-tabstatus with related projects
 
-Research date: **27 September 2026**.
+External research date: **27 September 2026**. Local status reconciled at
+`67a0823` on **3 October 2026**.
 
 This document compares `claude-tabstatus` with five projects that address terminal titles, session status, or attention management:
 
@@ -24,13 +25,46 @@ The evidence has three levels:
 
 This was not a common-hardware benchmark or a live end-to-end trial of all five integrations. No external project's installer was run against the user's configuration. Isolated tests and probes, where performed, are reported separately. Stars, commit counts and README length are not used as measures of reliability.
 
-For `claude-tabstatus`, the committed baseline was [`50bf014`](https://github.com/dalf/claude-tabstatus/tree/50bf014f727e441c080edf8393e3d555d8b1c6c7). Its runtime modules were inspected alongside the working tree. Another agent was changing installation to use only `install`; the deployment description below reflects that working-tree direction. It should not be read as a claim that the refactor was already committed or released. The removed `standalone` command is not evaluated as a competing installation option.
+For the historical `claude-tabstatus` comparison, the committed baseline was
+[`50bf014`](https://github.com/dalf/claude-tabstatus/tree/50bf014f727e441c080edf8393e3d555d8b1c6c7).
+Its runtime modules were inspected alongside an installer refactor in the working
+tree. The baseline account below and pinned source register preserve those dated
+observations; the following update states the current local conclusion. External
+projects have not been surveyed again.
+
+## Current local status (3 October 2026)
+
+PR #21 at `67a0823` separates terminal capabilities, multiplexer routing and native
+OS operations. Linux and Windows retain their existing behaviour and required CI.
+macOS remains experimental: native Apple Silicon process/state, protection/path,
+hostname, PTY and tmux acceptance passed on macOS 15.7.9 with tmux 3.7c. Intel
+retains compile checks; real terminal applications and live Claude Code remain
+unvalidated on macOS, and no Mac release artefact is added. See the
+[architecture](docs/architecture.md#the-three-axes) and
+[validation evidence](docs/architecture.md#macos-validation).
+
+The former no-dependency and Linux-only lifecycle descriptions are historical.
+The shared parser uses Serde/serde_json; native bindings are target-gated. Direct
+Unix delivery uses Linux `/proc` or Darwin `proc_pidfdinfo`; Windows retains its
+native console route. Ordinary tmux hooks deliver carriers directly to pane
+PTYs. The generated-tree installer is implemented. Current indicator and ownership
+semantics are specified in the [indicator](docs/indicator-semantics.md) and
+[state](docs/state-contract.md) contracts, including known background work.
+
+The historical parser/unknown-owner findings [#5](https://github.com/dalf/claude-tabstatus/issues/5),
+[#6](https://github.com/dalf/claude-tabstatus/issues/6) and
+[#7](https://github.com/dalf/claude-tabstatus/issues/7) are closed and their fixes
+are present in this branch. The consolidated review nevertheless reproduced an
+overlapping tmux start/teardown race; shared arming is only partially fixed and
+merge remains pending. The inherited orphan install-record and directory-shaped
+settings/doctor defects also remain. See [backend weaknesses](docs/backend-architecture.md#known-weaknesses)
+and [known defects](AGENTS.md#known-defects-reproduced-and-deferred).
 
 ## Choosing by use case
 
 | Project | Main question it answers | Primary fit | Cost or boundary to accept |
 |---|---|---|---|
-| [claude-tabstatus](#what-claude-tabstatus-actually-offers) | Which session needs input, and in which checkout/host? | Linux, Konsole, SSH and tmux pane aggregation | Hook-derived state, Linux lifecycle routing, known owner/parser issues |
+| [claude-tabstatus](#current-local-status-3-october-2026) | Which session needs input, and in which checkout/host? | Linux, Windows, SSH and tmux pane aggregation; experimental macOS source builds | Hook-derived state, best-effort restoration and the unresolved tmux lifecycle race |
 | [wt-tab-status](#terminal-addons--wt-tab-status) | Is this Windows Terminal tab working, waiting, done or in error? | Windows Terminal on WSL | No tmux; one wait owner; Windows notification integration |
 | [JasperSui's adapter](#jaspersuiclaude-code-iterm2-tab-status) | Which iTerm2 tab should attract my attention? | Native iTerm2 appearance and focus-aware alerts | Persistent Python adapter; focus acknowledgement can clear a live wait indication |
 | [headsup](#headsup) | Which window should I return to, and how do I manage its workflow? | A broader macOS session-management setup | More components and configuration; completion and input-needed share orange |
@@ -40,6 +74,11 @@ For `claude-tabstatus`, the committed baseline was [`50bf014`](https://github.co
 For this repository's stated Linux/Konsole/SSH/tmux use case, none of the inspected alternatives is a direct replacement with the same deployment and state semantics. Conversely, richer native iTerm2 appearance, Windows taskbar alerts or task summaries are real capabilities elsewhere that the local project does not currently provide.
 
 ## What claude-tabstatus actually offers
+
+This section preserves the **27 September baseline assessment**. Its Linux-only
+delivery, dependency, background and open-issue statements have been superseded
+by [current local status](#current-local-status-3-october-2026); its source links
+remain pinned to the historical baseline.
 
 ### A narrow, useful product boundary
 

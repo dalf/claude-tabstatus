@@ -173,9 +173,10 @@ The missing Unicode probes, corrected case-sensitive path fixtures and fault-mes
 assertions have also passed natively. See the recorded results and remaining
 coverage in the validation document. These suites do not establish behaviour in
 a terminal application.
-The hostname suite passed at `6d4bfa8`; required native tmux acceptance passed
-all 40 tests without skips at `bf7e910` on macOS 15.7.9 arm64, tmux 3.7c:
-see the recorded [native job](https://github.com/dalf/claude-tabstatus/actions/runs/37151659979/job/111286629516).
+The exact reviewed head `67a0823` passed the hostname suite and all 40 required
+native tmux tests without skips on macOS 15.7.9 arm64, tmux 3.7c:
+see the recorded [native job](https://github.com/dalf/claude-tabstatus/actions/runs/37151974515/job/111287539736).
+Earlier hostname and tmux milestones remain recorded in the validation document.
 SDK compilation, recording controls, PTY attachment and required observations
 fail when unavailable; tmux absence fails in CI.
 
@@ -194,8 +195,8 @@ example `target/release/tabstatus` or one triple's `bin/tabstatus-<triple>`.
 
 ### The shell suite (`tests/run.sh`)
 
-Dependency-free (no bats, no jq) and exits non-zero on any failure; 596
-assertions, 81 of them in the tmux section. Sections cover glyph per edge, location, JSON-hostile and
+Dependency-free (no bats, no jq) and exits non-zero on any failure; 843
+assertions at `67a0823`, including tmux. Sections cover glyph per edge, location, JSON-hostile and
 non-UTF-8 names, glyph overrides and position, stdin draining, the
 payload-discriminated edges, `hooks.json`, exit status, install and uninstall,
 the embedded manifests and source digests, `CCTAB_TERMINAL`, the state layer and
@@ -560,6 +561,12 @@ Rules:
 
 ### Known defects, reproduced and deferred
 
+- **Shared tmux arming races with a new session start.** At `67a0823`, an ending
+  hook can observe no other owner, then restore and disarm after another pane's
+  start has installed its policy and carrier. Sequential exit orders pass, but
+  overlapping lifecycle operations are not serialised. This remains an unresolved
+  P2 in PR #21's ownership fix; see the mechanism and regression requirement in
+  [backend weaknesses](docs/backend-architecture.md#known-weaknesses).
 - **`doctor` aborts when `settings.json` is a directory.** The read error in the
   env-key report propagates, so the env-key, settings, state, terminal, glyph, pty
   and title lines never print. Every other broken shape (empty, whitespace,

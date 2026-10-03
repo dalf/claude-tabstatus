@@ -51,10 +51,11 @@ any conforming caller must match to interoperate at all — an interface, not an
 expression of one. The Rust declarations and every comment around them in
 `src/sys/unix.rs` are this project's own words.
 
-The soundness of hand-writing that layout does not rest on trusting the reading,
-either: seven `const _: () = assert!(…)` items pin each size and the two offsets the
-code actually walks, and both Apple ABIs are `cargo check`ed in CI. A
-misremembered field is a failed build for the target it would have broken.
+Seven `const _: () = assert!(…)` items pin the required sizes and the two offsets
+the code walks, and both Apple ABIs are `cargo check`ed in CI. Wrong sizes or
+checked offsets fail the build; same-width field permutations can still pass.
+Native arm64 process and PTY tests separately exercise the declarations, while
+Intel remains compile-only. See [validation scope](../architecture.md#macos-validation).
 
 ### lsof — a non-standard permissive licence, and only the technique
 

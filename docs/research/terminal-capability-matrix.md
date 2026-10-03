@@ -4,6 +4,10 @@ Evidence base for the `claude-tabstatus` backend abstraction (issues #1 #3 #11 #
 Compiled 2026-09-28. Every row is labelled **V** (verified: I read the vendor source or
 the vendor doc in this session) or **I** (inferred: reasoned, not read).
 
+Native macOS arm64 PTY and tmux acceptance subsequently passed at `67a0823`.
+Those transport observations do not promote a source-derived row to measured
+terminal-application behaviour; see [validation scope](../architecture.md#macos-validation).
+
 Raw sources fetched during this survey live in `./src/` next to this file
 (konsole_vt102.cpp, vte_seq.cc, kitty_vtparser.c, kitty_window.py, tmux_input.c,
 tmux_opts.c, tmux_feat.c, tmux_tty.c, screen_ansi.c, xterm_charproc.c, xterm_ptyx.h,
