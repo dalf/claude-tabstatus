@@ -44,10 +44,10 @@
 //!
 //! And A REWRITE'S PROTECTION beyond its mode: [`security_of`] reads what the file
 //! being replaced carries besides its mode bits, and [`create_secured`] creates the
-//! replacement with it before a byte is written. On Unix that is nothing - the mode
-//! is the protection, the caller keeps it, and [`Security`] is uninhabited, so no
-//! Unix write makes one more syscall. On Windows it is the file's DACL (and its owner
-//! and group where they can be set), which the rename over it would otherwise
+//! replacement with it before a byte is written. Linux retains its mode-only
+//! policy without additional syscalls. Darwin also preserves ordered ACL entries
+//! and flags, including absence of an ACL. On Windows it is the file's DACL (and
+//! its owner and group where they can be set), which the rename over it would otherwise
 //! replace with the directory's inherited ACL.
 //!
 //! And THE SESSION'S TAB, for the two edges `terminalSequence` cannot carry. On Unix
@@ -70,12 +70,14 @@ mod windows;
 use windows as imp;
 
 pub use imp::{
-    create_private_dir, create_secured, display_bytes, file_id, file_id_at, file_id_of, gitpath_allowed, home_fallback,
+    copy_secured, create_private_dir, create_secured, display_bytes, file_id, file_id_at, file_id_of,
+    gitpath_allowed, home_fallback,
     is_executable, is_line_end, is_set_aside, is_within, kernel_hostname_file, link_dir, lock_exclusive, mode,
     normalize, os_str_from_bytes, os_string_from_vec, probe_dir_link, process_alive,
     process_start_time, remove_dir_command, remove_dir_link, replace_dir_link, replace_file,
     replace_running, replaces_open_files, reserved_name, same_path, same_process, security_of,
-    session_tty, set_mode, set_session_title, strip_home_prefix, sweep_replaced, with_mode, write_tty, Security, DIR_LINK, HAS_MODES,
+    session_tty, set_mode, set_session_title, strip_home_prefix, sweep_replaced, verify_security,
+    with_mode, write_tty, Security, CAN_FORCE_ACL, DIR_LINK, HAS_MODES, HAS_SECURITY,
     HAS_RECORD_LOCK, HAS_SESSION_CONSOLE, HAS_SESSION_TTY, HAS_UNLINK_RUNNING, NO_STATE_DIR,
     ORIGIN_KEY, RUNTIME_DIR_VAR,
 };
@@ -132,9 +134,7 @@ mod tests {
         assert_eq!(HAS_RECORD_LOCK, proven);
         assert_eq!(HAS_MODES, mode(&m).is_some());
         assert_eq!(HAS_MODES, is_executable(&m).is_some());
-        // Where the mode is the protection there is nothing more to carry; where there
-        // is no mode, an existing file's ACL is.
-        assert_eq!(HAS_MODES, security_of(&exe).expect("readable").is_none());
+        assert_eq!(HAS_SECURITY, security_of(&exe).expect("readable").is_some());
         // Without a console route the function answers "not painted" for anything,
         // our own pid included - so a caller branching on the constant and one calling
         // the function agree.

@@ -735,10 +735,11 @@ fn mode_note(mode: u32, tail: &str) -> String {
     }
 }
 
-/// `" (mode 0600 kept)"` where the mode is the protection, and where it is not
-/// (Windows) the access control list `write_settings` and `copy_settings` carry over.
+/// Report the protection the backend carries, including Darwin's mode AND ACL.
 fn kept_note(mode: u32) -> String {
-    if sys::HAS_MODES {
+    if sys::HAS_MODES && sys::HAS_SECURITY {
+        mode_note(mode, " and its access control list kept")
+    } else if sys::HAS_MODES {
         mode_note(mode, " kept")
     } else {
         " (its access control list kept)".to_string()
@@ -763,8 +764,8 @@ fn could_not_write(path: &Path, e: &std::io::Error) -> String {
 }
 
 /// [`write_atomic`] for settings.json and its backups: the new file also keeps what
-/// `like` carries beyond its mode - on Windows, its DACL, so an ACL the user set on
-/// the file survives the rename that replaces it (`sys::security_of`). `like` is the
+/// `like` carries beyond its mode - on Darwin its ACL, on Windows its DACL, so an
+/// ACL set on the file survives the rename that replaces it (`sys::security_of`). `like` is the
 /// file being replaced, or for a backup or a restore, the file being copied. Nothing
 /// there: the new file is made exactly as `write_atomic` makes it. An ACL this user
 /// cannot read refuses the write, before anything is written to `path` - the
@@ -786,23 +787,20 @@ fn write_settings(path: &Path, bytes: &[u8], mode: u32, like: &Path, allow_no_ac
 
 /// The one refusal `--force` lifts: a filesystem with no Windows ACL to carry.
 fn no_acl_here(e: &std::io::Error) -> bool {
-    e.kind() == std::io::ErrorKind::Unsupported
+    sys::CAN_FORCE_ACL && e.kind() == std::io::ErrorKind::Unsupported
 }
 
-/// A copy of settings.json at `to`, exactly as private as `from`: its mode on Unix,
-/// where `fs::copy` carries it, and on Windows its DACL, which `CopyFileExW` does not
-/// copy - so a backup, which holds the same secrets, was born with the directory's
-/// ACL. There the copy is written as `write_settings` writes, from `from`'s bytes
-/// (so it does not keep `from`'s timestamps, as `CopyFileExW` did). `what` names it
-/// in an error: `"the backup "`, or nothing.
+/// A copy with the SOURCE's protection, staged securely and replaced atomically.
+/// Linux retains fs::copy; Darwin retains copyfile's non-ACL metadata work on the
+/// secured fd; Windows retains its byte-copy policy. See sys::copy_secured.
 fn copy_settings(from: &Path, to: &Path, what: &str, allow_no_acl: bool) -> Result<(), String> {
     let fail = |e: &std::io::Error| format!("cannot write {}{}: {}", what, to.display(), e);
     match sys::security_of(from) {
         Ok(None) => fs::copy(from, to).map(drop).map_err(|e| fail(&e)),
         Err(e) if allow_no_acl && no_acl_here(&e) => fs::copy(from, to).map(drop).map_err(|e| fail(&e)),
         Ok(Some(sec)) => {
-            let bytes = fs::read(from).map_err(|e| fail(&e))?;
-            write_atomic_as(to, &bytes, mode_of(from).unwrap_or(0o600), Some(&sec)).map_err(|e| fail(&e))
+            atomic_as(to, mode_of(from).unwrap_or(0o600), Some(&sec), |f| sys::copy_secured(from, f, &sec))
+                .map_err(|e| fail(&e))
         }
         Err(e) => Err(acl_unreadable(from, &e, &format!("{} was not written", to.display()))),
     }
@@ -813,7 +811,7 @@ fn copy_settings(from: &Path, to: &Path, what: &str, allow_no_acl: bool) -> Resu
 /// share): there is nothing to read, and the permissions it does keep - Unix ones -
 /// cannot be carried from here either.
 fn acl_unreadable(p: &Path, e: &std::io::Error, tail: &str) -> String {
-    if e.kind() == std::io::ErrorKind::Unsupported {
+    if no_acl_here(e) {
         return format!(
             "{} is on a filesystem that keeps no Windows access control list ({}): a copy \
              or rewrite of it made from Windows would not keep its permissions (on a WSL \
@@ -823,6 +821,9 @@ fn acl_unreadable(p: &Path, e: &std::io::Error, tail: &str) -> String {
             e,
             tail
         );
+    }
+    if e.kind() == std::io::ErrorKind::Unsupported {
+        return format!("cannot preserve the access control list of {} ({}). {}.", p.display(), e, tail);
     }
     format!(
         "cannot read the access control list of {} ({}), and the file written in its \
@@ -835,7 +836,7 @@ fn acl_unreadable(p: &Path, e: &std::io::Error, tail: &str) -> String {
 
 /// Refuse, in a preflight, a settings file whose ACL this user cannot read: every
 /// rewrite of it, and every backup, has to carry that ACL over, so finding out after
-/// the first write would leave a half-done install. Never refuses on Unix.
+/// the first write would leave a half-done install. Linux adds no ACL query.
 ///
 /// With `allow_no_acl` (`--force`), a filesystem that keeps no Windows ACL is let
 /// through with a warning instead, said here once so the writes that follow need
@@ -854,6 +855,11 @@ fn refuse_unreadable_acl(p: &Path, allow_no_acl: bool) -> Result<(), String> {
 }
 
 fn write_atomic_as(path: &Path, bytes: &[u8], mode: u32, keep: Option<&sys::Security>) -> std::io::Result<()> {
+    atomic_as(path, mode, keep, |f| f.write_all(bytes))
+}
+
+fn atomic_as<F>(path: &Path, mode: u32, keep: Option<&sys::Security>, write: F) -> std::io::Result<()>
+where F: FnOnce(&mut fs::File) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     let name = path.file_name().map(|n| n.as_encoded_bytes().to_vec()).unwrap_or_default();
     let mut tmp_name = b".".to_vec();
@@ -866,13 +872,22 @@ fn write_atomic_as(path: &Path, bytes: &[u8], mode: u32, keep: Option<&sys::Secu
             Some(sec) => sys::create_secured(&tmp, sec)?,
             None => sys::with_mode(fs::OpenOptions::new().write(true).create_new(true), mode).open(&tmp)?,
         };
-        f.write_all(bytes)?;
-        f.sync_all()?;
-        drop(f);
+        if let Some(sec) = keep {
+            // A secured file is born private; restore the intended mode before
+            // configuration bytes, without permitting directory ACL inheritance.
+            sys::set_mode(&tmp, mode)?;
+            sys::verify_security(&f, sec, mode)?;
+        }
+        write(&mut f)?;
         // create_new honours `mode` only through the open(2) mode argument,
         // which umask narrows. Set it explicitly so a umask of 022 cannot
         // widen - or narrow - what we asked for.
         sys::set_mode(&tmp, mode)?;
+        if let Some(sec) = keep {
+            sys::verify_security(&f, sec, mode)?;
+        }
+        f.sync_all()?;
+        drop(f);
         fs::rename(&tmp, path)
     })();
     if res.is_err() {
@@ -2314,8 +2329,7 @@ fn remove_env_key(c: &Ctx, prior: &Prior, force: bool, restore_backup: bool) -> 
         json::parse(&raw).map_err(|e| {
             format!("{} is not valid JSON ({}). Refusing to restore it.", c.backup.display(), e)
         })?;
-        let mode = mode_of(&c.backup).or_else(|| mode_of(&c.settings)).unwrap_or(0o600);
-        // The ACL (Windows): the LIVE file's, as every rewrite keeps it - it is the
+        // The ACL and mode: the LIVE file's, as every rewrite keeps them - it is the
         // newest word on who may read this file, and may have been tightened since
         // install. Only with no live file does the restored one take the backup's,
         // which is the ACL the file had when it was backed up.
@@ -2326,9 +2340,10 @@ fn remove_env_key(c: &Ctx, prior: &Prior, force: bool, restore_backup: bool) -> 
         } else {
             &c.backup
         };
+        let mode = mode_of(like).unwrap_or(0o600);
         write_settings(&c.settings, &raw, mode, like, force)?;
         say(&format!("settings: restored from {}", c.backup.display()));
-        if !sys::HAS_MODES {
+        if sys::HAS_SECURITY {
             say(if like == &c.settings {
                 "          (the access control list of the file it replaced kept)"
             } else {
@@ -4295,14 +4310,15 @@ mod tests {
     fn a_filesystem_with_no_acl_is_refused_for_what_it_is() {
         let e = std::io::Error::new(std::io::ErrorKind::Unsupported, std::io::Error::from_raw_os_error(1));
         let m = acl_unreadable(Path::new("settings.json"), &e, "Nothing has been changed");
-        assert!(m.starts_with("settings.json is on a filesystem that keeps no Windows access control list"), "{m}");
+        assert_eq!(m.starts_with("settings.json is on a filesystem that keeps no Windows access control list"), sys::CAN_FORCE_ACL, "{m}");
         assert!(m.ends_with("Nothing has been changed."), "{m}");
-        assert!(m.contains("re-run with --force"), "the way through is named: {m}");
+        assert_eq!(m.contains("re-run with --force"), sys::CAN_FORCE_ACL, "{m}");
         let e = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         let m = acl_unreadable(Path::new("settings.json"), &e, "Nothing has been changed");
         assert!(m.starts_with("cannot read the access control list of settings.json"), "{m}");
         assert!(!m.contains("--force"), "an unreadable ACL is not something --force lifts: {m}");
-        assert!(!no_acl_here(&e) && no_acl_here(&std::io::Error::from(std::io::ErrorKind::Unsupported)));
+        assert!(!no_acl_here(&e));
+        assert_eq!(no_acl_here(&std::io::Error::from(std::io::ErrorKind::Unsupported)), sys::CAN_FORCE_ACL);
     }
 
     /// `--force` lifts the no-ACL refusal, and only it. Needs a settings.json on a

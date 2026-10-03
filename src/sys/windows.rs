@@ -424,6 +424,20 @@ pub struct Security {
     sd: Vec<u64>,
 }
 
+pub const HAS_SECURITY: bool = true;
+pub const CAN_FORCE_ACL: bool = true;
+
+/// Keep the existing Windows byte-copy policy; CopyFileExW copies no DACL.
+pub fn copy_secured(from: &Path, to: &mut File, _sec: &Security) -> io::Result<()> {
+    use std::io::Write;
+    to.write_all(&fs::read(from)?)
+}
+
+/// Windows has no final chmod that could alter the applied DACL.
+pub fn verify_security(_f: &File, _sec: &Security, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
 impl Security {
     /// For calls that only READ the descriptor, which is all [`set_security`] makes.
     fn ptr(&self) -> *mut core::ffi::c_void {

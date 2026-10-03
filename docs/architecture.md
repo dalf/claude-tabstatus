@@ -1093,7 +1093,57 @@ ACL (a symlink into a WSL share, where a rewrite from Windows would turn 0600 in
 or `uninstall` to write it anyway after a warning. `--force` lifts only that
 refusal; an ACL that exists but cannot be read stays refused. Integrity labels and
 auditing entries (the SACL) are not carried. A new `settings.json` inherits from
-its directory.
+its directory. A restore also keeps the live file's mode when present; with no
+live file it takes the backup's mode.
+
+On **Darwin**, mode bits are only part of a file's protection. `sys::Security`
+owns the original native ACL, preserving ordered allow/deny entries, permissions,
+entry inheritance flags and ACL flags. An existing file with no ACL has an
+explicit security snapshot; only a missing source permits normal directory
+inheritance. `fpathconf(_PC_EXTENDED_SECURITY_NP)` distinguishes a filesystem
+without ACL support, which is refused, from an ACL-capable file with no ACL.
+Only a successful `fstatx_np` snapshot followed by a successful property query
+can establish absence; even an `ENOENT` inspection error on an open fd is refused.
+Inspection errors are preflighted where practical and rechecked at each write;
+neither an unreadable ACL nor failed preservation is bypassed by `--force`.
+
+The empty staging file is born via `openx_np` with mode 0600 and an empty ACL
+with `ACL_FLAG_NO_INHERIT`. A plain `open(0600)` would still inherit directory
+allow entries. The original ACL is then set by fd, or removed explicitly for an
+original with no ACL. Applying it after creation matters: the kernel's creation
+inheritance pass filters inherited source entries. The intended mode and ACL are
+verified before configuration bytes; after writing, the mode is set again (writes
+can clear special mode bits), and both are verified before sync and atomic rename.
+Any failure removes the staging file and leaves the original file unchanged.
+Settings symlinks and byte-based concurrent-modification guards retain their
+existing behaviour; this is not a transaction across all installer steps.
+
+Darwin backups and safety copies use `fcopyfile(DATA | STAT | XATTR)` on the
+already-secured staging fd, retaining the non-ACL metadata copying of Rust's
+Darwin `fs::copy`. Birth time is copied separately, since the old successful
+clone path retained it and `COPYFILE_STAT` does not. `COPYFILE_ACL` is deliberately
+omitted: Apple's copyfile implementation combines explicit source entries with
+inherited **destination** entries. The source's complete ACL is already installed
+and verified instead. Copies no longer use the APFS clone optimisation; STAT
+metadata retains copyfile's existing best-effort ownership, flags and timestamp
+semantics. Byte-based settings rewrites still do not copy extended attributes,
+timestamps or ownership, as before. This change adds no hook calls or dependencies.
+
+API/provenance checks use Apple's current
+[ACL header](https://github.com/apple-oss-distributions/Libc/blob/main/include/sys/acl.h),
+[filesec implementation](https://github.com/apple-oss-distributions/Libc/blob/main/gen/filesec.c),
+[ACL file implementation](https://github.com/apple-oss-distributions/Libc/blob/main/posix1e/acl_file.c),
+[openx implementation](https://github.com/apple-oss-distributions/Libc/blob/main/sys/openx_np.c),
+[fcntl header](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/fcntl.h),
+[kernel inheritance implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_authorization.c),
+and [copyfile source](https://github.com/apple-oss-distributions/copyfile/blob/main/copyfile.c),
+alongside the locked libc 0.2.189 declarations and Rust 1.98.1's Darwin `fs::copy`.
+ACL/filesec allocations have separate RAII owners; borrowed flagsets are never
+freed separately. Native tests set ACLs with `chmod`, observe entries with `ls`
+and ACL-level flags with a separate native text observer,
+and inject SDK-level faults; `cargo check` alone proves neither linking nor ACL
+preservation. The added ACL coverage awaits a native macOS run; the previously
+recorded [macOS validation](#macos-validation) predates it.
 
 ### What uninstall removes, and what it declines to
 

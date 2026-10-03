@@ -6,7 +6,7 @@
 //! NEXT TO EACH OTHER rather than in a file of their own is the last section here,
 //! because it has been asked and it deserves an answer and not an assertion.
 //!
-//! ONLY THE SYSTEM CALL IS `cfg`-SELECTED. Every decision either side makes - the
+//! FOR HOOK PROCESS LOOKUPS, ONLY THE SYSTEM CALL IS `cfg`-SELECTED. Every decision either side makes - the
 //! errno-to-liveness mapping, the packing of a start time into the one number a
 //! record stores - is a pure function compiled on both and exercised by the Linux
 //! test run. Native arm64 macOS CI additionally exercises the actual calls and
@@ -28,18 +28,11 @@
 //! WHY THIS IS ONE FILE AND NOT THREE. The mix reads like two files wedged into one,
 //! and the answer is still no. Four reasons, each measured rather than assumed.
 //!
-//! THE COUNT IS SMALLER THAN IT LOOKS. Of the 28 `#[cfg]` sites, 14 are the mix: SEVEN
-//! questions with two answers - [`ORIGIN_KEY`], [`RUNTIME_DIR_VAR`], [`NO_STATE_DIR`],
+//! THE RUNTIME QUESTIONS remain adjacent: [`ORIGIN_KEY`], [`RUNTIME_DIR_VAR`], [`NO_STATE_DIR`],
 //! [`kernel_hostname_file`], [`process_start_time`], [`process_alive`] and `fd1_path`.
-//! The first four are a constant or a one-expression function and now sit in one
-//! 47-line run, two of them under a SINGLE doc comment that explains both answers at
-//! once - which a split would have to duplicate or cut in half. The other three are a
-//! system call each. Of the remaining 14 sites, seven are the `any(macos, test)`
-//! decisions, which are one body compiled on both and so the opposite of a mix; one is
-//! a Linux-only parse; two are macOS-only declarations with no counterpart anywhere
-//! (`mod abi` and the errno assert); four are the test module and its three Linux-only
-//! tests. Seven forks in a thousand lines, in two clusters, is not the file the
-//! attribute count describes.
+//! The installer-only `darwin_acl` module is a separate subsystem with opaque
+//! native resources; its regression tests need native macOS. It does not change
+//! which hook decisions are compiled and tested on Linux.
 //!
 //! THE ADJACENCY IS THE PROOF, and it is the real argument. Linux
 //! [`process_start_time`] and macOS [`process_start_time`] are 48 lines apart, and
@@ -267,20 +260,379 @@ pub fn with_mode(opts: &mut OpenOptions, mode: u32) -> &mut OpenOptions {
     opts.mode(mode)
 }
 
-/// What a rewrite carries over from the file it replaces BEYOND its mode - and on
-/// Unix that is nothing: the mode is the protection, and the caller already keeps
-/// it. Uninhabited, so [`security_of`] provably answers `None` and
-/// [`create_secured`] is never reached: no syscall is added to any Unix write.
+/// Linux keeps the existing mode-only behaviour; Darwin also carries an ACL.
+pub const HAS_SECURITY: bool = cfg!(target_os = "macos");
+/// Only the Windows backend permits the unsupported-filesystem `--force` escape.
+pub const CAN_FORCE_ACL: bool = false;
+
+/// No additional protection is carried by the Linux backend. This does not claim
+/// that every Unix filesystem's protection consists solely of mode bits.
+#[cfg(not(target_os = "macos"))]
 pub enum Security {}
 
 /// Always `None`, without a syscall; see [`Security`].
+#[cfg(not(target_os = "macos"))]
 pub fn security_of(_path: &Path) -> io::Result<Option<Security>> {
     Ok(None)
 }
 
 /// Unreachable: there is no [`Security`] to apply.
+#[cfg(not(target_os = "macos"))]
 pub fn create_secured(_path: &Path, sec: &Security) -> io::Result<File> {
     match *sec {}
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn copy_secured(_from: &Path, _to: &mut File, sec: &Security) -> io::Result<()> {
+    match *sec {}
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn verify_security(_f: &File, sec: &Security, _mode: u32) -> io::Result<()> {
+    match *sec {}
+}
+
+#[cfg(target_os = "macos")]
+pub use darwin_acl::{copy_secured, create_secured, security_of, verify_security, Security};
+
+/// Installer-only Darwin calls. libc 0.2.189 supplies fpathconf, fcopyfile, the
+/// flags and mode_t, but not the opaque ACL/filesec APIs. Declarations below are
+/// from Apple's sys/acl.h and sys/fcntl.h; see docs/architecture.md for provenance.
+/// No hook calls this module.
+#[cfg(target_os = "macos")]
+mod darwin_acl {
+    use super::*;
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::macos::fs::MetadataExt as DarwinMetadataExt;
+    use std::ptr::NonNull;
+
+    type Native = *mut libc::c_void;
+    const ACL_TYPE_EXTENDED: libc::c_uint = 0x100;
+    const ACL_FLAG_NO_INHERIT: libc::c_uint = 1 << 17;
+    const FILESEC_MODE: libc::c_uint = 4;
+    const FILESEC_ACL: libc::c_uint = 5;
+
+    extern "C" {
+        fn acl_set_fd_np(fd: libc::c_int, acl: Native, kind: libc::c_uint) -> libc::c_int;
+        fn acl_init(count: libc::c_int) -> Native;
+        fn acl_free(acl: Native) -> libc::c_int;
+        fn acl_get_flagset_np(acl: Native, flags: *mut Native) -> libc::c_int;
+        fn acl_add_flag_np(flags: Native, flag: libc::c_uint) -> libc::c_int;
+        fn acl_size(acl: Native) -> libc::ssize_t;
+        fn acl_copy_ext(buf: Native, acl: Native, size: libc::ssize_t) -> libc::ssize_t;
+        fn filesec_init() -> Native;
+        fn filesec_free(sec: Native);
+        fn filesec_query_property(
+            sec: Native,
+            property: libc::c_uint,
+            present: *mut libc::c_int,
+        ) -> libc::c_int;
+        fn filesec_get_property(sec: Native, property: libc::c_uint, value: Native) -> libc::c_int;
+        // Same inode64 selection as libc::fstat; arm64 has no legacy inode ABI.
+        #[cfg_attr(not(target_arch = "aarch64"), link_name = "fstatx_np$INODE64")]
+        fn fstatx_np(fd: libc::c_int, stat: *mut libc::stat, sec: Native) -> libc::c_int;
+        fn filesec_set_property(
+            sec: Native,
+            property: libc::c_uint,
+            value: *const libc::c_void,
+        ) -> libc::c_int;
+        fn fchmodx_np(fd: libc::c_int, sec: Native) -> libc::c_int;
+        fn openx_np(path: *const libc::c_char, flags: libc::c_int, sec: Native) -> libc::c_int;
+    }
+
+    struct Acl(NonNull<libc::c_void>);
+    impl Acl {
+        fn own(p: Native) -> io::Result<Self> {
+            NonNull::new(p)
+                .map(Self)
+                .ok_or_else(io::Error::last_os_error)
+        }
+        fn bytes(&self) -> io::Result<Vec<u8>> {
+            // SAFETY: a live ACL; acl_size and acl_copy_ext keep no pointers. The
+            // external format is zero-initialised by libc, includes ordered ACEs
+            // and ACL/entry flags, and does not include internal iterator state.
+            let size = unsafe { acl_size(self.0.as_ptr()) };
+            if size < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // u64 storage provides alignment for the native implementation.
+            let mut buf = vec![0u64; (size as usize).div_ceil(8)];
+            if unsafe { acl_copy_ext(buf.as_mut_ptr().cast(), self.0.as_ptr(), size) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: buf owns at least size initialised bytes, copied before drop.
+            Ok(unsafe { std::slice::from_raw_parts(buf.as_ptr().cast(), size as usize) }.to_vec())
+        }
+    }
+    impl Drop for Acl {
+        fn drop(&mut self) {
+            // SAFETY: the allocation returned by acl_init/filesec_get_property, once.
+            unsafe {
+                acl_free(self.0.as_ptr());
+            }
+        }
+    }
+
+    struct FileSec(NonNull<libc::c_void>);
+    impl FileSec {
+        fn new() -> io::Result<Self> {
+            // SAFETY: no arguments; caller owns the returned filesec allocation.
+            NonNull::new(unsafe { filesec_init() })
+                .map(Self)
+                .ok_or_else(io::Error::last_os_error)
+        }
+        fn set(&self, property: libc::c_uint, value: *const libc::c_void) -> io::Result<()> {
+            // SAFETY: callers supply a live property value of the header's type,
+            // or the documented REMOVE_ACL sentinel. filesec copies the value.
+            check(unsafe { filesec_set_property(self.0.as_ptr(), property, value) })
+        }
+    }
+    impl Drop for FileSec {
+        fn drop(&mut self) {
+            // SAFETY: this owns the filesec and its separate copied ACL buffer.
+            unsafe {
+                filesec_free(self.0.as_ptr());
+            }
+        }
+    }
+    fn check(rc: libc::c_int) -> io::Result<()> {
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Some(Security { acl: None }) is an EXISTING file with no ACL. Outer None
+    /// alone means missing source and permits normal directory inheritance.
+    pub struct Security {
+        acl: Option<Acl>,
+    }
+
+    fn read(f: &File) -> io::Result<Security> {
+        // SAFETY: live fd; this pathconf selector has a definite boolean answer.
+        match unsafe { libc::fpathconf(f.as_raw_fd(), libc::_PC_EXTENDED_SECURITY_NP) } {
+            1 => (),
+            0 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "filesystem does not support Darwin ACLs",
+                ))
+            }
+            _ => return Err(io::Error::last_os_error()),
+        }
+        let fs = FileSec::new()?;
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: live fd, writable libc stat (matching inode64 ABI) and filesec.
+        // Do NOT infer absence from acl_get_fd_np's NULL/ENOENT: that can mean
+        // either absent FILESEC_ACL or a failed underlying fstatx. Require a
+        // successful snapshot and then query the property explicitly.
+        check(unsafe { fstatx_np(f.as_raw_fd(), &mut stat, fs.0.as_ptr()) })?;
+        let mut present = 0;
+        check(unsafe { filesec_query_property(fs.0.as_ptr(), FILESEC_ACL, &mut present) })?;
+        let acl = if present == 0 {
+            None
+        } else {
+            let mut p: Native = std::ptr::null_mut();
+            // SAFETY: live filesec and acl_t output. FILESEC_ACL returns a NEW
+            // allocation; filesec retains its own separate native buffer.
+            check(unsafe {
+                filesec_get_property(fs.0.as_ptr(), FILESEC_ACL, (&mut p as *mut Native).cast())
+            })?;
+            Some(Acl::own(p)?)
+        };
+        Ok(Security { acl })
+    }
+
+    pub fn security_of(path: &Path) -> io::Result<Option<Security>> {
+        let f = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        read(&f).map(Some)
+    }
+
+    fn apply(f: &File, sec: &Security) -> io::Result<()> {
+        match &sec.acl {
+            // SAFETY: live fd and ACL, which the call copies, keeping entry order.
+            Some(acl) => {
+                check(unsafe { acl_set_fd_np(f.as_raw_fd(), acl.0.as_ptr(), ACL_TYPE_EXTENDED) })
+            }
+            None => {
+                let fs = FileSec::new()?;
+                // sys/fcntl.h: this sentinel is the property argument itself,
+                // NOT a pointer to an acl_t containing the sentinel.
+                fs.set(FILESEC_ACL, 1usize as *const libc::c_void)?;
+                // SAFETY: live fd/filesec. Removes the empty staging ACL too.
+                check(unsafe { fchmodx_np(f.as_raw_fd(), fs.0.as_ptr()) })
+            }
+        }
+    }
+
+    pub fn create_secured(path: &Path, sec: &Security) -> io::Result<File> {
+        let name = CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // Birth ACL: empty with NO_INHERIT. open(0600) alone would still inherit
+        // directory allow entries. openx's kernel inheritance pass also filters
+        // inherited ACEs, so apply the ORIGINAL ACL afterwards, on the empty file.
+        let birth = Acl::own(unsafe { acl_init(0) })?;
+        let mut flags = std::ptr::null_mut();
+        // SAFETY: live ACL and output pointer; flagset is borrowed from birth.
+        check(unsafe { acl_get_flagset_np(birth.0.as_ptr(), &mut flags) })?;
+        check(unsafe { acl_add_flag_np(flags, ACL_FLAG_NO_INHERIT) })?;
+        let fs = FileSec::new()?;
+        let mode: libc::mode_t = 0o600;
+        fs.set(FILESEC_MODE, (&mode as *const libc::mode_t).cast())?;
+        fs.set(FILESEC_ACL, (&birth.0.as_ptr() as *const Native).cast())?;
+        // SAFETY: nul-terminated path and live filesec. EXCL never opens an
+        // existing entry; returned fd is owned and CLOEXEC, just like OpenOptions.
+        let fd = unsafe {
+            openx_np(
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                fs.0.as_ptr(),
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let f = unsafe { File::from_raw_fd(fd) };
+        if let Err(e) = apply(&f, sec).and_then(|()| verify_acl(&f, sec)) {
+            drop(f);
+            let _ = fs::remove_file(path);
+            return Err(e);
+        }
+        Ok(f)
+    }
+
+    /// Retain the STAT/XATTR/DATA metadata work of std's Darwin fs::copy. Do not
+    /// ask copyfile to copy ACLs: it merges explicit source and inherited TARGET
+    /// entries rather than preserving all source ACEs. The target is secured
+    /// already; verify its ACL again after copyfile and the final chmod.
+    pub fn copy_secured(from: &Path, to: &mut File, _sec: &Security) -> io::Result<()> {
+        let source = File::open(from)?;
+        // std's successful clone path also retains birth time; COPYFILE_STAT
+        // handles access/modification times but does not copy birth time.
+        let metadata = source.metadata()?;
+        let mut attrs: libc::attrlist = unsafe { std::mem::zeroed() };
+        attrs.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
+        attrs.commonattr = libc::ATTR_CMN_CRTIME;
+        let mut birth = libc::timespec {
+            tv_sec: metadata.st_birthtime(),
+            tv_nsec: metadata.st_birthtime_nsec(),
+        };
+        // SAFETY: the single requested attribute is a writable, aligned timespec.
+        check(unsafe {
+            libc::fsetattrlist(
+                to.as_raw_fd(),
+                (&mut attrs as *mut libc::attrlist).cast(),
+                (&mut birth as *mut libc::timespec).cast(),
+                std::mem::size_of::<libc::timespec>(),
+                0,
+            )
+        })?;
+        // SAFETY: live fds; NULL makes copyfile own/free its internal state.
+        check(unsafe {
+            libc::fcopyfile(
+                source.as_raw_fd(),
+                to.as_raw_fd(),
+                std::ptr::null_mut(),
+                libc::COPYFILE_DATA | libc::COPYFILE_STAT | libc::COPYFILE_XATTR,
+            )
+        })
+    }
+
+    fn verify_acl(f: &File, sec: &Security) -> io::Result<()> {
+        let got = read(f)?;
+        let bytes = |s: &Security| s.acl.as_ref().map(Acl::bytes).transpose();
+        if bytes(&got)? != bytes(sec)? {
+            return Err(io::Error::other("Darwin ACL was not preserved"));
+        }
+        Ok(())
+    }
+    pub fn verify_security(f: &File, sec: &Security, wanted: u32) -> io::Result<()> {
+        verify_acl(f, sec)?;
+        if mode(&f.metadata()?) != Some(wanted) {
+            return Err(io::Error::other("Darwin mode was not preserved"));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::process::Command;
+
+        fn run(command: &str, args: &[&OsStr]) -> String {
+            let out = Command::new(command)
+                .args(args)
+                .output()
+                .expect("native tool");
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).expect("tool output")
+        }
+        fn acl(path: &Path) -> Vec<String> {
+            run("/bin/ls", &[OsStr::new("-lde"), path.as_os_str()])
+                .lines()
+                .skip(1)
+                .map(str::to_owned)
+                .collect()
+        }
+
+        /// chmod sets fixtures and ls observes them independently of our helpers.
+        /// Check the returned staging fd while it still contains ZERO bytes.
+        #[test]
+        fn staging_has_the_source_acl_before_any_configuration_bytes() {
+            let dir =
+                std::env::temp_dir().join(format!("cctab-darwin-staging-{}", std::process::id()));
+            fs::create_dir(&dir).expect("mkdir");
+            let source = dir.join("source");
+            fs::write(&source, b"secret").expect("fixture");
+            run(
+                "/bin/chmod",
+                &[
+                    OsStr::new("+a"),
+                    OsStr::new("group:everyone allow read,file_inherit,directory_inherit"),
+                    dir.as_os_str(),
+                ],
+            );
+            for explicit in [false, true] {
+                run("/bin/chmod", &[OsStr::new("-N"), source.as_os_str()]);
+                if explicit {
+                    run(
+                        "/bin/chmod",
+                        &[
+                            OsStr::new("+a"),
+                            OsStr::new("user:nobody deny read,write,execute"),
+                            source.as_os_str(),
+                        ],
+                    );
+                }
+                let wanted = acl(&source);
+                let sec = security_of(&source)
+                    .expect("ACL readable")
+                    .expect("existing");
+                let target = dir.join("staging");
+                let mut f = create_secured(&target, &sec).expect("secured");
+                assert_eq!(f.metadata().expect("stat").len(), 0);
+                assert_eq!(acl(&target), wanted, "staging before write");
+                set_mode(&target, 0o640).expect("chmod");
+                f.write_all(b"secret").expect("write");
+                set_mode(&target, 0o640).expect("final chmod");
+                verify_security(&f, &sec, 0o640).expect("final protection");
+                assert_eq!(acl(&target), wanted, "after chmod and write");
+                drop(f);
+                fs::remove_file(target).expect("cleanup");
+            }
+            fs::remove_dir_all(dir).expect("cleanup");
+        }
+    }
 }
 
 /// Whether any execute bit is set. Always an answer on Unix.

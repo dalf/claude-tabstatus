@@ -157,6 +157,7 @@ when they agree.
 | direct MCP elicitation | `python3 tests/test_elicitation.py` | Linux, Windows, macOS |
 | persistence and concurrency | `python3 tests/test_state_guarantees.py` | Linux, macOS (`fcntl`; strace fault injection Linux-only) |
 | direct Unix delivery | `python3 tests/test_unix_delivery.py -v` | Linux, macOS (disposable PTYs) |
+| settings ACLs and backup metadata | `python3 tests/test_macos_acl.py` | native macOS (chmod/ls, SDK fault interposition) |
 | tmux window status | `python3 tests/test_tmux_status.py` | Linux (tmux) |
 | corpus fixture helpers | `python3 -m unittest discover -s tests/corpus -p 'test_*.py' -v` | Linux |
 | golden corpus | `sh tests/corpus/replay.sh bin/tabstatus` | Linux |
@@ -361,6 +362,13 @@ limitation it closes; the pre-fix freeze is kept as `cases.jsonl.before-fixes`.
   renders differently after a wait with no hook firing, but not the client
   stream. `test_tmux_status.py` checks the window status line on an attached
   client, not the outer title.
+- `test_macos_acl.py`: isolated installer lifecycles, explicit and inherited ACLs,
+  no ACL in an inheriting directory, symlink targets, restrictive umasks, backup
+  metadata and native inspection/application/verification faults. Uses `chmod`
+  and `ls` plus a separate native text observer independently of production helpers. Its SDK-built dyld interposer
+  observes private, empty staging files through `fstatx_np`; a Rust test separately
+  observes the intended staging ACL before writing bytes. Apple cross-checks
+  compile that Rust test but cannot establish native ACL preservation.
 - macOS terminal applications and tmux, Intel macOS runtime behaviour and older
   macOS versions. Native arm64 CI covers the documented process, state and PTY scenarios.
 
@@ -399,7 +407,7 @@ branch push, pull request, manual dispatch, and as a reusable workflow.
 - *macOS* (`macos-15`, arm64 / `aarch64-apple-darwin`): links and executes
   `cargo test --locked --all-targets`, builds a native validation binary, and runs
   the payload, state-contract, background, elicitation, state-guarantees and Unix
-  delivery suites. No artifacts are uploaded. Both Apple ABI cross-checks remain
+  delivery suites, plus the native settings ACL suite. No artifacts are uploaded. Both Apple ABI cross-checks remain
   in the Linux job, including Intel. Native arm64 execution has passed;
   [evidence, scope and limits](docs/architecture.md#macos-validation).
 - *Windows* (`windows-2025`, steps under Git Bash): `cargo test --locked

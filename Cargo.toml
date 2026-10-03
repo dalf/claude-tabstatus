@@ -44,7 +44,9 @@ windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Wdk_
 # `proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)` for the path fd 1 names, which is the
 # session's own tab. libc has no required dependency of its own, and the crate sits
 # behind this target exactly as windows-sys sits behind cfg(windows): no Linux or
-# Windows build sees it.
+# Windows build sees it. Also used by the installer for Darwin ACLs, secure
+# creation and backup metadata copying; those operations never run on hooks. The locked
+# libc lacks the opaque ACL/filesec declarations, supplied in src/sys/unix.rs.
 #
 # Two of the three use libc's OWN declarations and hand-write no layout. The third
 # needs `struct proc_fileinfo`, `struct vnode_fdinfowithpath` and the flavour
