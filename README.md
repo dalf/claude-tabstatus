@@ -47,7 +47,7 @@ work cannot be remembered between hooks. The full policy is in
 | Windows Terminal, and any terminal that honours a plain OSC 0 title | works with no configuration |
 | Konsole | works; the tab is switched to show the title automatically ([Konsole](#konsole)) |
 | Konsole, then ssh to a Linux host | set one variable on the remote side ([Konsole over ssh](#konsole-over-ssh)) |
-| tmux (Linux; untested on macOS) | one indicator per Claude pane, decaying over time ([tmux](#tmux)) |
+| tmux (Linux; native macOS acceptance pending) | one indicator per Claude pane, decaying over time ([tmux](#tmux)) |
 | GNU screen | no indicator; tmux running inside screen works |
 
 Direct MCP elicitation tracking relies on two hook events found in the Claude

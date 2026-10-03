@@ -77,7 +77,7 @@ jobs:
             CCTAB_TEST_BIN="$binary" python3 tests/test_state_guarantees.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_unix_delivery.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_elicitation.py
-            CCTAB_TEST_BIN="$binary" python3 tests/test_tmux_status.py
+            CCTAB_TEST_BIN="$binary" CCTAB_TEST_TMUX="$(command -v tmux)" CCTAB_TEST_REQUIRE_TMUX=1 python3 tests/test_tmux_status.py -v
             CCTAB_TEST_BIN="$binary" python3 tests/test_install_paths.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_terminal_detection.py
             CCTAB_TEST_BIN="$binary" sh tests/run.sh
@@ -116,14 +116,32 @@ jobs:
           test "$(uname -m)" = arm64
           rustup toolchain install stable --profile minimal --target aarch64-apple-darwin
           rustup default stable
+          uname -m
           rustc -vV
           sw_vers
+
+      - name: Locate or install native tmux and record its version
+        run: |
+          if ! command -v tmux >/dev/null 2>&1; then
+            brew install tmux
+          fi
+          tmux_path="$(command -v tmux)"
+          test -x "$tmux_path"
+          case "$tmux_path" in /*) ;; *) exit 1 ;; esac
+          "$tmux_path" -V
+          printf 'CCTAB_TEST_TMUX=%s\n' "$tmux_path" >> "$GITHUB_ENV"
 
       - name: Link and run native Rust tests (including process identity and reaping)
         run: cargo test --locked --all-targets --target aarch64-apple-darwin
 
       - name: Build native validation binary
         run: sh scripts/build.sh
+
+      - name: Require native tmux hook transport, attached status, expiry and restoration
+        env:
+          CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
+          CCTAB_TEST_REQUIRE_TMUX: '1'
+        run: python3 tests/test_tmux_status.py -v
 
       - name: Test Unix delivery helper compilation and failure diagnostics
         run: python3 tests/test_unix_delivery_helpers.py -v
@@ -229,7 +247,8 @@ jobs:
 
       # The suites that run on native Windows Python. test_state_guarantees and
       # test_tmux_status need fcntl and tmux, and tests/run.sh and the corpus
-      # replay assume a Unix userland; they run in the Linux job only.
+      # replay assume a Unix userland. tmux runs on Linux and native macOS;
+      # the shell and corpus suites run in the Linux job only.
       - name: Run integration tests
         run: |
           binary="$GITHUB_WORKSPACE/bin/tabstatus-x86_64-pc-windows-msvc.exe"

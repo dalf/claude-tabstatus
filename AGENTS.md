@@ -161,7 +161,7 @@ when they agree.
 | settings ACLs, ownership and backup metadata | `python3 tests/test_macos_acl.py` | native macOS (chmod/ls/stat, SDK fault interposition) |
 | SSH hostname precedence, native lookup, bypasses and failures | `python3 tests/test_macos_hostname.py` | native macOS (SDK kernel observer and dyld faults; dry-run rendering) |
 | terminal-family detection, doctor evidence and title protocol | `python3 tests/test_terminal_detection.py` | Linux, Windows; macOS-specific cases require native macOS |
-| tmux window status | `python3 tests/test_tmux_status.py` | Linux (tmux) |
+| tmux end-to-end acceptance | `python3 tests/test_tmux_status.py -v` | Linux, native macOS (tmux; `CCTAB_TEST_REQUIRE_TMUX=1` in CI) |
 | corpus fixture helpers | `python3 -m unittest discover -s tests/corpus -p 'test_*.py' -v` | Linux |
 | golden corpus | `sh tests/corpus/replay.sh bin/tabstatus` | Linux |
 | ConPTY end to end | part of `cargo test` (`tests/conpty.rs`) | Windows |
@@ -173,9 +173,9 @@ The missing Unicode probes, corrected case-sensitive path fixtures and fault-mes
 assertions have also passed natively. See the recorded results and remaining
 coverage in the validation document. These suites do not establish behaviour in
 a terminal application.
-The hostname suite was added afterwards and native execution is pending; it is
-required in arm64 CI, with SDK compilation, recording controls and native
-observations failing when unavailable rather than silently skipping on Darwin.
+The hostname suite passed at `6d4bfa8`; native tmux acceptance is newly required
+and execution is pending. SDK compilation, recording controls, PTY attachment
+and required observations fail when unavailable; tmux absence fails in CI.
 
 The in-crate unit tests are not replaced by the shell and Python harnesses: they
 check argv and environment parsing, the location walk, the length cap and its
@@ -255,8 +255,9 @@ the binary.
   `XDG_RUNTIME_DIR`, `CCTAB_STATE_DIR` and `LOCALAPPDATA` at the top and pins them
   per case.
 - **The state layer is off unless a case turns it on.** With no
-  `XDG_RUNTIME_DIR`/`LOCALAPPDATA` and no `CCTAB_STATE_DIR` there is no record,
-  so every assertion outside the state section is the stateless answer and does
+  `XDG_RUNTIME_DIR`/`LOCALAPPDATA` (`TMPDIR` on macOS) and no
+  `CCTAB_STATE_DIR` there is no record, so every assertion outside the state
+  section is the stateless answer and does
   not depend on what an earlier case left behind. The state section sets
   `CCTAB_STATE_DIR` per case under the suite's temporary directory.
 - **Pin `CLAUDE_PID` per case** in anything that writes a record. This project is
@@ -333,7 +334,17 @@ the test process. Keep it that way in any new test.
   TTL decay and exact format restoration, on private servers with a unique socket
   and isolated configuration each. It attaches a disposable PTY client and checks
   the displayed status text, excluding outer-title escapes so they cannot satisfy
-  an assertion. `CCTAB_TEST_TMUX` selects another tmux build.
+  an assertion. `CCTAB_TEST_TMUX` selects an absolute executable path and puts
+  its directory on the isolated PATH for the binary's cold tmux calls. CI sets
+  `CCTAB_TEST_REQUIRE_TMUX=1`, so missing tmux or the compiled binary fails.
+  Short sockets under canonical `/tmp`, native UTF-8 locales, fresh environments
+  without Darwin's `TMPDIR` state fallback, and bounded attachment/delivery
+  observations keep the same suite portable. It checks real hook carriers,
+  attached working/waiting/idle/background status and clock-only decay, shared
+  arming in both exit orders, detach/reattach, exact uninstall restoration and
+  headless refusals. Missing delivery, a broken carrier and OSC-only text are
+  negative observer controls. Forced Konsole/WezTerm selections are protocol
+  tests, not terminal-application evidence. Native execution is pending.
 
 ### The golden corpus
 
@@ -390,8 +401,9 @@ limitation it closes; the pre-fix freeze is kept as `cases.jsonl.before-fixes`.
   dyld interposer observes private, empty staging files through `fstatx_np`; a Rust test separately
   observes the intended staging ACL and ownership before writing bytes. Apple
   cross-checks compile that Rust test but cannot establish native preservation.
-- macOS terminal applications and tmux, Intel macOS runtime behaviour and older
-  macOS versions. Native arm64 CI covers the documented process, state and PTY scenarios.
+- macOS terminal applications, Intel macOS runtime behaviour, older macOS
+  versions and untested tmux versions. Native tmux acceptance is pending.
+  Native arm64 CI covers the documented process, state and PTY scenarios.
 
 ## Benchmarking
 
@@ -428,7 +440,9 @@ branch push, pull request, manual dispatch, and as a reusable workflow.
 - *macOS* (`macos-15`, arm64 / `aarch64-apple-darwin`): links and executes
   `cargo test --locked --all-targets`, builds a native validation binary, and runs
   the payload, state-contract, background, elicitation, state-guarantees and Unix
-  delivery suites, the terminal-detection suite, plus the native settings ACL and
+  delivery suites, required real-server tmux acceptance with attached PTY clients
+  (absolute executable discovery or Homebrew installation; version recorded),
+  the terminal-detection suite, plus the native settings ACL and
   SSH hostname suites (mandatory SDK observation and fault controls), and the
   installer path suites with mandatory disposable case-insensitive APFS and case-sensitive APFSX volumes
   (lookup semantics verified). No artifacts are uploaded. Both Apple ABI cross-checks
@@ -441,7 +455,8 @@ branch push, pull request, manual dispatch, and as a reusable workflow.
   `api-ms-win-crt-*`); then `test_payload`, `test_state_contract`,
   `test_background` and `test_elicitation`. `tests/run.sh`, the corpus,
   `test_state_guarantees`, `test_unix_delivery` and `test_tmux_status` require Unix;
-  the shell, corpus and tmux suites run only on Linux. Uploads the `.exe` and its
+  the shell and corpus suites run only on Linux; tmux also runs on native macOS.
+  Uploads the `.exe` and its
   `SHA256SUMS` (written with `--text`, so the line format matches Linux) as `windows-binaries`.
 
 **Release** ([`.github/workflows/release.yml`](.github/workflows/release.yml)) runs
@@ -501,8 +516,10 @@ Rules:
 ## Roadmap: not yet built
 
 - **macOS** ([issue #1](https://github.com/dalf/claude-tabstatus/issues/1)):
-  native source builds and arm64 automated validation have passed CI. Terminal applications, tmux and Intel runtime behaviour
-  remain unvalidated. No release asset or product support claim is added; see
+  native source builds and arm64 automated validation have passed CI. Native
+  tmux acceptance is required, with execution pending. Terminal applications,
+  live Claude Code integration, Intel runtime behaviour and older macOS remain
+  unvalidated. No release asset or product support claim is added; see
   [validation scope](docs/architecture.md#macos-validation).
 - **aarch64 Linux**: add `aarch64-unknown-linux-musl` to `TARGETS` in
   `scripts/build.sh` and to the release assets. Until then the x86_64 binary

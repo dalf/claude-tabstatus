@@ -605,6 +605,7 @@ Three kinds of evidence must stay separate:
 |---|---|---|
 | Cross-checking on Linux | `cargo check --all-targets` for `aarch64-apple-darwin` and `x86_64-apple-darwin`; pure decision tests and ABI size/offset assertions | Available locally; does not link or execute Apple calls |
 | Native automated validation | `macos-15`, Apple Silicon (`aarch64-apple-darwin`), explicitly checked with `uname -m`; linked Rust tests, release-mode validation build, state suites, disposable PTY delivery and terminal-open observation | Passed on 2026-10-03 at `b43225be85ace4a9aff85d10bbe5553e43704e72`, macOS 15.7.9 (24G830), Rust 1.99.0: [native job](https://github.com/dalf/claude-tabstatus/actions/runs/37146656917/job/111271890833) |
+| Native tmux acceptance | Real compiled hooks, private servers and attached PTY clients on the same arm64 job | Newly required; native execution pending |
 | Terminal-application testing | Terminal.app, iTerm2, Ghostty, Konsole and Claude Code's live hook integration | Not performed on macOS; a PTY byte capture cannot show how a terminal applies an OSC |
 
 The runner label's architecture follows [GitHub's runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
@@ -704,9 +705,44 @@ boundary length, non-UTF-8 repair, existing display processing and doctor's row.
 Both recording fixtures have positive controls in each isolated test environment.
 Missing SDK tools or required observations fail on Darwin. These are dry-run
 title assertions, not delivery or terminal-application observations. At the
-hostname change, execution is pending on a Darwin host; the successful native
-run recorded above predates this suite. Linux Rust tests exercise native-output
-framing and byte handling; Apple cross-checks do not establish runtime behaviour.
+hostname baseline `6d4bfa81d9e3e89b38e4d3f1fb378bf4adae5168`, all six tests passed
+on macOS 15.7.9 (24G830), arm64, Rust 1.99.0 without skips:
+[native hostname job](https://github.com/dalf/claude-tabstatus/actions/runs/37149994805/job/111281611176).
+Linux Rust tests exercise native-output framing and byte handling; Apple cross-checks do not establish runtime behaviour.
+
+`tests/test_tmux_status.py` now runs as required acceptance on the native arm64
+job and against both Linux binaries. CI locates or installs tmux, records its
+version and passes its absolute executable path as `CCTAB_TEST_TMUX`; the harness
+also puts that executable's directory on its fresh PATH for cold-path calls.
+`CCTAB_TEST_REQUIRE_TMUX=1` fails on missing tmux or binary; unavailable PTYs,
+attachment, locales and observations fail rather than skipping acceptance.
+The only individual tmux skip is the existing read-only-record case when run as
+root, which bypasses mode-bit permissions; the hosted runner is unprivileged.
+
+Each test owns a server, short socket under canonical `/tmp`, configuration,
+panes and client PTYs. Darwin uses validated `en_US.UTF-8`, Linux retains
+`C.UTF-8`; real glyph and pill-width assertions remain unchanged. No harness
+observer assumes `/proc` or `/dev/pts`: tmux supplies the pane PID and terminal,
+and `pty.openpty` supplies client terminals. Fresh environments remove inherited
+terminal, SSH, mux, PID and runtime-directory values, including Darwin's `TMPDIR`
+state fallback. State is enabled explicitly, and uninstall isolates HOME, config,
+data and state. Clients, processes, descriptors and servers are cleaned up on
+failure; attachment and carrier timeouts report captured bytes or pane details.
+
+Real ordinary working/waiting/idle hooks use the pane shell's PID and must leave
+stdout empty while updating tmux's consumed pane carrier. Attached-client captures
+check status text, split panes, background windows and pill colours/widths,
+excluding outer-title OSCs. Added observations cover all four states, working
+expiry on tmux's own clock with no extra hook and persistent background beyond
+all deadlines. Controls require the positive observers to reject missing delivery,
+a malformed carrier and matching text present only in OSC title bytes.
+Shared arming covers overlapping owners, both exit orders, starts detached,
+reattachment and the client-attached hook's actual arming/restoration bytes.
+Forced Konsole/WezTerm rows are protocol tests, not real terminal applications.
+Exact title-setting and window-format restoration covers uninstall after the
+last owner, inherited/explicit/empty formats, literals and surviving user edits.
+Invalid, exited and file/pipe/null stdout owners leave pane and client titles
+unchanged. Native execution of these tmux scenarios is pending.
 
 The native job also runs payload, semantic state, background, elicitation and
 persistence suites. The latter's strace fault injection remains Linux-only;
@@ -717,8 +753,9 @@ Linux assertions. The Linux golden corpus remains a Linux specification and is
 not replayed as a macOS acceptance suite.
 
 The successful native run establishes only the tested architecture, OS image
-and scenarios. macOS tmux, terminal application behaviour, real Claude Code
-sessions, Intel runtime behaviour and older macOS versions remain unvalidated.
+and scenarios. Native tmux execution of the expanded acceptance suite is pending.
+Terminal application behaviour, real Claude Code sessions, Intel runtime behaviour,
+older macOS versions and untested tmux versions remain unvalidated.
 Forced PID reuse during terminal lookup/write and kernel permission-denied queries
 are not covered by these native scenarios; synthetic identity/errno tests cover
 only their decision rules.
@@ -1410,8 +1447,8 @@ application/verification failures and privileged/unprivileged owner changes in
 isolated fixtures. Native CI requires passwordless `sudo` for those owner fixtures;
 privileged invocations receive an explicit isolated environment. `cargo check`
 alone proves neither linking nor protection preservation. The added ACL and
-ownership coverage awaits a native macOS run; the previously
-recorded [macOS validation](#macos-validation) predates it.
+ownership coverage passed in the recorded native
+[macOS validation](#macos-validation), including all seventeen ACL/ownership tests.
 
 ### What uninstall removes, and what it declines to
 
@@ -1786,7 +1823,8 @@ tmux, while known background stays visible.
 
 All tmux paints write raw OSC directly to the pane's verified terminal - Claude
 Code's pty, through `/proc/$CLAUDE_PID/fd/1` on Linux and `proc_pidfdinfo` on
-macOS - so tmux integration is Unix-only, and on macOS untested. Claude Code 2.1.274
+macOS - so tmux integration is Unix-only; required native macOS acceptance is
+pending. Claude Code 2.1.274
 wraps hook `terminalSequence` OSCs in tmux passthrough, which bypasses `pane_title`;
 using that JSON delivery path would leave the startup idle record unchanged. A
 missing or redirected terminal is a silent no-op. The non-tmux JSON delivery path is

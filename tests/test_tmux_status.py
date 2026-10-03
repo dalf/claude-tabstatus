@@ -3,12 +3,16 @@
 
 CCTAB_TEST_BIN=/path/to/tabstatus python3 tests/test_tmux_status.py
 CCTAB_TEST_TMUX=/path/to/tmux selects another tmux build for every invocation.
+CCTAB_TEST_REQUIRE_TMUX=1 makes missing prerequisites a failure (required in CI).
 Every test owns a unique socket, isolated HOME and disposable shell panes.
+Forced terminal rows exercise protocols, not real terminal applications.
 """
 import contextlib
+import errno
 import fcntl
 from concurrent.futures import ThreadPoolExecutor
 import json
+import locale
 import os
 from pathlib import Path
 import pty
@@ -17,6 +21,7 @@ import select
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import time
@@ -26,6 +31,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("CCTAB_TEST_BIN", ROOT / "bin/tabstatus")).resolve()
 TMUX_OVERRIDE = os.environ.get("CCTAB_TEST_TMUX")
+TMUX = TMUX_OVERRIDE or shutil.which("tmux")
+REQUIRE_TMUX = os.environ.get("CCTAB_TEST_REQUIRE_TMUX") == "1"
 FORMATS = ("window-status-format", "window-status-current-format")
 # Exact rounded-pill formats from the reported display regression. The glyph
 # belongs inside the colored body, alongside the existing index and label.
@@ -42,7 +49,9 @@ SAVED = ("@cctab_window_format_saved", "@cctab_prev_window_format",
 
 def terminal_text_and_backgrounds(data, foreground=False):
     """Remove terminal controls while retaining each printed character's SGR background."""
-    data = re.sub(rb"\x1b\].*?(?:\x07|\x1b\\)", b"", data, flags=re.S)
+    # A PTY read may end mid-OSC. Hide that unfinished title as well, so its
+    # payload cannot satisfy a status assertion before the terminator arrives.
+    data = re.sub(rb"\x1b\].*?(?:\x07|\x1b\\|$)", b"", data, flags=re.S)
     text, backgrounds = [], []
     background = None
     reset, base, bright, extended = (39, 30, 90, 38) if foreground else (49, 40, 100, 48)
@@ -70,24 +79,51 @@ def terminal_text_and_backgrounds(data, foreground=False):
     return "".join(text), backgrounds
 
 
-@unittest.skipUnless(TMUX_OVERRIDE or shutil.which("tmux"), "tmux is required for window-status integration tests")
+@unittest.skipUnless(REQUIRE_TMUX or TMUX, "tmux is required for window-status integration tests")
 class TmuxStatusTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not TMUX:
+            raise RuntimeError("required tmux acceptance cannot run: tmux is unavailable")
+        selected = Path(TMUX)
+        if not selected.is_absolute() or not selected.is_file() or not os.access(selected, os.X_OK):
+            raise RuntimeError("CCTAB_TEST_TMUX must be an absolute executable path")
+        if not BIN.is_file() or not os.access(BIN, os.X_OK):
+            raise RuntimeError(f"required compiled binary is unavailable: {BIN}")
+        cls.tmux = str(selected.resolve())
+        # Darwin does not supply Linux's C.UTF-8. Validate a native UTF-8 locale
+        # before starting the server; do not silently fall back to ASCII widths.
+        cls.utf8_locale = "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8"
+        previous = locale.setlocale(locale.LC_CTYPE)
+        try:
+            locale.setlocale(locale.LC_CTYPE, cls.utf8_locale)
+            if locale.nl_langinfo(locale.CODESET).upper().replace("-", "") != "UTF8":
+                raise RuntimeError(f"not a UTF-8 locale: {cls.utf8_locale}")
+        finally:
+            locale.setlocale(locale.LC_CTYPE, previous)
+        version = subprocess.run([cls.tmux, "-V"], check=True, capture_output=True,
+                                 text=True, timeout=10).stdout.strip()
+        print(f"tmux acceptance: {version}; {os.uname().sysname} {os.uname().machine}; "
+              f"locale={cls.utf8_locale}; binary={BIN}", flush=True)
+
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="cctab-tmux-status-")
+        # Darwin TMPDIR can nearly fill sockaddr_un.sun_path (104 bytes).
+        # Own a short socket beneath /tmp, canonicalising its /private alias.
+        self.tmp = tempfile.TemporaryDirectory(prefix="cctm-", dir="/tmp")
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.socket = self.root / "tmux.sock"
+        self.assertLess(len(os.fsencode(self.socket)), 104)
+        # Fresh environment: no ambient terminal, mux, SSH, PID or Darwin TMPDIR
+        # state fallback. Enable persistence explicitly in cases that need it.
         self.env = {"PATH": "/usr/bin:/bin", "HOME": str(self.root),
-                    "TERM": "xterm-256color", "LC_ALL": "C.UTF-8", "PS1": ""}
-        tmux = "tmux"
-        if TMUX_OVERRIDE:
-            selected = Path(TMUX_OVERRIDE)
-            self.assertTrue(selected.is_absolute(), "CCTAB_TEST_TMUX must be an absolute executable path")
-            self.assertTrue(selected.is_file() and os.access(selected, os.X_OK),
-                            "CCTAB_TEST_TMUX must name an executable file")
-            tmux = str(selected)
-            self.env["PATH"] = str(selected.parent) + os.pathsep + self.env["PATH"]
-        self.base = [tmux, "-S", str(self.socket), "-f", "/dev/null"]
+                    "CLAUDE_CONFIG_DIR": str(self.root / "config"),
+                    "XDG_DATA_HOME": str(self.root / "data"),
+                    "TERM": "xterm-256color", "LC_ALL": self.utf8_locale, "PS1": ""}
+        # The binary's cold paths invoke tmux by name; Homebrew is outside the
+        # isolated /usr/bin:/bin PATH even when the harness has found it.
+        self.env["PATH"] = str(Path(self.tmux).parent) + os.pathsep + self.env["PATH"]
+        self.base = [self.tmux, "-S", str(self.socket), "-f", "/dev/null"]
         self.addCleanup(lambda: subprocess.run(self.base + ["kill-server"], env=self.env,
                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                               timeout=10))
@@ -122,7 +158,7 @@ class TmuxStatusTests(unittest.TestCase):
 
     def uninstall(self, pane=None):
         env = dict(self.env, TMUX=f"{self.socket},1,0", TMUX_PANE=pane or self.pane,
-                   CLAUDE_CONFIG_DIR=str(self.root / "config"), CLAUDE_PID="0")
+                   CCTAB_STATE_DIR=str(self.root / "state"), CLAUDE_PID="0")
         p = subprocess.run([str(BIN), "uninstall", "--force"], env=env, cwd=self.root,
                            capture_output=True, timeout=10)
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -157,7 +193,9 @@ class TmuxStatusTests(unittest.TestCase):
             if actual == expected:
                 return
             time.sleep(0.025)
-        self.assertEqual(actual, expected)
+        self.assertEqual(actual, expected,
+                         f"observation timed out; socket={self.socket}; "
+                         f"panes={self.tm('list-panes', '-a', '-F', '#{pane_id}|#{pane_pid}|#{pane_tty}|#{pane_title}')!r}")
 
     @contextlib.contextmanager
     def attached_client(self, session="alpha"):
@@ -171,39 +209,69 @@ class TmuxStatusTests(unittest.TestCase):
         client.
         """
         master, slave = pty.openpty()
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
-        client = subprocess.Popen(self.base + ["attach-session", "-t", session],
-                                  env=self.env, stdin=slave, stdout=slave, stderr=slave,
-                                  start_new_session=True)
-        os.close(slave)
+        try:
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
+            client = subprocess.Popen(self.base + ["attach-session", "-t", session],
+                                      env=self.env, cwd=self.root,
+                                      stdin=slave, stdout=slave, stderr=slave,
+                                      start_new_session=True)
+        except BaseException:
+            os.close(master)
+            raise
+        finally:
+            os.close(slave)
 
         class Client:
             captured = b""
+            eof = False
 
             def read(self, budget=0.1):
                 if select.select([master], [], [], budget)[0]:
                     try:
-                        self.captured += os.read(master, 65536)
-                    except OSError:
-                        pass
+                        data = os.read(master, 65536)
+                        self.captured += data
+                        self.eof = not data
+                    except OSError as error:
+                        if error.errno != errno.EIO:
+                            raise
+                        self.eof = True
 
-            def saw(self, wanted, timeout=5):
+            def saw(self, wanted, timeout=5, status=False):
                 deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
-                    if wanted in self.captured:
+                    observed = terminal_text_and_backgrounds(self.captured)[0] if status else self.captured
+                    if wanted in observed:
                         return True
+                    if self.eof:
+                        break
                     self.read()
-                return wanted in self.captured
+                observed = terminal_text_and_backgrounds(self.captured)[0] if status else self.captured
+                return wanted in observed
+
+            def clear(self):
+                deadline = time.monotonic() + 1
+                while (time.monotonic() < deadline and not self.eof
+                       and select.select([master], [], [], 0)[0]):
+                    self.read(0)
+                self.captured = b""
+
+            def diagnostic(self):
+                return f"client exit={client.poll()}; tty={client_tty}; bytes={self.captured[-4096:]!r}"
 
         watcher = Client()
         try:
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
-                if self.tm("list-clients", "-t", self.pane, "-F", "#{client_tty}"):
+                if client.poll() is not None:
+                    break
+                if self.tm("list-clients", "-t", session, "-F", "#{client_tty}"):
                     break
                 watcher.read(0.05)
-            self.assertTrue(self.tm("list-clients", "-t", self.pane, "-F", "#{client_tty}"),
-                            "no client attached, so no appearance byte has anywhere to go")
+            client_tty = self.tm("list-clients", "-t", session, "-F", "#{client_tty}")
+            self.assertTrue(client_tty,
+                            f"attachment timed out: exit={client.poll()}; socket={self.socket}; "
+                            f"bytes={watcher.captured[-4096:]!r}")
+            watcher.tty = client_tty
             yield watcher
         finally:
             client.terminate()
@@ -214,6 +282,15 @@ class TmuxStatusTests(unittest.TestCase):
                 client.wait(timeout=3)
             os.close(master)
 
+    def assert_carrier(self, pane, state, epoch, timeout=5):
+        self.wait_for(lambda: self.tm("display-message", "-p", "-t", pane,
+                                     "#{pane_title}").rsplit(" ct1 ", 1)[-1],
+                      f"{state} {epoch}", timeout=timeout)
+
+    def assert_status(self, client, wanted, timeout=5):
+        self.assertTrue(client.saw(wanted, timeout=timeout, status=True),
+                        f"status {wanted!r} missing: {client.diagnostic()}")
+
     def publish(self, pane, edge="working", age=0):
         # Invoke the real hook with the disposable pane shell as Claude's tty
         # owner. Replaying JSON ourselves would hide a broken hook transport.
@@ -222,14 +299,67 @@ class TmuxStatusTests(unittest.TestCase):
         output = self.hook(edge, pane, {"CCTAB_NOW": str(epoch), "CLAUDE_PID": pid})
         self.assertEqual(output, b"", "tmux hook updates must be delivered directly to the pane tty")
         state = {"working": "w", "waiting": "a", "idle": "i"}[edge]
-        self.wait_for(lambda: self.tm("display-message", "-p", "-t", pane,
-                                     "#{pane_title}").rsplit(" ct1 ", 1)[-1], f"{state} {epoch}")
+        self.assert_carrier(pane, state, epoch)
 
     def test_real_hook_updates_need_no_stdout_protocol_consumer(self):
         self.start()
         for edge, glyph in (("working", "🔵"), ("waiting", "🟠"), ("idle", "⚪")):
             self.publish(self.pane, edge)
             self.assertEqual(self.rendered(self.pane, True), glyph + " C:current")
+
+    def test_delivery_and_status_observers_reject_missing_and_broken_carriers(self):
+        self.start()
+        self.tm("select-pane", "-t", self.pane, "-T", "no-carrier")
+        epoch = int(self.tm("display-message", "-p", "%s"))
+        # A successful no-op hook cannot satisfy the positive carrier observer.
+        self.assertEqual(self.hook("working", self.pane, {"CLAUDE_PID": "0", "CCTAB_NOW": str(epoch)}), b"")
+        with self.assertRaises(AssertionError):
+            self.assert_carrier(self.pane, "w", epoch, timeout=0.15)
+        # This deliberately corrupt control is not a candidate paint. The real
+        # delivery test above always invokes the compiled hook for its carriers.
+        self.tm("select-pane", "-t", self.pane, "-T", f"project ct9 w {epoch}")
+        with self.attached_client() as client:
+            self.assert_status(client, "C:current")
+            with self.assertRaises(AssertionError):
+                self.assert_status(client, "🔵 C:current", timeout=0.2)
+            # Even matching outer-title bytes must not pass a status assertion.
+            for terminator in ("\x07", "\x1b\\", ""):
+                client.captured = ("\x1b]0;🔵 C:current" + terminator).encode()
+                with self.assertRaises(AssertionError):
+                    self.assert_status(client, "🔵 C:current", timeout=0)
+            client.clear()
+            self.publish(self.pane)
+            self.assert_status(client, "🔵 C:current")
+
+    def test_attached_status_shows_states_and_expires_on_tmux_clock_without_hooks(self):
+        self.start(CCTAB_TTL_WORKING="2", CCTAB_TTL_WAITING="2", CCTAB_TTL_GONE="4")
+        with self.attached_client() as client:
+            for edge, glyph in (("working", "🔵"), ("waiting", "🟠"), ("idle", "⚪")):
+                client.clear()
+                self.publish(self.pane, edge)
+                self.assert_status(client, glyph + " C:current")
+            client.clear()
+            self.publish(self.pane)
+            self.assert_status(client, "🔵 C:current")
+            carrier = self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}")
+            self.assert_status(client, "⚪ C:current", timeout=7)
+            self.wait_for(lambda: self.rendered(self.pane, True), "C:current", timeout=7)
+            client.clear()
+            # A full redraw after decay makes absence observable independently
+            # of tmux's cursor-delta optimisation. This invokes no hook.
+            self.tm("refresh-client", "-S", "-t", client.tty)
+            self.assert_status(client, "C:current")
+            self.assertNotRegex(terminal_text_and_backgrounds(client.captured)[0], "[🔵🟠⚪]")
+            self.assertEqual(self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}"), carrier)
+            # Known background remains visible past all display deadlines.
+            pid = self.tm("display-message", "-p", "-t", self.pane, "#{pane_pid}")
+            old = str(int(self.tm("display-message", "-p", "%s")) - 86400)
+            client.clear()
+            self.assertEqual(self.hook("idle", self.pane,
+                                      {"CLAUDE_PID": pid, "CCTAB_NOW": old,
+                                       "CCTAB_STATE_DIR": str(self.root / "state")},
+                                      {"session_id": "bg", "hook_event_name": "Stop", "background_tasks": [{}]}), b"")
+            self.assert_status(client, "🟣 C:current")
 
     def test_background_survives_decay_and_updates_waiting_fallback_in_both_directions(self):
         self.start(CCTAB_TTL_WORKING="1", CCTAB_TTL_WAITING="1", CCTAB_TTL_GONE="1")
@@ -377,42 +507,19 @@ class TmuxStatusTests(unittest.TestCase):
         self.tm("source-file", str(ROOT / "examples/tmux.conf"))
         self.start()
         self.publish(self.pane, "waiting")
-        master, slave = pty.openpty()
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
-        client = subprocess.Popen(self.base + ["attach-session", "-t", "alpha"],
-                                  env=self.env, stdin=slave, stdout=slave, stderr=slave,
-                                  start_new_session=True)
-        os.close(slave)
-        captured = b""
         fragment = "   0:"
-        try:
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                if select.select([master], [], [], 0.1)[0]:
-                    try:
-                        captured += os.read(master, 65536)
-                    except OSError:
-                        break
-                clean, foregrounds = terminal_text_and_backgrounds(captured, foreground=True)
-                if fragment in clean and "" in clean[clean.index(fragment):]:
-                    break
-            self.assertIn(fragment, clean)
+        with self.attached_client() as client:
+            self.assert_status(client, fragment)
+            self.assert_status(client, "")
+            clean, foregrounds = terminal_text_and_backgrounds(client.captured, foreground=True)
             left = clean.index(fragment)
             right = clean.index("", left)
-            _, backgrounds = terminal_text_and_backgrounds(captured)
+            _, backgrounds = terminal_text_and_backgrounds(client.captured)
             self.assertEqual(backgrounds[left + 1:left + 3], [(2, 251, 146, 60)] * 2)
             self.assertEqual(backgrounds[left + 3], (2, 229, 231, 235))
             self.assertEqual(foregrounds[left], (2, 251, 146, 60))
             self.assertEqual(foregrounds[right], (2, 229, 231, 235))
             self.assertNotRegex(clean[left:right], "[🔵🟠🟣⚪]")
-        finally:
-            client.terminate()
-            try:
-                client.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                client.kill()
-                client.wait(timeout=3)
-            os.close(master)
 
     def test_the_armed_record_drives_the_restore_when_the_terminal_changes(self):
         """THE DEFECT, byte for byte, on a real client pty.
@@ -445,10 +552,14 @@ class TmuxStatusTests(unittest.TestCase):
                                      "#{@cctab_armed}"), "")
 
     def test_shared_arming_survives_other_starts_and_either_exit_order(self):
+        """Forced Konsole/WezTerm rows: shared protocol ownership, not GUI evidence."""
         arm = b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07"
         restore = b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07"
         other = self.new_window("second")
         panes = (self.pane, other)
+        original_formats = {pane: self.formats(pane) for pane in panes}
+        original_titles = tuple(self.tm("show-options", "-gv", name)
+                                for name in ("set-titles", "set-titles-string"))
 
         def option(name):
             return self.tm("display-message", "-p", "-t", self.pane, "#{" + name + "}")
@@ -477,6 +588,7 @@ class TmuxStatusTests(unittest.TestCase):
                             self.assertIn("s konsole", (self.root / "state" / "s0").read_text().splitlines())
                         rearm = option("client-attached[1971]")
                         self.assertIn("tmux-arm", rearm)
+                        installed_formats = {pane: self.formats(pane) for pane in panes}
                         for step, index in enumerate((first_end, 1 - first_end)):
                             # Neither end hook can guess Konsole from its environment.
                             self.hook("session-end", panes[index],
@@ -484,6 +596,9 @@ class TmuxStatusTests(unittest.TestCase):
                                       {"session_id": f"s{index}"})
                             self.wait_for(lambda: self.tm("display-message", "-p", "-t", panes[index],
                                                           "#{pane_title}"), "")
+                            # SessionEnd retires appearance ownership; the shared
+                            # server renderer stays until explicit uninstall.
+                            self.assertEqual({pane: self.formats(pane) for pane in panes}, installed_formats)
                             if step == 0:
                                 self.assertFalse(client.saw(restore, timeout=0.5), "restored too early")
                                 self.assertEqual(option("@cctab_armed"), "konsole")
@@ -493,8 +608,13 @@ class TmuxStatusTests(unittest.TestCase):
                                 self.assertEqual(client.captured.count(restore), 1)
                                 self.assertEqual(option("@cctab_armed"), "")
                                 self.assertEqual(option("client-attached[1971]"), "")
+                    self.uninstall()
+                    self.assertEqual({pane: self.formats(pane) for pane in panes}, original_formats)
+                    self.assertEqual(tuple(self.tm("show-options", "-gv", name)
+                                           for name in ("set-titles", "set-titles-string")), original_titles)
 
     def test_detached_policy_survives_other_start_and_reattach_until_last_owner(self):
+        """Forced terminal rows observe protocol bytes on disposable clients."""
         arm = b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07"
         restore = b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07"
         other = self.new_window("second")
@@ -631,27 +751,47 @@ class TmuxStatusTests(unittest.TestCase):
                     self.assertEqual(record.read_bytes(), before)
                     self.assertEqual(self.rendered(self.pane, True), "🟠 C:current")
 
-    def test_invalid_pid_and_headless_process_never_emit_json_or_change_the_pane(self):
+    def test_invalid_exited_and_redirected_pids_never_change_pane_or_client_title(self):
         self.start()
         self.publish(self.pane)
         before = self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}")
-        headless = subprocess.Popen(["/bin/sleep", "60"], stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, env=self.env)
-        try:
-            cases = (("working", {"hook_event_name": "PostToolUse"}),
-                     ("waiting", {"hook_event_name": "PermissionRequest"}),
-                     ("idle", {"hook_event_name": "Stop"}),
-                     ("notify", {"hook_event_name": "Notification", "notification_type": "elicitation_dialog"}),
-                     ("elicitation", {"hook_event_name": "Elicitation", "mcp_server_name": "mcp", "elicitation_id": "a"}))
-            for pid in ("0", "999999999", str(headless.pid)):
+        exited = subprocess.Popen(["/usr/bin/true"], env=self.env, stdout=subprocess.DEVNULL)
+        exited.wait(timeout=3)
+        cases = (("working", {"hook_event_name": "PostToolUse"}),
+                 ("waiting", {"hook_event_name": "PermissionRequest"}),
+                 ("idle", {"hook_event_name": "Stop"}),
+                 ("notify", {"hook_event_name": "Notification", "notification_type": "elicitation_dialog"}),
+                 ("elicitation", {"hook_event_name": "Elicitation", "mcp_server_name": "mcp", "elicitation_id": "a"}))
+        with contextlib.ExitStack() as stack, self.attached_client() as client:
+            file_output = stack.enter_context((self.root / "redirected").open("wb"))
+            owners = []
+            for output in (subprocess.PIPE, subprocess.DEVNULL, file_output):
+                process = subprocess.Popen(["/bin/sleep", "60"], stdout=output,
+                                           stderr=subprocess.DEVNULL, env=self.env,
+                                           start_new_session=True)
+                owners.append(process)
+                def stop(owner=process):
+                    if owner.poll() is None:
+                        owner.kill()
+                    owner.communicate(timeout=3)
+                stack.callback(stop)
+            self.assert_status(client, "🔵 C:current")
+            client.clear()
+            for pid in ("0", "not-a-pid", "999999999", str(exited.pid), *(str(p.pid) for p in owners)):
                 for edge, payload in cases:
                     with self.subTest(pid=pid, edge=edge):
                         self.assertEqual(self.hook(edge, self.pane, {"CLAUDE_PID": pid}, payload), b"")
                         self.assertEqual(self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}"), before)
-        finally:
-            headless.terminate()
-            headless.wait(timeout=3)
-            headless.stdout.close()
+            # Read an actual client redraw too: no refused carrier may escape
+            # into an unrelated outer terminal or be passed through as JSON.
+            self.tm("refresh-client", "-S", "-t", client.tty)
+            self.assert_status(client, "🔵 C:current")
+            outer = self.tm("display-message", "-p", "-t", self.pane, "#{T:@cctab_title}").encode()
+            titles = re.findall(rb"\x1b\](?:0|2);(.*?)(?:\x07|\x1b\\)", client.captured, re.S)
+            self.assertTrue(all(title == outer for title in titles), client.diagnostic())
+            self.assertNotIn(b"\x1b]50;", client.captured)
+            file_output.flush()
+            self.assertEqual((self.root / "redirected").read_bytes(), b"")
 
     def test_explicit_marker_preserves_rounded_pill_formats_before_install_and_on_uninstall(self):
         for option, value in zip(FORMATS, MARKED_PILL_FORMATS):
@@ -785,6 +925,19 @@ class TmuxStatusTests(unittest.TestCase):
         self.assertEqual(self.tm("show-options", "-gv", "set-titles-string"), before)
         self.assertEqual(self.tm("display-message", "-p", "-t", self.pane,
                                  "#{==:#{set-titles-string},#{@test_expected_outer}}"), "1")
+
+    def test_outer_title_settings_restore_empty_and_nondefault_pairs(self):
+        for enabled, title in (("on", ""), ("off", "original #{session_name}\nsecond line")):
+            with self.subTest(enabled=enabled, title=title):
+                self.tm("set", "-g", "set-titles", enabled)
+                self.tm("set", "-g", "set-titles-string", title)
+                before = tuple(self.tm("show-options", "-gv", name)
+                               for name in ("set-titles", "set-titles-string"))
+                self.start()
+                self.publish(self.pane)
+                self.uninstall()
+                self.assertEqual(tuple(self.tm("show-options", "-gv", name)
+                                       for name in ("set-titles", "set-titles-string")), before)
 
     def test_nested_formats_and_shell_literals_are_saved_without_interpretation(self):
         raw = ('100% #{?window_active,ACTIVE,#{?window_bell_flag,BELL,quiet}} '
@@ -977,44 +1130,18 @@ class TmuxStatusTests(unittest.TestCase):
         self.publish(background, "waiting")
         self.publish(split, "idle")
         self.tm("select-window", "-t", self.pane)
-        master, slave = pty.openpty()
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
-        client = subprocess.Popen(self.base + ["attach-session", "-t", "alpha"],
-                                  env=self.env, stdin=slave, stdout=slave, stderr=slave,
-                                  start_new_session=True)
-        os.close(slave)
-        captured = b""
-        clean = ""
-        backgrounds = []
         wanted = (" 🔵 0:current ", " 🟠⚪ 1:background ")
-        try:
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                if select.select([master], [], [], 0.1)[0]:
-                    try:
-                        captured += os.read(master, 65536)
-                    except OSError:
-                        break
-                # Strip OSC titles first: the outer tab also contains the same
-                # glyphs, and must not accidentally satisfy this status-bar test.
-                clean, backgrounds = terminal_text_and_backgrounds(captured)
-                if all(fragment in clean for fragment in wanted):
-                    break
+        with self.attached_client() as client:
             for fragment in wanted:
-                self.assertIn(fragment, clean)
+                self.assert_status(client, fragment)
+            # OSC title text cannot satisfy these status-bar observations.
+            clean, backgrounds = terminal_text_and_backgrounds(client.captured)
+            for fragment in wanted:
                 offset = clean.index(fragment)
                 label = offset + fragment.index(":") + 1
                 self.assertIsNotNone(backgrounds[offset + 2])
                 self.assertEqual(backgrounds[offset + 2], backgrounds[label])
                 self.assertNotEqual(backgrounds[offset], backgrounds[offset + 2])
-        finally:
-            client.terminate()
-            try:
-                client.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                client.kill()
-                client.wait(timeout=3)
-            os.close(master)
 
 
 if __name__ == "__main__":
