@@ -124,7 +124,7 @@ pub enum Support<T = ()> {
     Available(T),
     Unsupported(&'static str),   // this build / this terminal cannot
     Disabled(&'static str),      // OUR knob, named so a user can grep for it
-    Unverifiable(&'static str),  // THEIR setting, which we cannot probe
+    Unverifiable(Option<T>, &'static str), // known value, if any; uncertainty reason
     Failed(io::Error),           // it was tried and it did not work
 }
 pub type Presence = Support<()>;
@@ -150,8 +150,24 @@ forced by measured facts rather than taste: Windows Terminal gates OSC 777 behin
 `compatibility.allowOSC777`, **default false**, with no env var, no version string
 and no query that reveals it; `profiles.suppressApplicationTitle` silently discards
 OSC 0/2 and is equally invisible. `Available` would lie to most users and
-`Unsupported` to the rest. It does **not** gate emission — a discarded sequence costs
-nothing — it gates what `doctor` claims.
+`Unsupported` to the rest. `Unverifiable(Some(value), reason)` retains the known
+implementation while declining to promise effectiveness; `Unverifiable(None,
+reason)` carries no implementation and permits no emission. Presence-only
+capabilities with a known operation use `Some(())`.
+
+`emittable()` borrows the value from `Available` or `Unverifiable(Some(_), _)`;
+`should_emit()` is exactly whether that value exists. `gate(Some(knob))` replaces
+both available and uncertain answers with `Disabled(knob)`, including report-only
+uncertainty, so an explicit disable always wins over uncertainty. Other negative
+answers keep their original reasons. `gate(None)` preserves the answer. These
+helpers contain no terminal-specific policy.
+
+`map` transforms available and uncertain values without losing the verdict or
+reason, and leaves an absent value absent. `ok` and `is_available` remain
+verified-only operations. `carry` now returns an unverified answer intact with
+its original payload type; a type-changing conversion must use `map`, because
+without a mapping it could only discard the uncertain value. Reporting retains
+exactly five verdicts, with actionable reasons.
 
 Liveness stays **outside** this vocabulary. It answers a question about a *foreign
 process*, not about a capability of this build, and folding it in would make
@@ -515,7 +531,12 @@ answer; `--surface` always displays the catalogue requirement as `?`, even if th
 local environment names a recent terminal. See
 [protocol catalogue and running-version evidence](architecture.md#protocol-catalogue-and-running-version-evidence)
 for the parsing and mux evidence rules. Neither path changes title emission or
-arming, and this does not redesign `Support<T>`.
+arming. Version-uncertain reporting answers carry no implementation of their own;
+the catalogue remains the source of the typed grammar. `reported()` is a reporting
+view, not an emission plan. Foreign-setting uncertainty in the catalogue retains
+the known grammar (Windows Terminal's OSC 777 and VS Code's OSC 99). Conhost
+progress remains uncertain with no known implementation; no syntax is invented
+for it.
 
 The platform axis reports the session's terminal from `$CLAUDE_PID` and deliberately
 does **not** open it to prove the capability: on Windows the console route attaches a

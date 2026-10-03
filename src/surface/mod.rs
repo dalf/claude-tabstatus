@@ -375,6 +375,8 @@ impl<T> Protocol<T> {
 
     /// Resolve a reporting claim without changing or discarding the catalogue's
     /// grammar. Unknown evidence never promotes a versioned entry to Available.
+    /// Version-uncertain answers are report-only (`None`); the implementation
+    /// remains in `catalogue`. This result is not an emission plan.
     pub fn reported(&self, evidence: VersionEvidence) -> &Support<T> {
         let Some(minimum) = self.minimum else {
             return self.catalogue;
@@ -387,16 +389,16 @@ impl<T> Protocol<T> {
                 &Support::Unsupported("the reported terminal version is below the required minimum")
             }
             (_, VersionEvidence::Catalogue) => {
-                &Support::Unverifiable("protocol catalogue only; no running terminal version checked")
+                &Support::Unverifiable(None, "protocol catalogue only; no running terminal version checked")
             }
             (_, VersionEvidence::Missing) => {
-                &Support::Unverifiable("KONSOLE_VERSION is missing or empty; the version is not established")
+                &Support::Unverifiable(None, "KONSOLE_VERSION is missing or empty; the version is not established")
             }
             (_, VersionEvidence::Invalid) => {
-                &Support::Unverifiable("KONSOLE_VERSION is invalid; expected six ASCII digits YYMMZZ with month 01..12")
+                &Support::Unverifiable(None, "KONSOLE_VERSION is invalid; expected six ASCII digits YYMMZZ with month 01..12")
             }
             (_, VersionEvidence::Unreliable) => {
-                &Support::Unverifiable("KONSOLE_VERSION cannot establish client versions inside a multiplexer")
+                &Support::Unverifiable(None, "KONSOLE_VERSION cannot establish client versions inside a multiplexer")
             }
         }
     }
@@ -474,6 +476,52 @@ mod tests {
             assert!(c.tab_color.catalogue.is_available());
             assert!(c.attention.progress.catalogue.is_available());
             assert!(c.attention.notify.reported(evidence).reason().is_some());
+            assert!(matches!(c.attention.notify.catalogue.emittable(),
+                Some(NotifySyntax::Osc777(Terminator::Bel))));
+            assert!(c.attention.notify.reported(evidence).emittable().is_none());
+        }
+    }
+
+    #[test]
+    fn uncertain_notification_catalogues_retain_typed_grammars_and_reasons() {
+        for (surface, expected, setting) in [
+            (Surface::WindowsTerminal, NotifySyntax::Osc777(Terminator::Bel), "compatibility.allowOSC777"),
+            (Surface::VsCode, NotifySyntax::Osc99(Terminator::St), "enable-notifications"),
+        ] {
+            let protocol = &surface.caps().attention.notify;
+            for evidence in [VersionEvidence::Catalogue, VersionEvidence::Missing] {
+                let report = protocol.reported(evidence);
+                assert_eq!(report.label(), "?");
+                assert!(report.reason().unwrap().contains(setting));
+                assert!(report.emittable() == Some(&expected));
+                assert!(report.should_emit());
+            }
+        }
+        let unknown = &Surface::ConHost.caps().attention.progress;
+        assert_eq!(unknown.reported(VersionEvidence::Catalogue).label(), "?");
+        assert!(unknown.catalogue.emittable().is_none());
+        assert!(!unknown.catalogue.should_emit());
+        assert!(unknown.catalogue.reason().unwrap().contains("not documented"));
+    }
+
+    #[test]
+    fn uncertain_grammars_survive_mapping_but_not_an_explicit_disable() {
+        for off in [None, Some("CCTAB_DRY_RUN")] {
+            for (catalogue, expected) in [
+                (rows::WINDOWS_NOTIFICATION, ("OSC 777 notify", Terminator::Bel)),
+                (rows::VSCODE_NOTIFICATION, ("OSC 99", Terminator::St)),
+            ] {
+                // A generic consumer needs only the typed grammar, never the
+                // terminal name. No notification bytes are implemented here.
+                let report = catalogue.gate(off).map(NotifySyntax::grammar);
+                assert_eq!(report.should_emit(), off.is_none());
+                assert!(report.emittable() == off.is_none().then_some(&expected));
+                assert_eq!(report.label(), if off.is_some() { "off" } else { "?" });
+                assert!(report.reason().is_some());
+                let disabled = report.gate(Some("CCTAB_DRY_RUN"));
+                assert!(disabled.emittable().is_none());
+                assert_eq!(disabled.to_string(), "off: CCTAB_DRY_RUN");
+            }
         }
     }
 

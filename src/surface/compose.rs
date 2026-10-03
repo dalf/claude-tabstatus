@@ -15,17 +15,15 @@ use crate::support::{Presence, Support, YES};
 
 /// Restate what a const row said, as the answer a composer gives back.
 ///
-/// A row can only ever say `Available`, `Unsupported` or `Unverifiable` - the
-/// table walk in `surface::tests` pins that - so the two remaining arms are
-/// unreachable rather than possible. They are mapped to a sentence saying so
-/// because `panic = "abort"`: an unreachable arm that aborts the process is worse
-/// than one that prints something a reader can recognise as impossible.
+/// Preserve uncertainty and any explicit gate layered over the row. A const
+/// capability row cannot contain a failed attempt; that impossible case is
+/// reported rather than panicking in a crate built with `panic = "abort"`.
 fn restated<T>(row: &Support<T>) -> Presence {
     match row {
         Support::Available(_) => YES,
         Support::Unsupported(r) => Support::Unsupported(r),
         Support::Disabled(r) => Support::Disabled(r),
-        Support::Unverifiable(r) => Support::Unverifiable(r),
+        Support::Unverifiable(value, r) => Support::Unverifiable(value.as_ref().map(|_| ()), r),
         Support::Failed(_) => Support::Unsupported("a const capability row cannot fail"),
     }
 }
@@ -145,6 +143,25 @@ mod tests {
                 s.caps().name,
                 p.label()
             );
+        }
+    }
+
+    #[test]
+    fn an_uncertain_title_is_composed_unless_our_knob_disables_it() {
+        for off in [None, Some("CCTAB_DRY_RUN")] {
+            let mut caps = crate::surface::rows::WINDOWS_TERMINAL;
+            caps.title.osc0 = caps.title.osc0.gate(off);
+            let mut out = Vec::new();
+            let result = push_title(&mut out, &caps, "x");
+            if off.is_some() {
+                assert!(out.is_empty());
+                assert!(!result.should_emit());
+                assert_eq!(result.to_string(), "off: CCTAB_DRY_RUN");
+            } else {
+                assert_eq!(out, b"\x1b]0;x\x07");
+                assert!(result.should_emit());
+                assert_eq!(result.to_string(), "?: profiles.suppressApplicationTitle silently discards it");
+            }
         }
     }
 }

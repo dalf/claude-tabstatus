@@ -39,8 +39,9 @@
 //! DA1, XTVERSION and DECRQSS are all unavailable and capability detection can
 //! never be dynamic in this process model. Calling such a row `Available` lies to
 //! the users who left the default alone and calling it `Unsupported` lies to the
-//! ones who changed it, so it gets its own word. It does NOT gate emission - a
-//! discarded escape sequence costs nothing - it gates what `doctor` claims.
+//! ones who changed it, so it gets its own word. With a known implementation it
+//! permits an attempt, unless our own knob disables it; without one it is only
+//! a reporting answer. Uncertainty never invents an implementation.
 //!
 //! The type PARAMETER is what keeps this one vocabulary instead of two. Without
 //! it there would be a capability enum answering "can you?" beside a `Result`
@@ -90,11 +91,10 @@ pub enum Support<T = ()> {
     /// The string names the FOREIGN setting the user must go and check:
     /// `"compatibility.allowOSC777"`, `"profiles.suppressApplicationTitle"`.
     ///
-    /// The Windows Terminal rows of the surface axis are what force it, and it
-    /// landed here before them because the vocabulary is the thing being fixed,
-    /// and a fifth word added later is a fifth word every existing caller has to
-    /// be re-read for.
-    Unverifiable(&'static str),
+    /// `Some` retains a known implementation; `None` is a report with no value
+    /// to attempt. A presence-only capability uses `Some(())` when its operation
+    /// is known. Neither form asserts that the operation will be effective.
+    Unverifiable(Option<T>, &'static str),
     /// It was attempted and the OS said no.
     // CONSUMER: doctor's `cap`, through `label` and `reason` - the formatter is
     // total over the five words and prints this one with the error's own text.
@@ -117,10 +117,12 @@ pub const YES: Presence = Support::Available(());
 // Live: `ok` and `is_available` in `mux`, `gate` and `is_available` in doctor's
 // platform and multiplexer axes, `should_emit` in the composer, and `label` /
 // `reason` / `Display` in doctor's formatter. The three that are not are the
-// TYPE-CHANGING half - they exist for a layer boundary that has to move a value or
-// a failure across, and #14's backends are the first that will - so each carries
-// the lint suppression on its own line, with its consumer named.
+// layer-boundary helpers - they move a value or a failure across, and #14's
+// backends are the first that will - so each carries the lint suppression on
+// its own line, with its consumer named.
 impl<T> Support<T> {
+    /// Extract only a verified value. Use `emittable` for a permitted attempt
+    /// whose effectiveness may still be uncertain.
     pub fn ok(self) -> Option<T> {
         match self {
             Support::Available(v) => Some(v),
@@ -132,57 +134,56 @@ impl<T> Support<T> {
         matches!(self, Support::Available(_))
     }
 
-    /// Emit? `Available` and `Unverifiable` say yes; the other three say no.
-    ///
-    /// This is the one place the reporting/emitting distinction is decided, and
-    /// it is why `Unverifiable` is safe to add: a sequence a terminal discards
-    /// costs one write that was going to happen anyway, and refusing to send it
-    /// would turn an unknown into a certain no.
+    /// A known implementation that may be attempted. Uncertainty preserves the
+    /// value without promising that the attempt will be effective. Report-only
+    /// uncertainty (`None`) supplies no implementation; callers must not invent one.
+    pub fn emittable(&self) -> Option<&T> {
+        match self {
+            Support::Available(v) | Support::Unverifiable(Some(v), _) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Emission requires an implementation as well as permission to attempt it.
     pub fn should_emit(&self) -> bool {
-        matches!(self, Support::Available(_) | Support::Unverifiable(_))
+        self.emittable().is_some()
     }
 
     // CONSUMER: #14's backends, which take a `Support<T>` out of a probe and hand
-    // on a value of their own. Kept because `carry` below is written in terms of
-    // the same total match and the two are read together.
+    // on a value of their own, preserving any uncertainty and its reason.
     #[allow(dead_code)]
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Support<U> {
         match self {
             Support::Available(v) => Support::Available(f(v)),
             Support::Unsupported(r) => Support::Unsupported(r),
             Support::Disabled(r) => Support::Disabled(r),
-            Support::Unverifiable(r) => Support::Unverifiable(r),
+            Support::Unverifiable(value, r) => Support::Unverifiable(value.map(f), r),
             Support::Failed(e) => Support::Failed(e),
         }
     }
 
-    /// Change the payload type while KEEPING the reason, so that a layer boundary
-    /// can never silently invent one. `Ok` is the value; `Err` is this same
-    /// absence wearing the outer layer's type parameter.
-    // CONSUMER: #14's backends, at the seam between a probe's answer and a
-    // delivery's. Nothing in this build crosses that boundary yet.
+    /// Extract a verified value, or return the original answer intact. An
+    /// uncertain value must keep both its payload and reason. Use `map` to change
+    /// payload types; a conversion without a mapping would discard that value.
     #[allow(dead_code)]
-    pub fn carry<U>(self) -> Result<T, Support<U>> {
+    pub fn carry(self) -> Result<T, Self> {
         match self {
             Support::Available(v) => Ok(v),
-            // Spelled out rather than `other.map(|_| unreachable!())`: that
-            // closure is never called, but it puts a panic in the crate, and
-            // `panic = "abort"` is why there are none.
-            Support::Unsupported(r) => Err(Support::Unsupported(r)),
-            Support::Disabled(r) => Err(Support::Disabled(r)),
-            Support::Unverifiable(r) => Err(Support::Unverifiable(r)),
-            Support::Failed(e) => Err(Support::Failed(e)),
+            other => Err(other),
         }
     }
 
     /// Layer OUR knob over a fact the platform or a const row already stated, so
-    /// that the row can say `Available` without knowing the knob exists. `None`
+    /// that available and uncertain rows need not know the knob exists. `None`
     /// means no knob applies. doctor's `hostname` row is what reads it: the
     /// platform answers, and `CCTAB_HOST` is what decides whether that answer is
-    /// the one painted.
+    /// the one painted. The knob overrides either form of uncertainty; existing
+    /// unsupported, disabled and failed answers keep their original reasons.
     pub fn gate(self, off: Option<&'static str>) -> Support<T> {
         match (self, off) {
-            (Support::Available(_), Some(knob)) => Support::Disabled(knob),
+            (Support::Available(_) | Support::Unverifiable(_, _), Some(knob)) => {
+                Support::Disabled(knob)
+            }
             (other, _) => other,
         }
     }
@@ -205,7 +206,7 @@ impl<T> Support<T> {
             Support::Available(_) => "ok",
             Support::Unsupported(_) => "n/a",
             Support::Disabled(_) => "off",
-            Support::Unverifiable(_) => "?",
+            Support::Unverifiable(_, _) => "?",
             Support::Failed(_) => "fail",
         }
     }
@@ -218,7 +219,7 @@ impl<T> Support<T> {
     pub fn reason(&self) -> Option<Cow<'_, str>> {
         match self {
             Support::Available(_) => None,
-            Support::Unsupported(r) | Support::Disabled(r) | Support::Unverifiable(r) => {
+            Support::Unsupported(r) | Support::Disabled(r) | Support::Unverifiable(_, r) => {
                 Some(Cow::Borrowed(*r))
             }
             Support::Failed(e) => Some(Cow::Owned(e.to_string())),
@@ -248,7 +249,7 @@ mod tests {
             YES,
             Support::Unsupported("a one-shot hook has no reader"),
             Support::Disabled("CCTAB_NO_TMUX"),
-            Support::Unverifiable("compatibility.allowOSC777"),
+            Support::Unverifiable(Some(()), "compatibility.allowOSC777"),
             Support::Failed(Error::from(ErrorKind::PermissionDenied)),
         ];
         let labels: Vec<&str> = rows.iter().map(Support::label).collect();
@@ -263,7 +264,7 @@ mod tests {
             "off: CCTAB_NO_TMUX"
         );
         assert_eq!(
-            Support::<()>::Unverifiable("compatibility.allowOSC777").to_string(),
+            Support::<()>::Unverifiable(Some(()), "compatibility.allowOSC777").to_string(),
             "?: compatibility.allowOSC777"
         );
         assert_eq!(
@@ -283,18 +284,19 @@ mod tests {
     /// limit, and the report has to be able to say which one it hit.
     #[test]
     fn our_knob_turns_a_fact_into_off_and_never_the_other_way_round() {
-        assert_eq!(YES.gate(Some("CCTAB_NO_TMUX")).label(), "off");
+        let disabled = YES.gate(Some("CCTAB_NO_TMUX"));
+        assert_eq!(disabled.label(), "off");
+        assert!(!disabled.should_emit());
         assert_eq!(YES.gate(None).label(), "ok");
         // A knob cannot promote something the platform cannot do.
         let n = Support::<()>::Unsupported("no /proc on this platform").gate(Some("CCTAB_NO_TMUX"));
         assert_eq!(n.reason().as_deref(), Some("no /proc on this platform"));
     }
 
-    /// `Unverifiable` gates the CLAIM, not the write. A row that stopped emitting
-    /// would turn "we cannot tell" into a certain "no".
+    /// Known-but-uncertain support permits an attempt without claiming success.
     #[test]
-    fn unverifiable_still_emits_and_disabled_does_not() {
-        assert!(Support::<()>::Unverifiable("allowOSC777").should_emit());
+    fn known_uncertain_values_still_emit_and_disabled_does_not() {
+        assert!(Support::<()>::Unverifiable(Some(()), "allowOSC777").should_emit());
         assert!(YES.should_emit());
         assert!(!Support::<()>::Disabled("CCTAB_NO_TMUX").should_emit());
         assert!(!Support::<()>::Unsupported("no console").should_emit());
@@ -303,12 +305,48 @@ mod tests {
 
     #[test]
     fn a_reason_survives_a_change_of_payload_type() {
-        let r: Result<u32, Presence> = Support::<u32>::Unsupported("no /proc").carry();
+        let r: Result<u32, Support<u32>> = Support::<u32>::Unsupported("no /proc").carry();
         match r {
             Err(p) => assert_eq!(p.reason().as_deref(), Some("no /proc")),
             Ok(_) => panic!("Unsupported is not a value"),
         }
         assert_eq!(Support::Available(2u32).map(|v| v + 1).ok(), Some(3));
+    }
+
+    #[test]
+    fn uncertainty_keeps_its_value_through_mapping_until_explicitly_disabled() {
+        for off in [None, Some("CCTAB_DRY_RUN")] {
+            let uncertain = Support::Unverifiable(Some(7u32), "foreign setting");
+            assert!(!uncertain.is_available());
+            // Verified-only extraction must return uncertainty intact.
+            let Err(uncertain) = uncertain.carry() else {
+                panic!("uncertainty is not verified success");
+            };
+            let mapped = uncertain.gate(off).map(|v| v.to_string());
+            assert_eq!(mapped.should_emit(), off.is_none());
+            assert_eq!(mapped.emittable().map(String::as_str), off.is_none().then_some("7"));
+            assert_eq!(mapped.label(), if off.is_some() { "off" } else { "?" });
+            assert_eq!(mapped.reason().as_deref(), Some(off.unwrap_or("foreign setting")));
+            // Gating after mapping gives the same permission and preserves the knob.
+            let disabled = mapped.gate(Some("CCTAB_DRY_RUN"));
+            assert!(!disabled.should_emit());
+            assert!(disabled.emittable().is_none());
+            assert_eq!(disabled.to_string(), "off: CCTAB_DRY_RUN");
+        }
+        assert!(Support::Unverifiable(Some(7), "foreign setting").ok().is_none());
+    }
+
+    #[test]
+    fn no_value_is_invented_by_mapping_or_gating_report_only_uncertainty() {
+        for off in [None, Some("CCTAB_DRY_RUN")] {
+            let unknown = Support::<u32>::Unverifiable(None, "no known implementation")
+                .map(|_| -> String { panic!("there is no value to map") })
+                .gate(off);
+            assert!(!unknown.should_emit());
+            assert!(unknown.emittable().is_none());
+            assert_eq!(unknown.label(), if off.is_some() { "off" } else { "?" });
+            assert_eq!(unknown.reason().as_deref(), Some(off.unwrap_or("no known implementation")));
+        }
     }
 
     #[test]

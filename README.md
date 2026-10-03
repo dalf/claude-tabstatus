@@ -512,6 +512,7 @@ the tab (the *surface*) and the multiplexer. Its verdict column has five words:
 can turn back on),
 `?` (the terminal may or may not honour it and nothing we can read says which)
 or `fail` (an attempt the OS refused), with escape bytes named, never written.
+A `?` entry still shows its known grammar, if any, alongside the setting to check.
 
 For Konsole's versioned protocols, `ok` requires a valid `KONSOLE_VERSION` at
 or above the documented minimum: notifications (OSC 777) need 23.04, tab colour

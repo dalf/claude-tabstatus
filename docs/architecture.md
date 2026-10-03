@@ -1333,7 +1333,23 @@ diffs cleanly against the block inside the full report. The names are the fourte
 `surface::Protocol<T>` keeps a catalogue grammar separate from its reporting
 verdict. Each known minimum is typed data beside the grammar in
 `src/surface/rows.rs`; `Protocol::reported` resolves it, and doctor only formats
-that answer plus the grammar and requirement. `Support<T>` itself is unchanged.
+that answer plus the grammar and requirement. The catalogue's
+`Support::Unverifiable(Some(grammar), reason)` retains syntax when a foreign
+setting makes effectiveness uncertain. Windows Terminal notifications retain
+`OSC 777 notify BEL`; VS Code notifications retain `OSC 99 ST`. Conhost progress
+uses `Unverifiable(None, reason)`: its handling is undocumented, so the catalogue
+supplies no implementation. Doctor prints known grammars alongside uncertainty
+reasons without claiming those settings are enabled.
+
+`Support::emittable` returns a known value for either available or uncertain
+support, and `should_emit` is true exactly when that value exists. An explicit
+`gate(Some(knob))` suppresses both states and reports `off` with the knob's name;
+it also overrides uncertainty without a value. Unsupported, already-disabled
+and failed answers retain their reasons. `map` preserves uncertainty and maps
+only values that exist; verified-only extraction does not promote uncertainty.
+See [one vocabulary for absence](backend-architecture.md#one-vocabulary-for-absence)
+for the full helper contract.
+
 The three Konsole entries have the floors recorded in the
 [capability matrix](research/terminal-capability-matrix.md#runtime-version-reporting).
 
@@ -1342,7 +1358,9 @@ It accepts Konsole's six ASCII digits `YYMMZZ` (non-zero year, month 01–12,
 two-digit patch), compares the whole value including the patch, and rejects
 partial numbers, signs, whitespace, suffixes and non-UTF-8 values. A known older
 version yields `Unsupported`; absent, malformed or unreliable evidence yields
-`Unverifiable`. A non-empty `$TMUX` or `$STY` vetoes the inherited version even
+`Unverifiable(None, reason)` in the reporting view. Those report-only answers
+leave the catalogue grammar intact; `reported()` does not construct an emission
+plan. A non-empty `$TMUX` or `$STY` vetoes the inherited version even
 when mux integration is disabled or the mux value is malformed. A terminal-family
 override or mux family hint does not establish any client's version. Outside a
 mux, an explicitly forwarded version over SSH is taken at its word, like the

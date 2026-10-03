@@ -2379,6 +2379,17 @@ _wt=$(cd -- "$tmp/plaindir" && HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere \
 check 'doctor --surface: the row that forced a fifth word prints as that word' '1' \
     "$(printf '%s\n' "$_wt" \
        | grep -c '^  title (OSC 0)         ?     profiles.suppressApplicationTitle silently discards it$')"
+check 'doctor --surface: uncertain Windows notification keeps its reason and grammar' '1' \
+    "$(printf '%s\n' "$_wt" | grep -A1 '^  notification          ?     compatibility.allowOSC777, default false$' \
+       | grep -c '^                              OSC 777 notify BEL$')"
+_vscode=$("$bin" doctor --surface vscode </dev/null 2>&1)
+check 'doctor --surface: uncertain VS Code notification keeps its reason and grammar' '1' \
+    "$(printf '%s\n' "$_vscode" | grep -A1 '^  notification          ?     .*enable-notifications setting$' \
+       | grep -c '^                              OSC 99 ST$')"
+_conhost=$("$bin" doctor --surface conhost </dev/null 2>&1)
+check 'doctor --surface: uncertain conhost progress has no invented grammar' '1' \
+    "$(printf '%s\n' "$_conhost" | grep -A1 '^  taskbar progress      ?     .*not documented$' \
+       | grep -c '^  acknowledge ')"
 check 'doctor --surface: the vendor-source provenance is on the surface line' '1' \
     "$(printf '%s\n' "$_wt" \
        | grep -c '^surface     windows-terminal             Windows Terminal, read from vendor source, never run$')"

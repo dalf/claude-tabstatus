@@ -190,7 +190,7 @@ mod tests {
         let unreadable = [
             Support::Unsupported("not inside a multiplexer"),
             Support::Disabled("CCTAB_NO_TMUX"),
-            Support::Unverifiable("the server did not answer"),
+            Support::Unverifiable(None, "the server did not answer"),
             Support::Failed(std::io::Error::other("gone")),
         ];
         for m in unreadable {

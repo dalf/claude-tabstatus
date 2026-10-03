@@ -3361,13 +3361,16 @@ fn report_protocol<T>(
     version: surface::VersionEvidence,
     syntax: impl Fn(&T) -> (&'static str, Terminator),
 ) {
-    let detail = match protocol.catalogue {
-        Support::Available(g) => grammar(syntax(g)),
-        _ => String::new(),
-    };
+    let detail = protocol
+        .catalogue
+        .emittable()
+        .map(|g| grammar(syntax(g)))
+        .unwrap_or_default();
     cap(name, protocol.reported(version), &detail);
     if let Some(minimum) = protocol.minimum {
         more(&format!("{detail}; requires {minimum} or newer"));
+    } else if !detail.is_empty() && !protocol.catalogue.is_available() {
+        more(&detail);
     }
 }
 
