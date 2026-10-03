@@ -505,6 +505,15 @@ including a terminal this machine could never run. Every input is `&'static` dat
 it needs no terminal, no session and no config directory, and it is how the Windows
 column gets read from a Linux box.
 
+The const surface table is a protocol catalogue. Versioned entries keep their
+minimum beside the grammar in `rows.rs`, and `Protocol::reported` resolves the
+reporting verdict from separate `VersionEvidence`. Ordinary doctor uses that
+answer; `--surface` always displays the catalogue requirement as `?`, even if the
+local environment names a recent terminal. See
+[protocol catalogue and running-version evidence](architecture.md#protocol-catalogue-and-running-version-evidence)
+for the parsing and mux evidence rules. Neither path changes title emission or
+arming, and this does not redesign `Support<T>`.
+
 The platform axis reports the session's terminal from `$CLAUDE_PID` and deliberately
 does **not** open it to prove the capability: on Windows the console route attaches a
 console, and releasing one invalidates the process's stdout handles — so a report

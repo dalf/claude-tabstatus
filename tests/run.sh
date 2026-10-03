@@ -2301,6 +2301,36 @@ check 'doctor: inside a multiplexer the evidence is gone, and says why' '1' \
 check 'doctor: and with nothing in the environment there was none to swallow' '1' \
     "$(printf '%s\n' "$_axdoc" \
        | grep -c '^  evidence              n/a   nothing in the environment named it$')"
+# Versioned catalogue entries need evidence about the running terminal. The
+# override names a family only; a claimed mux vetoes even valid version values.
+# Fixed columns keep multi-word capability names from affecting label extraction.
+_version_labels() {
+    sed -n '/^  notification /p; /^  tab colour /p; /^  taskbar progress /p' \
+        | cut -c25-30 | tr -d ' ' | tr '\n' '|'
+}
+for _case in '220400:n/a|n/a|n/a|' '230399:n/a|n/a|n/a|' \
+    '230400:n/a|ok|n/a|' '230401:n/a|ok|n/a|' \
+    '241199:n/a|ok|n/a|' '241200:ok|ok|n/a|' '241201:ok|ok|n/a|' \
+    '260399:ok|ok|n/a|' '260400:ok|ok|ok|' '260401:ok|ok|ok|'; do
+    _ver=${_case%%:*}
+    check "doctor: Konsole version boundary $_ver" "${_case#*:}" \
+        "$(_axes KONSOLE_VERSION=$_ver | _version_labels)"
+done
+for _ver in '' bad 23.04 23040 0230400 +230400 ' 230400' 230400beta 230000 231300 999999; do
+    check "doctor: unknown or invalid Konsole version '$_ver' is unverified" '?|?|?|' \
+        "$(_axes CCTAB_TERMINAL=konsole KONSOLE_VERSION="$_ver" | _version_labels)"
+done
+check 'doctor: an override without a version is unverified' '?|?|?|' \
+    "$(_axes CCTAB_TERMINAL=konsole | _version_labels)"
+check 'doctor: DBus family evidence without a version is unverified' '?|?|?|' \
+    "$(_axes KONSOLE_DBUS_SESSION=/Sessions/1 | _version_labels)"
+for _muxenv in 'TMUX=nonsense' 'STY=screen' 'TMUX=/tmp/not-a-server,1,0'; do
+    check "doctor: $_muxenv makes inherited versions unreliable even with mux disabled" '?|?|?|' \
+        "$(_axes CCTAB_TERMINAL=konsole KONSOLE_VERSION=260400 CCTAB_NO_TMUX=1 "$_muxenv" | _version_labels)"
+done
+check 'doctor: empty mux evidence does not veto a version' 'ok|ok|ok|' \
+    "$(_axes KONSOLE_VERSION=260400 TMUX= STY= | _version_labels)"
+
 # The arm and its restore, PRINTED AS A PAIR, because an arm whose restore drifted
 # from it is this project's named recurring defect and a report is where a drift
 # would be seen. Named, never written: doctor is read in the terminal whose tab is
@@ -2394,14 +2424,31 @@ check 'doctor: still ignores an option it does not know' '1' \
           "$bin" doctor --force </dev/null 2>&1 ) | grep -c '^title:')"
 # The two spellings print the SAME rows, which is the fixed-column claim as a test:
 # the block a Linux reader sees for konsole and the block they would read for a
-# surface they cannot run differ only in the evidence there is about this session.
+# surface they cannot run share the rows that do not depend on version evidence.
 _axblock=$(printf '%s\n' "$_axkon" | sed -n '/^surface /,/^multiplexer /p' \
-    | grep -v '^multiplexer ' | grep -v '^  evidence ')
+    | grep -v '^multiplexer ' | grep -v '^  evidence ' \
+    | grep -Ev '^  (tab colour|notification|taskbar progress) ')
 _onblock=$( ( cd -- "$tmp/plaindir" && HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere \
     "$bin" doctor --surface konsole </dev/null 2>&1 ) | sed -n '/^surface /,$p' \
-    | grep -v '^            CCTAB_TERMINAL=')
-check 'doctor --surface: the block is byte-identical to the one in the full report' \
+    | grep -v '^            CCTAB_TERMINAL=' \
+    | grep -Ev '^  (tab colour|notification|taskbar progress) ')
+check 'doctor --surface: non-versioned rows and protocol requirements match the full report' \
     "$_axblock" "$_onblock"
+
+# Offline catalogue mode ignores even a valid local version, retains all three
+# grammars and states each floor, without requiring a terminal or config directory.
+_catalogue=$(HOME=$_nowhere CLAUDE_CONFIG_DIR=$_nowhere KONSOLE_VERSION=260400 \
+    "$bin" doctor --surface konsole </dev/null 2>&1)
+check 'doctor --surface: catalogue entries are not running-version claims' '?|?|?|' \
+    "$(printf '%s\n' "$_catalogue" | _version_labels)"
+for _requirement in 'OSC 777 notify BEL; requires Konsole 23.04.0 or newer' \
+    'OSC 34 BEL; requires Konsole 24.12.0 or newer' \
+    'OSC 9;4 BEL; requires Konsole 26.04.0 or newer'; do
+    check "doctor --surface: $_requirement" '1' \
+        "$(printf '%s\n' "$_catalogue" | grep -Fc "$_requirement")"
+done
+check 'doctor --surface: explicitly identifies the versioned catalogue claims' '3' \
+    "$(printf '%s\n' "$_catalogue" | grep -c 'protocol catalogue only; no running terminal version checked')"
 
 # --- the state layer: wait ownership --------------------------------------
 # Everything above this point is the STATELESS program, because the suite unsets

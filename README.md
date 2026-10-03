@@ -508,14 +508,26 @@ paint, without painting it.
 
 `doctor` also prints a capability table for the platform, the terminal drawing
 the tab (the *surface*) and the multiplexer. Its verdict column has five words:
-`ok`, `n/a` ("this cannot, ever"), `off` (a knob of ours you can turn back on),
+`ok`, `n/a` (unsupported by this terminal or version), `off` (a knob of ours you
+can turn back on),
 `?` (the terminal may or may not honour it and nothing we can read says which)
 or `fail` (an attempt the OS refused), with escape bytes named, never written.
+
+For Konsole's versioned protocols, `ok` requires a valid `KONSOLE_VERSION` at
+or above the documented minimum: notifications (OSC 777) need 23.04, tab colour
+(OSC 34) needs 24.12 and progress (OSC 9;4) needs 26.04. Older versions show
+`n/a`; missing, malformed or inherited multiplexer version evidence shows `?`.
+`CCTAB_TERMINAL=konsole` names the family but does not establish a version.
+These entries describe terminal protocols; this release does not emit notifications,
+tab colour or progress.
+
 `tabstatus doctor --surface <name>` prints one terminal's table with no terminal,
 session or config directory, for any of the fourteen names `CCTAB_TERMINAL`
 accepts: `unknown`, `konsole`, `vte`, `kitty`, `alacritty`, `wezterm`, `foot`,
 `ghostty`, `xterm`, `iterm2`, `apple-terminal`, `windows-terminal`, `conhost`,
-`vscode`. Why the table looks as it does is in
+`vscode`. This offline catalogue shows versioned protocols as `?`, with their
+minimum versions, regardless of the local environment. Why the table looks as it
+does is in
 [docs/architecture.md](docs/architecture.md#the-three-axes).
 
 | symptom | cause and fix |

@@ -20,8 +20,8 @@
 //! `CCTAB_TERMINAL` value other than `konsole` on the layout it has today.
 
 use super::{
-    Arming, AttentionCaps, CapSource, Elide, NotifySyntax, ProgressSyntax, SurfaceCaps, TabColor,
-    Terminator, TitleCaps,
+    Arming, AttentionCaps, CapSource, Elide, MinimumVersion, NotifySyntax, ProgressSyntax, Protocol,
+    SurfaceCaps, TabColor, Terminator, TitleCaps,
 };
 use crate::support::{Presence, Support, YES};
 
@@ -64,13 +64,13 @@ pub const UNKNOWN: SurfaceCaps = SurfaceCaps {
             "nothing beyond OSC 0 is assumed of a terminal we cannot name",
         ),
     },
-    tab_color: Support::Unsupported("a colour cannot be restored on a terminal we cannot name"),
+    tab_color: Protocol::new(&Support::Unsupported("a colour cannot be restored on a terminal we cannot name")),
     attention: AttentionCaps {
         bell: Support::Unsupported("no bell behaviour is assumed of a terminal we cannot name"),
-        notify: Support::Unsupported("the three notification grammars do not overlap, so an \
-                                      unnamed surface has no safe one"),
-        progress: Support::Unsupported("OSC 9 means two unrelated things, so an unnamed surface \
-                                        has no safe one"),
+        notify: Protocol::new(&Support::Unsupported("the three notification grammars do not overlap, so an \
+                                      unnamed surface has no safe one")),
+        progress: Protocol::new(&Support::Unsupported("OSC 9 means two unrelated things, so an unnamed surface \
+                                        has no safe one")),
         acknowledge: NO_ACK,
     },
     arming: None,
@@ -89,11 +89,9 @@ pub const UNKNOWN: SurfaceCaps = SurfaceCaps {
 /// The `tab_color` row below is that seam's other half: `OSC 34` is the direct
 /// route and needs no profile round trip.
 ///
-/// The three attention grammars are version-gated - `OSC 777` landed in 23.04,
-/// `OSC 99` and `OSC 34` in 24.12, `OSC 9;4` in 26.04 - and this row states the
-/// grammar with the OLDEST floor for each effect, because this build does not
-/// read `KONSOLE_VERSION` for a tier. Nothing emits them yet; the tier belongs
-/// with the code that does.
+/// The catalogue uses the oldest grammar for each effect. Its version floors
+/// live beside the syntax below and are resolved only for capability reporting.
+/// Nothing emits these three protocols yet.
 pub const KONSOLE: SurfaceCaps = SurfaceCaps {
     name: "konsole",
     human: "Konsole",
@@ -108,11 +106,20 @@ pub const KONSOLE: SurfaceCaps = SurfaceCaps {
             "parsed and deliberately discarded, Vt102Emulation.cpp:2054",
         ),
     },
-    tab_color: Support::Available(TabColor::Osc34(Terminator::Bel)),
+    tab_color: Protocol::since(
+        &Support::Available(TabColor::Osc34(Terminator::Bel)),
+        MinimumVersion::Konsole(241200),
+    ),
     attention: AttentionCaps {
         bell: Support::Unverifiable("the profile's bell mode decides whether it is seen"),
-        notify: Support::Available(NotifySyntax::Osc777(Terminator::Bel)),
-        progress: Support::Available(ProgressSyntax::Osc94(Terminator::Bel)),
+        notify: Protocol::since(
+            &Support::Available(NotifySyntax::Osc777(Terminator::Bel)),
+            MinimumVersion::Konsole(230400),
+        ),
+        progress: Protocol::since(
+            &Support::Available(ProgressSyntax::Osc94(Terminator::Bel)),
+            MinimumVersion::Konsole(260400),
+        ),
         acknowledge: NO_ACK,
     },
     arming: Some(Arming::new(
@@ -139,14 +146,14 @@ pub const VTE: SurfaceCaps = SurfaceCaps {
         // Ps=1 is an explicit no-op; the window-title half works.
         stack_22t: YES,
     },
-    tab_color: Support::Unsupported("VTE has no tab-colour escape; it is a settings file"),
+    tab_color: Protocol::new(&Support::Unsupported("VTE has no tab-colour escape; it is a settings file")),
     attention: AttentionCaps {
         bell: Support::Unverifiable("the VTE product's own bell setting decides whether it \
                                     is seen"),
-        notify: Support::Unsupported("OSC 9 is routed to the progress parser, OSC 777 needs \
+        notify: Protocol::new(&Support::Unsupported("OSC 9 is routed to the progress parser, OSC 777 needs \
                                       enable_legacy_osc777 and is not a desktop notification, \
-                                      and OSC 99 is not parsed"),
-        progress: Support::Available(ProgressSyntax::Osc94(Terminator::St)),
+                                      and OSC 99 is not parsed")),
+        progress: Protocol::new(&Support::Available(ProgressSyntax::Osc94(Terminator::St))),
         acknowledge: NO_ACK,
     },
     arming: None,
@@ -158,12 +165,12 @@ pub const KITTY: SurfaceCaps = SurfaceCaps {
     human: "kitty",
     elide: Elide::Right,
     title: TITLE_ALL,
-    tab_color: Support::Unsupported("`kitty @ set-tab-color` is a remote-control socket round \
-                                     trip behind allow_remote_control, not an escape"),
+    tab_color: Protocol::new(&Support::Unsupported("`kitty @ set-tab-color` is a remote-control socket round \
+                                     trip behind allow_remote_control, not an escape")),
     attention: AttentionCaps {
         bell: Support::Unverifiable("window_alert_on_bell decides whether it is seen"),
-        notify: Support::Available(NotifySyntax::Osc99(Terminator::St)),
-        progress: Support::Available(ProgressSyntax::Osc94(Terminator::St)),
+        notify: Protocol::new(&Support::Available(NotifySyntax::Osc99(Terminator::St))),
+        progress: Protocol::new(&Support::Available(ProgressSyntax::Osc94(Terminator::St))),
         acknowledge: NO_ACK,
     },
     arming: None,
@@ -185,12 +192,12 @@ pub const ALACRITTY: SurfaceCaps = SurfaceCaps {
         osc2: YES,
         stack_22t: YES,
     },
-    tab_color: Support::Unsupported("Alacritty has no tabs"),
+    tab_color: Protocol::new(&Support::Unsupported("Alacritty has no tabs")),
     attention: AttentionCaps {
         bell: Support::Unverifiable("Alacritty's own bell configuration decides whether it \
                                     is seen"),
-        notify: Support::Unsupported("the vte crate's OSC table carries no notification grammar"),
-        progress: Support::Unsupported("the vte crate's OSC table carries no progress grammar"),
+        notify: Protocol::new(&Support::Unsupported("the vte crate's OSC table carries no notification grammar")),
+        progress: Protocol::new(&Support::Unsupported("the vte crate's OSC table carries no progress grammar")),
         acknowledge: NO_ACK,
     },
     arming: None,
@@ -212,14 +219,14 @@ pub const WEZTERM: SurfaceCaps = SurfaceCaps {
              not even logged",
         ),
     },
-    tab_color: Support::Unsupported("a colour needs a lua format-tab-title handler reading a \
-                                     SetUserVar, which is configuration on the other side"),
+    tab_color: Protocol::new(&Support::Unsupported("a colour needs a lua format-tab-title handler reading a \
+                                     SetUserVar, which is configuration on the other side")),
     attention: AttentionCaps {
         bell: Support::Unverifiable("WezTerm's own bell configuration decides whether it is seen"),
         // OSC 9 is a toast here too, but this surface also parses OSC 9;4, and
         // 777 carries a title where 9 carries only a body.
-        notify: Support::Available(NotifySyntax::Osc777(Terminator::St)),
-        progress: Support::Available(ProgressSyntax::Osc94(Terminator::St)),
+        notify: Protocol::new(&Support::Available(NotifySyntax::Osc777(Terminator::St))),
+        progress: Protocol::new(&Support::Available(ProgressSyntax::Osc94(Terminator::St))),
         acknowledge: NO_ACK,
     },
     arming: None,
@@ -231,11 +238,11 @@ pub const FOOT: SurfaceCaps = SurfaceCaps {
     human: "foot",
     elide: Elide::Right,
     title: TITLE_ALL,
-    tab_color: Support::Unsupported("foot has no tabs"),
+    tab_color: Protocol::new(&Support::Unsupported("foot has no tabs")),
     attention: AttentionCaps {
         bell: Support::Unverifiable("foot's own bell configuration decides whether it is seen"),
-        notify: Support::Available(NotifySyntax::Osc99(Terminator::St)),
-        progress: Support::Unsupported("OSC 9;4 is not in foot-ctlseqs"),
+        notify: Protocol::new(&Support::Available(NotifySyntax::Osc99(Terminator::St))),
+        progress: Protocol::new(&Support::Unsupported("OSC 9;4 is not in foot-ctlseqs")),
         acknowledge: NO_ACK,
     },
     arming: None,
@@ -247,11 +254,11 @@ pub const GHOSTTY: SurfaceCaps = SurfaceCaps {
     human: "Ghostty",
     elide: Elide::Right,
     title: TITLE_ALL,
-    tab_color: Support::Unsupported("Ghostty has no tab-colour escape"),
+    tab_color: Protocol::new(&Support::Unsupported("Ghostty has no tab-colour escape")),
     attention: AttentionCaps {
         bell: Support::Unverifiable("Ghostty's own bell configuration decides whether it is seen"),
-        notify: Support::Available(NotifySyntax::Osc99(Terminator::St)),
-        progress: Support::Available(ProgressSyntax::Osc94(Terminator::St)),
+        notify: Protocol::new(&Support::Available(NotifySyntax::Osc99(Terminator::St))),
+        progress: Protocol::new(&Support::Available(ProgressSyntax::Osc94(Terminator::St))),
         acknowledge: NO_ACK,
     },
     arming: None,
@@ -267,11 +274,11 @@ pub const XTERM: SurfaceCaps = SurfaceCaps {
     human: "xterm",
     elide: Elide::Right,
     title: TITLE_ALL,
-    tab_color: Support::Unsupported("xterm has no tabs"),
+    tab_color: Protocol::new(&Support::Unsupported("xterm has no tabs")),
     attention: AttentionCaps {
         bell: Support::Unverifiable("bellIsUrgent, default false"),
-        notify: Support::Unsupported("no notification grammar is in ctlseqs"),
-        progress: Support::Unsupported("no progress grammar is in ctlseqs"),
+        notify: Protocol::new(&Support::Unsupported("no notification grammar is in ctlseqs")),
+        progress: Protocol::new(&Support::Unsupported("no progress grammar is in ctlseqs")),
         acknowledge: NO_ACK,
     },
     arming: None,
@@ -283,13 +290,13 @@ pub const ITERM2: SurfaceCaps = SurfaceCaps {
     human: "iTerm2",
     elide: Elide::Right,
     title: TITLE_ALL,
-    tab_color: Support::Available(TabColor::Osc1337(Terminator::St)),
+    tab_color: Protocol::new(&Support::Available(TabColor::Osc1337(Terminator::St))),
     attention: AttentionCaps {
         bell: Support::Unverifiable("iTerm2's own bell configuration decides whether it is seen"),
         // The one surface whose only notification grammar is the overloaded OSC
         // 9; the `4;` prefix is what keeps it apart from the progress row above.
-        notify: Support::Available(NotifySyntax::Osc9(Terminator::St)),
-        progress: Support::Available(ProgressSyntax::Osc94(Terminator::St)),
+        notify: Protocol::new(&Support::Available(NotifySyntax::Osc9(Terminator::St))),
+        progress: Protocol::new(&Support::Available(ProgressSyntax::Osc94(Terminator::St))),
         acknowledge: NO_ACK,
     },
     arming: None,
@@ -311,11 +318,11 @@ pub const APPLE_TERMINAL: SurfaceCaps = SurfaceCaps {
             "no source and no documentation; it must be measured on a Mac",
         ),
     },
-    tab_color: Support::Unsupported("no per-tab colour escape is documented"),
+    tab_color: Protocol::new(&Support::Unsupported("no per-tab colour escape is documented")),
     attention: AttentionCaps {
         bell: Support::Unverifiable("the profile's bell setting decides whether it is seen"),
-        notify: Support::Unsupported("no notification grammar is documented"),
-        progress: Support::Unsupported("no progress grammar is documented"),
+        notify: Protocol::new(&Support::Unsupported("no notification grammar is documented")),
+        progress: Protocol::new(&Support::Unsupported("no progress grammar is documented")),
         acknowledge: NO_ACK,
     },
     arming: None,
@@ -340,11 +347,11 @@ pub const WINDOWS_TERMINAL: SurfaceCaps = SurfaceCaps {
         osc2: Support::Unverifiable("profiles.suppressApplicationTitle silently discards it"),
         stack_22t: Support::Unsupported("WindowManipulationType has no 22 and no 23"),
     },
-    tab_color: Support::Unsupported("tabColor is a profile setting; there is no colour verb"),
+    tab_color: Protocol::new(&Support::Unsupported("tabColor is a profile setting; there is no colour verb")),
     attention: AttentionCaps {
         bell: Support::Unverifiable("bellStyle decides whether it is seen"),
-        notify: Support::Unverifiable("compatibility.allowOSC777, default false"),
-        progress: Support::Available(ProgressSyntax::Osc94(Terminator::Bel)),
+        notify: Protocol::new(&Support::Unverifiable("compatibility.allowOSC777, default false")),
+        progress: Protocol::new(&Support::Available(ProgressSyntax::Osc94(Terminator::Bel))),
         acknowledge: NO_ACK,
     },
     arming: None,
@@ -363,13 +370,13 @@ pub const CONHOST: SurfaceCaps = SurfaceCaps {
         osc2: YES,
         stack_22t: Support::Unsupported("WindowManipulationType has no 22 and no 23"),
     },
-    tab_color: Support::Unsupported("conhost has no tabs"),
+    tab_color: Protocol::new(&Support::Unsupported("conhost has no tabs")),
     attention: AttentionCaps {
         bell: Support::Unverifiable("the console host's own bell setting decides whether it \
                                     is seen"),
-        notify: Support::Unsupported("conhost never sets the DesktopNotification optional feature"),
-        progress: Support::Unverifiable("the taskbar ring belongs to the Windows Terminal host; \
-                                         conhost's own handling is not documented"),
+        notify: Protocol::new(&Support::Unsupported("conhost never sets the DesktopNotification optional feature")),
+        progress: Protocol::new(&Support::Unverifiable("the taskbar ring belongs to the Windows Terminal host; \
+                                         conhost's own handling is not documented")),
         acknowledge: NO_ACK,
     },
     arming: None,
@@ -391,12 +398,12 @@ pub const VSCODE: SurfaceCaps = SurfaceCaps {
             "ITerminalOptions.windowOptions is {} by default and VS Code does not set pushTitle",
         ),
     },
-    tab_color: Support::Unsupported("createTerminal({color}) is an extension API, not an escape"),
+    tab_color: Protocol::new(&Support::Unsupported("createTerminal({color}) is an extension API, not an escape")),
     attention: AttentionCaps {
         bell: Support::Unverifiable("terminal.integrated.enableBell decides whether it is seen"),
-        notify: Support::Unverifiable("the OSC 99 handler is gated on VS Code's own \
-                                       enable-notifications setting"),
-        progress: Support::Unsupported("no progress grammar is in xterm.js's OSC table"),
+        notify: Protocol::new(&Support::Unverifiable("the OSC 99 handler is gated on VS Code's own \
+                                       enable-notifications setting")),
+        progress: Protocol::new(&Support::Unsupported("no progress grammar is in xterm.js's OSC table")),
         acknowledge: NO_ACK,
     },
     arming: None,

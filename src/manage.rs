@@ -3086,13 +3086,16 @@ fn surface_names() -> String {
 /// of the report.
 ///
 /// This is the user-visible payoff of the whole backend refactor: the axes existed
-/// and nobody could see them. Every verdict here is the same value the paint path
-/// reads - a `&'static` capability row, or a `HAS_*` / `Option` a platform function
-/// answered with - so the table cannot claim a capability the program does not act
-/// on.
+/// and nobody could see them. Platform verdicts lift the paint path's native
+/// answers; the surface resolves its protocol catalogue against version evidence
+/// here, without adding version queries to the painting path.
 fn report_stack(cfg: &Config) {
     report_platform(cfg);
-    report_leaf(cfg.stack.leaf, Some(&leaf_evidence(cfg)));
+    report_leaf(
+        cfg.stack.leaf,
+        Some(&leaf_evidence(cfg)),
+        surface::version_evidence(cfg.stack.leaf, cfg.stack.claimed.is_some()),
+    );
     report_mux(&cfg.stack);
 }
 
@@ -3287,9 +3290,13 @@ fn report_platform(cfg: &Config) {
 ///
 /// `evidence` is `None` for `doctor --surface <name>`, where there is no session to
 /// have evidence about - the point of that spelling is to read a table for a machine
-/// this is not. Everything else about the block is the same in both, so the two
-/// diff cleanly.
-fn report_leaf(s: Surface, evidence: Option<&Support<String>>) {
+/// this is not. Versioned protocols use the surface's reporting resolver in both
+/// modes; the offline catalogue never borrows evidence from the local environment.
+fn report_leaf(
+    s: Surface,
+    evidence: Option<&Support<String>>,
+    version: surface::VersionEvidence,
+) {
     let c = s.caps();
     axis("surface", c.name, &format!("{}, {}", c.human, c.source.why()));
     if let Some(e) = evidence {
@@ -3315,23 +3322,11 @@ fn report_leaf(s: Surface, evidence: Option<&Support<String>>) {
     cap("title (OSC 1)", &c.title.osc1, "");
     cap("title (OSC 2)", &c.title.osc2, "");
     cap("title stack (CSI 22t)", &c.title.stack_22t, "");
-    let colour = match &c.tab_color {
-        Support::Available(g) => grammar(g.grammar()),
-        _ => String::new(),
-    };
-    cap("tab colour", &c.tab_color, &colour);
+    report_protocol("tab colour", &c.tab_color, version, |g| g.grammar());
     let a = &c.attention;
     cap("bell", &a.bell, "");
-    let notify = match &a.notify {
-        Support::Available(g) => grammar(g.grammar()),
-        _ => String::new(),
-    };
-    cap("notification", &a.notify, &notify);
-    let progress = match &a.progress {
-        Support::Available(g) => grammar(g.grammar()),
-        _ => String::new(),
-    };
-    cap("taskbar progress", &a.progress, &progress);
+    report_protocol("notification", &a.notify, version, |g| g.grammar());
+    report_protocol("taskbar progress", &a.progress, version, |g| g.grammar());
     cap("acknowledge", &a.acknowledge, "");
     // `Option<Arming>` has nowhere to carry a reason, so the two absences are spelled
     // here. They are not the same absence: twelve surfaces need no arming, and
@@ -3355,6 +3350,24 @@ fn report_leaf(s: Surface, evidence: Option<&Support<String>>) {
             more("which is the terminal's COMPILED-IN default, not your profile");
         }
         None => cap("arm / restore", &armed, ""),
+    }
+}
+
+/// Format the resolved claim and retain the catalogue grammar and requirement
+/// even when the running terminal's version cannot establish support.
+fn report_protocol<T>(
+    name: &str,
+    protocol: &surface::Protocol<T>,
+    version: surface::VersionEvidence,
+    syntax: impl Fn(&T) -> (&'static str, Terminator),
+) {
+    let detail = match protocol.catalogue {
+        Support::Available(g) => grammar(syntax(g)),
+        _ => String::new(),
+    };
+    cap(name, protocol.reported(version), &detail);
+    if let Some(minimum) = protocol.minimum {
+        more(&format!("{detail}; requires {minimum} or newer"));
     }
 }
 
@@ -3418,7 +3431,7 @@ fn surface_table(name: &OsStr) -> i32 {
         return 1;
     };
     version();
-    report_leaf(s, None);
+    report_leaf(s, None, surface::VersionEvidence::Catalogue);
     // At the AXIS's own column, not a capability's: indented to `more`'s depth it
     // would read as a third line of the arming row above it.
     say(&format!(

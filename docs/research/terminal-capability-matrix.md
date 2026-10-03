@@ -12,6 +12,27 @@ gh_osc.zig, gt_client.cc, konsole_session.cpp).
 
 ---
 
+## Runtime version reporting
+
+The matrix describes terminal families and the surveyed implementations, not a
+proof that every installed release implements every listed protocol. The executable
+requirements live beside their grammars in `src/surface/rows.rs`, the authoritative
+source for both runtime reporting and the offline catalogue:
+
+| Konsole protocol | Minimum release |
+|---|---|
+| OSC 777 notification | 23.04.0 |
+| OSC 34 tab colour | 24.12.0 |
+| OSC 9;4 progress | 26.04.0 |
+
+These are the existing Konsole floors carried by the surface row, now enforced in
+reporting; no new protocol survey or emission is implied. Ordinary doctor resolves
+these against usable `KONSOLE_VERSION` evidence. Older versions report `n/a`;
+missing, invalid or mux-inherited evidence reports `?`. `doctor --surface konsole`
+shows the grammars and requirements as an offline catalogue, without claiming a
+running version. The full evidence policy is in
+[the architecture](../architecture.md#protocol-catalogue-and-running-version-evidence).
+
 ## 0. Legend
 
 | mark | meaning |

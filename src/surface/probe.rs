@@ -18,6 +18,47 @@ use super::Surface;
 use crate::config;
 use std::ffi::OsStr;
 
+/// Evidence for reporting versioned protocols, deliberately separate from the
+/// presence-only family detector on the painting path.
+#[derive(Clone, Copy)]
+pub enum VersionEvidence {
+    Catalogue,
+    Missing,
+    Invalid,
+    Unreliable,
+    Konsole(u32),
+}
+
+/// Cold-path query only. An override establishes the family, not a version.
+/// A claimed mux vetoes inherited versions even if disabled or malformed: neither
+/// its server environment nor a family hint proves the versions of its clients.
+pub fn version_evidence(surface: Surface, in_mux: bool) -> VersionEvidence {
+    if surface != Surface::Konsole {
+        return VersionEvidence::Missing;
+    }
+    konsole_version(std::env::var_os("KONSOLE_VERSION").as_deref(), in_mux)
+}
+
+fn konsole_version(raw: Option<&OsStr>, in_mux: bool) -> VersionEvidence {
+    if in_mux {
+        return VersionEvidence::Unreliable;
+    }
+    let Some(bytes) = raw.map(OsStr::as_encoded_bytes).filter(|b| !b.is_empty()) else {
+        return VersionEvidence::Missing;
+    };
+    // Konsole exports major * 10000 + minor * 100 + patch. The supported
+    // calendar-release spelling is exactly YYMMZZ; reject signs, whitespace,
+    // suffixes, non-UTF-8 and out-of-range months rather than guessing a tier.
+    if bytes.len() != 6 || !bytes.iter().all(u8::is_ascii_digit) {
+        return VersionEvidence::Invalid;
+    }
+    let version = bytes.iter().fold(0u32, |v, b| v * 10 + u32::from(b - b'0'));
+    if version / 10000 == 0 || !(1..=12).contains(&(version / 100 % 100)) {
+        return VersionEvidence::Invalid;
+    }
+    VersionEvidence::Konsole(version)
+}
+
 /// One environment-shaped piece of evidence, as data.
 pub struct Probe {
     /// Tested with `config::flag` semantics - set and non-empty - so `TMUX=''`
@@ -246,6 +287,34 @@ pub fn by_name(name: &[u8]) -> Option<Surface> {
 mod tests {
     use super::*;
     use crate::surface::Elide;
+
+    #[test]
+    fn version_evidence_requires_a_complete_calendar_version() {
+        for raw in [None, Some("")] {
+            assert!(matches!(konsole_version(raw.map(OsStr::new), false), VersionEvidence::Missing));
+        }
+        for raw in ["23.04", "23040", "0230400", "+230400", " 230400", "230400\n",
+                    "230400beta", "230000", "231300", "000100", "999999", "é30400"] {
+            assert!(matches!(konsole_version(Some(OsStr::new(raw)), false), VersionEvidence::Invalid), "{raw:?}");
+        }
+        for raw in ["220400", "230400", "241200", "260400", "260801"] {
+            assert!(matches!(konsole_version(Some(OsStr::new(raw)), false), VersionEvidence::Konsole(v) if v == raw.parse::<u32>().unwrap()));
+        }
+    }
+
+    #[test]
+    fn mux_versions_are_unreliable_even_when_well_formed() {
+        for raw in [None, Some("260400"), Some("220400"), Some("invalid")] {
+            assert!(matches!(konsole_version(raw.map(OsStr::new), true), VersionEvidence::Unreliable));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_version_is_invalid() {
+        use std::os::unix::ffi::OsStrExt;
+        assert!(matches!(konsole_version(Some(OsStr::from_bytes(b"2604\xff0")), false), VersionEvidence::Invalid));
+    }
 
     /// The environment as a literal set of names, so a test never depends on the
     /// process it runs in.

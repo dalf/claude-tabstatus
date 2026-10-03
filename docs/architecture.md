@@ -1304,8 +1304,8 @@ multiplexer tmux
 ```
 
 The verdict column has exactly five words - `ok`, `n/a`, `off`, `?`, `fail` - and
-each one means something different. `n/a` is "this cannot, ever"; `off` names a knob
-of **ours** you can turn back on; `?` is "the terminal may or may not honour it and
+each one means something different. `n/a` means unsupported by this terminal or
+version; `off` names a knob of **ours** you can turn back on; `?` is "the terminal may or may not honour it and
 nothing we can read says which", which is what Windows Terminal's
 `compatibility.allowOSC777` and `profiles.suppressApplicationTitle` force; and `fail`
 is an attempt the OS refused. Escape bytes are **named, never written** - doctor is
@@ -1327,6 +1327,36 @@ diffs cleanly against the block inside the full report. The names are the fourte
 `CCTAB_TERMINAL` accepts: `unknown`, `konsole`, `vte`, `kitty`, `alacritty`,
 `wezterm`, `foot`, `ghostty`, `xterm`, `iterm2`, `apple-terminal`,
 `windows-terminal`, `conhost`, `vscode`.
+
+### Protocol catalogue and running-version evidence
+
+`surface::Protocol<T>` keeps a catalogue grammar separate from its reporting
+verdict. Each known minimum is typed data beside the grammar in
+`src/surface/rows.rs`; `Protocol::reported` resolves it, and doctor only formats
+that answer plus the grammar and requirement. `Support<T>` itself is unchanged.
+The three Konsole entries have the floors recorded in the
+[capability matrix](research/terminal-capability-matrix.md#runtime-version-reporting).
+
+Only ordinary doctor reads version evidence, through `surface::version_evidence`.
+It accepts Konsole's six ASCII digits `YYMMZZ` (non-zero year, month 01–12,
+two-digit patch), compares the whole value including the patch, and rejects
+partial numbers, signs, whitespace, suffixes and non-UTF-8 values. A known older
+version yields `Unsupported`; absent, malformed or unreliable evidence yields
+`Unverifiable`. A non-empty `$TMUX` or `$STY` vetoes the inherited version even
+when mux integration is disabled or the mux value is malformed. A terminal-family
+override or mux family hint does not establish any client's version. Outside a
+mux, an explicitly forwarded version over SSH is taken at its word, like the
+existing family evidence; no active terminal query is attempted.
+
+`doctor --surface` always uses catalogue mode and ignores local version evidence.
+It prints `?` for versioned entries, retaining their grammar and required minimum.
+Entries without a recorded floor retain their existing catalogue verdict; this
+change does not claim to have surveyed version floors for all terminal families.
+
+The reporting resolver is absent from `Config`, title composition, arming and
+routing. Family detection remains presence-only, so even malformed version text
+continues to select the same title and arming behaviour. No attention or colour
+emission is implemented, and the shared tmux arming ownership fix is unchanged.
 
 ## Konsole arming
 

@@ -34,7 +34,7 @@ pub mod compose;
 mod probe;
 mod rows;
 
-pub use probe::{by_name, evidence, resolve_leaf};
+pub use probe::{by_name, evidence, resolve_leaf, version_evidence, VersionEvidence};
 
 use crate::support::{Presence, Support};
 
@@ -261,8 +261,8 @@ pub struct AttentionCaps {
     /// setting that decides it: xterm's `bellIsUrgent` defaults to false, and
     /// every other terminal hides the same choice under its own name.
     pub bell: Presence,
-    pub notify: Support<NotifySyntax>,
-    pub progress: Support<ProgressSyntax>,
+    pub notify: Protocol<NotifySyntax>,
+    pub progress: Protocol<ProgressSyntax>,
     /// The INBOUND half: being told the tab was looked at. `Unsupported` on every
     /// surface, permanently, under this process model - fd 0 is /dev/null,
     /// /dev/tty is unusable and nothing in this crate is long-lived. It is in the
@@ -341,6 +341,67 @@ impl Arming {
     }
 }
 
+/// A protocol catalogue entry, with any known version requirement alongside its
+/// syntax. Catalogue support alone is not evidence about the running terminal.
+/// Only reporting resolves these requirements; title emission and arming do not.
+pub struct Protocol<T: 'static> {
+    pub catalogue: &'static Support<T>,
+    pub minimum: Option<MinimumVersion>,
+}
+
+/// Version schemes belong to the surface, not to doctor. Add another scheme when
+/// a catalogue entry has a documented floor and usable evidence for that family.
+#[derive(Clone, Copy)]
+pub enum MinimumVersion {
+    Konsole(u32),
+}
+
+impl std::fmt::Display for MinimumVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Konsole(v) => write!(f, "Konsole {}.{:02}.{}", v / 10000, v / 100 % 100, v % 100),
+        }
+    }
+}
+
+impl<T> Protocol<T> {
+    pub const fn new(catalogue: &'static Support<T>) -> Self {
+        Self { catalogue, minimum: None }
+    }
+
+    pub const fn since(catalogue: &'static Support<T>, minimum: MinimumVersion) -> Self {
+        Self { catalogue, minimum: Some(minimum) }
+    }
+
+    /// Resolve a reporting claim without changing or discarding the catalogue's
+    /// grammar. Unknown evidence never promotes a versioned entry to Available.
+    pub fn reported(&self, evidence: VersionEvidence) -> &Support<T> {
+        let Some(minimum) = self.minimum else {
+            return self.catalogue;
+        };
+        match (minimum, evidence) {
+            (MinimumVersion::Konsole(floor), VersionEvidence::Konsole(v)) if v >= floor => {
+                self.catalogue
+            }
+            (MinimumVersion::Konsole(_), VersionEvidence::Konsole(_)) => {
+                &Support::Unsupported("the reported terminal version is below the required minimum")
+            }
+            (_, VersionEvidence::Catalogue) => {
+                &Support::Unverifiable("protocol catalogue only; no running terminal version checked")
+            }
+            (_, VersionEvidence::Missing) => {
+                &Support::Unverifiable("KONSOLE_VERSION is missing or empty; the version is not established")
+            }
+            (_, VersionEvidence::Invalid) => {
+                &Support::Unverifiable("KONSOLE_VERSION is invalid; expected six ASCII digits YYMMZZ with month 01..12")
+            }
+            (_, VersionEvidence::Unreliable) => {
+                &Support::Unverifiable("KONSOLE_VERSION cannot establish client versions inside a multiplexer")
+            }
+        }
+    }
+}
+
 /// Everything one surface can do, as one `const`. No method, no receiver, no
 /// dispatch: a new surface is a row, not a code path, and doctor can print the
 /// whole table for a terminal this machine cannot run.
@@ -357,7 +418,7 @@ pub struct SurfaceCaps {
     /// Read by doctor's capability table, and by #11 when it lands. It is here
     /// because tab colour rides in Konsole's arming property list, and a colour
     /// armed without a restore outlives the session.
-    pub tab_color: Support<TabColor>,
+    pub tab_color: Protocol<TabColor>,
     /// Read by doctor's capability table, and by #14 when it lands.
     pub attention: AttentionCaps,
     /// `Some` iff this surface needs arming AND the paired restore is known.
@@ -374,6 +435,48 @@ mod tests {
     use super::*;
     use std::borrow::Cow;
 
+    fn konsole_labels(evidence: VersionEvidence) -> [&'static str; 3] {
+        let c = Surface::Konsole.caps();
+        [
+            c.attention.notify.reported(evidence).label(),
+            c.tab_color.reported(evidence).label(),
+            c.attention.progress.reported(evidence).label(),
+        ]
+    }
+
+    #[test]
+    fn konsole_protocols_resolve_at_each_version_boundary() {
+        for (version, expected) in [
+            (220400, ["n/a", "n/a", "n/a"]),
+            (230399, ["n/a", "n/a", "n/a"]),
+            (230400, ["ok", "n/a", "n/a"]),
+            (230401, ["ok", "n/a", "n/a"]),
+            (241199, ["ok", "n/a", "n/a"]),
+            (241200, ["ok", "ok", "n/a"]),
+            (241201, ["ok", "ok", "n/a"]),
+            (260399, ["ok", "ok", "n/a"]),
+            (260400, ["ok", "ok", "ok"]),
+            (260401, ["ok", "ok", "ok"]),
+        ] {
+            assert_eq!(konsole_labels(VersionEvidence::Konsole(version)), expected, "{version}");
+        }
+    }
+
+    #[test]
+    fn unknown_versions_do_not_promote_catalogue_protocols() {
+        for evidence in [
+            VersionEvidence::Catalogue, VersionEvidence::Missing,
+            VersionEvidence::Invalid, VersionEvidence::Unreliable,
+        ] {
+            assert_eq!(konsole_labels(evidence), ["?", "?", "?"]);
+            let c = Surface::Konsole.caps();
+            assert!(c.attention.notify.catalogue.is_available());
+            assert!(c.tab_color.catalogue.is_available());
+            assert!(c.attention.progress.catalogue.is_available());
+            assert!(c.attention.notify.reported(evidence).reason().is_some());
+        }
+    }
+
     /// Every capability answer of one row, as the two things a report shows: the
     /// label and the reason. `Support` is neither `Copy` nor `PartialEq` - it
     /// holds an `io::Error` - so a table walk compares what doctor would print
@@ -386,10 +489,10 @@ mod tests {
             ("osc1", c.title.osc1.label(), c.title.osc1.reason()),
             ("osc2", c.title.osc2.label(), c.title.osc2.reason()),
             ("stack_22t", c.title.stack_22t.label(), c.title.stack_22t.reason()),
-            ("tab_color", c.tab_color.label(), c.tab_color.reason()),
+            ("tab_color", c.tab_color.catalogue.label(), c.tab_color.catalogue.reason()),
             ("bell", c.attention.bell.label(), c.attention.bell.reason()),
-            ("notify", c.attention.notify.label(), c.attention.notify.reason()),
-            ("progress", c.attention.progress.label(), c.attention.progress.reason()),
+            ("notify", c.attention.notify.catalogue.label(), c.attention.notify.catalogue.reason()),
+            ("progress", c.attention.progress.catalogue.label(), c.attention.progress.catalogue.reason()),
             (
                 "acknowledge",
                 c.attention.acknowledge.label(),
