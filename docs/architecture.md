@@ -621,7 +621,9 @@ PID is not used as evidence of death: macOS deliberately reports it unverifiable
 The existing multi-process lock/race tests also run in the native Rust suite.
 
 `tests/test_unix_delivery.py` captures exact session-start/session-end bytes from
-newly allocated raw PTYs, with hook stdio on pipes. It checks the Apple Terminal,
+newly allocated raw PTYs, with the real hook in a fresh session and all its stdio
+on pipes. A separate stand-in owns the target controlling PTY. It checks the
+Apple Terminal,
 iTerm2, generic and Konsole rows, the remembered restore obligation after a
 surface change, the ordinary hook's matching protocol payload, and the native
 record origin key. These row selections simulate configuration, not terminal apps.
@@ -629,6 +631,29 @@ Missing, malformed and exited PIDs, compaction and dry-run must deliver no bytes
 File, pipe and `/dev/null` redirections retain a real controlling terminal: the
 suite checks that neither that terminal nor the redirected output receives a title.
 Every subprocess and state directory is disposable; no user terminal is a target.
+
+The same suite now requires a native SDK-built dyld observer on Darwin. It records
+the flags of the actual production terminal open on both `session-start`/`session-end`
+and `tmux-arm <disposable-pty>`, verifies `O_NOCTTY` and the descriptor's close-on-exec
+bit, and observes descriptor metadata, terminal checks, writes and closure. It reads
+the detached child's controlling-terminal flags through `proc_pidinfo` before and
+after the open and at exit, independently of byte capture. It also checks an unowned
+PTY with `tmux-arm`. That command exercises the native client-opening helper without
+a tmux server; it does not establish full macOS tmux behaviour.
+
+Test-only interposition substitutes a regular file or `/dev/null` after the path
+guard, injects descriptor-metadata and terminal-check failures, and checks no bytes
+are written and the rejected descriptor is closed. Open/write failures and partial
+writes retain recorded restoration policy. A test-only Rust probe compiles the
+production Unix backend against the existing native libc build artefact and checks
+the actual `session_tty`/`write_tty` return values, including inspection-error mapping;
+the real CLI deliberately hides these outcomes. Missing open observations and a native
+control that deliberately omits `O_NOCTTY` must fail the flag check. The control
+reports its observed controlling-terminal state; acquiring one is not a required
+negative control on a kernel where an ordinary PTY open does not acquire it.
+Native execution of this hardening and its observer is **pending**; the recorded
+successful run above predates them. Cross-checks do not prove runtime open flags or
+controlling-terminal behaviour. ACL, path and detection suites remain required.
 
 `tests/test_terminal_detection.py` adds compiled-binary configuration tests for
 doctor's selected family and evidence, ordinary title protocol bytes, exact vendor
@@ -661,9 +686,9 @@ The Linux zero-subprocess gate is unchanged and still required for both binaries
 tab on Unix by writing to Claude Code's pty. Linux resolves the pty by reading the
 symlink `/proc/$CLAUDE_PID/fd/1`; macOS has no `/proc` and asks the kernel for the
 same file descriptor's path with `proc_pidfdinfo`. Everything after that - the
-`/dev/pts/` or `/dev/tty` prefix, the character-device test, the writable test -
-is one shared body, so the two Unixes accept and refuse exactly the same
-terminals. Konsole arming and the direct writes to tmux's panes go the same way,
+`/dev/pts/` or `/dev/tty` prefix, pathname character-device test, write-only open,
+then descriptor metadata and `IsTerminal` checks - is one shared helper. Konsole
+arming and the direct writes to tmux's panes go the same way,
 through the same guard, on both. The macOS native job now tests those OS calls
 and direct delivery, with a successful arm64 run recorded; see
 [macOS validation](#macos-validation) for evidence and limits. On Windows they
@@ -672,7 +697,38 @@ hidden console, attaches to Claude Code's (`$CLAUDE_PID`), calls
 `SetConsoleTitleW` - the idle title, or an empty one at the end - and detaches; the
 pseudo console under Windows Terminal forwards that as an OSC 0.
 
-The headless guard is three proofs, and any "no" paints nothing:
+Unix session delivery and tmux client arming/restoration retain the same acquired
+File through delivery, never reopening a checked pathname. On Darwin the shared
+open explicitly requests libc's `O_NOCTTY`; std's `OpenOptions` still supplies
+close-on-exec. Linux retains its existing flags and no libc dependency is added
+there. Descriptor validation intentionally tightens both Unix routes: a pathname
+that passes its guard can still yield a non-character or non-terminal descriptor,
+which is refused before writing. This adds descriptor inspection syscalls (`fstat`
+or the platform equivalent and the `IsTerminal` check); zero subprocesses does not
+mean zero additional syscalls or establish unchanged latency.
+
+`session_tty` returns an eligible File or `None`, including on open or inspection
+errors. `write_tty` returns `Ok(false)` for path/type refusals and failed terminal
+checks (`IsTerminal` returns false on inspection errors), `Ok(true)` for completed
+transport, and an error for open, descriptor-metadata or write failures. Path-metadata
+errors retain their previous refusal mapping. A write error may follow partial
+transport. Rejected Files are dropped, and no outcome cancels recorded restoration
+policy or prevents attempts to other tmux clients. Ordinary `terminalSequence`
+delivery and the title, arm and restore byte sequences are unchanged.
+
+This is hardening, not a reproduced macOS controlling-terminal acquisition failure.
+[POSIX leaves acquisition without O_NOCTTY implementation-defined](https://pubs.opengroup.org/onlinepubs/9799919799/functions/open.html).
+[Darwin's open manual](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/open.2)
+documents the flag, while the current
+[XNU PTY open path](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/tty_dev.c)
+does not itself establish that ordinary PTY opens acquire a controlling terminal.
+The requested flag, observed session state and successful transport are separate
+evidence. Production introduces no mode changes, foreground-group changes or
+`TIOCSCTTY` calls. Descriptor type/TTY checks do not bind the terminal to the
+originally queried vnode or process: PID reuse and pathname/terminal-identity races
+remain outside this change.
+
+The Windows headless guard is three proofs, and any "no" paints nothing:
 
 1. `$CLAUDE_PID` is a running ancestor of the hook.
 2. Its current stdout, read out of its PEB, is a character device (refusing

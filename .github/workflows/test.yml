@@ -140,7 +140,9 @@ jobs:
           CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
         run: python3 tests/test_install_paths.py
 
-      - name: Run native state and disposable PTY tests
+      # The PTY suite requires SDK-built observation of actual O_NOCTTY opens on
+      # both session delivery and tmux-arm, including refusal/fault controls.
+      - name: Run native state, detached PTY delivery and terminal-open hardening tests
         env:
           CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
         run: |

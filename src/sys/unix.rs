@@ -82,7 +82,7 @@
 use std::borrow::Cow;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, FileType, Metadata, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -1230,36 +1230,19 @@ fn same_as_recorded(
 /// here; `CLAUDE_PID` is exported into every hook subprocess.
 ///
 /// THE HEADLESS GUARD: unless fd 1 of that pid resolves to a writable character
-/// device under /dev/pts or /dev/tty, do nothing rather than retitle an unrelated
+/// device under /dev/pts or /dev/tty, and the acquired descriptor is a character
+/// device and an actual terminal, do nothing rather than retitle an unrelated
 /// terminal - which covers a redirected `claude -p` and every platform where fd 1
 /// cannot be resolved at all. `None` is therefore both "no tab to paint" and "fd 1
 /// would not resolve", deliberately the same answer: painting on a guess is the one
 /// outcome that retitles somebody else's terminal.
 ///
-/// ONE body for every Unix. Only [`fd1_path`] is `cfg`-selected, because only the
-/// lookup differs; the three checks below are the contract and they are the same
-/// three whichever kernel answered.
+/// Lookup, open and inspection failures all return `None`. The shared
+/// [`open_tty`] retains the acquired descriptor and requests `O_NOCTTY` on Darwin;
+/// hooks may themselves be detached session leaders without a controlling terminal.
 pub fn session_tty(claude_pid: &OsStr) -> Option<File> {
     let target = fd1_path(claude_pid)?;
-    if !is_tty_path(&target) || !is_char_device(&target.metadata().ok()?.file_type()) {
-        return None;
-    }
-    // Asking whether it is writable and opening it are the same question; ask it
-    // once.
-    //
-    // NO `O_NOCTTY`, and that is a decision rather than an omission, because this
-    // opens somebody else's terminal by name and the flag is the obvious hardening.
-    // What it would guard against is acquiring a controlling terminal by accident,
-    // which takes a session leader that has none; the hook is a child of `claude`
-    // and inherits its ctty, so it is never one, and an attempt to reproduce the
-    // acquisition on Linux from a `setsid` process left `tty_nr` at 0. What it
-    // would COST is the part that decides it: `libc` is a
-    // `cfg(target_os = "macos")` dependency here, so spelling `O_NOCTTY` on Linux
-    // means either widening that dependency to every Unix - which
-    // `docs/backend-scouting.md` §5's gate governs and this is not the commit for -
-    // or hand-writing a per-architecture octal constant, which is the exact kind of
-    // guess the macOS declarations below go to such lengths not to make.
-    OpenOptions::new().write(true).open(&target).ok()
+    open_tty(&target).ok().flatten()
 }
 
 /// What fd 1 of `claude_pid` names, where a `/proc` says so: the symlink
@@ -1525,19 +1508,46 @@ pub fn set_session_title(_claude_pid: &OsStr, _title: &str) -> io::Result<bool> 
 
 /// Write to a pty NAMED BY tmux - an attached client's terminal - under the same
 /// guard [`session_tty`] applies to fd 1: under /dev/pts or /dev/tty, a character
-/// device, and writable. `Ok(false)` is a refused/unresolvable destination;
+/// device, and writable, with the opened descriptor checked too.
+/// `Ok(false)` is a refused/unresolvable destination (including a non-terminal
+/// descriptor or a failed `IsTerminal` check);
 /// `Ok(true)` is a completed write, not terminal acknowledgement. An open/write
-/// error is returned; a write error may follow a partial write. The client may
-/// have detached between the listing and the write.
+/// or descriptor-metadata error is returned; a write error may follow a partial
+/// write. Path-metadata failures remain refusals. The client may have detached
+/// between the listing and the write. No outcome changes restore obligations.
 pub fn write_tty(path: &Path, bytes: &[u8]) -> io::Result<bool> {
+    let Some(mut f) = open_tty(path)? else { return Ok(false) };
+    f.write_all(bytes).map(|()| true)
+}
+
+/// Keep the pathname restrictions and supplement them with descriptor checks.
+/// The same File is inspected and delivered; rejected Files are dropped here.
+/// This does not bind the terminal to the process queried by `fd1_path`, or
+/// eliminate pathname races. OpenOptions retains std's close-on-exec behaviour.
+fn open_tty(path: &Path) -> io::Result<Option<File>> {
     if !is_tty_path(path) {
-        return Ok(false);
+        return Ok(None);
     }
     if !path.metadata().is_ok_and(|m| is_char_device(&m.file_type())) {
-        return Ok(false);
+        return Ok(None);
     }
-    let mut f = OpenOptions::new().write(true).open(path)?;
-    f.write_all(bytes).map(|()| true)
+    let mut opts = OpenOptions::new();
+    opts.write(true);
+    // Darwin's existing libc dependency supplies the platform's declaration.
+    // Linux retains its open flags and dependency graph; descriptor validation
+    // below intentionally tightens both Unix routes on both platforms.
+    #[cfg(target_os = "macos")]
+    opts.custom_flags(libc::O_NOCTTY);
+    let f = opts.open(path)?;
+    let metadata = f.metadata();
+    checked_tty(f, metadata)
+}
+
+fn checked_tty(f: File, metadata: io::Result<Metadata>) -> io::Result<Option<File>> {
+    if !is_char_device(&metadata?.file_type()) || !f.is_terminal() {
+        return Ok(None);
+    }
+    Ok(Some(f))
 }
 
 /// A byte prefix, not `Path::starts_with`: /dev/ttyS0 is a single component, so
@@ -1554,6 +1564,30 @@ fn is_char_device(ft: &FileType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opened_descriptor_guards_refuse_files_null_and_inspection_errors() {
+        let path = std::env::temp_dir().join(format!("cctab-tty-guard-{}", std::process::id()));
+        let f = OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        let metadata = f.metadata();
+        let rejected = checked_tty(f, metadata).unwrap().is_none();
+        let untouched = fs::read(&path).unwrap().is_empty();
+        fs::remove_file(&path).unwrap();
+        assert!(rejected && untouched);
+
+        let f = OpenOptions::new().write(true).open("/dev/null").unwrap();
+        let metadata = f.metadata();
+        assert!(is_char_device(&metadata.as_ref().unwrap().file_type()));
+        assert!(!f.is_terminal());
+        assert!(checked_tty(f, metadata).unwrap().is_none());
+
+        let f = File::open("/dev/null").unwrap();
+        let error = checked_tty(f, Err(io::Error::other("injected descriptor inspection failure")));
+        assert_eq!(error.unwrap_err().to_string(), "injected descriptor inspection failure");
+        // Path refusals retain write_tty's existing Ok(false) contract.
+        assert!(!write_tty(Path::new("/dev/null"), b"unused").unwrap());
+        assert!(!write_tty(Path::new("/dev/tty-cctab-missing"), b"unused").unwrap());
+    }
 
     #[test]
     fn native_process_identity_and_headless_guard_follow_a_real_child() {

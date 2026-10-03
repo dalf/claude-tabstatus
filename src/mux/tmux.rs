@@ -548,8 +548,8 @@ fn exe_path() -> Option<String> {
 ///
 /// It takes the pty as an argument instead of asking tmux, so the hook costs one
 /// fork and no socket round trip, and so the verb needs no `$TMUX` of its own.
-/// [`sys::write_tty`] is the guard: /dev/pts or /dev/tty, a character device,
-/// writable. The caller keeps this hook silent even on a write failure.
+/// [`sys::write_tty`] checks the pathname and the acquired terminal descriptor.
+/// The caller keeps this hook silent even on an inspection or write failure.
 pub fn arm_tty(path: &OsStr) -> io::Result<bool> {
     // The verb exists only for Konsole, so it reads Konsole's row directly rather
     // than resolving a surface it has no environment for: the hook fires in a tmux

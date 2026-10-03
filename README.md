@@ -634,6 +634,9 @@ does is in
   is supported, but a client detached when the last Claude exits cannot receive
   the restore. Failed or interrupted writes are not retried; a recorded restore
   obligation does not prove that the terminal applied the arming.
+  Direct Unix delivery also refuses an opened destination that is not a terminal
+  character device. These checks do not prove that a terminal still belongs to
+  the process whose stdout was queried.
 - **`KONSOLE_*` is inherited environment**: an xterm launched from a Konsole
   shell carries it, and there the switch sets the font instead. Set
   `CCTAB_TERMINAL` to anything other than `konsole` to turn it off.

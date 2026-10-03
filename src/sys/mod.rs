@@ -53,13 +53,19 @@
 //! replace with the directory's inherited ACL.
 //!
 //! And THE SESSION'S TAB, for the two edges `terminalSequence` cannot carry. On Unix
-//! it is a pty, resolved by [`session_tty`] and written as bytes. On Windows it is
-//! the console Claude Code runs in, and [`set_session_title`] sets that console's
+//! it is a pty, resolved by [`session_tty`] and written as bytes.
+//! Pathname guards are supplemented by character-device and terminal
+//! checks on the acquired File; that File is retained through delivery. Darwin
+//! terminal opens explicitly request O_NOCTTY. Inspection/open failures return
+//! None from session_tty; write_tty propagates descriptor-metadata/open/write
+//! errors, and returns Ok(false) for type/terminal-check refusals.
+//! On Windows it is the console Claude Code runs in, and [`set_session_title`]
+//! sets that console's
 //! title, which the pseudo console forwards to the terminal as an OSC 0. Each backend
 //! has both functions; the one with nothing to reach says so (`None`, `Ok(false)`),
 //! and [`HAS_SESSION_TTY`] and [`HAS_SESSION_CONSOLE`] say which route exists. Both
-//! routes sit behind the same HEADLESS GUARD - paint only a terminal that provably
-//! belongs to this session - documented at each.
+//! routes sit behind a HEADLESS GUARD documented at each. Unix descriptor checks
+//! establish type/TTY eligibility, not process/terminal identity across races.
 
 #[cfg(unix)]
 mod unix;
