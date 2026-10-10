@@ -39,16 +39,22 @@ work cannot be remembered between hooks. The full policy is in
 |---|---|---|
 | Linux x86_64 | supported; the musl build is static and recommended - it runs on any x86_64 Linux whatever its glibc | `tabstatus-x86_64-unknown-linux-musl` (or `-linux-gnu`) |
 | Windows x86_64, native | supported; needs Git Bash, which Claude Code itself requires on Windows and runs hooks through | `tabstatus-x86_64-pc-windows-msvc.exe` |
-| macOS | **not supported yet** - see [issue #1](https://github.com/dalf/claude-tabstatus/issues/1) | none |
-| aarch64 / ARM | no build; an x86_64 binary fails with *Exec format error*. Check `uname -m` on a remote VM first | none |
+| macOS | **experimental; native arm64 CI validated**. Native builds, process/state checks, disposable PTY delivery and tmux 3.7c acceptance passed on macOS 15 arm64; Intel runtime behaviour remains unvalidated. Automated PTY tests do not establish behaviour in Terminal.app, iTerm2 or other terminal applications; see [issue #1](https://github.com/dalf/claude-tabstatus/issues/1). | none |
+| Linux aarch64 / ARM | no build; an x86_64 binary fails with *Exec format error*. Check `uname -m` on a remote VM first | none |
 
 | Terminal | What you get |
 |---|---|
 | Windows Terminal, and any terminal that honours a plain OSC 0 title | works with no configuration |
 | Konsole | works; the tab is switched to show the title automatically ([Konsole](#konsole)) |
 | Konsole, then ssh to a Linux host | set one variable on the remote side ([Konsole over ssh](#konsole-over-ssh)) |
-| tmux (Linux only) | one indicator per Claude pane, decaying over time ([tmux](#tmux)) |
+| tmux (Linux; experimental on macOS, tested with 3.7c on macOS 15 arm64) | one indicator per Claude pane, decaying over time ([tmux](#tmux)) |
 | GNU screen | no indicator; tmux running inside screen works |
+
+macOS tmux validation uses disposable PTY clients. Real Terminal.app/iTerm2
+behaviour and live Claude Code integration, Intel runtime behaviour, older macOS
+versions and other tmux versions remain unvalidated. PTY observations establish
+transport and tmux behaviour for that configuration; they do not show how a
+terminal application applies the title.
 
 Direct MCP elicitation tracking relies on two hook events found in the Claude
 Code 2.1.274 executable; earlier versions and live interactive delivery have not
@@ -168,6 +174,18 @@ set, or in your `--tree` directory; `doctor` prints the live tree.
 | `--restore-backup` | roll `settings.json` back wholesale to `settings.json.cctab-preinstall` |
 | `--force` | remove the env key even when there is no state record proving it is ours; on Windows, also write a `settings.json` whose filesystem keeps no ACL (see below) |
 
+After an interrupted or failed first install, the record may hold original values
+without confirmation that settings were updated. Reinstall and ordinary uninstall
+then refuse automatic recovery and leave your settings in place. Some older
+records are also ambiguous, particularly if the plugin link is missing or already
+pointed at the recorded target before installation. `--force` does not confirm
+these records. Follow the printed paths: inspect the original key value in the
+record and your current settings, restore only that key manually if appropriate,
+then move the record aside and re-run the desired command. After moving it aside,
+`uninstall --force` explicitly removes the key instead of restoring its original
+value. `--restore-backup` requests whole-file restoration when a backup exists;
+it overwrites unrelated later edits too. Invalid records must first be moved aside.
+
 On Windows a running program's file cannot be deleted, so an `uninstall` run by
 the installed tree's own `bin\tabstatus.exe` is refused with nothing changed:
 run it from another copy, or pass `--keep-tree`. Removal hints there are given as
@@ -196,21 +214,41 @@ Uninstall is an undo, not a delete:
 | the generated plugin tree (manifests and a copy of the binary, `bin/tabstatus`; `bin\tabstatus.exe` on Windows) | `$XDG_DATA_HOME/claude-tabstatus`, default `~/.local/share/claude-tabstatus` (Windows: `%USERPROFILE%\.local\share\claude-tabstatus`); `install --tree <dir>` puts it elsewhere |
 | one settings key | `env.CLAUDE_CODE_DISABLE_TERMINAL_TITLE = "1"` in `~/.claude/settings.json` |
 | the plugin link | `~/.claude/skills/claude-tabstatus` → the tree: a symlink on Linux, a junction on Windows |
-| the install record | `~/.claude/claude-tabstatus.state`: what was there before, and which tree this install owns |
-| per-session records, written by the running plugin | `$XDG_RUNTIME_DIR/claude-tabstatus` on Linux, emptied at logout; `%LOCALAPPDATA%\claude-tabstatus` on Windows, which only `uninstall` empties |
+| the install record | `~/.claude/claude-tabstatus.state`: original values, settings completion and the current generated tree |
+| management lock | `~/.claude/claude-tabstatus.lock`: an empty coordination file, retained after uninstall |
+| per-session records, written by the running plugin | `$XDG_RUNTIME_DIR/claude-tabstatus` on Linux, emptied at logout; `$TMPDIR/claude-tabstatus` on macOS; `%LOCALAPPDATA%\claude-tabstatus` on Windows, which only `uninstall` empties |
 
 The settings key is not optional: Claude Code repaints its own title about once
 a second, straight over this one, and a plugin cannot set environment variables.
 It also means Claude Code no longer clears the title on exit, so this plugin does
 that at `SessionEnd`.
 
-Your own `settings.json` formatting is kept, and so are its permissions (its ACL
-on Windows); a backup is kept at `settings.json.cctab-preinstall`. When `install`
-cannot proceed safely, it refuses, and every refusal ends with **"Nothing has
-been changed."** On Windows that includes a `settings.json` on a filesystem that
+Your own `settings.json` formatting is kept, and so are its permissions (mode bits
+on Unix, plus owner, group and ACLs on macOS; the DACL on Windows); a backup is
+kept at `settings.json.cctab-preinstall`. Settings rewrites and backups refuse an ACL
+they cannot read or preserve. On macOS, filesystems without ACL support and
+operations whose owner or group cannot be preserved with the current privileges
+are also refused; `--force` does not bypass these refusals. A restore keeps the
+live file's protection, or the backup's when the live file is missing. Preflight
+refusals leave installation files unchanged; later I/O errors or interruption can
+leave a partial installation with its recovery record. An empty management lock
+file may remain after a refusal or uninstall. On Windows preflight also refuses a
+`settings.json` on a filesystem that
 keeps no ACL, such as a symlink into a WSL share: edit it from the system it
 lives on, or pass `--force` to `install` or `uninstall` to write it anyway. The
 details are in [docs/architecture.md](docs/architecture.md).
+
+The tree must be outside `<config>/skills` and the source checkout, including
+paths reached through ancestor symlinks. On macOS the guards recognise existing
+case and Unicode-normalisation aliases and respect case-sensitive volumes.
+The tree root itself must be a directory, and its generated directory components
+must not be symlinks. Unresolvable paths are refused before installation writes.
+For differing missing Unicode names on APFS or HFS+, management commands create
+and remove private temporary filename probes beneath the deepest existing ancestor.
+These checks keep no cache and do not run during hooks. The ancestor's timestamps
+can change; interruption or cleanup failure can leave a `.cctab-name-probe-*`
+directory. A probe failure or another filesystem retains uncertainty: create the
+intended ancestor directory first so the filesystem can identify it, then retry.
 
 ## When each colour appears
 
@@ -271,6 +309,36 @@ same informative tail. See [Location tuning](#location-tuning).
 
 ## Terminal setup
 
+### Automatic terminal detection
+
+The terminal family is selected in this order: a non-empty `CCTAB_TERMINAL`, a
+multiplexer hint when available, eligible environment signals, then `unknown`.
+The current multiplexer integration supplies no family hint.
+
+| Build | Automatic signals, highest priority first |
+|---|---|
+| Linux | non-empty `KONSOLE_VERSION`, then non-empty `KONSOLE_DBUS_SESSION` → Konsole |
+| macOS source build | non-empty `ITERM_SESSION_ID` → iTerm2; `LC_TERMINAL=iTerm2` → iTerm2; `TERM_PROGRAM=iTerm.app` → iTerm2 or `TERM_PROGRAM=Apple_Terminal` → Terminal.app |
+| Windows | non-empty `WT_SESSION` → Windows Terminal |
+
+The macOS shared-variable values must match exactly, including case. Whitespace,
+prefixes, suffixes and other values do not match; an unknown earlier value lets
+later signals be checked. For example, `LC_TERMINAL=some-other-terminal` with
+`TERM_PROGRAM=Apple_Terminal` selects Terminal.app.
+
+Non-empty `TMUX` or `STY` suppress inherited Linux and macOS family signals,
+including malformed `TMUX` and tmux disabled through `CCTAB_NO_TMUX`.
+An explicit override still works. Recognised override names such as `konsole`,
+`iterm2` and `apple-terminal` match ASCII case-insensitively; any unrecognised
+non-empty override selects `unknown` and stops automatic detection. An empty
+override is unset. Use `tabstatus doctor` to see the family and matched evidence.
+
+Environment signals are hints: they can be inherited or configured remotely.
+SSH forwarding depends on client and server configuration. Family detection
+establishes neither a terminal version nor that a terminal applied a sequence.
+The macOS validation and support limits in [Supported platforms](#supported-platforms)
+still apply.
+
 ### Windows Terminal
 
 Nothing to configure, and the same goes for any terminal that honours a plain
@@ -305,11 +373,12 @@ enough, with or without tmux on the remote side: it switches the tab to show the
 title and puts the glyph - or, in tmux, the strip - on the end Konsole does not
 elide. You do not need `CCTAB_GLYPH_POS` as well. Inside tmux the switch is sent
 to each attached client's terminal, and a detach-and-reattach re-arms the tab
-automatically.
+automatically. The tab stays armed until the last Claude pane in that tmux session
+ends, even when other panes start with a different `CCTAB_TERMINAL` value.
 
-`CCTAB_TERMINAL` set to anything else says explicitly that the terminal is
-**not** Konsole, which is how you turn off a false detection (an xterm launched
-from a Konsole shell inherits `KONSOLE_*`).
+`CCTAB_TERMINAL=unknown` turns off a false Konsole detection (an xterm launched
+from a Konsole shell inherits `KONSOLE_*`). Other recognised override names
+select their own terminal family; see [automatic detection](#automatic-terminal-detection).
 
 ### tmux
 
@@ -362,6 +431,9 @@ tmux:      OK   tmux 3.7c on /tmp/tmux-1000/default, pane %3
            konsole: off  set CCTAB_TERMINAL=konsole when the outer terminal is Konsole
            ttl: working 1200s, waiting 900s, gone 3600s (0 = never)
 ```
+
+Overlapping Claude starts and exits share ownership of the tmux session's arming.
+The last owner restores Konsole; a new start waits for that teardown before arming.
 
 In Konsole mode it also reports the re-arm hook, and warns when the strip on the
 server is on the other end from the one this session would install:
@@ -484,15 +556,24 @@ host prefix; `CCTAB_ELLIPSIS` and `CCTAB_HOST` change the marker and the prefix.
 | `CCTAB_MAX_HOST` | `16` | characters for the ssh host prefix; `0` = no limit |
 | `CCTAB_ELLIPSIS` | `…` | the elision marker; `...` for an ASCII-only terminal |
 | `CCTAB_HOST` | this machine's hostname | the ssh prefix |
-| `CCTAB_TERMINAL` | unset | `konsole` (any case) arms Konsole's per-tab format even over ssh or inside tmux, and puts the glyph or strip on the end Konsole does not elide; any other value says explicitly NOT Konsole. The one knob here that changes what paints outside tmux as well as in |
+| `CCTAB_TERMINAL` | unset | terminal-family override; recognised names match in any ASCII case, unrecognised non-empty values select `unknown`, empty is unset. `konsole` also arms Konsole's per-tab format and changes glyph placement; see [automatic detection](#automatic-terminal-detection) |
 | `CCTAB_TTL_WORKING` | `1200` | seconds before 🔵 decays to ⚪ (🟣 while background work is known) in a tmux tab; `0` = never |
 | `CCTAB_TTL_WAITING` | `900` | seconds before 🟠 decays to ⚪ (🟣 while background work is known) in a tmux tab, **and** before an outstanding wait expires (applied at the next hook); `0` = never |
 | `CCTAB_TTL_GONE` | `3600` | seconds before a cell leaves the tmux strip; `0` = never |
 | `CCTAB_NO_TMUX` | unset | set to anything: no tmux integration at all |
 | `CCTAB_DRY_RUN` | unset | `1` prints the computed tab title and emits nothing |
-| `CCTAB_STATE_DIR` | `$XDG_RUNTIME_DIR/claude-tabstatus`; on Windows `%LOCALAPPDATA%\claude-tabstatus` | where the per-session records live. Unset with no `XDG_RUNTIME_DIR` (`LOCALAPPDATA`) means background and wait tracking are off. **Use a dedicated, empty directory**: stale records are cleaned up there, and `doctor` lists anything it leaves alone. On Windows give a drive-absolute path (`C:\...`) on NTFS - Git Bash rewrites a `\\server\share` value into a drive-rooted one - and do not share it with WSL: each reads the other's records as having no origin |
+| `CCTAB_STATE_DIR` | `$XDG_RUNTIME_DIR/claude-tabstatus`; on macOS `$TMPDIR/claude-tabstatus`; on Windows `%LOCALAPPDATA%\claude-tabstatus` | where the per-session records live. Unset with no `XDG_RUNTIME_DIR` (`TMPDIR` on macOS, `LOCALAPPDATA` on Windows) means background and wait tracking are off. **Use a dedicated, empty directory**: stale records are cleaned up there, and `doctor` lists anything it leaves alone. On Windows give a drive-absolute path (`C:\...`) on NTFS - Git Bash rewrites a `\\server\share` value into a drive-rooted one - and do not share it with WSL: each reads the other's records as having no origin |
 
 `XDG_DATA_HOME` is read only by `install`, to choose where the plugin tree goes.
+
+A non-empty `CCTAB_HOST` sets the SSH hostname. On macOS, a non-empty exported
+`HOSTNAME` comes next, then the native kernel hostname (the same name as
+`hostname`, independent of `PATH`). If the native lookup fails or returns an
+empty or incomplete answer, the prefix is `ssh:`; no command fallback runs.
+Linux tries `/proc/sys/kernel/hostname`, then `HOSTNAME`, then the `hostname`
+command. Windows tries `HOSTNAME`, then the command. Empty environment values
+try the next source. Local hooks do not look up a hostname; `doctor` explicitly
+checks it for its diagnostic row.
 
 ## Troubleshooting
 
@@ -505,6 +586,31 @@ directory, the terminal it detected and why, the glyph position, and the tmux
 checks above. `CCTAB_DRY_RUN=1 tabstatus working` prints the title it would
 paint, without painting it.
 
+`doctor` also prints a capability table for the platform, the terminal drawing
+the tab (the *surface*) and the multiplexer. Its verdict column has five words:
+`ok`, `n/a` (unsupported by this terminal or version), `off` (a knob of ours you
+can turn back on),
+`?` (the terminal may or may not honour it and nothing we can read says which)
+or `fail` (an attempt the OS refused), with escape bytes named, never written.
+A `?` entry still shows its known grammar, if any, alongside the setting to check.
+
+For Konsole's versioned protocols, `ok` requires a valid `KONSOLE_VERSION` at
+or above the documented minimum: notifications (OSC 777) need 23.04, tab colour
+(OSC 34) needs 24.12 and progress (OSC 9;4) needs 26.04. Older versions show
+`n/a`; missing, malformed or inherited multiplexer version evidence shows `?`.
+`CCTAB_TERMINAL=konsole` names the family but does not establish a version.
+These entries describe terminal protocols; this release does not emit notifications,
+tab colour or progress.
+
+`tabstatus doctor --surface <name>` prints one terminal's table with no terminal,
+session or config directory, for any of the fourteen names `CCTAB_TERMINAL`
+accepts: `unknown`, `konsole`, `vte`, `kitty`, `alacritty`, `wezterm`, `foot`,
+`ghostty`, `xterm`, `iterm2`, `apple-terminal`, `windows-terminal`, `conhost`,
+`vscode`. This offline catalogue shows versioned protocols as `?`, with their
+minimum versions, regardless of the local environment. Why the table looks as it
+does is in
+[docs/architecture.md](docs/architecture.md#the-three-axes).
+
 | symptom | cause and fix |
 |---|---|
 | tab stays blank in a new session | the plugin tree was deleted but the link and settings key remain; `doctor` says `FAIL the plugin directory is not there`. Run `install` |
@@ -514,7 +620,7 @@ paint, without painting it.
 | `install` refuses a `--tree` directory | it is not empty and was not created by `install`; choose an empty or new directory |
 | *Exec format error* | wrong architecture: only x86_64 builds exist |
 | Konsole tab shows the directory, not the title, over ssh | set `CCTAB_TERMINAL=konsole` on the remote side ([Konsole over ssh](#konsole-over-ssh)) |
-| the ssh prefix is wrong, or a bare `ssh:` | set `CCTAB_HOST` |
+| the ssh prefix is wrong, or a bare `ssh:` | set a non-empty `CCTAB_HOST`; on macOS also check any exported `HOSTNAME` |
 | tab reads `~/code/one ct1 w 1790…` (tmux) | something replaced tmux's title string - a `tmux source-file`, an uninstall while another Claude runs, or a killed Claude. Start a new Claude session or `/clear` |
 | tmux cells never decay | `status` is off or `status-interval` is 0; see [What you must have on](#what-you-must-have-on) |
 | tab stays blue after Ctrl+C | see [Known limitations](#known-limitations) |
@@ -555,7 +661,15 @@ paint, without painting it.
 - **Konsole repaints the tab on a ~2s tick**, so the dot trails the real state by
   up to about two seconds.
 - **The Konsole restore puts back Konsole's stock formats** (`%d : %n` and
-  `(%u) %H`), not a customised profile's.
+  `(%u) %H`), not a customised profile's. Restoration is best effort: it remembers
+  the terminal type, not the original terminal destination. Keep the session's
+  terminal and tmux routing stable. Detach/reattach within the same tmux session
+  is supported, but a client detached when the last Claude exits cannot receive
+  the restore. Failed or interrupted writes are not retried; a recorded restore
+  obligation does not prove that the terminal applied the arming.
+  Direct Unix delivery also refuses an opened destination that is not a terminal
+  character device. These checks do not prove that a terminal still belongs to
+  the process whose stdout was queried.
 - **`KONSOLE_*` is inherited environment**: an xterm launched from a Konsole
   shell carries it, and there the switch sets the font instead. Set
   `CCTAB_TERMINAL` to anything other than `konsole` to turn it off.
@@ -576,10 +690,7 @@ paint, without painting it.
   network share other than the one the session is on is not followed (touching
   it would send your NTLM credentials to that server), and the tab shows the
   plain path instead of `repo@branch`.
-- **Known bugs:** `doctor` exits 1 without a report if `settings.json` is a
-  directory. After an install that aborted half way, `uninstall` can remove a
-  `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` you set yourself afterwards; a
-  `settings.json.cctab-preuninstall` backup is kept.
+- **Known bug:** `doctor` exits 1 without a report if `settings.json` is a directory.
 
 ## For contributors
 

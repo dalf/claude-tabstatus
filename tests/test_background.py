@@ -25,9 +25,10 @@ class BackgroundTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="cctab-background-")
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        # Match getcwd's physical path, including macOS's /var -> /private/var.
+        self.root = Path(self.tmp.name).resolve()
         self.state = self.root / "state"
-        self.env = {"PATH": "/usr/bin:/bin", "HOME": self.tmp.name, "CLAUDE_PID": "0",
+        self.env = {"PATH": "/usr/bin:/bin", "HOME": str(self.root), "CLAUDE_PID": "0",
                     "CCTAB_STATE_DIR": str(self.state), "CCTAB_DRY_RUN": "1",
                     "CCTAB_TERMINAL": "other", "CCTAB_GLYPH_POS": "prefix"}
         for state in STATES:
@@ -164,7 +165,7 @@ class BackgroundTests(unittest.TestCase):
             "session_id": "s1", "hook_event_name": "Stop", "background_tasks": [{}]
         }).encode(), env=self.env, cwd=self.root, capture_output=True, timeout=10)
         self.assertEqual((result.returncode, result.stderr), (0, b""))
-        self.assertEqual(result.stdout.decode(), str(self.root).replace(self.tmp.name, "~") + "\n")
+        self.assertEqual(result.stdout, b"~\n")
         self.assertTrue(self.record()["background"])
 
     def test_startup_reaper_cannot_age_out_background_without_process_metadata(self):

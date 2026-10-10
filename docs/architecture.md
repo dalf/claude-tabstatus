@@ -27,6 +27,7 @@ project with similar ones.
 - [The per-session record](#the-per-session-record)
 - [Stale records and the reaper](#stale-records-and-the-reaper)
 - [Locking and atomic writes](#locking-and-atomic-writes)
+- [macOS validation](#macos-validation)
 - [Windows console-title painting](#windows-console-title-painting)
 - [Location resolution](#location-resolution)
 - [Install and uninstall mechanics](#install-and-uninstall-mechanics)
@@ -40,6 +41,7 @@ project with similar ones.
   - [Native Windows](#native-windows)
   - [Migrating from a checkout symlink](#migrating-from-a-checkout-symlink)
   - [A deleted tree behind a live link](#a-deleted-tree-behind-a-live-link)
+- [The three axes](#the-three-axes)
 - [Konsole arming](#konsole-arming)
 - [tmux integration](#tmux-integration)
 - [TTL rationale](#ttl-rationale)
@@ -75,7 +77,7 @@ There are four moving parts:
 
 The title itself reaches the terminal in one of three ways: as the hook's JSON
 `terminalSequence` (the ordinary case), written straight to Claude Code's pty
-(`session-start` and `session-end` on Linux, which the hook protocol cannot carry,
+(`session-start` and `session-end` on Unix, which the hook protocol cannot carry,
 and every paint inside tmux), or as a console title on native Windows.
 
 ## Hook registration
@@ -102,6 +104,11 @@ and every paint inside tmux), or as a console title on native Windows.
 Live waits take precedence over everything in the right-hand column, and idle
 transitions preserve known background work; the exact rules are the
 [transitions table](state-contract.md#transitions-and-retirement).
+
+The resolver also carries dormant attention metadata independently of its optional
+title paint. Its [logical comparison contract](state-contract.md#logical-attention-transitions)
+is tested directly in `src/state.rs`, including events that change state silently.
+This metadata is not a delivery acknowledgement; no attention effect is emitted.
 
 The `SessionStart` and `PreToolUse` scopes are hook *matchers*, so those hooks do
 not even run outside them. The `Notification` kinds and the `compact` source are
@@ -394,11 +401,12 @@ b i                                            base = w | a | i
 g 1790380620                                   last main Stop reporting background
 p 3709427 84460384                             the session's (pid, start time)
 w aec99e1f4bda1972b:1790380630 -:1790380631    one wait per word: owner, then epoch
+s konsole                                      the surface this session may need to restore
 ```
 
-On Windows the origin line is `q <pid> <creation FILETIME>` instead of `p`, and
-each platform reads the other's key as an unknown field - no origin, the mtime rule
-- never as a pid of its own.
+On macOS the origin line is `r <pid> <us>` and on Windows
+`q <pid> <creation FILETIME>` instead of `p`, and each platform reads the others'
+keys as unknown fields - no origin, the mtime rule - never as a pid of its own.
 
 Owner tokens on the `w` line map onto the contract's
 [wait identities](state-contract.md#wait-identities):
@@ -428,6 +436,12 @@ the [contract](state-contract.md#transitions-and-retirement), and why child
 completion alone does not prove a workflow ended is in the
 [indicator policy](indicator-semantics.md#background-lifecycle-and-reconciliation).
 
+The optional `s` line follows the normative rule in
+[time and persistence](state-contract.md#time-and-persistence). It records a
+conservative restore obligation, not confirmed delivery; the
+[arming and restore contract](backend-architecture.md#the-armed-record) explains
+its ordering, fallback and best-effort limits.
+
 The `n` key is reserved, last in the file so free-form text would arrive whole, for
 a cached session title; it is not implemented (see the roadmap in
 [AGENTS.md](../AGENTS.md)).
@@ -450,12 +464,14 @@ fires no `SessionEnd`, so the record has three independent bounds and no daemon:
 - **A `SessionStart` in any session reaps the others**, by asking whether the
   process that wrote each record is still running. Every write stamps the record
   with `$CLAUDE_PID` *and that pid's start time* - field 22 of `/proc/<pid>/stat`;
-  on Windows the process's creation FILETIME - and the reaper unlinks a record only
+  on macOS `proc_pidinfo`'s start time in microseconds; on Windows the process's
+  creation FILETIME - and the reaper unlinks a record only
   when that pair no longer names a running process. Stamping on every write, not
   only at `SessionStart`, covers a session whose `SessionStart` ran before this
   plugin was installed, which would otherwise be left on the one-day mtime rule for
   its whole life.
-- The directory is under `$XDG_RUNTIME_DIR`, which the OS empties at logout. On
+- The directory is under `$XDG_RUNTIME_DIR`, which the OS empties at logout, and
+  on macOS under `$TMPDIR` (`/var/folders/<hash>/T`), which the OS also empties. On
   Windows it is `%LOCALAPPDATA%\claude-tabstatus`, which nothing empties; after a
   reboot no origin is alive, so the next `SessionStart` reaps every record.
 
@@ -581,16 +597,238 @@ wait, so main-thread edges paint nothing until that agent's next tool call or it
 And because NTFS compares names without case, two session ids differing only in
 case would share one record; Claude Code's ids are lowercase UUIDs.
 
+## macOS validation
+
+Three kinds of evidence must stay separate:
+
+| Validation | Scope | Evidence at this change |
+|---|---|---|
+| Cross-checking on Linux | `cargo check --all-targets` for `aarch64-apple-darwin` and `x86_64-apple-darwin`; pure decision tests and ABI size/offset assertions | Available locally; does not link or execute Apple calls |
+| Native automated validation | `macos-15`, Apple Silicon (`aarch64-apple-darwin`), explicitly checked with `uname -m`; linked Rust tests, release-mode validation build, state suites, disposable PTY delivery and terminal-open observation | Passed on 2026-10-03 at reviewed head `67a08236d2579548c02bcc0fa335b498a6a781ac`, macOS 15.7.9 (24G830), Rust 1.99.0: [native job](https://github.com/dalf/claude-tabstatus/actions/runs/37151974515/job/111287539736) |
+| Native tmux acceptance | Real compiled hooks, private servers and attached PTY clients on the same arm64 job | Passed at the same reviewed head and OS image, arm64, tmux 3.7c; all 40 tests without skips: [native tmux job](https://github.com/dalf/claude-tabstatus/actions/runs/37151974515/job/111287539736) |
+| Terminal-application testing | Terminal.app, iTerm2, Ghostty, Konsole and Claude Code's live hook integration | Not performed on macOS; a PTY byte capture cannot show how a terminal applies an OSC |
+
+Earlier milestones were the terminal-open run at `b43225b`, hostname acceptance
+at `6d4bfa8`, and the first required tmux acceptance at `bf7e910`:
+[earlier tmux job](https://github.com/dalf/claude-tabstatus/actions/runs/37151659979/job/111286629516).
+The table records the later exact-head rerun, rather than treating those earlier
+successes as evidence for an untested head. Successful acceptance covers the
+authored scenarios; the subsequent consolidated review reproduced the concurrent
+start/teardown defect described in [backend weaknesses](backend-architecture.md#known-weaknesses).
+
+The runner label's architecture follows [GitHub's runner reference](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+Intel macOS retains its cross-check; it has no native execution coverage here.
+`scripts/build.sh` selects the current Darwin architecture for local validation
+builds. Neither architecture gains a release asset or a support claim from this job.
+
+The native Rust process test queries a real child's start time twice, checks its
+identity and a deliberately mismatched timestamp, then waits for exit and checks
+liveness again. On macOS the timestamp must fall within the child's creation
+interval in epoch microseconds. The reaper and doctor tests now include macOS,
+retain an aged live record and remove a real exited child's record. An impossible
+PID is not used as evidence of death: macOS deliberately reports it unverifiable.
+The existing multi-process lock/race tests also run in the native Rust suite.
+
+`tests/test_unix_delivery.py` captures exact session-start/session-end bytes from
+newly allocated raw PTYs, with the real hook in a fresh session and all its stdio
+on pipes. A separate stand-in owns the target controlling PTY. It checks the
+Apple Terminal,
+iTerm2, generic and Konsole rows, the remembered restore obligation after a
+surface change, the ordinary hook's matching protocol payload, and the native
+record origin key. These row selections simulate configuration, not terminal apps.
+Missing, malformed and exited PIDs, compaction and dry-run must deliver no bytes.
+File, pipe and `/dev/null` redirections retain a real controlling terminal: the
+suite checks that neither that terminal nor the redirected output receives a title.
+Every subprocess and state directory is disposable; no user terminal is a target.
+
+The same suite now requires a native SDK-built dyld observer on Darwin. It records
+the flags of the actual production terminal open on both `session-start`/`session-end`
+and `tmux-arm <disposable-pty>`, verifies `O_NOCTTY` and the descriptor's close-on-exec
+bit, and observes descriptor metadata, terminal checks, writes and closure. It reads
+the detached child's controlling-terminal flags through `proc_pidinfo` before and
+after the open and at exit, independently of byte capture. It also checks an unowned
+PTY with `tmux-arm`. That command exercises the native client-opening helper without
+a tmux server; it does not establish full macOS tmux behaviour.
+
+Test-only interposition substitutes a regular file or `/dev/null` after the path
+guard, injects descriptor-metadata and terminal-check failures, and checks no bytes
+are written and the rejected descriptor is closed. Open/write failures and partial
+writes retain recorded restoration policy. A test-only Rust probe compiles the
+production Unix backend against the existing native libc build artefact and checks
+the actual `session_tty`/`write_tty` return values, including inspection-error mapping;
+the real CLI deliberately hides these outcomes. The probe selects a release libc
+artefact and matches `panic=abort` and Rust `lto=fat`, so rustc processes the release
+dependency's LLVM bitcode before invoking Apple's native linker. Debug artefacts
+can omit the bitcode required by [Rust LTO](https://doc.rust-lang.org/rustc/codegen-options/index.html#lto)
+and are not selected. Portable compiler tests link and execute consumers of both
+abort and unwind libraries, including bitcode-only release dependencies, with an
+incompatible panic strategy as a negative control. Helper build failures
+include the compiler diagnostics. Missing open observations and a native
+control that deliberately omits `O_NOCTTY` must fail the flag check. The control
+reports its observed controlling-terminal state; acquiring one is not a required
+negative control on a kernel where an ordinary PTY open does not acquire it.
+The recorded native job passed all ten Unix delivery tests, including all five
+Darwin observer tests without skips. It observed `O_NOCTTY` and close-on-exec on
+both production delivery paths, zero controlling-terminal flags before and after
+their opens and at exit, and the expected bytes. Descriptor refusal, inspection
+and transport faults, partial writes, restore obligations and the observer's
+missing-observation/missing-flag controls all passed. The ordinary-open control
+on an unowned PTY changed its masked `PROC_FLAG_CTTY | PROC_FLAG_CONTROLT` value
+from `0` to `192`. This is evidence for that synthetic detached child on this
+runner, not a claim that every Darwin PTY open acquires a controlling terminal or
+that a live Claude hook failure has been reproduced.
+
+The
+[first hardening job at f8710ca](https://github.com/dalf/claude-tabstatus/actions/runs/37145349648/job/111268023048)
+passed the ordinary PTY cases but failed while compiling the API probe, before the
+observer tests ran. Its command selected a release libc artefact without matching
+that artefact's abort panic strategy. The
+[follow-up job at 1954602](https://github.com/dalf/claude-tabstatus/actions/runs/37146032618/job/111270045915)
+reached the linker after correcting the panic strategy, but failed because Apple's
+LLVM 17 linker could not read the Rust LLVM 23 release bitcode. Neither failed job
+ran the observer tests. The successful native rerun above includes the Rust LTO
+correction. Cross-checks alone do not prove runtime open flags or controlling-terminal
+behaviour. The same workflow passed both Linux binaries' actual-delivery subprocess
+gates, shell suites (843 assertions each) and golden corpus (312 cases each), both
+Apple ABI cross-checks and the Windows job. Descriptor inspection still adds syscalls;
+the zero-subprocess result is not a latency measurement.
+
+`tests/test_terminal_detection.py` adds compiled-binary configuration tests for
+doctor's selected family and evidence, ordinary title protocol bytes, exact vendor
+values, conflicts, overrides and multiplexer vetoes. Its macOS-specific cases run
+in the native job; cross-platform pure tests exercise every candidate table on
+each host. All eleven detection tests passed in the recorded native run, along
+with all seventeen ACL/ownership tests and the APFS/APFSX installation suite
+(82 cases, two conditional skips). Captured protocol output does not establish
+visible behaviour in Terminal.app or iTerm2. The ACL/ownership and APFS/APFSX
+installation-path suites remain required in the native job.
+
+`tests/test_macos_hostname.py` is also required in native arm64 CI. Its SDK-built
+kernel observer independently reads `KERN_HOSTNAME` and compares it to the
+system's `hostname(1)`; the candidate renders that observed input through both
+automatic lookup with empty `PATH` and the existing override path. A recording
+fake `hostname` on `PATH` and dyld observation/faults check native calls,
+precedence, local/override bypasses, failure/empty/unterminated/partial output,
+boundary length, non-UTF-8 repair, existing display processing and doctor's row.
+Both recording fixtures have positive controls in each isolated test environment.
+Missing SDK tools or required observations fail on Darwin. These are dry-run
+title assertions, not delivery or terminal-application observations. At the
+hostname baseline `6d4bfa81d9e3e89b38e4d3f1fb378bf4adae5168`, all six tests passed
+on macOS 15.7.9 (24G830), arm64, Rust 1.99.0 without skips:
+[native hostname job](https://github.com/dalf/claude-tabstatus/actions/runs/37149994805/job/111281611176).
+Linux Rust tests exercise native-output framing and byte handling; Apple cross-checks do not establish runtime behaviour.
+
+`tests/test_tmux_status.py` now runs as required acceptance on the native arm64
+job and against both Linux binaries. CI locates or installs tmux, records its
+version and passes its absolute executable path as `CCTAB_TEST_TMUX`; the harness
+also puts that executable's directory on its fresh PATH for cold-path calls.
+`CCTAB_TEST_REQUIRE_TMUX=1` fails on missing tmux or binary; unavailable PTYs,
+attachment, locales and observations fail rather than skipping acceptance.
+The only individual tmux skip is the existing read-only-record case when run as
+root, which bypasses mode-bit permissions; the hosted runner is unprivileged.
+
+Each test owns a server, short socket under canonical `/tmp`, configuration,
+panes and client PTYs. Darwin uses validated `en_US.UTF-8`, Linux retains
+`C.UTF-8`; real glyph and pill-width assertions remain unchanged. No harness
+observer assumes `/proc` or `/dev/pts`: tmux supplies the pane PID and terminal,
+and `pty.openpty` supplies client terminals. Fresh environments remove inherited
+terminal, SSH, mux, PID and runtime-directory values, including Darwin's `TMPDIR`
+state fallback. HOME, config, data and state are pinned under each disposable
+directory; stateless controls explicitly clear the state knob. Clients, processes,
+descriptors and servers are cleaned up on
+failure; attachment and carrier timeouts report captured bytes or pane details.
+
+Real ordinary working/waiting/idle hooks use the pane shell's PID and must leave
+stdout empty while updating tmux's consumed pane carrier. Attached-client captures
+check status text, split panes, background windows and pill colours/widths,
+excluding outer-title OSCs. Added observations cover all four states, working
+expiry on tmux's own clock with no extra hook and persistent background beyond
+all deadlines. Controls require the positive observers to reject missing delivery,
+a malformed carrier and matching text present only in OSC title bytes.
+The later [observer correction](#tmux-status-observer-correction) adds required
+cached-status and stale-capture controls without changing production semantics.
+Shared arming covers overlapping owners, both exit orders, starts detached,
+reattachment and the client-attached hook's actual arming/restoration bytes.
+Forced Konsole/WezTerm rows are protocol tests, not real terminal applications.
+Exact title-setting and window-format restoration covers uninstall after the
+last owner, inherited/explicit/empty formats, literals and surviving user edits.
+Invalid, exited and file/pipe/null stdout owners leave pane and client titles
+unchanged. All 40 tmux tests passed without skips in the native tmux job above,
+including the read-only-record case and every observer control. No production
+change was needed. The existing hostname, ACL/ownership, APFS/APFSX, terminal
+detection and Unix-open suites also passed in that job. The installation-path
+suite retained two skips for case-sensitive scenarios on case-insensitive
+fixtures; those scenarios ran on its required APFSX fixture. Persistence
+retained its Linux-only strace fault-injection skip. The Linux and Windows jobs
+for the same commit passed as well.
+
+The native job also runs payload, semantic state, background, elicitation and
+persistence suites. The latter's strace fault injection remains Linux-only;
+its other delivery and locking tests run on both Unixes. Linux-specific `/proc`
+parsing and canonical-path unit tests retain their guards. The new native child
+and PTY tests cover the actual macOS headless path instead of weakening those
+Linux assertions. The Linux golden corpus remains a Linux specification and is
+not replayed as a macOS acceptance suite.
+
+The successful native run establishes only the tested architecture, OS image
+and scenarios. PTY observations establish transport and tmux behaviour for
+the tested configuration, not how a terminal application applies the resulting title.
+Terminal application behaviour, real Claude Code sessions, Intel runtime behaviour,
+older macOS versions and untested tmux versions remain unvalidated.
+Forced PID reuse during terminal lookup/write and kernel permission-denied queries
+are not covered by these native scenarios; synthetic identity/errno tests cover
+only their decision rules.
+The Linux zero-subprocess gate is unchanged and still required for both binaries.
+
 ## Windows console-title painting
 
 `session-start` and `session-end`, which the hook protocol cannot carry, reach the
-tab on Linux by writing to Claude Code's pty through `/proc/$CLAUDE_PID/fd/1`. On
-Windows they reach it as a **console title** instead: the hook leaves its own
+tab on Unix by writing to Claude Code's pty. Linux resolves the pty by reading the
+symlink `/proc/$CLAUDE_PID/fd/1`; macOS has no `/proc` and asks the kernel for the
+same file descriptor's path with `proc_pidfdinfo`. Everything after that - the
+`/dev/pts/` or `/dev/tty` prefix, pathname character-device test, write-only open,
+then descriptor metadata and `IsTerminal` checks - is one shared helper. Konsole
+arming and the direct writes to tmux's panes go the same way,
+through the same guard, on both. The macOS native job now tests those OS calls
+and direct delivery, with a successful arm64 run recorded; see
+[macOS validation](#macos-validation) for evidence and limits. On Windows they
+reach it as a **console title** instead: the hook leaves its own
 hidden console, attaches to Claude Code's (`$CLAUDE_PID`), calls
 `SetConsoleTitleW` - the idle title, or an empty one at the end - and detaches; the
 pseudo console under Windows Terminal forwards that as an OSC 0.
 
-The headless guard is three proofs, and any "no" paints nothing:
+Unix session delivery and tmux client arming/restoration retain the same acquired
+File through delivery, never reopening a checked pathname. On Darwin the shared
+open explicitly requests libc's `O_NOCTTY`; std's `OpenOptions` still supplies
+close-on-exec. Linux retains its existing flags and no libc dependency is added
+there. Descriptor validation intentionally tightens both Unix routes: a pathname
+that passes its guard can still yield a non-character or non-terminal descriptor,
+which is refused before writing. This adds descriptor inspection syscalls (`fstat`
+or the platform equivalent and the `IsTerminal` check); zero subprocesses does not
+mean zero additional syscalls or establish unchanged latency.
+
+`session_tty` returns an eligible File or `None`, including on open or inspection
+errors. `write_tty` returns `Ok(false)` for path/type refusals and failed terminal
+checks (`IsTerminal` returns false on inspection errors), `Ok(true)` for completed
+transport, and an error for open, descriptor-metadata or write failures. Path-metadata
+errors retain their previous refusal mapping. A write error may follow partial
+transport. Rejected Files are dropped, and no outcome cancels recorded restoration
+policy or prevents attempts to other tmux clients. Ordinary `terminalSequence`
+delivery and the title, arm and restore byte sequences are unchanged.
+
+No controlling-terminal acquisition failure has been reproduced in a live Claude hook.
+[POSIX leaves acquisition without O_NOCTTY implementation-defined](https://pubs.opengroup.org/onlinepubs/9799919799/functions/open.html).
+[Darwin's open manual](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/open.2)
+documents the flag, while the current
+[XNU PTY open path](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/tty_dev.c)
+does not itself establish that ordinary PTY opens acquire a controlling terminal.
+The requested flag, observed session state and successful transport are separate
+evidence. Production introduces no mode changes, foreground-group changes or
+`TIOCSCTTY` calls. Descriptor type/TTY checks do not bind the terminal to the
+originally queried vnode or process: PID reuse and pathname/terminal-identity races
+remain outside this change.
+
+The Windows headless guard is three proofs, and any "no" paints nothing:
 
 1. `$CLAUDE_PID` is a running ancestor of the hook.
 2. Its current stdout, read out of its PEB, is a character device (refusing
@@ -668,11 +906,46 @@ every main-thread `PostToolUse`.
   reports the same repository and branch `git` does, named after the real toplevel
   rather than after a symlink. The `~` abbreviation still uses the logical `$PWD`,
   so a distro whose `/home` is a symlink keeps its `~`.
-- **The ssh hostname comes from `/proc/sys/kernel/hostname`**, which keeps it
-  fork-free on Linux. Elsewhere it falls back to `$HOSTNAME` and then to a
-  `hostname` fork, the only fork on the paint path outside tmux; `CCTAB_HOST` skips the guessing. If
-  none of the three answers, the prefix becomes a literal `ssh:` rather than
-  nothing, because no prefix means "local".
+- **The SSH hostname is resolved lazily**, only for an SSH prefix or doctor's
+  explicit hostname diagnostic. Non-empty `CCTAB_HOST` bypasses automatic
+  lookup on every platform. Linux then tries `/proc/sys/kernel/hostname`,
+  non-empty `$HOSTNAME` and the existing `hostname` command. Windows tries
+  non-empty `$HOSTNAME` and the command. Darwin tries non-empty `$HOSTNAME`
+  before native `gethostname`, preserving the environment name's precedence.
+  Empty environment inputs fall through. A failed, empty or unterminated Darwin
+  answer ends resolution without executing a command. With no resolved name,
+  the renderer supplies literal `ssh:`, because no prefix means "local".
+
+Darwin's hostname lookup uses the existing macOS-only libc dependency.
+The [Apple manual](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/gethostname.3.html)
+warns that insufficient space may leave output unterminated. The current
+[gethostname implementation](https://github.com/apple-oss-distributions/Libc/blob/main/gen/FreeBSD/gethostname.c)
+reads `CTL_KERN/KERN_HOSTNAME`; it also has a small-buffer branch that truncates
+and inserts a NUL. The [hostname utility](https://github.com/apple-oss-distributions/shell_cmds/blob/main/hostname/hostname.c)
+calls the same API. This is the kernel hostname, not System Configuration's
+ComputerName or LocalHostName.
+
+The reviewed [unistd.h declaration](https://github.com/apple-oss-distributions/Libc/blob/main/include/unistd.h)
+is `int gethostname(char *, size_t)`, matching locked libc 0.2.189's
+`gethostname(*mut c_char, size_t) -> c_int`.
+[sys/param.h](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/param.h)
+defines `MAXHOSTNAMELEN` as 256; libc does not bind that constant. The 257-byte
+stack buffer matches the implementation's `MAXHOSTNAMELEN + 1` threshold,
+avoiding its small-buffer truncation branch. Native test helpers check the
+runner's SDK constant and signature. Initial nonzero sentinel bytes ensure a
+partial write cannot acquire a fabricated terminator from untouched storage.
+Accepting output requires return value zero and a non-empty byte slice ending
+at a NUL found inside the supplied buffer. There is no unbounded C-string read
+or forced terminator. Non-UTF-8 bytes still cross `text::repair` in `location`;
+domain stripping, numeric addresses, host cap, ellipsis and sanitisation remain
+in the renderer. Future SDK limit changes require reviewing this fixed bound.
+
+`sys::hostname_fallback` selects the native API or the existing command within
+the platform seam; callers have no platform branches. The Linux/Windows command
+retains null stdin/stderr, successful-exit checking and removal of all trailing
+line endings (LF on Unix, CR/LF on Windows). This removes Darwin's hostname
+subprocess and dependence on `PATH`; no latency regression was demonstrated by
+the finding and no latency improvement is measured here.
 
 **Elision.** A path is cut at the front on a component boundary, and a
 `repo@branch` at the end, so both Konsole (which elides from the left) and Windows
@@ -797,19 +1070,121 @@ Further refusals close the remaining doors:
   preflight, so a failure lands before the marker exists rather than half way
   through.
 
-**`--tree` is made absolute and lexically normalised once, before anything looks at
-it.** Everything downstream compares that path, writes through it and *records* it,
-and a raw argument defeated all three. `--tree skills/claude-tabstatus` run from
-`<config>` walked straight past the refusal whose job is to keep the tree out of
-`skills/`, because that test is a component-prefix test on the string; the symlink
-then got the relative string as its target, which resolves against the *link's*
-directory rather than the shell's, so the link dangled while the env key was set and
-`install` said "Done."; and the record kept the relative string, so a later
-`uninstall` run from somewhere else removed files from whatever happened to be named
-that there. `fs::canonicalize` is the wrong tool - it resolves symlinks, and it fails
-on a path that does not exist yet, which the tree usually does not - so `.` and `..`
-are folded textually. A `tree` field in the record that is not absolute can only
-come from a hand edit and is ignored rather than resolved.
+**Management paths are absolute; spelling, link identity and destination identity
+are separate questions.** Relative `--tree`, config and default/environment paths
+are anchored before they are recorded. Unix removes redundant separators and `.`
+but leaves `..` for the kernel: `alias/..` can name a different directory from its
+lexical parent. Windows keeps its existing stored-spelling, short-name and verbatim
+prefix normalisation. A relative `tree` field in an installation record is ignored.
+
+`sys::same_path` and `sys::is_within` return `Result<bool, String>`; inspection
+failure is neither “different” nor “outside”. On Unix, existing directory identity
+is device/inode. For an absent destination, lstat peels genuinely missing components
+until the deepest existing directory, then resolves that directory. Permission
+errors, non-directory ancestors, symlink loops and dangling ancestor links are
+errors. Containment of an existing base checks identities along the physical
+ancestor chain. Two missing destinations can intersect only if their existing
+anchors have the same identity; their remaining components are compared with
+component boundaries intact (`skills2` stays outside `skills`).
+
+Darwin compares differing missing ASCII names using `pathconf(_PC_CASE_SENSITIVE)`
+on that existing ancestor. Both the [current XNU selector declaration](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/unistd.h)
+and [Apple's HFS implementation](https://github.com/apple-oss-distributions/hfs/blob/main/core/hfs_vnops.c)
+were checked against the locked libc bindings: 0 means insensitive, 1 sensitive,
+and other answers retain uncertainty. Existing Unicode-normalisation aliases use
+filesystem identity directly. For differing missing non-ASCII names on APFS/HFS,
+`sys/darwin_names.rs` creates a private `.cctab-name-probe-*` directory directly
+under the deepest existing ancestor. It creates one exact name and looks up the
+other with `fstatat(AT_SYMLINK_NOFOLLOW)`. Matching device/inode proves equivalence;
+if the other name is absent, creating both with distinct identities proves
+separation. Failed creation or inspection remains uncertainty. Each component is
+tested on the volume where the missing directories would be created, including
+multiple missing Unicode components. This follows the filesystem-evidence idea
+of [Git's composition probe](https://github.com/git/git/blob/master/compat/precompose_utf8.c),
+but tests each actual pair and keeps no persisted result or userspace Unicode table.
+The probe is limited to APFS/HFS's volume-wide filename semantics; remote and
+unknown filesystems retain uncertainty rather than assuming a sibling directory
+has the same name rules. This matters
+because [APFS preserves spelling but supports normalisation-insensitive lookup and
+both case variants](https://developer.apple.com/library/archive/documentation/FileManagement/Conceptual/APFS_Guide/FAQ/FAQ.html).
+Create the intended ancestor first when a comparison lacks sufficient evidence.
+Probe creation uses public `mkdirx_np` from [current XNU sys/stat.h](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/stat.h)
+with mode 0700 and an empty `ACL_FLAG_NO_INHERIT` birth ACL, so inherited allow
+entries cannot expose its contents. The existing settings ACL/ownership helpers
+and their tests are unchanged; a separate directory creation helper shares their
+opaque ACL/filesec declarations. Its actual ACL is also inspected and must have
+no entries before any Unicode names are placed in it. `acl_valid` and `acl_get_entry`
+use [Apple's current declarations](https://github.com/apple-oss-distributions/Libc/blob/main/include/sys/acl.h)
+and [Darwin's empty-ACL iterator result](https://github.com/apple-oss-distributions/Libc/blob/main/posix1e/acl_entry.c).
+The locked libc supplies `arc4random`, `openat`,
+`fstatat`, `mkdirat`, `unlinkat` and `fstatfs`; its inode64 selection is retained.
+No subprocess or dependency is added. Probe operations hold directory handles and
+cleanup removes only the exact empty directories created by that probe, without
+following links or recursively deleting unknown contents. Cleanup is checked
+before accepting the comparison, with a best-effort retry on failure. No result
+is cached: these checks run only on management commands, never on hook events.
+Temporary creation/removal changes ancestor directory timestamps. A killed process
+or persistent cleanup failure can leave a private probe, whose path is reported
+when cleanup fails. Installation files, settings protection, records and links
+remain untouched by a preflight refusal; “Nothing has been changed” describes
+those installation effects, not every filesystem timestamp.
+Linux keeps byte comparison for missing names. Windows keeps spelling identity for
+links, including its system case table, and resolves destination containment; its
+resolution now also propagates inspection failures instead of peeling them away.
+
+The requested tree root is inspected without following its final link **before**
+resolution; existing and dangling root symlinks remain refused. Every generated
+directory component is inspected without following links, during preflight and
+again at each write/removal. Ancestor symlinks remain permitted, with guards applied
+to the destinations they reach. Checkout protection walks physical ancestors as
+well as spelled ones, without the old 24-directory bound. It still requires a
+`.git` beside `.claude-plugin/plugin.json` above the target, so an unrelated HOME
+repository alone does not block the default. settings.json keeps its separate
+symlink-target policy. Display paths and `strip_home_prefix` are unchanged.
+
+Reinstall and doctor recognise equivalent live generated-tree destinations.
+Orphan detection requires proven difference from the live tree and previously
+identified candidates; uncertainty names the inspection failure and skips the
+candidate. Uninstall checks that its live destination can be inspected before any
+writes, and retains the root/component link guards for deletion. These are
+filesystem observations at inspection time, **not protection against concurrent
+filesystem replacement**. Generated-tree/settings mutations still do not form a
+handle-relative transaction.
+
+`tests/test_install_paths.py --reproduce-old` is a native, isolated reproducer:
+first prove case-insensitive lookup, then request `config/SKILLS/claude-tabstatus`
+with `config/skills` already present. The baseline is expected to fail only after
+writing the tree, record and settings. Normal suite execution requires the same
+case to refuse with every fixture unchanged, including file identities, bytes,
+mode, owner/group and native ACL entries. Its native classes create disposable
+APFS and APFSX images with hdiutil and prove the lookup semantics; failure to create
+either volume fails CI. Coverage includes missing config/skills, Unicode aliases,
+`/var` and `/private/var`, ancestor links, checkout guards, inspection failures,
+reinstall/doctor/uninstall identity, root/component symlinks and case-sensitive
+siblings. Missing Unicode coverage requires safe allowed destinations and refusals
+on both volumes, exact normalisation/case behaviour, private probe birth in an
+ACL-inheriting directory, and native create/lookup/cleanup/filesystem faults.
+The previous native ACL/ownership suite remains required. The native job for
+`f4b9fff` passed the case-insensitive APFS tests but failed its APFSX format name
+and two `/var` spelling assertions. This follow-up uses the case-sensitive format
+name and filesystem-identity assertions. The [native job for `722ec43`](https://github.com/dalf/claude-tabstatus/actions/runs/37136471276/job/111241911812)
+executed both APFS variants and the Unicode scenarios, and passed all 17 ACL/ownership
+tests. Its eight failures were fault-message assertions for child creation and
+lookup: each installation had refused with the fixture unchanged, then the test
+required the word "probe" in a "cannot inspect missing Unicode names" message.
+The assertions now require each fault's failure stage and injected errno instead.
+The [native job at `b43225b`](https://github.com/dalf/claude-tabstatus/actions/runs/37146656917/job/111271890833)
+passed the corrected suite on both APFS variants (82 cases, two conditional skips),
+all 17 ACL/ownership tests and the later state/PTY step. Local Linux tests and Apple
+cross-checks cannot establish filesystem behaviour. The suite uses APFS volumes;
+the HFS probe path also lacks
+native runtime coverage.
+`--reproduce-missing-unicode` separately runs against the pre-probe `f4b9fff` binary:
+it proves Unicode lookup equivalence, then requires refusal of the safe
+`café/data/claude-tabstatus` tree with `café/config` also missing. Normal suite
+execution requires that installation to succeed and its live aliases to survive
+reinstall, doctor and uninstall without orphan classification. Native execution
+of that baseline reproducer is also pending locally.
 
 **The marker is written first, before the binary and before either manifest.** It
 is the only evidence of ownership the refusal accepts, so a run killed in that
@@ -935,10 +1310,10 @@ additional dependency.
 The reason for the last two is the half-state between them: the env key switches
 Claude Code's own title painting off and the plugin paints the replacement, so "key
 set, plugin gone" is the one combination that paints **no tab title at all**. The
-tree goes before both because it is **inert until the link points at it**, so an
-abort anywhere before that last step leaves a first-time user exactly as they were.
-And the link swap is the only irreversible step - it is the one write that changes
-what code a running session executes - so it goes last *and* after the copy in the
+tree goes before both because it is **inert until the link points at it**. Settings
+can already have changed when a later step fails; an abort before linking is not a
+complete no-op. The link swap changes what code a running session executes, so it
+goes last *and* after the copy in the
 tree has been exec'd, which is what proves the new target works.
 
 The link is repointed with a temp link and `rename(2)`, not `unlink` then `symlink`:
@@ -953,14 +1328,16 @@ symlink is reported as broken and replaced, and a real directory is refused outr
 Both halves preflight every refusal - the tree's ownership and writability, the
 `skills` directory and its writability, `settings.json`'s shape, mode and parent, a
 `settings.json` symlink that does not resolve, and whether there is a state record
-proving the key is ours - so nothing between the writes can decide to stop, and every
-refusal still honestly ends **"Nothing has been changed."** A `settings.json` with
+and its ownership status - so detected unsafe paths are refused before installation
+writes, and every preflight refusal leaves installation files unchanged. Temporary
+Unicode probes have the directory timestamp and interruption limits described above.
+A `settings.json` with
 duplicate members at the top level or inside `env` is refused too: this tool resolves
 first-wins and `JSON.parse` resolves last-wins, so editing it could set a key Claude
 Code never reads.
 
-What is preflighted cannot fail between the writes; what is left is a full disk or a
-tampered tree, and both land at the **first** write - directly under a header that
+A successful preflight does not prevent later filesystem replacement or I/O
+failure. An early materialisation error is reported directly under a header that
 may have just announced that the live plugin link "will ->" somewhere new. The bare
 OS error alone leaves the only question that matters unanswered, so the failure
 answers it:
@@ -983,9 +1360,87 @@ mean "install anyway, I am about to build"; it means only "write settings.json
 even where its Windows permissions cannot be kept" (see the settings.json notes
 below).
 
-`~/.claude/claude-tabstatus.state` is a small JSON record in two halves: what was
-there before (written once, never rewritten) and which tree this install owns
-(rewritten every install, because `--tree` moves it). `uninstall` removes it.
+`~/.claude/claude-tabstatus.state` is a small JSON record. Its original key spelling,
+whether `env` existed, and original link target survive reinstalls; its current
+generated tree is updated when `--tree` moves it. **Restoration history is separate
+from evidence that a settings operation completed.** In state_version 4:
+
+1. A first install atomically saves the narrow restoration history with
+   `settings_ownership: "pending"` before attempting the settings change.
+2. It performs the existing protected text splice and settings replacement, or
+   recognises a pre-existing `"1"` without rewriting settings or taking a backup.
+3. Only after that operation returns successfully does it atomically write
+   `settings_ownership: "confirmed"`, before linking the plugin. A failure to write
+   this receipt is an install failure, with the pending history retained.
+
+A process killed before settings replacement leaves pending history without
+ownership. A process killed after replacement but before the receipt leaves the
+same pending history, including any original raw value. Neither a matching
+settings path nor a current value of `"1"` resolves that ambiguity. Ordinary
+uninstall and reinstall refuse before changing settings, the link or the tree;
+`--force` does not confirm an incomplete record. Recovery instructions name the
+settings and record: inspect them, restore only the key manually if appropriate,
+then move the record aside before running the desired management command. The
+existing no-record `uninstall --force` remains explicit key removal. A requested
+`uninstall --restore-backup` can instead restore the whole backup, when one exists;
+it can overwrite unrelated edits and is never selected automatically. A missing
+or blank original settings file and a pre-existing `"1"` may have no backup.
+
+A refresh with an earlier confirmed receipt retains that receipt and the original
+restoration history, including when settings replacement fails or the process is
+killed. Updating the tracked tree does not replace either with values left by the
+first install. New metadata has a strict version, phase, key, settings path and
+history schema; missing fields, duplicate members, mismatches and invalid raw
+values refuse rather than defaulting to ownership.
+
+Versions 1–3 have no settings receipt. Compatibility relies on the old installers'
+settings-before-link ordering: a live link to their recorded `tree` (or `repo`)
+that differs from the recorded original link witnesses reaching the last step.
+Normal linked legacy installations still restore their original values, including
+version 1's JSON `value`. Reinstall records this historical witness separately as
+`legacy_completion_link`, with `settings_ownership: "legacy"`; it does **not**
+claim a confirmed settings write. That witness survives failed refreshes and tree
+moves. An orphan, missing installed target, or unchanged pre-existing link is
+ambiguous and requires the explicit recovery above. This compatibility inference
+assumes the old record and wiring have not been independently recreated by hand;
+legacy files cannot provide the new write receipt.
+
+Installation and uninstallation hold an exclusive OS lock on the stable empty
+`<config>/claude-tabstatus.lock` anchor before re-reading ownership and making
+changes. Install first checks its preflight, then locks, resolves the tree again
+and repeats preflight. Uninstall resolves its context again under the lock.
+Different config directories are independent. The anchor is retained after
+uninstall and refusals: deleting it could let queued operations lock different
+inodes. It holds no settings data. The kernel releases the lock on process exit,
+including abrupt termination; a suspended holder keeps later management commands
+waiting. Hooks and read-only diagnostics do not acquire it. External editors and
+older management binaries do not participate; the settings byte-comparison guard
+continues to detect edits in its existing window, rather than making all external
+filesystem changes transactional.
+
+Each settings/record staging file is synced before its atomic rename. This covers
+ordinary errors and process interruption, **not power-loss durability across the
+settings and record renames**: their parent directories are not synchronised as a
+transaction, and a symlink target may be on another filesystem. No power-loss
+ordering or whole-install rollback is claimed. The journal stores only the
+original title-disable value and link information, with the record's existing
+0600 Unix mode or directory-inherited Windows DACL; no whole settings document or
+unrelated secrets are added. Settings, backup and restoration protection still
+use their existing source-specific writers. `uninstall` removes the record after
+restoring settings and the prior link.
+
+`tests/test_install_ownership.py` observes the actual candidate binary and these
+production paths. Bounded opt-in `CCTAB_TEST_MANAGE_DIR` /
+`CCTAB_TEST_MANAGE_POINT` barriers require a reached file and a release; missing
+observation fails. Tests kill processes on both sides of settings replacement and
+remove closed settings/receipt staging files to force real rename failures.
+The principal regression makes a valid external edit after history is saved,
+requires the real concurrent-edit refusal, then supplies a user-owned key and
+asserts that ordinary uninstall preserves it. It fails at that preservation
+assertion on `b38e5fd` rebuilt with only the history-saved barrier added; the
+uninstrumented freshly built binary also reproduced the original timing-window
+defect. The suite runs for both Linux binaries and natively on Windows and macOS
+arm64 in required CI. It does not establish behaviour in a terminal application.
 
 ### The settings.json splice
 
@@ -1020,7 +1475,79 @@ ACL (a symlink into a WSL share, where a rewrite from Windows would turn 0600 in
 or `uninstall` to write it anyway after a warning. `--force` lifts only that
 refusal; an ACL that exists but cannot be read stays refused. Integrity labels and
 auditing entries (the SACL) are not carried. A new `settings.json` inherits from
-its directory.
+its directory. A restore also keeps the live file's mode when present; with no
+live file it takes the backup's mode.
+
+On **Darwin**, mode bits are only part of a file's protection. `sys::Security`
+owns the original native ACL and records UID/GID from the same `fstatx_np`
+snapshot, preserving owner, group, ordered allow/deny entries, permissions,
+entry inheritance flags and ACL flags. An existing file with no ACL has an
+explicit security snapshot; only a missing source permits normal directory
+inheritance. `fpathconf(_PC_EXTENDED_SECURITY_NP)` distinguishes a filesystem
+without ACL support, which is refused, from an ACL-capable file with no ACL.
+Only a successful `fstatx_np` snapshot followed by a successful property query
+can establish absence; even an `ENOENT` inspection error on an open fd is refused.
+Inspection errors are preflighted where practical and rechecked at each write;
+neither an unreadable ACL nor failed preservation is bypassed by `--force`.
+Preflight also creates an empty private ownership probe beside the source, applies
+and verifies its UID/GID, then removes it. This asks the filesystem whether the
+current credentials can recreate the ownership before installer mutations, rather
+than predicting privileges from group membership. A writable settings file owned
+by someone else can therefore be refused: write access does not grant permission
+to assign that owner to a replacement. The source is untouched by the probe.
+
+The empty staging file is born via `openx_np` with mode 0600 and an empty ACL
+with `ACL_FLAG_NO_INHERIT`. A plain `open(0600)` would still inherit directory
+allow entries. Its owner/group are set and verified first, changing only the IDs
+that differ; `fchown` errors refuse the operation. The original ACL is then set by
+fd, or removed explicitly for an original with no ACL. Applying it after creation
+matters: the kernel's creation
+inheritance pass filters inherited source entries. Ownership changes precede the
+final `chmod`, since `chown` can clear set-ID bits. The intended ownership, mode
+and ACL are verified before configuration bytes; after writing, the mode is set again (writes
+can clear special mode bits), and all are verified before sync and atomic rename.
+A write or preservation failure leaves the destination unchanged and attempts to
+remove the staging file. Persistent cleanup failure or interruption can leave
+scratch files.
+Settings symlinks and byte-based concurrent-modification guards retain their
+existing behaviour; this is not a transaction across all installer steps.
+
+Darwin backups and safety copies use `fcopyfile(DATA | STAT | XATTR)` on the
+already-secured staging fd, retaining the non-ACL metadata copying of Rust's
+Darwin `fs::copy`. Birth time is copied separately, since the old successful
+clone path retained it and `COPYFILE_STAT` does not. `COPYFILE_ACL` is deliberately
+omitted: Apple's copyfile implementation combines explicit source entries with
+inherited **destination** entries. The source's complete ACL is already installed
+and verified instead. Copies no longer use the APFS clone optimisation; STAT
+metadata retains copyfile's existing flags and timestamp semantics. Ownership is
+now strict: final verification catches even a successful copy that changed UID/GID.
+Both backups use their source's protection. A restore over a live file uses the
+live file's owner/group, mode and ACL; a missing live file takes the backup's.
+Byte-based settings rewrites still do not copy extended attributes, timestamps or
+BSD file flags, as before. Linux's existing mode/copy policy and Windows'
+best-effort ownership policy are unchanged. This change adds no hook calls or dependencies.
+
+API/provenance checks use Apple's current
+[ACL header](https://github.com/apple-oss-distributions/Libc/blob/main/include/sys/acl.h),
+[filesec implementation](https://github.com/apple-oss-distributions/Libc/blob/main/gen/filesec.c),
+[ACL file implementation](https://github.com/apple-oss-distributions/Libc/blob/main/posix1e/acl_file.c),
+[openx implementation](https://github.com/apple-oss-distributions/Libc/blob/main/sys/openx_np.c),
+[fcntl header](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/fcntl.h),
+[kernel inheritance implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_authorization.c),
+[chown contract](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/chown.2),
+and [copyfile source](https://github.com/apple-oss-distributions/copyfile/blob/main/copyfile.c),
+alongside the locked libc 0.2.189 declarations and Rust 1.98.1's Darwin `fs::copy`.
+ACL/filesec allocations have separate RAII owners; borrowed flagsets are never
+freed separately. Native tests set ACLs with `chmod`, observe entries with `ls`
+and ACL-level flags with a separate native text observer,
+and inject SDK-level faults. Independent `stat` observations check UID/GID,
+including a source group differing from its directory, set-ID mode bits, ownership
+application/verification failures and privileged/unprivileged owner changes in
+isolated fixtures. Native CI requires passwordless `sudo` for those owner fixtures;
+privileged invocations receive an explicit isolated environment. `cargo check`
+alone proves neither linking nor protection preservation. The added ACL and
+ownership coverage passed in the recorded native
+[macOS validation](#macos-validation), including all seventeen ACL/ownership tests.
 
 ### What uninstall removes, and what it declines to
 
@@ -1109,7 +1636,8 @@ left an empty `old/` that no later marker lists, so `remove` never took it and t
 tree could never come down.
 
 **Uninstall is an undo, not a delete**: it puts back whatever
-`claude-tabstatus.state` says was there before. If you had already set
+the confirmed or historically witnessed restoration record says was there before.
+Pending or ambiguous legacy history is refused before automatic removal. If you had already set
 `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` yourself, your value comes back byte for byte -
 the state file records the value's original *text*. If that record is missing and
 the key is present, the key is left alone unless you pass `--force`, because there is
@@ -1254,6 +1782,111 @@ tree:      /home/me/.local/share/claude-tabstatus (from the plugin symlink)
 tree is rewritten there and the link is not touched. An `install --tree <somewhere>`
 you chose once is not silently abandoned for the default path.
 
+## The three axes
+
+The design behind this section, and the evidence under it, are in
+[docs/backend-architecture.md](backend-architecture.md) and
+[docs/backend-scouting.md](backend-scouting.md).
+
+Three things decide what a paint looks like and where it goes, and they are
+independent: the **platform** this binary was built for, the **surface** - the leaf
+terminal drawing the tab - and the **multiplexer**, if any, between them.
+`tabstatus doctor` prints all three as one fixed-column capability table, so a
+report from Linux and a report from Windows can be diffed against each other:
+
+```text
+platform    linux                        a record carries its session's origin as `p <pid> <start>`
+  session terminal      ok    CLAUDE_PID=4242 - session-start and session-end write it directly
+  record lock           ok    a record is written under an exclusive lock proven to hold that same file
+  state dir             n/a   no CCTAB_STATE_DIR and no XDG_RUNTIME_DIR
+surface     konsole                      Konsole, measured on a running terminal
+  evidence              ok    $KONSOLE_VERSION
+  elide                 left  the tab label is cut from the left, so a glyph goes last
+  title (OSC 0)         ok    icon name and window title together
+  arm / restore         ok    ESC]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w BEL
+                              back to ESC]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H BEL
+multiplexer tmux
+  outer title           ok    it re-renders its own format on a timer, which is what lets a glyph decay
+```
+
+The verdict column has exactly five words - `ok`, `n/a`, `off`, `?`, `fail` - and
+each one means something different. `n/a` means unsupported by this terminal or
+version; `off` names a knob of **ours** you can turn back on; `?` is "the terminal may or may not honour it and
+nothing we can read says which", which is what Windows Terminal's
+`compatibility.allowOSC777` and `profiles.suppressApplicationTitle` force; and `fail`
+is an attempt the OS refused. Escape bytes are **named, never written** - doctor is
+read in the terminal whose tab is misbehaving.
+
+Each surface line says how far its row should be trusted, because **thirteen of the
+fourteen have never had a byte delivered to them** by this program: one row, Konsole,
+was measured on a running terminal, eleven were read out of vendor source and two are
+inferred. They exist because
+`CCTAB_TERMINAL` can name them over ssh, and their table can be read without them:
+
+```sh
+tabstatus doctor --surface windows-terminal
+```
+
+That spelling needs no terminal, no session and no config directory - every input is
+compiled-in data - and prints the surface axis alone, in the same columns, so it
+diffs cleanly against the block inside the full report. The names are the fourteen
+`CCTAB_TERMINAL` accepts: `unknown`, `konsole`, `vte`, `kitty`, `alacritty`,
+`wezterm`, `foot`, `ghostty`, `xterm`, `iterm2`, `apple-terminal`,
+`windows-terminal`, `conhost`, `vscode`.
+
+### Protocol catalogue and running-version evidence
+
+`surface::Protocol<T>` keeps a catalogue grammar separate from its reporting
+verdict. Each known minimum is typed data beside the grammar in
+`src/surface/rows.rs`; `Protocol::reported` resolves it, and doctor only formats
+that answer plus the grammar and requirement. The catalogue's
+`Support::Unverifiable(Some(grammar), reason)` retains syntax when a foreign
+setting makes effectiveness uncertain. Windows Terminal notifications retain
+`OSC 777 notify BEL`; VS Code notifications retain `OSC 99 ST`. Conhost progress
+uses `Unverifiable(None, reason)`: its handling is undocumented, so the catalogue
+supplies no implementation. Doctor prints known grammars alongside uncertainty
+reasons without claiming those settings are enabled.
+
+`Support::emittable` returns a known value for either available or uncertain
+support, and `should_emit` is true exactly when that value exists. An explicit
+`gate(Some(knob))` suppresses both states and reports `off` with the knob's name;
+it also overrides uncertainty without a value. Unsupported, already-disabled
+and failed answers retain their reasons. `map` preserves uncertainty and maps
+only values that exist; verified-only extraction does not promote uncertainty.
+See [one vocabulary for absence](backend-architecture.md#one-vocabulary-for-absence)
+for the full helper contract.
+
+The three Konsole entries have the floors recorded in the
+[capability matrix](research/terminal-capability-matrix.md#runtime-version-reporting).
+
+Only ordinary doctor reads version evidence, through `surface::version_evidence`.
+It accepts Konsole's six ASCII digits `YYMMZZ` (non-zero year, month 01–12,
+two-digit patch), compares the whole value including the patch, and rejects
+partial numbers, signs, whitespace, suffixes and non-UTF-8 values. A known older
+version yields `Unsupported`; absent, malformed or unreliable evidence yields
+`Unverifiable(None, reason)` in the reporting view. Those report-only answers
+leave the catalogue grammar intact; `reported()` does not construct an emission
+plan. A non-empty `$TMUX` or `$STY` vetoes the inherited version even
+when mux integration is disabled or the mux value is malformed. A terminal-family
+override or mux family hint does not establish any client's version. Outside a
+mux, an explicitly forwarded version over SSH is taken at its word, like the
+existing family evidence; no active terminal query is attempted.
+
+`doctor --surface` always uses catalogue mode and ignores local version evidence.
+It prints `?` for versioned entries, retaining their grammar and required minimum.
+Entries without a recorded floor retain their existing catalogue verdict; this
+change does not claim to have surveyed version floors for all terminal families.
+
+The reporting resolver is absent from `Config`, title composition, arming and
+routing. Konsole family detection retains non-empty presence matching, so even
+malformed Konsole version text selects the same title and arming behaviour.
+macOS shared-variable probes use exact vendor values, as documented in the
+[automatic probe policy](research/terminal-capability-matrix.md#automatic-probe-policy).
+Doctor prints the recognised value for these probes, while Linux and Windows
+presence-evidence output is unchanged. Family matching does not establish a
+version or change uncertain capability verdicts. No attention or colour
+emission is implemented, and the shared tmux arming ownership fix is unchanged.
+
 ## Konsole arming
 
 Konsole's stock tab format is `%d : %n`, not the shell-supplied title. On
@@ -1263,8 +1896,10 @@ format to `%w`, and on `SessionEnd` sets both formats back to Konsole's defaults
 in memory, and never inherits them into new tabs or writes them to disk. OSC 50
 means "set font" in xterm, so it is sent only when Konsole is detected
 (`KONSOLE_VERSION` or `KONSOLE_DBUS_SESSION`, outside tmux and screen) or
-`CCTAB_TERMINAL=konsole` says so. Konsole arming is Linux-only: Windows has no
-console form of it. The user-facing rules, including the ssh case, are in the README.
+`CCTAB_TERMINAL=konsole` says so. Konsole arming is Unix-only. Its forced protocol
+bytes passed native macOS PTY and tmux tests; no real Konsole application was
+tested there. Windows has no console form of it. The user-facing rules, including
+the ssh case, are in the README.
 
 Konsole's elide direction is not configurable: it is
 `QTabBar::setElideMode(Qt::ElideLeft)` at one hardcoded call site, with no config key
@@ -1287,8 +1922,10 @@ tmux, while known background stays visible.
 
 ### Delivery
 
-All tmux paints write raw OSC directly to the pane's verified terminal through
-`/proc/$CLAUDE_PID/fd/1`, so tmux integration is Linux-only. Claude Code 2.1.274
+All tmux paints write raw OSC directly to the pane's verified terminal - Claude
+Code's pty, through `/proc/$CLAUDE_PID/fd/1` on Linux and `proc_pidfdinfo` on
+macOS - so tmux integration is Unix-only. Native macOS 15 arm64 acceptance
+with tmux 3.7c passed; see [evidence and limits](#macos-validation). Claude Code 2.1.274
 wraps hook `terminalSequence` OSCs in tmux passthrough, which bypasses `pane_title`;
 using that JSON delivery path would leave the startup idle record unchanged. A
 missing or redirected terminal is a silent no-op. The non-tmux JSON delivery path is
@@ -1341,6 +1978,8 @@ set -s @cctab_title                      the generated strip-and-label format
 set -s @cctab_string                     the set-titles-string we installed
 set -s @cctab_window_strip               the generated strip for one window
 set -s @cctab_window_color               one status color for a themed window cap
+set -t <our session> @cctab_members      explicit lifecycle ownership and retirement
+set -t <our session> @cctab_armed        the surface this session armed, or `-`
 set -g set-titles on
 set -g set-titles-string '#{s|^ ||:#{T:@cctab_title}}'
 set -w -t <window> window-status-format          a strip plus the saved normal format
@@ -1355,6 +1994,90 @@ set -s @cctab_exe                        this binary, for the hook to run
 set-hook -t <our session> 'client-attached[1971]' \
     'run-shell -b "'\''#{@cctab_exe}'\''  tmux-arm '\''#{client_tty}'\''"'
 ```
+
+`@cctab_armed` and `@cctab_members` are **session** options. The rendering options
+feed `set-titles-string`, which is
+server-wide and genuinely is "the last `SessionStart` wins". An arming is not - it
+goes to the ptys of the clients attached to *one* session, so two tmux sessions on
+one server are two different outer tabs, and a server-wide record would let either
+one's `SessionEnd` erase the other's. Within a tmux session it is a shared restore
+obligation: an arming start records the surface's name; a non-arming start uses
+tmux's `set -o` to initialise `-` only if no record exists. It preserves both an
+outstanding policy and its reattach hook. The last Claude pane attempts restoration
+and removes both, regardless of which pane selected the policy. `SessionEnd` reads it back instead
+of guessing from its own environment - so a `CCTAB_TERMINAL` that changes
+mid-session no longer loses the remembered surface. This is retained policy, written
+before client delivery, including detached starts; it proves no terminal application.
+The [arming contract](backend-architecture.md#the-armed-record) states the current-destination
+and best-effort restoration limits. A value naming no surface this build knows reads as **absent**,
+never as a different terminal. `tabstatus uninstall` removes it with the hook.
+
+### Tmux lifecycle coordination
+
+`src/mux/tmux/lifecycle.rs` coordinates cold startup and teardown for the actual
+session returned by tmux, using its `socket_path` and `session_id`. An exclusive
+OS file lock on `<socket>.cctab-<session-number>.lock` beside the socket is held
+from before membership and restore-policy selection until all carrier/client
+writes and final policy removal finish. Different state directories, installed
+binary paths and `$TMUX` session-number hints cannot split the lock domain.
+Different tmux sessions have separate locks. The anchor is never replaced or
+unlinked, including at uninstall, because queued hooks must continue to lock the
+same inode. Creating the anchor requires a writable socket directory. Its empty
+file can outlive the session; it holds no persistent lock or ownership. Failure to establish coordination for a live server suppresses
+lifecycle delivery rather than proceeding unlocked. An absent server preserves
+the historical direct-only fallback.
+
+The session-scoped `@cctab_members` is a versioned JSON register. Each pane maps
+to `[pid, process-start-time, session-id, active]`; there is at most one entry per
+pane. Startup registers before shared arming-policy installation, client arming
+and real carrier publication. Teardown marks its entry retired before clearing
+the carrier and selecting the last owner. Active membership therefore does not
+wait for tmux's title parser. Retired entries are retained while their pane
+exists so an uncleared or unparsed old carrier cannot become an owner again.
+Unregistered panes with recognised carriers remain conservative legacy owners.
+Unknown or corrupt register shapes fail closed, preserving existing policy.
+
+Repeated starts replace their pane's entry without adding an owner. Repeated
+ends after successful policy removal do not fall through to an assumed restore;
+a repeated end with policy still present can finish interrupted cleanup. An end
+with a different known PID or supplied session ID cannot retire a replacement
+in the same pane. Without identifying metadata, distinct sessions using the same
+process cannot be distinguished. This does not change the per-Claude state
+record's separate quiescent-teardown requirement.
+
+**Interruption recovery.** The kernel releases the lock when its last descriptor
+closes, including process death. Mutating tmux children inherit the same locked
+file as stdin, so killing a hook cannot let a successor overtake an in-flight
+mutation; the child retains the lock until it exits. Killing the whole hook group
+also releases it. There is no persistent `wait-for -L` lock. Later lifecycle hooks
+remove entries for vanished panes and retire owners whose native PID/start-time
+identity proves death or reuse. Unverifiable identity retains the obligation;
+without a usable `CLAUDE_PID`, the actual pane process supplies the lifetime.
+An interrupted start whose Claude process still lives remains an owner until
+its end or a repeated start. An interrupted retired owner does not block the
+successor's final restore, even if its old carrier survives. Recovery occurs on
+another lifecycle hook, not a timer or acknowledgement/retry queue.
+
+The review's real-query race at `67a0823` is closed: when old teardown holds the
+lock, a new start waits; restore/removal completes before the successor registers,
+arms and publishes. If startup acquires the lock first, its registered ownership
+prevents old teardown from restoring. Concurrent final exits similarly elect
+one final owner without depending on carrier-clear parsing. Deterministic tests
+use actual candidate hooks, real pane processes, private servers and attached
+PTYs, delaying completed real tmux commands. They check client byte ordering,
+policy/hook state, eventual successor restore, duplicate ends, surviving child
+locks, interruption/dead-owner recovery and session isolation. Mixed old/new
+binaries and topology changes remain outside this coordination guarantee.
+
+Local Linux validation of this fix passed the 46-test tmux suite on both freshly
+built musl and GNU binaries, 310 Rust tests per target, the required actual-delivery
+and zero-subprocess gates, state/delivery/install suites, 843 shell assertions and
+the unchanged 312-case corpus. Both source digests matched; both Apple ABI and
+Windows MSVC compile checks passed. These are separate from the historical native
+macOS evidence above. The exact pushed-head CI evidence is recorded in PR #21;
+macOS remains experimental with native arm64 automated validation. That lifecycle
+fix left the separately recorded `refresh-client -S` observer false failure in
+place; the subsequent correction is documented below.
 
 `@cctab_window_color` returns the highest-priority visible state across all Claude
 panes in the window (orange > blue > purple > white), sharing the strip's carrier
@@ -1371,8 +2094,8 @@ is not a command-execution vector: tmux defangs it to `_(` when it *stores* the
 title. (`select-pane -T`, which this plugin never uses, expands its argument at set
 time and must never carry a location.)
 
-**The hot path execs nothing.** Only `SessionStart` runs `tmux`, and `SessionEnd`
-only in Konsole mode; ordinary paints write the pane carrier without invoking `tmux`.
+**The hot path execs nothing.** Only `SessionStart` and `SessionEnd` run `tmux`;
+ordinary paints write the pane carrier without invoking `tmux`.
 
 **What is deliberately not set.** `SessionStart` does not turn on `status`, set
 `status-interval`, or add terminal features, although decay depends on the first two.
@@ -1400,6 +2123,50 @@ elided end while the Konsole arming stays in force. `doctor`'s `layout: WARN` li
 exists because the `title: OK` test cannot catch it (the same `SessionStart` rewrites
 `@cctab_string`, so those two always agree). A per-session policy would need the
 deadlines carried in the record instead.
+
+### Tmux status observer correction
+
+The [Linux push job at `a2d24af`](https://github.com/dalf/claude-tabstatus/actions/runs/37159816520/job/111310748207)
+passed both installer ownership suites, then failed the GNU clock-only decay
+observer with `C:current` missing and `bytes=b''`. The server format had reached
+the expected value before capture was cleared. `refresh-client -S` requests a
+status refresh, and tmux can omit new bytes when its cached status is already
+correct. Empty capture did not establish an incorrect displayed status. The
+push run remains failed; its successful macOS/Windows jobs and the separate
+[PR merge run](https://github.com/dalf/claude-tabstatus/actions/runs/37159819149)
+remain historical evidence.
+
+Both affected observations now clear old PTY capture and call `refresh-client`
+without `-S`, which requests a full client redraw. The decisive assertion still
+requires status text delivered to the attached disposable client, with outer-title
+OSCs filtered out. Clock-only expiry still fires no Claude hook, and the test
+checks that the carrier is unchanged and the fresh redraw contains no state glyph.
+No production TTL, renderer or delivery code changes.
+
+The cached-status regression disables periodic status updates and automatic
+renaming, observes tmux's actual extended device-attributes query, replies with a
+fixture identity and requires tmux to acknowledge it. This prevents the startup
+query timeout's incidental full redraw from rescuing the old observer. An
+`after-refresh-client` hook writes a file marker without changing tmux options;
+changing an option would itself invalidate the display and spoil this control.
+Attachment, the query/acknowledgement, refresh execution and fresh client status
+are all required. The old status-only refresh produces no status bytes; the full
+redraw delivers the unchanged text. A second control disables status delivery and
+seeds matching stale capture, which cannot satisfy the fresh observation. Existing
+missing/broken-carrier and complete/partial OSC-only controls remain effective.
+
+Local validation used fresh `sh scripts/build.sh --all` binaries and tmux 3.7c
+on Linux x86_64. Focused controls passed; all 48 tmux acceptance tests passed
+without skips on each Linux binary. Reverting only the observer to `-S` in a
+disposable test copy fails the new regression with empty capture after verified
+refresh execution. Removing capture clearing fails the disabled-delivery control
+because stale text is accepted. An earlier control without the terminal-query
+reply allowed the old observer to pass on tmux's delayed redraw; the strengthened
+control closes that escape. These controlled failures, rather than repeated CI
+passes, demonstrate the correction. The same suite remains required for both
+Linux binaries and native macOS arm64; Windows checks are unchanged. Exact pushed
+commit CI results are recorded in [PR #21](https://github.com/dalf/claude-tabstatus/pull/21).
+Experimental macOS scope remains as described in [validation limits](#macos-validation).
 
 ### Save and restore
 
@@ -1472,8 +2239,9 @@ space arrived byte for byte. A path holding a single quote has no representation
 inside the hook's shell quoting and drops the re-arm, keeping everything else.
 
 The restore is sent only when no *other* claude pane is left in the session, because
-the arming is per tab and inside tmux one tab holds every window. Our own pane is
-excluded from that count rather than relied on to have been cleared already.
+the arming is per tab and inside tmux one tab holds every window. Registered
+ownership is retired under the shared lock before clearing the carrier; it does
+not wait for tmux's asynchronous title parser.
 
 ### screen and nested tmux
 
@@ -1532,16 +2300,103 @@ build's 556us, below even `/bin/true`'s 312us, because it never enters `ld.so`.
 24-42ms. Konsole repaints its tab on a ~2s tick, not when the title arrives, so in
 Konsole that tick, not the hook, is the responsiveness ceiling.
 
-**The state layer.** Remembered numbers did not reproduce: a per-edge cost of tens of
-microseconds against a fork-and-exec floor of several hundred is below the noise of a
-desktop that is also doing something else, and an earlier harness that forked three
-times per invocation put an 1100us floor under a 500us measurement. So the numbers
-live in a script:
+**Required subprocess check.** Linux CI runs
+`python3 tests/check_hot_subprocesses.py` for both release targets, independently
+of timing and of `CCTAB_BENCH`. It requires working `strace`, `tmux` and `cc`;
+missing tools, tracer errors, incomplete traces and missing output fail the job.
+Only the hook process and its descendants are traced. The harness's launches and
+private tmux server are outside that trace.
+
+The check permits the initial successful `execve`, then rejects every attempt at
+`fork`, `vfork`, `clone`, `clone3`, `execve` or `execveat`, including failed calls.
+It requires normal tracee completion. A compiled clean control must pass; seven
+violation controls must fail, covering all six names plus a failed `execve`.
+Raw syscalls stop libc substituting `clone` for `fork`; a refused or unsupported
+syscall still tests detection of an attempt. Checker tests also reject empty,
+truncated and failed traces, missing tracers and tracers that exit without tracing.
+
+The exercised scope is `working`, `waiting`, `idle` and permission-prompt `notify`
+on x86_64 Linux, with a local repository, the `other` terminal row, and state both
+disabled and enabled. Each case paints twice, including record writes and reuse;
+idle starts from a seeded working record so the first Stop changes state.
+Ordinary delivery must produce the expected `terminalSequence`
+JSON. Tmux delivery must change a private server's disposable pane title to the
+expected carrier, with no protocol output. Every `CLAUDE_PID` names an owned PTY
+stand-in, so tmux delivery exercises native `/proc` session-terminal discovery,
+carrier construction and the PTY write. No dry-run shortcut is used.
+
+This enforces zero subprocess attempts for those configurations, not every possible
+hook input or backend. Other terminal rows, SSH host discovery, background and
+no-op transitions, nested multiplexers, macOS and Windows are outside this tracer
+check. Session start/end and management commands intentionally may launch tools.
+The existing semantic, corpus and tmux suites cover additional behaviour; they do
+not expand the measured zero-subprocess scope or prove an end-to-end latency bound.
+
+**Optional timing.** Timing remains a local opt-in measurement because shared CI
+noise makes a per-PR microsecond threshold unreliable. No latency regression has
+been demonstrated by this review. `bench-hot.sh` measures four **stateless dry-run**
+edges: payload handling, location, title composition and dry-run stdout, including
+the harness's process launch. It returns before routing, tmux carrier construction,
+native terminal discovery and delivery. `bench-state.sh` measures dry-run state
+arms; neither script measures Claude Code's complete hook pipeline or terminal
+repainting.
 
 ```sh
-sh scripts/bench-state.sh                      # the layer against itself, switched off
-sh scripts/bench-state.sh <baseline-binary>    # ...and against another build
+python3 tests/check_hot_subprocesses.py        # required by Linux CI, no timing
+sh scripts/bench-hot.sh --calibrate           # identical arms, no regression verdict
+sh scripts/bench-hot.sh /absolute/baseline    # candidate defaults to bin/tabstatus
+sh scripts/bench-state.sh                     # dry-run state arms against layer-off
+CCTAB_BENCH=1 sh tests/run.sh                  # optional calibration
+CCTAB_BENCH=1 CCTAB_BENCH_BASELINE=/absolute/baseline sh tests/run.sh
 ```
+
+`bench-hot.sh` requires an explicit baseline or `--calibrate`; identical binary
+contents always mean calibration, including copies at different paths. The
+candidate is selected with `CCTAB_BENCH_BIN`. Both arms use the same isolated
+stateless environment. With a distinct baseline the script fails when any edge's
+candidate minimum minus baseline minimum exceeds `CCTAB_BENCH_BAND` (default
+50 µs). It also reports the median of paired per-round deltas and the candidate's
+spread. The band is a local heuristic inherited from historical calibration,
+not a portable guarantee: calibrate on the measurement host and report noisy runs
+as inconclusive. Calibration reports band crossings but gives no regression verdict.
+
+For an explicit baseline comparison, build two pinned revisions with **one installed
+Rust toolchain, one target and the same release profile and flags**. For example,
+from the checkout with `cargo`, `rustc` and `rustup` on PATH:
+
+```sh
+baseline=$(git rev-parse be497b0)       # replace with the intended baseline
+candidate=$(git rev-parse HEAD)        # commit the candidate before measuring
+toolchain=$(rustup show active-toolchain | cut -d ' ' -f 1)
+measure_dir=$(mktemp -d)
+mkdir "$measure_dir/base" "$measure_dir/new"
+git archive "$baseline" | tar -x -C "$measure_dir/base"
+git archive "$candidate" | tar -x -C "$measure_dir/new"
+rustup run "$toolchain" rustc -Vv      # retain this alongside both commit IDs
+# Before building, compare [profile.*] in both Cargo.toml files and .cargo configs.
+# Resolve any differences explicitly; do not compare musl with gnu or debug with release.
+for arm in base new; do
+    (cd "$measure_dir/$arm" &&
+     env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS \
+         CARGO_TARGET_DIR="$measure_dir/$arm/target" \
+         cargo +"$toolchain" build --locked --release --target x86_64-unknown-linux-musl)
+done
+CCTAB_BENCH_BIN="$measure_dir/new/target/x86_64-unknown-linux-musl/release/tabstatus" \
+    sh scripts/bench-hot.sh "$measure_dir/base/target/x86_64-unknown-linux-musl/release/tabstatus"
+```
+
+The explicit toolchain prevents directory-specific rustup selection. With another
+toolchain manager, pin its compiler in the same way. Review inherited Cargo configuration and build
+environment overrides; save `cargo build -vv` output when comparing changed build
+settings. The extracted source trees and separate target directories avoid stale
+artefacts from another revision. Repeat for gnu if that target matters. Preserve
+the revisions, toolchain, target, flags, sample counts and calibration output with
+any reported comparison. The subprocess gate needs no baseline build.
+
+**The state layer: historical measurements.** Remembered numbers did not reproduce:
+a per-edge cost of tens of microseconds against a fork-and-exec floor of several
+hundred is below the noise of a busy desktop. `bench-state.sh` makes that cost
+re-measurable.
 
 It interleaves every arm within each round, reports the spread as well as the
 minimum, and gives the **median of the per-round paired deltas** rather than a

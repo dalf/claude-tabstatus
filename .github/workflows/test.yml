@@ -12,7 +12,11 @@ permissions:
 
 jobs:
   test:
-    name: Build and test Linux binaries
+    # The name says the Apple targets too. This runner builds no Mac binary and
+    # never will - `cargo check` does not link - but it is where the macOS ABI
+    # asserts are evaluated, and a job whose name hides that is a job nobody looks
+    # in when one of them fails.
+    name: Build and test Linux binaries, and check both Apple ABIs
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
@@ -26,18 +30,26 @@ jobs:
       - name: Install build and test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes musl-tools tmux
+          sudo apt-get install --yes musl-tools tmux strace
 
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add x86_64-unknown-linux-musl
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
       - name: Run Rust unit tests
         run: |
           cargo test --locked --target x86_64-unknown-linux-musl
           cargo test --locked --target x86_64-unknown-linux-gnu
+
+      # Keep both ABI checks, including Intel macOS which the native arm64 job
+      # does not execute. These assert layouts but do not link or test OS calls.
+      - name: Check the macOS ABI declarations on both Apple targets
+        run: |
+          cargo check --locked --all-targets --target aarch64-apple-darwin
+          cargo check --locked --all-targets --target x86_64-apple-darwin
 
       - name: Build release binaries and source manifests
         run: sh scripts/build.sh --all
@@ -45,16 +57,30 @@ jobs:
       - name: Test corpus fixtures
         run: python3 -m unittest discover -s tests/corpus -p 'test_*.py' -v
 
+      - name: Test Unix delivery helper compilation and failure diagnostics
+        run: python3 tests/test_unix_delivery_helpers.py -v
+
+      - name: Require Linux hot-edge subprocess and delivery checks
+        run: |
+          python3 -m unittest discover -s tests -p 'test_hot_subprocesses.py' -v
+          for target in x86_64-unknown-linux-musl x86_64-unknown-linux-gnu; do
+            python3 tests/check_hot_subprocesses.py --binary "$GITHUB_WORKSPACE/bin/tabstatus-$target"
+          done
+
       - name: Run integration tests and golden corpus
         run: |
           for target in x86_64-unknown-linux-musl x86_64-unknown-linux-gnu; do
             binary="$GITHUB_WORKSPACE/bin/tabstatus-$target"
+            CCTAB_TEST_BIN="$binary" python3 tests/test_install_ownership.py -v
             CCTAB_TEST_BIN="$binary" python3 tests/test_payload.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_state_contract.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_background.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_state_guarantees.py
+            CCTAB_TEST_BIN="$binary" python3 tests/test_unix_delivery.py
             CCTAB_TEST_BIN="$binary" python3 tests/test_elicitation.py
-            CCTAB_TEST_BIN="$binary" python3 tests/test_tmux_status.py
+            CCTAB_TEST_BIN="$binary" CCTAB_TEST_TMUX="$(command -v tmux)" CCTAB_TEST_REQUIRE_TMUX=1 python3 tests/test_tmux_status.py -v
+            CCTAB_TEST_BIN="$binary" python3 tests/test_install_paths.py
+            CCTAB_TEST_BIN="$binary" python3 tests/test_terminal_detection.py
             CCTAB_TEST_BIN="$binary" sh tests/run.sh
             sh tests/corpus/replay.sh "$binary"
           done
@@ -73,6 +99,94 @@ jobs:
             bin/SHA256SUMS
           if-no-files-found: error
           retention-days: 14
+
+  macos:
+    name: Native macOS arm64 validation (no release artifact)
+    # macos-15 is Apple Silicon; assert this below so coverage cannot drift.
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust and verify native architecture
+        run: |
+          test "$(uname -m)" = arm64
+          rustup toolchain install stable --profile minimal --target aarch64-apple-darwin
+          rustup default stable
+          uname -m
+          rustc -vV
+          sw_vers
+
+      - name: Locate or install native tmux and record its version
+        run: |
+          if ! command -v tmux >/dev/null 2>&1; then
+            brew install tmux
+          fi
+          tmux_path="$(command -v tmux)"
+          test -x "$tmux_path"
+          case "$tmux_path" in /*) ;; *) exit 1 ;; esac
+          "$tmux_path" -V
+          printf 'CCTAB_TEST_TMUX=%s\n' "$tmux_path" >> "$GITHUB_ENV"
+
+      - name: Link and run native Rust tests (including process identity and reaping)
+        run: cargo test --locked --all-targets --target aarch64-apple-darwin
+
+      - name: Build native validation binary
+        run: sh scripts/build.sh
+
+      - name: Require native tmux hook transport, attached status, expiry and restoration
+        env:
+          CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
+          CCTAB_TEST_REQUIRE_TMUX: '1'
+        run: python3 tests/test_tmux_status.py -v
+
+      - name: Test Unix delivery helper compilation and failure diagnostics
+        run: python3 tests/test_unix_delivery_helpers.py -v
+
+      - name: Require native SSH hostname lookup, precedence, bypasses and failure tests
+        env:
+          CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
+        run: python3 tests/test_macos_hostname.py
+
+      - name: Require native terminal detection, doctor evidence and title protocol tests
+        env:
+          CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
+        run: python3 tests/test_terminal_detection.py
+
+      - name: Require native settings ACL and ownership preservation and failure tests
+        env:
+          CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
+          CCTAB_TEST_REQUIRE_SUDO: '1'
+        run: python3 tests/test_macos_acl.py
+
+      - name: Require installer ownership, interruption and recovery lifecycles
+        env:
+          CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
+        run: python3 tests/test_install_ownership.py -v
+
+      # Both disposable volumes are required. The suite proves lookup semantics
+      # before testing; failure to create APFS/APFSX is a failed job, not a skip.
+      - name: Require path guards and missing Unicode probes on APFS and case-sensitive APFS
+        env:
+          CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
+        run: python3 tests/test_install_paths.py
+
+      # The PTY suite requires SDK-built observation of actual O_NOCTTY opens on
+      # both session delivery and tmux-arm, including refusal/fault controls.
+      - name: Run native state, detached PTY delivery and terminal-open hardening tests
+        env:
+          CCTAB_TEST_BIN: ${{ github.workspace }}/bin/tabstatus-aarch64-apple-darwin
+        run: |
+          python3 tests/test_payload.py
+          python3 tests/test_state_contract.py
+          python3 tests/test_background.py
+          python3 tests/test_elicitation.py
+          python3 tests/test_state_guarantees.py
+          python3 tests/test_unix_delivery.py -v
 
   windows:
     name: Build and test Windows binary
@@ -139,14 +253,17 @@ jobs:
 
       # The suites that run on native Windows Python. test_state_guarantees and
       # test_tmux_status need fcntl and tmux, and tests/run.sh and the corpus
-      # replay assume a Unix userland; they run in the Linux job only.
+      # replay assume a Unix userland. tmux runs on Linux and native macOS;
+      # the shell and corpus suites run in the Linux job only.
       - name: Run integration tests
         run: |
           binary="$GITHUB_WORKSPACE/bin/tabstatus-x86_64-pc-windows-msvc.exe"
+          CCTAB_TEST_BIN="$binary" python tests/test_install_ownership.py -v
           CCTAB_TEST_BIN="$binary" python tests/test_payload.py
           CCTAB_TEST_BIN="$binary" python tests/test_state_contract.py
           CCTAB_TEST_BIN="$binary" python tests/test_background.py
           CCTAB_TEST_BIN="$binary" python tests/test_elicitation.py
+          CCTAB_TEST_BIN="$binary" python tests/test_terminal_detection.py
 
       # --text so the line reads "<hash>  name" like the Linux ones in the merged
       # release SHA256SUMS; Git Bash defaults to "<hash> *name". The digest is the

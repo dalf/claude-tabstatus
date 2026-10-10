@@ -3,19 +3,26 @@
 
 CCTAB_TEST_BIN=/path/to/tabstatus python3 tests/test_tmux_status.py
 CCTAB_TEST_TMUX=/path/to/tmux selects another tmux build for every invocation.
+CCTAB_TEST_REQUIRE_TMUX=1 makes missing prerequisites a failure (required in CI).
 Every test owns a unique socket, isolated HOME and disposable shell panes.
+Forced terminal rows exercise protocols, not real terminal applications.
 """
+import contextlib
+import errno
 import fcntl
 from concurrent.futures import ThreadPoolExecutor
 import json
+import locale
 import os
 from pathlib import Path
 import pty
 import re
 import select
+import signal
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import termios
 import time
@@ -25,6 +32,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 BIN = Path(os.environ.get("CCTAB_TEST_BIN", ROOT / "bin/tabstatus")).resolve()
 TMUX_OVERRIDE = os.environ.get("CCTAB_TEST_TMUX")
+TMUX = TMUX_OVERRIDE or shutil.which("tmux")
+REQUIRE_TMUX = os.environ.get("CCTAB_TEST_REQUIRE_TMUX") == "1"
 FORMATS = ("window-status-format", "window-status-current-format")
 # Exact rounded-pill formats from the reported display regression. The glyph
 # belongs inside the colored body, alongside the existing index and label.
@@ -37,11 +46,15 @@ MARKED_PILL_FORMATS = tuple(fmt.replace("#I:#W", "#{T:@cctab_window_strip} #I:#W
 SAVED = ("@cctab_window_format_saved", "@cctab_prev_window_format",
          "@cctab_prev_window_format_local", "@cctab_window_current_saved",
          "@cctab_prev_window_current", "@cctab_prev_window_current_local")
+ARM = b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07"
+RESTORE = b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07"
 
 
 def terminal_text_and_backgrounds(data, foreground=False):
     """Remove terminal controls while retaining each printed character's SGR background."""
-    data = re.sub(rb"\x1b\].*?(?:\x07|\x1b\\)", b"", data, flags=re.S)
+    # A PTY read may end mid-OSC. Hide that unfinished title as well, so its
+    # payload cannot satisfy a status assertion before the terminator arrives.
+    data = re.sub(rb"\x1b\].*?(?:\x07|\x1b\\|$)", b"", data, flags=re.S)
     text, backgrounds = [], []
     background = None
     reset, base, bright, extended = (39, 30, 90, 38) if foreground else (49, 40, 100, 48)
@@ -69,24 +82,52 @@ def terminal_text_and_backgrounds(data, foreground=False):
     return "".join(text), backgrounds
 
 
-@unittest.skipUnless(TMUX_OVERRIDE or shutil.which("tmux"), "tmux is required for window-status integration tests")
+@unittest.skipUnless(REQUIRE_TMUX or TMUX, "tmux is required for window-status integration tests")
 class TmuxStatusTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not TMUX:
+            raise RuntimeError("required tmux acceptance cannot run: tmux is unavailable")
+        selected = Path(TMUX)
+        if not selected.is_absolute() or not selected.is_file() or not os.access(selected, os.X_OK):
+            raise RuntimeError("CCTAB_TEST_TMUX must be an absolute executable path")
+        if not BIN.is_file() or not os.access(BIN, os.X_OK):
+            raise RuntimeError(f"required compiled binary is unavailable: {BIN}")
+        cls.tmux = str(selected.resolve())
+        # Darwin does not supply Linux's C.UTF-8. Validate a native UTF-8 locale
+        # before starting the server; do not silently fall back to ASCII widths.
+        cls.utf8_locale = "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8"
+        previous = locale.setlocale(locale.LC_CTYPE)
+        try:
+            locale.setlocale(locale.LC_CTYPE, cls.utf8_locale)
+            if locale.nl_langinfo(locale.CODESET).upper().replace("-", "") != "UTF8":
+                raise RuntimeError(f"not a UTF-8 locale: {cls.utf8_locale}")
+        finally:
+            locale.setlocale(locale.LC_CTYPE, previous)
+        version = subprocess.run([cls.tmux, "-V"], check=True, capture_output=True,
+                                 text=True, timeout=10).stdout.strip()
+        print(f"tmux acceptance: {version}; {os.uname().sysname} {os.uname().machine}; "
+              f"locale={cls.utf8_locale}; binary={BIN}", flush=True)
+
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="cctab-tmux-status-")
+        # Darwin TMPDIR can nearly fill sockaddr_un.sun_path (104 bytes).
+        # Own a short socket beneath /tmp, canonicalising its /private alias.
+        self.tmp = tempfile.TemporaryDirectory(prefix="cctm-", dir="/tmp")
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.socket = self.root / "tmux.sock"
+        self.assertLess(len(os.fsencode(self.socket)), 104)
+        # Fresh environment: no ambient terminal, mux, SSH, PID or Darwin TMPDIR
+        # state fallback. Pin state storage; stateless controls clear the knob.
         self.env = {"PATH": "/usr/bin:/bin", "HOME": str(self.root),
-                    "TERM": "xterm-256color", "LC_ALL": "C.UTF-8", "PS1": ""}
-        tmux = "tmux"
-        if TMUX_OVERRIDE:
-            selected = Path(TMUX_OVERRIDE)
-            self.assertTrue(selected.is_absolute(), "CCTAB_TEST_TMUX must be an absolute executable path")
-            self.assertTrue(selected.is_file() and os.access(selected, os.X_OK),
-                            "CCTAB_TEST_TMUX must name an executable file")
-            tmux = str(selected)
-            self.env["PATH"] = str(selected.parent) + os.pathsep + self.env["PATH"]
-        self.base = [tmux, "-S", str(self.socket), "-f", "/dev/null"]
+                    "CLAUDE_CONFIG_DIR": str(self.root / "config"),
+                    "XDG_DATA_HOME": str(self.root / "data"),
+                    "CCTAB_STATE_DIR": str(self.root / "state"),
+                    "TERM": "xterm-256color", "LC_ALL": self.utf8_locale, "PS1": ""}
+        # The binary's cold paths invoke tmux by name; Homebrew is outside the
+        # isolated /usr/bin:/bin PATH even when the harness has found it.
+        self.env["PATH"] = str(Path(self.tmux).parent) + os.pathsep + self.env["PATH"]
+        self.base = [self.tmux, "-S", str(self.socket), "-f", "/dev/null"]
         self.addCleanup(lambda: subprocess.run(self.base + ["kill-server"], env=self.env,
                                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                               timeout=10))
@@ -121,7 +162,7 @@ class TmuxStatusTests(unittest.TestCase):
 
     def uninstall(self, pane=None):
         env = dict(self.env, TMUX=f"{self.socket},1,0", TMUX_PANE=pane or self.pane,
-                   CLAUDE_CONFIG_DIR=str(self.root / "config"), CLAUDE_PID="0")
+                   CCTAB_STATE_DIR=str(self.root / "state"), CLAUDE_PID="0")
         p = subprocess.run([str(BIN), "uninstall", "--force"], env=env, cwd=self.root,
                            capture_output=True, timeout=10)
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -156,7 +197,112 @@ class TmuxStatusTests(unittest.TestCase):
             if actual == expected:
                 return
             time.sleep(0.025)
-        self.assertEqual(actual, expected)
+        self.assertEqual(actual, expected,
+                         f"observation timed out; socket={self.socket}; "
+                         f"panes={self.tm('list-panes', '-a', '-F', '#{pane_id}|#{pane_pid}|#{pane_tty}|#{pane_title}')!r}")
+
+    @contextlib.contextmanager
+    def attached_client(self, session="alpha"):
+        """A real tmux client on a pty THIS process owns both ends of.
+
+        The appearance bytes go to the ptys `list-clients` names, never through
+        tmux's allow-passthrough, so there is no other way to see them: the client
+        writes its redraw into the slave and the plugin writes its OSC 50 into the
+        same slave, and both come back out of the master interleaved. Reading has
+        to keep going the whole time, because a full pty buffer blocks the tmux
+        client.
+        """
+        master, slave = pty.openpty()
+        try:
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
+            client = subprocess.Popen(self.base + ["attach-session", "-t", session],
+                                      env=self.env, cwd=self.root,
+                                      stdin=slave, stdout=slave, stderr=slave,
+                                      start_new_session=True)
+        except BaseException:
+            os.close(master)
+            raise
+        finally:
+            os.close(slave)
+
+        class Client:
+            captured = b""
+            eof = False
+
+            def read(self, budget=0.1):
+                if select.select([master], [], [], budget)[0]:
+                    try:
+                        data = os.read(master, 65536)
+                        self.captured += data
+                        self.eof = not data
+                    except OSError as error:
+                        if error.errno != errno.EIO:
+                            raise
+                        self.eof = True
+
+            def saw(self, wanted, timeout=5, status=False):
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    observed = terminal_text_and_backgrounds(self.captured)[0] if status else self.captured
+                    if wanted in observed:
+                        return True
+                    if self.eof:
+                        break
+                    self.read()
+                observed = terminal_text_and_backgrounds(self.captured)[0] if status else self.captured
+                return wanted in observed
+
+            def clear(self):
+                deadline = time.monotonic() + 1
+                while (time.monotonic() < deadline and not self.eof
+                       and select.select([master], [], [], 0)[0]):
+                    self.read(0)
+                self.captured = b""
+
+            def send(self, data):
+                os.write(master, data)
+
+            def diagnostic(self):
+                return f"client exit={client.poll()}; tty={client_tty}; bytes={self.captured[-4096:]!r}"
+
+        watcher = Client()
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                if client.poll() is not None:
+                    break
+                if self.tm("list-clients", "-t", session, "-F", "#{client_tty}"):
+                    break
+                watcher.read(0.05)
+            client_tty = self.tm("list-clients", "-t", session, "-F", "#{client_tty}")
+            self.assertTrue(client_tty,
+                            f"attachment timed out: exit={client.poll()}; socket={self.socket}; "
+                            f"bytes={watcher.captured[-4096:]!r}")
+            watcher.tty = client_tty
+            yield watcher
+        finally:
+            client.terminate()
+            try:
+                client.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                client.kill()
+                client.wait(timeout=3)
+            os.close(master)
+
+    def assert_carrier(self, pane, state, epoch, timeout=5):
+        self.wait_for(lambda: self.tm("display-message", "-p", "-t", pane,
+                                     "#{pane_title}").rsplit(" ct1 ", 1)[-1],
+                      f"{state} {epoch}", timeout=timeout)
+
+    def assert_status(self, client, wanted, timeout=5):
+        self.assertTrue(client.saw(wanted, timeout=timeout, status=True),
+                        f"status {wanted!r} missing: {client.diagnostic()}")
+
+    def redraw_status(self, client):
+        # Forget old bytes, then request a full client redraw. A status-only
+        # refresh (-S) can emit nothing when tmux's cached status is unchanged.
+        client.clear()
+        self.tm("refresh-client", "-t", client.tty)
 
     def publish(self, pane, edge="working", age=0):
         # Invoke the real hook with the disposable pane shell as Claude's tty
@@ -166,14 +312,112 @@ class TmuxStatusTests(unittest.TestCase):
         output = self.hook(edge, pane, {"CCTAB_NOW": str(epoch), "CLAUDE_PID": pid})
         self.assertEqual(output, b"", "tmux hook updates must be delivered directly to the pane tty")
         state = {"working": "w", "waiting": "a", "idle": "i"}[edge]
-        self.wait_for(lambda: self.tm("display-message", "-p", "-t", pane,
-                                     "#{pane_title}").rsplit(" ct1 ", 1)[-1], f"{state} {epoch}")
+        self.assert_carrier(pane, state, epoch)
 
     def test_real_hook_updates_need_no_stdout_protocol_consumer(self):
         self.start()
         for edge, glyph in (("working", "🔵"), ("waiting", "🟠"), ("idle", "⚪")):
             self.publish(self.pane, edge)
             self.assertEqual(self.rendered(self.pane, True), glyph + " C:current")
+
+    def test_delivery_and_status_observers_reject_missing_and_broken_carriers(self):
+        self.start()
+        self.tm("select-pane", "-t", self.pane, "-T", "no-carrier")
+        epoch = int(self.tm("display-message", "-p", "%s"))
+        # A successful no-op hook cannot satisfy the positive carrier observer.
+        self.assertEqual(self.hook("working", self.pane, {"CLAUDE_PID": "0", "CCTAB_NOW": str(epoch)}), b"")
+        with self.assertRaises(AssertionError):
+            self.assert_carrier(self.pane, "w", epoch, timeout=0.15)
+        # This deliberately corrupt control is not a candidate paint. The real
+        # delivery test above always invokes the compiled hook for its carriers.
+        self.tm("select-pane", "-t", self.pane, "-T", f"project ct9 w {epoch}")
+        with self.attached_client() as client:
+            self.assert_status(client, "C:current")
+            with self.assertRaises(AssertionError):
+                self.assert_status(client, "🔵 C:current", timeout=0.2)
+            # Even matching outer-title bytes must not pass a status assertion.
+            for terminator in ("\x07", "\x1b\\", ""):
+                client.captured = ("\x1b]0;🔵 C:current" + terminator).encode()
+                with self.assertRaises(AssertionError):
+                    self.assert_status(client, "🔵 C:current", timeout=0)
+            client.clear()
+            self.publish(self.pane)
+            self.assert_status(client, "🔵 C:current")
+
+    def test_cached_status_redraw_delivers_fresh_bytes_after_capture_clear(self):
+        # Keep the already displayed status unchanged, with no periodic redraw
+        # or hook activity. The after-hook marks execution without setting a
+        # tmux option (which itself would invalidate the cached display).
+        self.tm("set", "-g", "status-interval", "0")
+        self.tm("set", "-w", "-t", self.pane, "automatic-rename", "off")
+        marker = self.root / "refresh-seen"
+        self.tm("set-hook", "-g", "after-refresh-client", f'run-shell "touch {marker}"')
+        with self.attached_client() as client:
+            # Answer the actual extended device-attributes query. Otherwise
+            # tmux's startup query timeout can cause an unrelated full redraw
+            # and rescue the old observer. Require tmux to acknowledge the reply.
+            self.assertTrue(client.saw(b"\x1b[>q"), client.diagnostic())
+            client.clear()
+            client.send(b"\x1bP>|cctab-status-observer\x1b\\")
+            self.wait_for(lambda: self.tm("display-message", "-p", "-c", client.tty,
+                                          "#{client_termtype}"), "cctab-status-observer")
+            self.assert_status(client, "C:current")
+            client.clear()
+            with self.assertRaises(AssertionError):
+                self.assert_status(client, "C:current", timeout=0.2)
+            # Reproduce the old observer's false failure, and require proof that
+            # it reached refresh-client rather than failing before attachment.
+            self.tm("refresh-client", "-S", "-t", client.tty)
+            self.wait_for(marker.exists, True)
+            with self.assertRaises(AssertionError):
+                self.assert_status(client, "C:current", timeout=0.2)
+            marker.unlink()
+            self.redraw_status(client)
+            self.wait_for(marker.exists, True)
+            self.assert_status(client, "C:current")
+
+    def test_status_redraw_rejects_stale_capture_when_delivery_is_disabled(self):
+        self.tm("set", "-g", "status-interval", "0")
+        marker = self.root / "refresh-seen"
+        self.tm("set-hook", "-g", "after-refresh-client", f'run-shell "touch {marker}"')
+        with self.attached_client() as client:
+            self.assert_status(client, "C:current")
+            stale = client.captured
+            self.tm("set", "-g", "status", "off")
+            client.captured = stale
+            self.redraw_status(client)
+            self.wait_for(marker.exists, True)
+            with self.assertRaises(AssertionError):
+                self.assert_status(client, "C:current", timeout=0.2)
+
+    def test_attached_status_shows_states_and_expires_on_tmux_clock_without_hooks(self):
+        self.start(CCTAB_TTL_WORKING="2", CCTAB_TTL_WAITING="2", CCTAB_TTL_GONE="4")
+        with self.attached_client() as client:
+            for edge, glyph in (("working", "🔵"), ("waiting", "🟠"), ("idle", "⚪")):
+                client.clear()
+                self.publish(self.pane, edge)
+                self.assert_status(client, glyph + " C:current")
+            client.clear()
+            self.publish(self.pane)
+            self.assert_status(client, "🔵 C:current")
+            carrier = self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}")
+            self.assert_status(client, "⚪ C:current", timeout=7)
+            self.wait_for(lambda: self.rendered(self.pane, True), "C:current", timeout=7)
+            # A full redraw after decay makes absence observable independently
+            # of tmux's cached status and cursor-delta optimisation. No hook runs.
+            self.redraw_status(client)
+            self.assert_status(client, "C:current")
+            self.assertNotRegex(terminal_text_and_backgrounds(client.captured)[0], "[🔵🟠⚪]")
+            self.assertEqual(self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}"), carrier)
+            # Known background remains visible past all display deadlines.
+            pid = self.tm("display-message", "-p", "-t", self.pane, "#{pane_pid}")
+            old = str(int(self.tm("display-message", "-p", "%s")) - 86400)
+            client.clear()
+            self.assertEqual(self.hook("idle", self.pane,
+                                      {"CLAUDE_PID": pid, "CCTAB_NOW": old,
+                                       "CCTAB_STATE_DIR": str(self.root / "state")},
+                                      {"session_id": "bg", "hook_event_name": "Stop", "background_tasks": [{}]}), b"")
+            self.assert_status(client, "🟣 C:current")
 
     def test_background_survives_decay_and_updates_waiting_fallback_in_both_directions(self):
         self.start(CCTAB_TTL_WORKING="1", CCTAB_TTL_WAITING="1", CCTAB_TTL_GONE="1")
@@ -321,42 +565,419 @@ class TmuxStatusTests(unittest.TestCase):
         self.tm("source-file", str(ROOT / "examples/tmux.conf"))
         self.start()
         self.publish(self.pane, "waiting")
-        master, slave = pty.openpty()
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
-        client = subprocess.Popen(self.base + ["attach-session", "-t", "alpha"],
-                                  env=self.env, stdin=slave, stdout=slave, stderr=slave,
-                                  start_new_session=True)
-        os.close(slave)
-        captured = b""
         fragment = "   0:"
-        try:
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                if select.select([master], [], [], 0.1)[0]:
-                    try:
-                        captured += os.read(master, 65536)
-                    except OSError:
-                        break
-                clean, foregrounds = terminal_text_and_backgrounds(captured, foreground=True)
-                if fragment in clean and "" in clean[clean.index(fragment):]:
-                    break
-            self.assertIn(fragment, clean)
+        with self.attached_client() as client:
+            self.assert_status(client, fragment)
+            self.assert_status(client, "")
+            clean, foregrounds = terminal_text_and_backgrounds(client.captured, foreground=True)
             left = clean.index(fragment)
             right = clean.index("", left)
-            _, backgrounds = terminal_text_and_backgrounds(captured)
+            _, backgrounds = terminal_text_and_backgrounds(client.captured)
             self.assertEqual(backgrounds[left + 1:left + 3], [(2, 251, 146, 60)] * 2)
             self.assertEqual(backgrounds[left + 3], (2, 229, 231, 235))
             self.assertEqual(foregrounds[left], (2, 251, 146, 60))
             self.assertEqual(foregrounds[right], (2, 229, 231, 235))
             self.assertNotRegex(clean[left:right], "[🔵🟠🟣⚪]")
-        finally:
-            client.terminate()
+
+    def test_the_armed_record_drives_the_restore_when_the_terminal_changes(self):
+        """THE DEFECT, byte for byte, on a real client pty.
+
+        `session_end` used to decide whether to restore the outer tab by
+        re-deriving the arming condition from ITS OWN environment, an unbounded
+        time after `session_start` derived it from the start hook's. Change
+        CCTAB_TERMINAL in between - or land in a shell whose rc sets it
+        differently - and the end hook wrote nothing at all, leaving Konsole's
+        `LocalTabTitleFormat=%w` in force with nothing left that would ever put it
+        back. What is armed is now RECORDED in `@cctab_armed`, and the restore is
+        driven by the record.
+
+        The arming bytes go to the ptys `list-clients` names, so seeing them needs
+        a real client attached to a real pty. tests/run.sh asserts the decision and the
+        record; this asserts what actually reaches the terminal.
+        """
+        arm = b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07"
+        restore = b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07"
+        with self.attached_client() as client:
+            self.hook("session-start", self.pane, {"CCTAB_TERMINAL": "konsole"})
+            self.assertTrue(client.saw(arm), "the arming never reached the client's pty")
+            self.assertEqual(self.tm("display-message", "-p", "-t", self.pane,
+                                     "#{@cctab_armed}"), "konsole")
+            # The terminal this hook can see is now WezTerm, which arms nothing.
+            # Before the record that was the whole input to the decision.
+            self.hook("session-end", self.pane, {"CCTAB_TERMINAL": "wezterm"})
+            self.assertTrue(client.saw(restore), "the restore was lost with CCTAB_TERMINAL")
+            self.assertEqual(self.tm("display-message", "-p", "-t", self.pane,
+                                     "#{@cctab_armed}"), "")
+
+    def test_shared_arming_survives_other_starts_and_either_exit_order(self):
+        """Forced Konsole/WezTerm rows: shared protocol ownership, not GUI evidence."""
+        arm = b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07"
+        restore = b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07"
+        other = self.new_window("second")
+        panes = (self.pane, other)
+        original_formats = {pane: self.formats(pane) for pane in panes}
+        original_titles = tuple(self.tm("show-options", "-gv", name)
+                                for name in ("set-titles", "set-titles-string"))
+
+        def option(name):
+            return self.tm("display-message", "-p", "-t", self.pane, "#{" + name + "}")
+
+        for state_record in (False, True):
+            for second_terminal in ("wezterm", "konsole"):
+                for first_end in (0, 1):
+                    with self.subTest(state_record=state_record, second_terminal=second_terminal,
+                                      first_end=first_end), self.attached_client() as client:
+                        envs = [{"CLAUDE_PID": self.tm("display-message", "-p", "-t", pane,
+                                                       "#{pane_pid}"),
+                                 "CCTAB_TERMINAL": terminal}
+                                for pane, terminal in zip(panes, ("konsole", second_terminal))]
+                        for env in envs:
+                            env["CCTAB_STATE_DIR"] = str(self.root / "state") if state_record else ""
+                        for index, (pane, env) in enumerate(zip(panes, envs)):
+                            self.hook("session-start", pane, env,
+                                      {"session_id": f"s{index}", "source": "startup"})
+                            # Real carriers make the other-pane lifetime check observable.
+                            self.wait_for(lambda: self.tm("display-message", "-p", "-t", pane,
+                                                          "#{pane_title}").split()[-2:-1], ["i"])
+                            self.assertTrue(client.saw(arm))
+                            self.assertEqual(option("@cctab_armed"), "konsole")
+                        if state_record:
+                            self.assertIn("s konsole", (self.root / "state" / "s0").read_text().splitlines())
+                        rearm = option("client-attached[1971]")
+                        self.assertIn("tmux-arm", rearm)
+                        installed_formats = {pane: self.formats(pane) for pane in panes}
+                        for step, index in enumerate((first_end, 1 - first_end)):
+                            # Neither end hook can guess Konsole from its environment.
+                            self.hook("session-end", panes[index],
+                                      dict(envs[index], CCTAB_TERMINAL="wezterm"),
+                                      {"session_id": f"s{index}"})
+                            self.wait_for(lambda: self.tm("display-message", "-p", "-t", panes[index],
+                                                          "#{pane_title}"), "")
+                            # SessionEnd retires appearance ownership; the shared
+                            # server renderer stays until explicit uninstall.
+                            self.assertEqual({pane: self.formats(pane) for pane in panes}, installed_formats)
+                            if step == 0:
+                                self.assertFalse(client.saw(restore, timeout=0.5), "restored too early")
+                                self.assertEqual(option("@cctab_armed"), "konsole")
+                                self.assertEqual(option("client-attached[1971]"), rearm)
+                            else:
+                                self.assertTrue(client.saw(restore), "lost the shared restore")
+                                self.assertEqual(client.captured.count(restore), 1)
+                                self.assertEqual(option("@cctab_armed"), "")
+                                self.assertEqual(option("client-attached[1971]"), "")
+                    self.uninstall()
+                    self.assertEqual({pane: self.formats(pane) for pane in panes}, original_formats)
+                    self.assertEqual(tuple(self.tm("show-options", "-gv", name)
+                                           for name in ("set-titles", "set-titles-string")), original_titles)
+
+    def lifecycle_env(self, pane, terminal="konsole"):
+        return {"CLAUDE_PID": self.tm("display-message", "-p", "-t", pane, "#{pane_pid}"),
+                "CCTAB_TERMINAL": terminal, "CCTAB_STATE_DIR": str(self.root / "state")}
+
+    def policy(self, pane=None):
+        return tuple(self.tm("display-message", "-p", "-t", pane or self.pane, "#{" + name + "}")
+                     for name in ("@cctab_armed", "client-attached[1971]"))
+
+    def spawn_hook(self, edge, pane, extra_env, session):
+        env = dict(self.env, TMUX=f"{self.socket},1,0", TMUX_PANE=pane,
+                   CCTAB_TERMINAL="other", CCTAB_GLYPH_POS="prefix")
+        env.update(extra_env)
+        process = subprocess.Popen([str(BIN), edge], env=env, cwd=self.root,
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+        process.stdin.write(json.dumps({"session_id": session}).encode())
+        process.stdin.close()
+        process.stdin = None
+
+        def cleanup():
+            # Only this disposable hook group, including a barrier child.
             try:
-                client.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                client.kill()
-                client.wait(timeout=3)
-            os.close(master)
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate(timeout=3)
+        self.addCleanup(cleanup)
+        return process
+
+    def finish_hook(self, process):
+        out, err = process.communicate(timeout=8)
+        self.assertEqual((process.returncode, out, err), (0, b"", b""))
+
+    def lifecycle_barrier(self, stage):
+        """Delay RETURN of a completed real command, never fabricate its result.
+
+        Registration/retirement is already in tmux before ready appears. The
+        child inherits the candidate's lock on stdin. A second wrapper records
+        its completed target query so we can launch a contender deterministically
+        without requiring it to finish while the first hook holds the lock.
+        """
+        proxy = self.root / ("proxy-" + stage)
+        proxy.mkdir()
+        marker = self.root / ("barrier-" + stage)
+        wrapper = proxy / "tmux"
+        wrapper.write_text(
+            "#!" + sys.executable + "\n"
+            "import os,sys,subprocess,pathlib,time\n"
+            "args=sys.argv[1:]\n"
+            "r=subprocess.run([" + repr(self.tmux) + "]+args,capture_output=True)\n"
+            "p=pathlib.Path(os.environ['CCTAB_BARRIER'])\n"
+            "mode=os.environ['CCTAB_BARRIER_MODE']\n"
+            "target=args[0]=='display-message' and '#{socket_path}' in args[-1]\n"
+            "member=args[0]=='set-option' and '@cctab_members' in args\n"
+            "hold=(mode=='member' and member) or (mode=='clients' and args[0]=='list-clients')\n"
+            "if mode=='contender' and target: p.with_suffix('.attempt').touch()\n"
+            "if hold:\n"
+            " p.with_suffix('.result').write_bytes(r.stdout)\n"
+            " p.with_suffix('.ready').touch()\n"
+            " deadline=time.monotonic()+8\n"
+            " while not p.with_suffix('.release').exists():\n"
+            "  if time.monotonic()>deadline: sys.exit(97)\n"
+            "  time.sleep(.005)\n"
+            "sys.stdout.buffer.write(r.stdout)\n"
+            "sys.stderr.buffer.write(r.stderr)\n"
+            "sys.exit(r.returncode)\n")
+        wrapper.chmod(0o755)
+        return marker, {"PATH": str(proxy) + ":" + self.env["PATH"],
+                        "CCTAB_BARRIER": str(marker), "CCTAB_BARRIER_MODE": "member"}
+
+    def wait_marker(self, marker, suffix):
+        self.wait_for(lambda: marker.with_suffix(suffix).exists(), True)
+
+    def test_old_final_exit_serialises_new_start_and_successor_restores(self):
+        other = self.new_window("successor")
+        envs = [self.lifecycle_env(pane) for pane in (self.pane, other)]
+        marker, barrier = self.lifecycle_barrier("overlap")
+        with self.attached_client() as client:
+            self.hook("session-start", self.pane, envs[0], {"session_id": "old"})
+            self.assertTrue(client.saw(ARM))
+            client.clear()
+            old = self.spawn_hook("session-end", self.pane, dict(envs[0], **barrier), "old")
+            self.wait_marker(marker, ".ready")
+            members = json.loads(self.tm("display-message", "-p", "-t", self.pane, "#{@cctab_members}"))
+            self.assertFalse(members["panes"][self.pane][3], "old owner was not retired")
+            self.assertEqual(self.policy()[0], "konsole")
+            new = self.spawn_hook("session-start", other,
+                                  dict(envs[1], **dict(barrier, CCTAB_BARRIER_MODE="contender")), "new")
+            self.wait_marker(marker, ".attempt")
+            # The completed real identity query precedes acquisition of the
+            # shared lock; startup must wait rather than publish into retirement.
+            time.sleep(.1)
+            self.assertIsNone(new.poll())
+            marker.with_suffix(".release").touch()
+            self.finish_hook(old)
+            self.finish_hook(new)
+            self.wait_for(lambda: self.tm("display-message", "-p", "-t", other,
+                                          "#{pane_title}").split()[-2:-1], ["i"])
+            self.assertTrue(client.saw(ARM))
+            self.assertTrue(client.saw(RESTORE))
+            self.assertLess(client.captured.rindex(RESTORE), client.captured.rindex(ARM))
+            self.assertEqual(self.policy()[0], "konsole")
+            self.assertIn("tmux-arm", self.policy()[1])
+            client.clear()
+            self.hook("session-end", self.pane, envs[0], {"session_id": "old"})
+            self.assertFalse(client.saw(RESTORE, timeout=.2), "duplicate old exit restored successor")
+            self.hook("session-end", other, envs[1], {"session_id": "new"})
+            self.assertTrue(client.saw(RESTORE))
+            self.assertEqual(client.captured.count(RESTORE), 1)
+            self.assertEqual(self.policy(), ("", ""))
+            client.clear()
+            self.hook("session-end", other, envs[1], {"session_id": "new"})
+            self.assertFalse(client.saw(RESTORE, timeout=.2), "duplicate final exit restored twice")
+
+    def test_concurrent_final_exits_restore_once_despite_unparsed_carriers(self):
+        other = self.new_window("second")
+        panes = (self.pane, other)
+        envs = [self.lifecycle_env(pane) for pane in panes]
+        marker, barrier = self.lifecycle_barrier("exits")
+        with self.attached_client() as client:
+            for index, pane in enumerate(panes):
+                self.hook("session-start", pane, envs[index], {"session_id": f"s{index}"})
+            self.assertTrue(client.saw(ARM))
+            client.clear()
+            first = self.spawn_hook("session-end", self.pane, dict(envs[0], **barrier), "s0")
+            self.wait_marker(marker, ".ready")
+            second = self.spawn_hook("session-end", other,
+                                     dict(envs[1], **dict(barrier, CCTAB_BARRIER_MODE="contender")), "s1")
+            self.wait_marker(marker, ".attempt")
+            self.assertIsNone(second.poll())
+            marker.with_suffix(".release").touch()
+            self.finish_hook(first)
+            self.finish_hook(second)
+            self.assertTrue(client.saw(RESTORE))
+            self.assertEqual(client.captured.count(RESTORE), 1)
+            self.assertEqual(self.policy(), ("", ""))
+            for pane in panes:
+                self.wait_for(lambda: self.tm("display-message", "-p", "-t", pane, "#{pane_title}"), "")
+
+    def test_duplicate_start_and_old_end_cannot_retire_same_pane_replacement(self):
+        env = self.lifecycle_env(self.pane)
+        with self.attached_client() as client:
+            for session in ("old", "new", "new"):
+                self.hook("session-start", self.pane, env, {"session_id": session})
+            self.assertTrue(client.saw(ARM))
+            members = json.loads(self.tm("display-message", "-p", "-t", self.pane,
+                                         "#{@cctab_members}"))
+            self.assertEqual(len(members["panes"]), 1)
+            self.assertEqual(members["panes"][self.pane][2:], ["new", True])
+            self.wait_for(lambda: self.tm("display-message", "-p", "-t", self.pane,
+                                          "#{pane_title}").split()[-2:-1], ["i"])
+            carrier = self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}")
+            client.clear()
+            self.hook("session-end", self.pane, env, {"session_id": "old"})
+            self.assertFalse(client.saw(RESTORE, timeout=.2))
+            self.assertEqual(self.policy()[0], "konsole")
+            self.assertEqual(self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}"), carrier)
+            self.hook("session-end", self.pane, env, {"session_id": "new"})
+            self.assertTrue(client.saw(RESTORE))
+            self.assertEqual(self.policy(), ("", ""))
+
+    def test_interrupted_retirement_keeps_child_lock_then_successor_recovers(self):
+        other = self.new_window("successor")
+        envs = [self.lifecycle_env(pane) for pane in (self.pane, other)]
+        marker, barrier = self.lifecycle_barrier("interrupted-end")
+        with self.attached_client() as client:
+            self.hook("session-start", self.pane, envs[0], {"session_id": "old"})
+            self.assertTrue(client.saw(ARM))
+            old = self.spawn_hook("session-end", self.pane, dict(envs[0], **barrier), "old")
+            self.wait_marker(marker, ".ready")
+            old.kill()  # Leave its in-flight wrapper alive, with inherited lock.
+            old.wait(timeout=3)
+            new = self.spawn_hook("session-start", other,
+                                  dict(envs[1], **dict(barrier, CCTAB_BARRIER_MODE="contender")), "new")
+            self.wait_marker(marker, ".attempt")
+            time.sleep(.1)
+            self.assertIsNone(new.poll(), "successor overtook the surviving lifecycle child")
+            marker.with_suffix(".release").touch()
+            self.finish_hook(new)
+            self.assertEqual(self.policy()[0], "konsole")
+            self.assertIn("tmux-arm", self.policy()[1])
+            client.clear()
+            # The interrupted end never cleared its old carrier. Membership,
+            # rather than that asynchronous title, still permits final restore.
+            self.hook("session-end", other, envs[1], {"session_id": "new"})
+            self.assertTrue(client.saw(RESTORE))
+            self.assertEqual(self.policy(), ("", ""))
+
+    def test_interrupted_start_recovers_and_dead_owner_does_not_strand_policy(self):
+        other = self.new_window("successor")
+        env = self.lifecycle_env(self.pane)
+        marker, barrier = self.lifecycle_barrier("interrupted-start")
+        barrier["CCTAB_BARRIER_MODE"] = "clients"
+        with self.attached_client() as client:
+            start = self.spawn_hook("session-start", self.pane, dict(env, **barrier), "old")
+            self.wait_marker(marker, ".ready")
+            self.assertEqual(self.policy()[0], "konsole")
+            os.killpg(start.pid, signal.SIGKILL)
+            start.communicate(timeout=3)
+            # Repeat the actual interrupted startup, then publish a real carrier.
+            self.hook("session-start", self.pane, env, {"session_id": "old"})
+            self.assertTrue(client.saw(ARM))
+            self.wait_for(lambda: self.tm("display-message", "-p", "-t", self.pane,
+                                          "#{pane_title}").split()[-2:-1], ["i"])
+            # Replace the pane's real shell process without a SessionEnd. Its
+            # stale title may survive; native process identity retires the owner.
+            self.tm("respawn-pane", "-k", "-t", self.pane, "/bin/sh")
+            successor_env = self.lifecycle_env(other, "wezterm")
+            self.hook("session-start", other, successor_env, {"session_id": "new"})
+            self.assertEqual(self.policy()[0], "konsole")
+            client.clear()
+            self.hook("session-end", other, successor_env, {"session_id": "new"})
+            self.assertTrue(client.saw(RESTORE))
+            self.assertEqual(self.policy(), ("", ""))
+
+    def test_retiring_one_tmux_session_does_not_block_another_session(self):
+        other = self.tm("new-session", "-d", "-s", "beta", "-P", "-F", "#{pane_id}", "/bin/sh")
+        env = self.lifecycle_env(self.pane)
+        marker, barrier = self.lifecycle_barrier("isolation")
+        with self.attached_client() as alpha, self.attached_client("beta") as beta:
+            self.hook("session-start", self.pane, env, {"session_id": "old"})
+            self.assertTrue(alpha.saw(ARM))
+            old = self.spawn_hook("session-end", self.pane, dict(env, **barrier), "old")
+            self.wait_marker(marker, ".ready")
+            other_env = self.lifecycle_env(other)
+            self.hook("session-start", other, other_env, {"session_id": "other"})
+            self.assertTrue(beta.saw(ARM))
+            marker.with_suffix(".release").touch()
+            self.finish_hook(old)
+            self.assertTrue(alpha.saw(RESTORE))
+            self.assertFalse(beta.saw(RESTORE, timeout=.2))
+            self.assertEqual(self.policy(other)[0], "konsole")
+            self.hook("session-end", other, other_env, {"session_id": "other"})
+            self.assertTrue(beta.saw(RESTORE))
+            self.assertEqual(self.policy(other), ("", ""))
+
+    def test_detached_policy_survives_other_start_and_reattach_until_last_owner(self):
+        """Forced terminal rows observe protocol bytes on disposable clients."""
+        arm = b"\x1b]50;LocalTabTitleFormat=%w;RemoteTabTitleFormat=%w\x07"
+        restore = b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07"
+        other = self.new_window("second")
+
+        def option(name):
+            return self.tm("display-message", "-p", "-t", self.pane, "#{" + name + "}")
+
+        self.assertEqual(self.tm("list-clients", "-t", self.pane), "")
+        envs = [{"CLAUDE_PID": self.tm("display-message", "-p", "-t", pane, "#{pane_pid}"),
+                 "CCTAB_TERMINAL": surface, "CCTAB_STATE_DIR": str(self.root / "state")}
+                for pane, surface in ((self.pane, "konsole"), (other, "wezterm"))]
+        for index, pane in enumerate((self.pane, other)):
+            self.hook("session-start", pane, envs[index], {"session_id": f"s{index}"})
+            self.wait_for(lambda: self.tm("display-message", "-p", "-t", pane,
+                                          "#{pane_title}").split()[-2:-1], ["i"])
+        self.assertEqual(option("@cctab_armed"), "konsole")
+        rearm = option("client-attached[1971]")
+        self.assertIn("tmux-arm", rearm)
+        self.assertIn("s konsole", (self.root / "state" / "s0").read_text().splitlines())
+        report = self.hook("doctor", self.pane).decode()
+        self.assertIn("retained policy, not confirmed delivery", report)
+        self.assertIn("none attached", report)
+
+        with self.attached_client() as client:
+            self.assertTrue(client.saw(arm), "detached policy did not arm the attaching client")
+            self.hook("session-end", self.pane, dict(envs[0], CCTAB_TERMINAL="wezterm"),
+                      {"session_id": "s0"})
+            self.wait_for(lambda: option("pane_title"), "")
+            self.assertFalse(client.saw(restore, timeout=0.3))
+            self.assertEqual(option("@cctab_armed"), "konsole")
+            self.assertEqual(option("client-attached[1971]"), rearm)
+        self.wait_for(lambda: self.tm("list-clients", "-t", self.pane), "")
+        # The remaining owner never selected Konsole, but retains its policy.
+        with self.attached_client() as client:
+            self.assertTrue(client.saw(arm), "shared policy was lost before reattachment")
+            self.hook("session-end", other, envs[1], {"session_id": "s1"})
+            self.assertTrue(client.saw(restore))
+            self.assertEqual(option("@cctab_armed"), "")
+            self.assertEqual(option("client-attached[1971]"), "")
+        self.wait_for(lambda: self.tm("list-clients", "-t", self.pane), "")
+        with self.attached_client() as client:
+            self.assertFalse(client.saw(arm, timeout=0.3), "retired policy armed a later client")
+
+    def test_last_detached_owner_retires_policy_without_a_restore_receipt(self):
+        self.hook("session-start", self.pane, {"CCTAB_TERMINAL": "konsole"})
+        self.assertEqual(self.tm("list-clients", "-t", self.pane), "")
+        self.hook("session-end", self.pane, {"CCTAB_TERMINAL": "wezterm"})
+        for name in ("@cctab_armed", "client-attached[1971]"):
+            self.assertEqual(self.tm("display-message", "-p", "-t", self.pane,
+                                     "#{" + name + "}"), "")
+        with self.attached_client() as client:
+            self.assertFalse(client.saw(b"\x1b]50;", timeout=0.3))
+
+    def test_a_session_that_armed_nothing_is_not_restored_by_a_late_terminal(self):
+        """The other half of the same defect, and the reason `-` is a value.
+
+        A store that says nothing was armed must not be talked out of it by an
+        environment that names Konsole only at the end. Writing the restore here
+        would be an un-arming with no arming - a tab handed the compiled-in
+        Konsole defaults it may never have had.
+        """
+        restore = b"\x1b]50;LocalTabTitleFormat=%d : %n;RemoteTabTitleFormat=(%u) %H\x07"
+        with self.attached_client() as client:
+            self.hook("session-start", self.pane, {"CCTAB_TERMINAL": "wezterm"})
+            self.assertEqual(self.tm("display-message", "-p", "-t", self.pane,
+                                     "#{@cctab_armed}"), "-")
+            self.hook("session-end", self.pane, {"CCTAB_TERMINAL": "konsole"})
+            # Give the client the same budget the positive case gets, so this is a
+            # real absence and not a race the timeout hid.
+            self.assertFalse(client.saw(restore, timeout=2))
 
     def test_current_state_semantics_agree_with_plain_terminal(self):
         # Exercise all four states and ownership precedence through ordinary
@@ -423,27 +1044,47 @@ class TmuxStatusTests(unittest.TestCase):
                     self.assertEqual(record.read_bytes(), before)
                     self.assertEqual(self.rendered(self.pane, True), "🟠 C:current")
 
-    def test_invalid_pid_and_headless_process_never_emit_json_or_change_the_pane(self):
+    def test_invalid_exited_and_redirected_pids_never_change_pane_or_client_title(self):
         self.start()
         self.publish(self.pane)
         before = self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}")
-        headless = subprocess.Popen(["/bin/sleep", "60"], stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, env=self.env)
-        try:
-            cases = (("working", {"hook_event_name": "PostToolUse"}),
-                     ("waiting", {"hook_event_name": "PermissionRequest"}),
-                     ("idle", {"hook_event_name": "Stop"}),
-                     ("notify", {"hook_event_name": "Notification", "notification_type": "elicitation_dialog"}),
-                     ("elicitation", {"hook_event_name": "Elicitation", "mcp_server_name": "mcp", "elicitation_id": "a"}))
-            for pid in ("0", "999999999", str(headless.pid)):
+        exited = subprocess.Popen(["/usr/bin/true"], env=self.env, stdout=subprocess.DEVNULL)
+        exited.wait(timeout=3)
+        cases = (("working", {"hook_event_name": "PostToolUse"}),
+                 ("waiting", {"hook_event_name": "PermissionRequest"}),
+                 ("idle", {"hook_event_name": "Stop"}),
+                 ("notify", {"hook_event_name": "Notification", "notification_type": "elicitation_dialog"}),
+                 ("elicitation", {"hook_event_name": "Elicitation", "mcp_server_name": "mcp", "elicitation_id": "a"}))
+        with contextlib.ExitStack() as stack, self.attached_client() as client:
+            file_output = stack.enter_context((self.root / "redirected").open("wb"))
+            owners = []
+            for output in (subprocess.PIPE, subprocess.DEVNULL, file_output):
+                process = subprocess.Popen(["/bin/sleep", "60"], stdout=output,
+                                           stderr=subprocess.DEVNULL, env=self.env,
+                                           start_new_session=True)
+                owners.append(process)
+                def stop(owner=process):
+                    if owner.poll() is None:
+                        owner.kill()
+                    owner.communicate(timeout=3)
+                stack.callback(stop)
+            self.assert_status(client, "🔵 C:current")
+            client.clear()
+            for pid in ("0", "not-a-pid", "999999999", str(exited.pid), *(str(p.pid) for p in owners)):
                 for edge, payload in cases:
                     with self.subTest(pid=pid, edge=edge):
                         self.assertEqual(self.hook(edge, self.pane, {"CLAUDE_PID": pid}, payload), b"")
                         self.assertEqual(self.tm("display-message", "-p", "-t", self.pane, "#{pane_title}"), before)
-        finally:
-            headless.terminate()
-            headless.wait(timeout=3)
-            headless.stdout.close()
+            # Read an actual client redraw too: no refused carrier may escape
+            # into an unrelated outer terminal or be passed through as JSON.
+            self.redraw_status(client)
+            self.assert_status(client, "🔵 C:current")
+            outer = self.tm("display-message", "-p", "-t", self.pane, "#{T:@cctab_title}").encode()
+            titles = re.findall(rb"\x1b\](?:0|2);(.*?)(?:\x07|\x1b\\)", client.captured, re.S)
+            self.assertTrue(all(title == outer for title in titles), client.diagnostic())
+            self.assertNotIn(b"\x1b]50;", client.captured)
+            file_output.flush()
+            self.assertEqual((self.root / "redirected").read_bytes(), b"")
 
     def test_explicit_marker_preserves_rounded_pill_formats_before_install_and_on_uninstall(self):
         for option, value in zip(FORMATS, MARKED_PILL_FORMATS):
@@ -577,6 +1218,19 @@ class TmuxStatusTests(unittest.TestCase):
         self.assertEqual(self.tm("show-options", "-gv", "set-titles-string"), before)
         self.assertEqual(self.tm("display-message", "-p", "-t", self.pane,
                                  "#{==:#{set-titles-string},#{@test_expected_outer}}"), "1")
+
+    def test_outer_title_settings_restore_empty_and_nondefault_pairs(self):
+        for enabled, title in (("on", ""), ("off", "original #{session_name}\nsecond line")):
+            with self.subTest(enabled=enabled, title=title):
+                self.tm("set", "-g", "set-titles", enabled)
+                self.tm("set", "-g", "set-titles-string", title)
+                before = tuple(self.tm("show-options", "-gv", name)
+                               for name in ("set-titles", "set-titles-string"))
+                self.start()
+                self.publish(self.pane)
+                self.uninstall()
+                self.assertEqual(tuple(self.tm("show-options", "-gv", name)
+                                       for name in ("set-titles", "set-titles-string")), before)
 
     def test_nested_formats_and_shell_literals_are_saved_without_interpretation(self):
         raw = ('100% #{?window_active,ACTIVE,#{?window_bell_flag,BELL,quiet}} '
@@ -769,44 +1423,18 @@ class TmuxStatusTests(unittest.TestCase):
         self.publish(background, "waiting")
         self.publish(split, "idle")
         self.tm("select-window", "-t", self.pane)
-        master, slave = pty.openpty()
-        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
-        client = subprocess.Popen(self.base + ["attach-session", "-t", "alpha"],
-                                  env=self.env, stdin=slave, stdout=slave, stderr=slave,
-                                  start_new_session=True)
-        os.close(slave)
-        captured = b""
-        clean = ""
-        backgrounds = []
         wanted = (" 🔵 0:current ", " 🟠⚪ 1:background ")
-        try:
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline:
-                if select.select([master], [], [], 0.1)[0]:
-                    try:
-                        captured += os.read(master, 65536)
-                    except OSError:
-                        break
-                # Strip OSC titles first: the outer tab also contains the same
-                # glyphs, and must not accidentally satisfy this status-bar test.
-                clean, backgrounds = terminal_text_and_backgrounds(captured)
-                if all(fragment in clean for fragment in wanted):
-                    break
+        with self.attached_client() as client:
             for fragment in wanted:
-                self.assertIn(fragment, clean)
+                self.assert_status(client, fragment)
+            # OSC title text cannot satisfy these status-bar observations.
+            clean, backgrounds = terminal_text_and_backgrounds(client.captured)
+            for fragment in wanted:
                 offset = clean.index(fragment)
                 label = offset + fragment.index(":") + 1
                 self.assertIsNotNone(backgrounds[offset + 2])
                 self.assertEqual(backgrounds[offset + 2], backgrounds[label])
                 self.assertNotEqual(backgrounds[offset], backgrounds[offset + 2])
-        finally:
-            client.terminate()
-            try:
-                client.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                client.kill()
-                client.wait(timeout=3)
-            os.close(master)
 
 
 if __name__ == "__main__":

@@ -117,9 +117,12 @@
 //     loses updates and a lost CLEAR is a tab stuck orange - but it is taken on the
 //     session's OWN record, so five concurrent sessions never contend.
 
-use crate::edge::{Edge, Glyph, Notification, Paint};
+use crate::clock;
+use crate::edge::{Edge, Glyph, Notification, Paint, Resolved};
 use crate::payload::{Payload, MAX_ELICITATION_ID_BYTES};
-use crate::{sys, tmux};
+use crate::support::Support;
+use crate::surface::{self, Surface};
+use crate::sys;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
@@ -210,8 +213,9 @@ impl Origin {
     }
 
     /// Whether the process that wrote this record is STILL the process under that
-    /// pid. False means gone: either `/proc/<pid>` has disappeared, or something
-    /// else has since been given the number.
+    /// pid. False means gone: the process is provably not there - no `/proc/<pid>`
+    /// on Linux, `ESRCH` from `kill(pid, 0)` on macOS - or something else has since
+    /// been given the number.
     ///
     /// This is the reaper's whole decision, and it PROVABLY cannot reap a live
     /// session. A hook process is a child of `$CLAUDE_PID`, so while any of a
@@ -225,7 +229,8 @@ impl Origin {
     /// On Windows the same proof holds with the process's creation time: `$CLAUDE_PID`
     /// is the live `claude.exe` (measured), the time is set once at creation, and a
     /// pid is not reissued while any handle to its process is open. There the error
-    /// it can make needs a reused pid inside the same 100ns creation stamp.
+    /// it can make needs a reused pid inside the same 100ns creation stamp. On macOS
+    /// it holds with `proc_pidinfo`'s start time, to the microsecond.
     ///
     /// Whatever cannot be asked - a process this user may not open - counts as
     /// alive, so the reaper keeps the record rather than guess.
@@ -235,7 +240,9 @@ impl Origin {
 }
 
 // The start time is `sys::process_start_time`: field 22 of `/proc/<pid>/stat` on
-// Linux, the creation FILETIME from `GetProcessTimes` on Windows.
+// Linux, the creation FILETIME from `GetProcessTimes` on Windows, and
+// `proc_pidinfo`'s start `timeval` in microseconds on macOS. Three encodings, which
+// is why there are three `sys::ORIGIN_KEY`s and not one.
 
 /// Who owns a wait.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -409,6 +416,7 @@ fn id_str(raw: &[u8]) -> Option<String> {
 ///   g 1790380620                            last positive main Stop snapshot
 ///   p 3709427 84460384                         the session's (pid, start time)
 ///   w aec99e1f4bda1972b:1790380630 -:1790380631
+///   s konsole                                  the surface this session may need to restore
 /// ```
 ///
 /// Each `w` word is one wait: its owner, a colon, and the epoch at which THAT wait
@@ -422,8 +430,14 @@ fn id_str(raw: &[u8]) -> Option<String> {
 /// older readers from silently dropping background activity. The optional g
 /// epoch records known in-flight work independently of the main base and never
 /// expires. An absent `p` line means the reaper falls back to mtime for this file.
-/// On Windows the origin line is `q <pid> <creation FILETIME>` instead
-/// ([`sys::ORIGIN_KEY`]), and each platform reads the other's as no origin.
+/// On Windows the origin line is `q <pid> <creation FILETIME>` instead, and on
+/// macOS `r <pid> <microseconds since the epoch>` ([`sys::ORIGIN_KEY`]): one key
+/// per ENCODING, and each platform reads the others' as no origin.
+///
+/// The optional `s` line is rung 2 of [`crate::armed`]: a conservative restore
+/// obligation written only when startup routing selects appearance bytes. It
+/// records no delivery receipt, including for skipped/headless starts. Absence
+/// falls through to the legacy assumption; older readers skip this optional key.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Record {
     base: Glyph,
@@ -439,6 +453,14 @@ struct Record {
     /// Recently completed exact identities, oldest first. Suppresses replayed
     /// starts and preserves result-before-start ordering within the wait TTL.
     completed: Vec<Wait>,
+    /// The CANONICAL name of the surface this session armed, or `None`.
+    ///
+    /// The name and not a `Surface`, for two reasons that point the same way: the
+    /// name is the wire form, and validating it at PARSE time is what makes "an
+    /// unrecognised value reads as absent" a property of the record rather than of
+    /// every reader; and `Surface` is deliberately not `Debug`, while this struct
+    /// is, for its own tests.
+    armed: Option<&'static str>,
 }
 
 impl Record {
@@ -451,6 +473,7 @@ impl Record {
             origin: None,
             waits: Vec::new(),
             completed: Vec::new(),
+            armed: None,
         }
     }
 
@@ -509,6 +532,10 @@ impl Record {
                 "e" => r.completed = rest.split(' ').filter_map(Wait::parse)
                     .filter(|w| matches!(w.who, Owner::Elicitation(_)))
                     .take(MAX_WAITS).collect(),
+                // ABSENT, never DIFFERENT: a surface name from a later version -
+                // or from a hand-edited record - must not choose escape bytes, so
+                // it reads as no record at all and the next rung answers.
+                "s" => r.armed = surface::by_name(rest.as_bytes()).map(|s| s.caps().name),
                 // Unknown fields remain forward-extensible.
                 _ => {}
             }
@@ -566,6 +593,13 @@ impl Record {
                 out.push(' ');
                 out.push_str(&w.render());
             }
+            out.push('\n');
+        }
+        // LAST, so that every record a session which armed nothing writes is byte
+        // for byte the record it wrote before this line existed.
+        if let Some(name) = self.armed {
+            out.push_str("s ");
+            out.push_str(name);
             out.push('\n');
         }
         out
@@ -626,9 +660,11 @@ impl Record {
         if let Some(epoch) = self.background {
             s.push_str(&format!(", background reported {}s ago (last known snapshot; not expired)", now.saturating_sub(epoch)));
         }
-        // Three answers, not two: `alive()` keeps what it cannot ask about (a
-        // process this user may not open, on Windows), and the report must not
-        // call that "live". Unix always has an answer, so it never prints the third.
+        // Three answers, not two: `alive()` keeps what it cannot ask about - a
+        // process this user may not open on Windows, one this user may not signal
+        // on macOS, a `hidepid` mount on Linux - and the report must not call that
+        // "live". Every platform can reach the third answer now; before macOS had
+        // its own liveness primitive, Linux's `/proc` check answered two.
         match self.origin.map(|o| (o.pid, sys::same_process(o.pid, o.start))) {
             Some((pid, Some(true))) => s.push_str(&format!(", session pid {} live", pid)),
             Some((pid, Some(false))) => s.push_str(&format!(", session pid {} GONE", pid)),
@@ -652,6 +688,12 @@ impl Record {
             ));
         }
         s
+    }
+
+    /// Logical attention, including the legacy waiting base. This says nothing
+    /// about which title was painted or delivered.
+    fn asking(&self) -> bool {
+        !self.waits.is_empty() || self.base == Glyph::Waiting
     }
 
     fn paint(&self, glyph: Glyph) -> Paint {
@@ -776,6 +818,12 @@ fn at_the_prompt(p: &Payload) -> bool {
 /// the golden corpus's pty cases, which set `CLAUDE_PID` to a live helper, write
 /// records into the real `/run/user/<uid>`.
 ///
+/// On macOS the variable is `TMPDIR`, which launchd sets per user to a directory
+/// under `/var/folders/<hash>/T` that is 0700, ours, and emptied by the OS - the
+/// same volatility `XDG_RUNTIME_DIR` has, so the reaper's rules carry over unchanged.
+/// There is no `XDG_RUNTIME_DIR` there to read, and reading it anyway is what used
+/// to leave that platform with no state directory and so no wait ownership at all.
+///
 /// On Windows the variable is `LOCALAPPDATA` ([`sys::RUNTIME_DIR_VAR`]): per-user,
 /// private by inherited ACL, local rather than roaming, and - unlike `%TEMP%` -
 /// never emptied behind a live session's back by Storage Sense. Nothing empties it
@@ -838,23 +886,27 @@ impl Session {
         Some(Session {
             dir,
             path,
-            now: tmux::now(),
-            ttl: tmux::ttl_secs("CCTAB_TTL_WAITING", tmux::DEFAULT_TTL_WAITING),
+            now: clock::now(),
+            ttl: clock::ttl_secs("CCTAB_TTL_WAITING", clock::DEFAULT_TTL_WAITING),
         })
     }
 
-    /// The record on disk, and the record after expiry. BOTH, because an expiry is
+    /// The record on disk, its expired copy, and the known prior attention bit.
+    /// Keep absence separate from the fresh fallback. BOTH records, because expiry is
     /// itself a transition: handing `write_if_changed` the already-expired record
     /// as `was` made the two compare equal, so the dead `w` line survived for the
     /// life of the session and a later `CCTAB_TTL_WAITING` could resurrect it.
-    fn load(&self) -> (Record, Record) {
-        let on_disk = match stored_at(&self.path) {
-            Stored::Ours(r) => r,
-            _ => Record::fresh(),
+    fn load(&self) -> (Record, Record, Option<bool>) {
+        let (on_disk, before) = match stored_at(&self.path) {
+            Stored::Ours(r) => {
+                let before = Some(r.asking());
+                (r, before)
+            }
+            _ => (Record::fresh(), None),
         };
         let mut live = on_disk.clone();
         live.expire(self.now, self.ttl);
-        (on_disk, live)
+        (on_disk, live, before)
     }
 
     /// An exclusive advisory lock on this session's own record, held for a whole
@@ -962,6 +1014,44 @@ impl Session {
         let _ = fs::remove_file(&self.path);
     }
 
+    /// RUNG 2, read back: this session's conservative restore obligation.
+    ///
+    /// It takes NO LOCK and it is called before [`Session::resolve`], because the
+    /// `SessionEnd` branch of that function DELETES this file - and unlocked is the
+    /// same discipline the reaper and doctor already read on, since
+    /// `write_if_changed` renames over the path and a reader therefore sees the old
+    /// record or the new one and never a torn one.
+    ///
+    /// The absences are all `Unsupported`, and they have to be: an `Available`
+    /// stops the ladder in [`crate::armed`], and a record that predates this line -
+    /// or a session whose SessionStart armed nothing - has said nothing about
+    /// arming at all. Only rung 1 can state a negative.
+    pub fn armed(&self) -> Support<Option<Surface>> {
+        let Stored::Ours(r) = stored_at(&self.path) else {
+            return Support::Unsupported("this session has no record of its own");
+        };
+        match r.armed.and_then(|n| surface::by_name(n.as_bytes())) {
+            Some(s) => Support::Available(Some(s)),
+            None => Support::Unsupported("the record has no restore obligation"),
+        }
+    }
+
+    /// RUNG 2: remember the selected surface before direct startup delivery.
+    ///
+    /// This is a second locked update because routing follows state resolution.
+    /// It is creation-capable even for headless starts whose default state needed
+    /// no file. A skipped or failed write does not cancel it: the combined
+    /// arm/title write may fail after arming has reached the destination.
+    ///
+    /// Persistence is best effort. Lock/write failure leaves restoration relying
+    /// on the other rungs, without a guarantee if the environment later changes.
+    pub fn note_armed(&self, surface: Surface) {
+        let Some(_lock) = self.lock(true) else { return };
+        let (was, mut now, _) = self.load();
+        now.armed = Some(surface.caps().name);
+        self.write_if_changed(&was, &mut now);
+    }
+
     /// Delete the records of sessions that are gone. Runs on `SessionStart` only -
     /// once per session, against a directory holding one small file per live
     /// session - so the cost never reaches a painting edge. This is the whole
@@ -987,37 +1077,46 @@ impl Session {
         }
     }
 
-    /// The paint for this edge, having consulted and updated the record.
+    /// The logical decision and independent paint, having consulted state.
     ///
     /// The edges the state layer has nothing to say about defer to
     /// [`Edge::resolve`], so there is exactly one place each of those decisions
     /// lives.
-    pub fn resolve(&self, edge: Edge, p: &Payload) -> Option<Paint> {
+    pub fn resolve(&self, edge: Edge, p: &Payload) -> Option<Resolved> {
         match edge {
             // A session starting over must not inherit the previous run's waits:
             // `--resume` and `--clear` both land here, and neither one leaves a
             // dialog on screen. A mid-turn compaction re-fire is filtered by
             // `Edge::resolve` BEFORE this, and so resets nothing.
             Edge::SessionStart => {
-                let paint = edge.resolve(p)?;
+                let paint = edge.resolve(p)?.paint?;
                 let mut claimed = Record::claimed();
                 let Some(lock) = self.lock(claimed.origin.is_some()) else {
                     self.reap();
-                    return Some(paint);
+                    return Some(Resolved::stateless(paint));
                 };
-                let (was, _) = self.load();
+                let (was, _, before) = self.load();
                 self.write_if_changed(&was, &mut claimed);
                 // Released before the scan: the reaper never touches our own file,
                 // so holding it across a 256-entry walk would only delay the
                 // session's own next hook.
                 drop(lock);
                 self.reap();
-                Some(paint)
+                Some(Resolved::stateful(before, claimed.asking(), Some(paint)))
             }
             Edge::SessionEnd => {
-                let paint = edge.resolve(p)?;
+                let paint = edge.resolve(p)?.paint?;
+                // Teardown remains unlocked and requires lifecycle quiescence.
+                // Refuse special paths as evidence, without changing deletion.
+                let before = match fs::symlink_metadata(&self.path) {
+                    Ok(m) if m.is_file() => match stored_at(&self.path) {
+                        Stored::Ours(r) => Some(r.asking()),
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 self.remove();
-                Some(paint)
+                Some(Resolved::stateful(before, false, Some(paint)))
             }
             Edge::Working => self.progress(Owner::of(p), p),
             Edge::Waiting => {
@@ -1050,14 +1149,14 @@ impl Session {
     }
 
     /// `UserPromptSubmit`, `PostToolUse`, `PostToolUseFailure`: something ran.
-    fn progress(&self, o: Owner, p: &Payload) -> Option<Paint> {
+    fn progress(&self, o: Owner, p: &Payload) -> Option<Resolved> {
         // A supplied but unusable agent id is not evidence of main-thread
         // progress and must not inherit its cross-owner recovery permissions.
         if (o == Owner::Main && p.agent_id().is_some()) || p.agent_id() == Some("-") {
             return None;
         }
         let _lock = self.lock(o == Owner::Main)?;
-        let (was, mut now) = self.load();
+        let (was, mut now, before) = self.load();
         match &o {
             Owner::Agent(_) => {
                 // THE FIX. A subagent's tool call paints nothing - that filter is
@@ -1072,7 +1171,7 @@ impl Session {
                     // not be the one that starts writing records, which is what
                     // keeps a background subagent's tool call free of any write.
                     self.write_if_changed(&was, &mut now);
-                    return None;
+                    return Some(Resolved::stateful(before, now.asking(), None));
                 }
                 // It says nothing about the main loop, so the base is untouched.
             }
@@ -1117,16 +1216,17 @@ impl Session {
         // A wait somebody else still holds keeps the tab: this is the second half
         // of the fix, and the half that matters most. Stateless, a main-thread
         // PostToolUse repainted blue over a subagent's open dialog.
-        now.waits.is_empty().then_some(now.paint(now.base))
+        Some(Resolved::stateful(before, now.asking(),
+            now.waits.is_empty().then(|| now.paint(now.base))))
     }
 
     /// `PermissionRequest`, `PreToolUse` on the two tools that always block, and
     /// the `Notification` backstop: a dialog is up.
-    fn wait(&self, o: Owner) -> Option<Paint> {
+    fn wait(&self, o: Owner) -> Option<Resolved> {
         let Some(_lock) = self.lock(true) else {
-            return Some(self.unpersisted_wait());
+            return Some(Resolved::stateless(self.unpersisted_wait()));
         };
-        let (was, mut now) = self.load();
+        let (was, mut now, before) = self.load();
         // The backstop fires ~6s after the dialog for a PermissionRequest already
         // reported - capture: PermissionRequest(aec99e) at 69.960, then
         // Notification permission_prompt at 75.983 for the SAME dialog. Adding an
@@ -1148,7 +1248,7 @@ impl Session {
         self.write_if_changed(&was, &mut now);
         // Always orange, whatever the base: a dialog on screen is the truth, and
         // repainting refreshes the tmux carrier's epoch, which restarts the decay.
-        Some(now.paint(Glyph::Waiting))
+        Some(Resolved::stateful(before, now.asking(), Some(now.paint(Glyph::Waiting))))
     }
 
     /// A failed write lock still permits a conservative orange paint. Preserve
@@ -1162,7 +1262,7 @@ impl Session {
     }
 
     /// `Stop`, `StopFailure`, and the idle nudge: the main loop is free.
-    fn free(&self, p: &Payload) -> Option<Paint> {
+    fn free(&self, p: &Payload) -> Option<Resolved> {
         // Live 2.1.274 captures establish main Stop as a complete parent-session
         // registry snapshot, including the automatic turn after a task finishes.
         // SubagentStop may still list its own finishing task; never infer that
@@ -1174,9 +1274,9 @@ impl Session {
             // A genuinely fresh quiet session needs no record. An inaccessible
             // or contended existing record must never be mutated without a lock.
             return matches!(fs::symlink_metadata(&self.path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-                .then_some(Paint::Line(if snapshot == Some(false) { Glyph::Background } else { Glyph::Idle }));
+                .then(|| Resolved::stateless(Paint::Line(if snapshot == Some(false) { Glyph::Background } else { Glyph::Idle })));
         };
-        let (was, mut now) = self.load();
+        let (was, mut now, before) = self.load();
         now.base = Glyph::Idle;
         match snapshot {
             Some(false) => now.background = Some(self.now),
@@ -1205,13 +1305,13 @@ impl Session {
         // Never paint idle over an outstanding dialog. A changed background
         // fact may need an orange refresh so tmux retains the correct fallback.
         if now.waits.is_empty() {
-            Some(now.paint(Glyph::Idle))
+            Some(Resolved::stateful(before, now.asking(), Some(now.paint(Glyph::Idle))))
         } else if was.background.is_some() != now.background.is_some() {
             // Keep orange while updating tmux's fallback when this snapshot
             // first discovers background work, or proves it has ended.
-            Some(now.paint(Glyph::Waiting))
+            Some(Resolved::stateful(before, now.asking(), Some(now.paint(Glyph::Waiting))))
         } else {
-            None
+            Some(Resolved::stateful(before, now.asking(), None))
         }
     }
 
@@ -1223,24 +1323,25 @@ impl Session {
     /// the capture has a `SubagentStop` for `a8e90c10` nine seconds before the user
     /// answered `aec99e1f`'s dialog, so a `SubagentStop` that owns nothing is inert,
     /// including when the outstanding dialog has no identifiable owner.
-    fn agent_gone(&self, o: Owner) -> Option<Paint> {
+    fn agent_gone(&self, o: Owner) -> Option<Resolved> {
         let Owner::Agent(_) = o else {
             return None;
         };
         let _lock = self.lock(false)?;
-        let (was, mut now) = self.load();
+        let (was, mut now, before) = self.load();
         if !now.clear(&o) {
             self.write_if_changed(&was, &mut now);
-            return None;
+            return Some(Resolved::stateful(before, now.asking(), None));
         }
         self.write_if_changed(&was, &mut now);
-        now.waits.is_empty().then_some(now.paint(now.base))
+        Some(Resolved::stateful(before, now.asking(),
+            now.waits.is_empty().then(|| now.paint(now.base))))
     }
 
     /// Direct starts and identified notification backstops share one exact key.
     /// An unidentified notification remains independent: without identity there
     /// is no evidence that it duplicates any active or completed direct request.
-    fn elicitation_start(&self, p: &Payload, notification: bool) -> Option<Paint> {
+    fn elicitation_start(&self, p: &Payload, notification: bool) -> Option<Resolved> {
         if !notification && (p.hook_event_name() != Some("Elicitation") || !p.elicitation_mode_supported()) {
             return None;
         }
@@ -1252,12 +1353,12 @@ impl Session {
         let Some(_lock) = self.lock(true) else {
             // Painting a request is harmless without persistence; resolving one
             // without persistence is not, so results below instead stay silent.
-            return Some(self.unpersisted_wait());
+            return Some(Resolved::stateless(self.unpersisted_wait()));
         };
-        let (was, mut now) = self.load();
+        let (was, mut now, before) = self.load();
         if now.completed.iter().any(|w| w.who == owner) {
             self.write_if_changed(&was, &mut now);
-            return None;
+            return Some(Resolved::stateful(before, now.asking(), None));
         }
         // Replayed direct starts do not extend a wait's TTL, including the
         // anonymous aggregate. Legacy notification-only waits retain refreshes.
@@ -1265,10 +1366,10 @@ impl Session {
             now.raise(owner, self.now);
         }
         self.write_if_changed(&was, &mut now);
-        Some(now.paint(Glyph::Waiting))
+        Some(Resolved::stateful(before, now.asking(), Some(now.paint(Glyph::Waiting))))
     }
 
-    fn elicitation_result(&self, p: &Payload) -> Option<Paint> {
+    fn elicitation_result(&self, p: &Payload) -> Option<Resolved> {
         if p.hook_event_name() != Some("ElicitationResult")
             || !p.elicitation_mode_supported()
             || !matches!(p.action(), Some("accept" | "decline" | "cancel")) {
@@ -1277,11 +1378,12 @@ impl Session {
         let owner = elicitation_key(p)?;
         // A failed lock must never lead to an unlocked removal or tombstone.
         let _lock = self.lock(true)?;
-        let (was, mut now) = self.load();
+        let (was, mut now, before) = self.load();
         let cleared = now.clear(&owner);
         now.complete(owner, self.now);
         self.write_if_changed(&was, &mut now);
-        (cleared && now.waits.is_empty()).then_some(now.paint(now.base))
+        Some(Resolved::stateful(before, now.asking(),
+            (cleared && now.waits.is_empty()).then(|| now.paint(now.base))))
     }
 }
 
@@ -1644,8 +1746,8 @@ pub fn survey() -> Survey {
             stale: 0,
         };
     };
-    let now = tmux::now();
-    let ttl = tmux::ttl_secs("CCTAB_TTL_WAITING", tmux::DEFAULT_TTL_WAITING);
+    let now = clock::now();
+    let ttl = clock::ttl_secs("CCTAB_TTL_WAITING", clock::DEFAULT_TTL_WAITING);
     let mut records = Vec::new();
     let mut stale = 0;
     let listed = fs::read_dir(&d);
@@ -1761,6 +1863,7 @@ pub fn survey() -> Survey {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::edge::{JustPaint, Transition};
     use std::ffi::OsString;
     use std::sync::Mutex;
 
@@ -1913,15 +2016,15 @@ mod tests {
             f.session(&main).resolve(Edge::Working, &main);
             for (server, id) in [("one", "A"), ("one", "B"), ("two", "A")] {
                 let request = elicitation(server, id, None);
-                assert_eq!(f.session(&request).resolve(Edge::Elicitation, &request), Some(Paint::Line(Glyph::Waiting)));
+                assert_eq!(f.session(&request).resolve(Edge::Elicitation, &request).paint(), Some(Paint::Line(Glyph::Waiting)));
             }
             let first = elicitation("one", "A", Some(action));
-            assert_eq!(f.session(&first).resolve(Edge::ElicitationResult, &first), None);
+            assert_eq!(f.session(&first).resolve(Edge::ElicitationResult, &first).paint(), None);
             assert_eq!(Record::parse(&f.record()).unwrap().waits.len(), 2);
             let second = elicitation("one", "B", Some(action));
-            assert_eq!(f.session(&second).resolve(Edge::ElicitationResult, &second), None);
+            assert_eq!(f.session(&second).resolve(Edge::ElicitationResult, &second).paint(), None);
             let third = elicitation("two", "A", Some(action));
-            assert_eq!(f.session(&third).resolve(Edge::ElicitationResult, &third), Some(Paint::Line(Glyph::Working)));
+            assert_eq!(f.session(&third).resolve(Edge::ElicitationResult, &third).paint(), Some(Paint::Line(Glyph::Working)));
             assert_eq!(Record::parse(&f.record()).unwrap().completed.len(), 3);
         }
     }
@@ -1941,14 +2044,14 @@ mod tests {
             (Edge::Idle, quiet_stop()),
             (Edge::ElicitationResult, payload(r#"{"session_id":"s1","hook_event_name":"ElicitationResult","mcp_server_name":"server","action":"accept"}"#)),
         ] {
-            assert_eq!(f.session(&event).resolve(edge, &event), None);
+            assert_eq!(f.session(&event).resolve(edge, &event).paint(), None);
             assert_eq!(Record::parse(&f.record()).unwrap().waits.len(), 2);
         }
         let result = elicitation("server", "A", Some("cancel"));
-        assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result), None);
+        assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result).paint(), None);
         assert_eq!(Record::parse(&f.record()).unwrap().waits[0].who, Owner::AnonymousElicitation);
         let prompt = user_prompt();
-        assert_eq!(f.session(&prompt).resolve(Edge::Working, &prompt), Some(Paint::Line(Glyph::Working)));
+        assert_eq!(f.session(&prompt).resolve(Edge::Working, &prompt).paint(), Some(Paint::Line(Glyph::Working)));
         assert!(Record::parse(&f.record()).unwrap().waits.is_empty());
     }
 
@@ -1956,15 +2059,15 @@ mod tests {
     fn completion_tombstones_handle_out_of_order_replays_without_refreshing() {
         let f = Fixture::new("direct-replay");
         let result = elicitation("server", "A", Some("accept"));
-        assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result), None);
+        assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result).paint(), None);
         let completed = f.record();
         std::env::set_var("CCTAB_NOW", "1000002");
         let request = elicitation("server", "A", None);
-        assert_eq!(f.session(&request).resolve(Edge::Elicitation, &request), None);
-        assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result), None);
+        assert_eq!(f.session(&request).resolve(Edge::Elicitation, &request).paint(), None);
+        assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result).paint(), None);
         assert_eq!(f.record(), completed);
         std::env::set_var("CCTAB_NOW", "1000901");
-        assert_eq!(f.session(&request).resolve(Edge::Elicitation, &request), Some(Paint::Line(Glyph::Waiting)));
+        assert_eq!(f.session(&request).resolve(Edge::Elicitation, &request).paint(), Some(Paint::Line(Glyph::Waiting)));
         let raised = f.record();
         std::env::set_var("CCTAB_NOW", "1000902");
         f.session(&request).resolve(Edge::Elicitation, &request);
@@ -1980,10 +2083,10 @@ mod tests {
         f.session(&request).resolve(Edge::Elicitation, &request);
         assert_eq!(Record::parse(&f.record()).unwrap().waits.len(), 1);
         let result = elicitation("server", "A", Some("decline"));
-        assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result), Some(Paint::Line(Glyph::Idle)));
-        assert_eq!(f.session(&identified).resolve(Edge::Notify, &identified), None);
+        assert_eq!(f.session(&result).resolve(Edge::ElicitationResult, &result).paint(), Some(Paint::Line(Glyph::Idle)));
+        assert_eq!(f.session(&identified).resolve(Edge::Notify, &identified).paint(), None);
         let unidentified = notify("elicitation_url_dialog");
-        assert_eq!(f.session(&unidentified).resolve(Edge::Notify, &unidentified), Some(Paint::Line(Glyph::Waiting)));
+        assert_eq!(f.session(&unidentified).resolve(Edge::Notify, &unidentified).paint(), Some(Paint::Line(Glyph::Waiting)));
         let record = Record::parse(&f.record()).unwrap();
         assert_eq!(record.waits.len(), 1);
         assert_eq!(record.waits[0].who, Owner::UnknownElicitation);
@@ -2021,19 +2124,19 @@ mod tests {
         // 68.946 Stop, with the subagent already launched and LISTED in
         // background_tasks, which is why this one retires nothing.
         assert_eq!(
-            f.session(&main).resolve(Edge::Idle, &main),
+            f.session(&main).resolve(Edge::Idle, &main).paint(),
             Some(Paint::LineWithBackground(Glyph::Background))
         );
         // 69.960 the subagent's PermissionRequest.
         assert_eq!(
-            f.session(&agent).resolve(Edge::Waiting, &agent),
+            f.session(&agent).resolve(Edge::Waiting, &agent).paint(),
             Some(Paint::LineWithBackground(Glyph::Waiting))
         );
         // 75.983 the 6s backstop for the SAME dialog: still orange, and it must
         // not add an owner nothing can clear.
         let backstop = notify("permission_prompt");
         assert_eq!(
-            f.session(&backstop).resolve(Edge::Notify, &backstop),
+            f.session(&backstop).resolve(Edge::Notify, &backstop).paint(),
             Some(Paint::LineWithBackground(Glyph::Waiting))
         );
         let origin = f.origin_line();
@@ -2041,11 +2144,11 @@ mod tests {
         assert_eq!(f.record(), held);
         // 98.459 the GHOST SubagentStop, for an agent that owns nothing.
         let ghost = agent_stop("a8e90c10430da8891");
-        assert_eq!(f.session(&ghost).resolve(Edge::SubagentStop, &ghost), None);
+        assert_eq!(f.session(&ghost).resolve(Edge::SubagentStop, &ghost).paint(), None);
         assert_eq!(f.record(), held);
         // 107.496 you approved: the subagent's own PostToolUse restores the base.
         assert_eq!(
-            f.session(&agent).resolve(Edge::Working, &agent),
+            f.session(&agent).resolve(Edge::Working, &agent).paint(),
             Some(Paint::LineWithBackground(Glyph::Background))
         );
         assert_eq!(f.record(), format!("cts5\nb i\ng 1000000\n{origin}"));
@@ -2057,7 +2160,7 @@ mod tests {
         let agent = agent_ev("aaa");
         // Nothing is waiting, so this is the ORIGINAL filter, unchanged - and it
         // writes nothing at all, which is what keeps the hot edge a read.
-        assert_eq!(f.session(&agent).resolve(Edge::Working, &agent), None);
+        assert_eq!(f.session(&agent).resolve(Edge::Working, &agent).paint(), None);
         assert_eq!(f.record(), "");
         assert!(!f.dir.join("s1").exists());
     }
@@ -2070,7 +2173,7 @@ mod tests {
         f.session(&agent).resolve(Edge::Waiting, &agent);
         // The base is still updated - main IS working - but the tab keeps the
         // dialog. Stateless, this painted blue over an open dialog.
-        assert_eq!(f.session(&main).resolve(Edge::Working, &main), None);
+        assert_eq!(f.session(&main).resolve(Edge::Working, &main).paint(), None);
         assert_eq!(
             f.record(),
             format!("cts5\nb w\n{}w aaa:1000000\n", f.origin_line())
@@ -2078,7 +2181,7 @@ mod tests {
         // ...and when the agent resolves it, the base that comes back is the
         // WORKING one this turn established, not a guess.
         assert_eq!(
-            f.session(&agent).resolve(Edge::Working, &agent),
+            f.session(&agent).resolve(Edge::Working, &agent).paint(),
             Some(Paint::Line(Glyph::Working))
         );
     }
@@ -2098,9 +2201,9 @@ mod tests {
         // stays orange. A single owner slot would have got this wrong whichever
         // one it kept.
         let mainwork = main_tool();
-        assert_eq!(f.session(&mainwork).resolve(Edge::Working, &mainwork), None);
+        assert_eq!(f.session(&mainwork).resolve(Edge::Working, &mainwork).paint(), None);
         assert_eq!(
-            f.session(&agent).resolve(Edge::Working, &agent),
+            f.session(&agent).resolve(Edge::Working, &agent).paint(),
             Some(Paint::Line(Glyph::Working))
         );
     }
@@ -2111,13 +2214,13 @@ mod tests {
         let agent = agent_ev("aaa");
         let main = main_ev();
         f.session(&agent).resolve(Edge::Waiting, &agent);
-        assert_eq!(f.session(&main).resolve(Edge::Idle, &main), Some(Paint::LineWithBackground(Glyph::Waiting)));
+        assert_eq!(f.session(&main).resolve(Edge::Idle, &main).paint(), Some(Paint::LineWithBackground(Glyph::Waiting)));
         // The idle nudge is the same transition and is guarded the same way. It
         // matters because this user's `messageIdleNotifThresholdMs` is 3000. Its
         // payload carries no `background_tasks` at all, so it cannot retire
         // anything either.
         let nudge = notify("idle_prompt");
-        assert_eq!(f.session(&nudge).resolve(Edge::Notify, &nudge), None);
+        assert_eq!(f.session(&nudge).resolve(Edge::Notify, &nudge).paint(), None);
     }
 
     #[test]
@@ -2130,7 +2233,7 @@ mod tests {
         // this Stop's array is deliberately NON-empty to prove that.
         f.session(&main).resolve(Edge::Waiting, &main);
         assert_eq!(
-            f.session(&main).resolve(Edge::Idle, &main),
+            f.session(&main).resolve(Edge::Idle, &main).paint(),
             Some(Paint::LineWithBackground(Glyph::Background))
         );
         assert_eq!(f.record(), format!("cts5\nb i\ng 1000000\n{}", f.origin_line()));
@@ -2147,7 +2250,7 @@ mod tests {
         f.session(&agent).resolve(Edge::Waiting, &agent);
         let quiet = quiet_stop();
         assert_eq!(
-            f.session(&quiet).resolve(Edge::Idle, &quiet),
+            f.session(&quiet).resolve(Edge::Idle, &quiet).paint(),
             Some(Paint::Line(Glyph::Idle))
         );
         assert_eq!(f.record(), format!("cts5\nb i\n{}", f.origin_line()));
@@ -2164,12 +2267,12 @@ mod tests {
         f.session(&agent).resolve(Edge::Waiting, &agent);
         // A main-thread TOOL call says nothing about somebody else's dialog.
         let tool = main_tool();
-        assert_eq!(f.session(&tool).resolve(Edge::Working, &tool), None);
+        assert_eq!(f.session(&tool).resolve(Edge::Working, &tool).paint(), None);
         // Nor does the `UserPromptSubmit` the PRODUCT injects when an async agent
         // finishes: with two agents running, the first one's completion would
         // otherwise retire the second one's live dialog. Capture s4, 110.251.
         let injected = task_notification();
-        assert_eq!(f.session(&injected).resolve(Edge::Working, &injected), None);
+        assert_eq!(f.session(&injected).resolve(Edge::Working, &injected).paint(), None);
         assert_eq!(
             f.record(),
             format!("cts5\nb w\n{}w aaa:1000000\n", f.origin_line())
@@ -2177,7 +2280,7 @@ mod tests {
         // The user typing does.
         let prompt = user_prompt();
         assert_eq!(
-            f.session(&prompt).resolve(Edge::Working, &prompt),
+            f.session(&prompt).resolve(Edge::Working, &prompt).paint(),
             Some(Paint::Line(Glyph::Working))
         );
         assert_eq!(f.record(), format!("cts5\nb w\n{}", f.origin_line()));
@@ -2207,7 +2310,7 @@ mod tests {
         std::env::set_var("CCTAB_NOW", "1000009");
         std::env::set_var("CCTAB_TTL_WAITING", "3");
         let main = main_ev();
-        assert_eq!(f.session(&main).resolve(Edge::Idle, &main), Some(Paint::LineWithBackground(Glyph::Waiting)));
+        assert_eq!(f.session(&main).resolve(Edge::Idle, &main).paint(), Some(Paint::LineWithBackground(Glyph::Waiting)));
         // And the expiry was PERSISTED rather than recomputed for ever, so raising
         // the TTL later cannot resurrect a wait already declared dead.
         assert_eq!(
@@ -2223,15 +2326,15 @@ mod tests {
             let request = payload(&format!(
                 r#"{{"session_id":"s1","hook_event_name":"PermissionRequest","agent_id":"{id}"}}"#
             ));
-            assert_eq!(f.session(&request).resolve(Edge::Waiting, &request),
+            assert_eq!(f.session(&request).resolve(Edge::Waiting, &request).paint(),
                 Some(Paint::Line(Glyph::Waiting)));
             assert_eq!(f.record(), format!("cts5\nb i\n{}w ?p:1000000\n", f.origin_line()));
             let stop = payload(r#"{"session_id":"s1","hook_event_name":"Stop"}"#);
-            assert_eq!(f.session(&stop).resolve(Edge::Idle, &stop), None);
+            assert_eq!(f.session(&stop).resolve(Edge::Idle, &stop).paint(), None);
             let unrelated = agent_stop("other");
-            assert_eq!(f.session(&unrelated).resolve(Edge::SubagentStop, &unrelated), None);
+            assert_eq!(f.session(&unrelated).resolve(Edge::SubagentStop, &unrelated).paint(), None);
             let human = user_prompt();
-            assert_eq!(f.session(&human).resolve(Edge::Working, &human),
+            assert_eq!(f.session(&human).resolve(Edge::Working, &human).paint(),
                 Some(Paint::Line(Glyph::Working)));
             assert!(!f.record().contains("\nw "));
         }
@@ -2242,7 +2345,7 @@ mod tests {
         let f = Fixture::new("unknown");
         let backstop = notify("agent_needs_input");
         assert_eq!(
-            f.session(&backstop).resolve(Edge::Notify, &backstop),
+            f.session(&backstop).resolve(Edge::Notify, &backstop).paint(),
             Some(Paint::Line(Glyph::Waiting))
         );
         assert_eq!(
@@ -2251,15 +2354,15 @@ mod tests {
         );
         // A `Stop` with a live subagent still says nothing about it.
         let busy = main_ev();
-        assert_eq!(f.session(&busy).resolve(Edge::Idle, &busy), Some(Paint::LineWithBackground(Glyph::Waiting)));
+        assert_eq!(f.session(&busy).resolve(Edge::Idle, &busy).paint(), Some(Paint::LineWithBackground(Glyph::Waiting)));
         // No evidence connects this agent to the notification's unknown owner.
         let agent = agent_ev("aaa");
         let held = f.record();
-        assert_eq!(f.session(&agent).resolve(Edge::Working, &agent), None);
+        assert_eq!(f.session(&agent).resolve(Edge::Working, &agent).paint(), None);
         assert_eq!(f.record(), held);
         let quiet = quiet_stop();
         assert_eq!(
-            f.session(&quiet).resolve(Edge::Idle, &quiet),
+            f.session(&quiet).resolve(Edge::Idle, &quiet).paint(),
             Some(Paint::Line(Glyph::Idle))
         );
         assert_eq!(f.record(), format!("cts5\nb i\n{}", f.origin_line()));
@@ -2281,13 +2384,13 @@ mod tests {
             let f = Fixture::new("unknownkinds");
             let backstop = notify(kind);
             assert_eq!(
-                f.session(&backstop).resolve(Edge::Notify, &backstop),
+                f.session(&backstop).resolve(Edge::Notify, &backstop).paint(),
                 Some(Paint::Line(Glyph::Waiting)),
                 "{kind}"
             );
             let quiet = quiet_stop();
             assert_eq!(
-                f.session(&quiet).resolve(Edge::Idle, &quiet),
+                f.session(&quiet).resolve(Edge::Idle, &quiet).paint(),
                 Some(Paint::Line(Glyph::Idle)),
                 "{kind}"
             );
@@ -2309,7 +2412,7 @@ mod tests {
             format!("cts5\nb i\n{}w aaa:1000000\n", f.origin_line())
         );
         assert_eq!(
-            f.session(&agent).resolve(Edge::Working, &agent),
+            f.session(&agent).resolve(Edge::Working, &agent).paint(),
             Some(Paint::Line(Glyph::Idle))
         );
     }
@@ -2323,7 +2426,7 @@ mod tests {
         // arrives. SubagentStop is the only signal left.
         let stop = agent_stop("aaa");
         assert_eq!(
-            f.session(&stop).resolve(Edge::SubagentStop, &stop),
+            f.session(&stop).resolve(Edge::SubagentStop, &stop).paint(),
             Some(Paint::Line(Glyph::Idle))
         );
         assert_eq!(f.record(), format!("cts5\nb i\n{}", f.origin_line()));
@@ -2337,7 +2440,7 @@ mod tests {
         f.session(&backstop).resolve(Edge::Notify, &backstop);
         let stop = agent_stop("aaa");
         let held = f.record();
-        assert_eq!(f.session(&stop).resolve(Edge::SubagentStop, &stop), None);
+        assert_eq!(f.session(&stop).resolve(Edge::SubagentStop, &stop).paint(), None);
         assert_eq!(f.record(), held);
     }
 
@@ -2359,10 +2462,10 @@ mod tests {
                 (Edge::Working, payload(r#"{"session_id":"s1","agent_id":"-","hook_event_name":"PostToolUse"}"#)),
                 (Edge::Working, payload(r#"{"session_id":"s1","agent_id":"unrelated","hook_event_name":"PostToolUseFailure"}"#)),
             ] {
-                assert_eq!(f.session(&event).resolve(edge, &event), None, "{kind}");
+                assert_eq!(f.session(&event).resolve(edge, &event).paint(), None, "{kind}");
                 assert_eq!(f.record(), held, "{kind}");
             }
-            assert_eq!(f.session(&prompt).resolve(Edge::Working, &prompt), Some(Paint::Line(Glyph::Working)));
+            assert_eq!(f.session(&prompt).resolve(Edge::Working, &prompt).paint(), Some(Paint::Line(Glyph::Working)));
             assert!(!f.record().contains("\nw "));
         }
     }
@@ -2382,7 +2485,7 @@ mod tests {
                 f.session(event).resolve(edge, event);
             }
             assert_eq!(Record::parse(&f.record()).unwrap().waits.len(), 2);
-            assert_eq!(f.session(&permission).resolve(Edge::Working, &permission), None);
+            assert_eq!(f.session(&permission).resolve(Edge::Working, &permission).paint(), None);
             assert_eq!(f.record(), format!("cts5\nb i\n{}w ?!:1000000\n", f.origin_line()));
         }
     }
@@ -2401,7 +2504,7 @@ mod tests {
             let owner = agent_ev("aaa");
             f.session(&owner).resolve(Edge::Waiting, &owner);
             assert_eq!(f.record(), format!("cts5\nb i\n{}w ?!:1000000 aaa:1000000\n", f.origin_line()));
-            assert_eq!(f.session(&owner).resolve(Edge::Working, &owner), None);
+            assert_eq!(f.session(&owner).resolve(Edge::Working, &owner).paint(), None);
             assert_eq!(f.record(), format!("cts5\nb i\n{}w ?!:1000000\n", f.origin_line()));
         }
     }
@@ -2415,10 +2518,10 @@ mod tests {
             if expire {
                 std::env::set_var("CCTAB_NOW", "1000901");
                 let unrelated = agent_ev("aaa");
-                assert_eq!(f.session(&unrelated).resolve(Edge::Working, &unrelated), None);
+                assert_eq!(f.session(&unrelated).resolve(Edge::Working, &unrelated).paint(), None);
             } else {
                 let main = main_tool();
-                assert_eq!(f.session(&main).resolve(Edge::Working, &main), Some(Paint::Line(Glyph::Working)));
+                assert_eq!(f.session(&main).resolve(Edge::Working, &main).paint(), Some(Paint::Line(Glyph::Working)));
             }
             assert!(!f.record().contains("\nw "));
         }
@@ -2431,7 +2534,7 @@ mod tests {
         let legacy = "cts1\nb w\nw ?:1000000\n";
         fs::write(f.dir.join("s1"), legacy).unwrap();
         for (edge, event) in [(Edge::Working, agent_ev("aaa")), (Edge::SubagentStop, agent_stop("aaa"))] {
-            assert_eq!(f.session(&event).resolve(edge, &event), None);
+            assert_eq!(f.session(&event).resolve(edge, &event).paint(), None);
             assert_eq!(f.record(), legacy);
         }
         let prompt = user_prompt();
@@ -2451,7 +2554,7 @@ mod tests {
         std::env::set_var("CCTAB_NOW", "1000901");
         let main = main_ev();
         assert_eq!(
-            f.session(&main).resolve(Edge::Idle, &main),
+            f.session(&main).resolve(Edge::Idle, &main).paint(),
             Some(Paint::LineWithBackground(Glyph::Background))
         );
     }
@@ -2464,7 +2567,7 @@ mod tests {
         let start =
             payload(r#"{"session_id":"s1","hook_event_name":"SessionStart","source":"resume"}"#);
         assert_eq!(
-            f.session(&start).resolve(Edge::SessionStart, &start),
+            f.session(&start).resolve(Edge::SessionStart, &start).paint(),
             Some(Paint::SessionStart)
         );
         // Reset, AND claimed: the origin is what lets another session's reaper
@@ -2472,10 +2575,49 @@ mod tests {
         assert_eq!(f.record(), format!("cts5\nb i\n{}", f.origin_line()));
         let end = payload(r#"{"session_id":"s1","hook_event_name":"SessionEnd"}"#);
         assert_eq!(
-            f.session(&end).resolve(Edge::SessionEnd, &end),
+            f.session(&end).resolve(Edge::SessionEnd, &end).paint(),
             Some(Paint::SessionEnd)
         );
         assert_eq!(f.record(), "");
+    }
+
+    /// Rung 2 preserves an optional restore obligation through ordinary updates
+    /// and reads it before teardown. A session with no appearance route keeps
+    /// the existing record bytes without adding an arming field.
+    #[test]
+    fn a_restore_obligation_is_optional_preserved_and_read_back_at_the_end() {
+        let f = Fixture::new("armed");
+        let start =
+            payload(r#"{"session_id":"s1","hook_event_name":"SessionStart","source":"startup"}"#);
+        let plain = f.session(&start);
+        plain.resolve(Edge::SessionStart, &start);
+        let untouched = format!("cts5\nb i\n{}", f.origin_line());
+        assert_eq!(f.record(), untouched);
+        // A session with no appearance route never calls `note_armed`, so this is the
+        // whole of the claim: the file is what it was.
+        assert!(matches!(plain.armed(), Support::Unsupported(_)));
+        plain.note_armed(Surface::Konsole);
+        assert_eq!(f.record(), format!("{untouched}s konsole\n"));
+        assert!(matches!(plain.armed(), Support::Available(Some(Surface::Konsole))));
+        // And an ordinary painting edge carries it through untouched, because
+        // every write starts from the record it read.
+        let stop = payload(r#"{"session_id":"s1","hook_event_name":"Stop"}"#);
+        f.session(&stop).resolve(Edge::Idle, &stop);
+        assert!(f.record().ends_with("s konsole\n"));
+        assert!(matches!(f.session(&stop).armed(), Support::Available(Some(Surface::Konsole))));
+        // A name this build has no row for reads as ABSENT and lets the next rung
+        // answer - never as a different surface whose bytes would then be written.
+        fs::write(f.dir.join("s1"), "cts5\nb i\ns konsole-ng\n").expect("a writable state dir");
+        assert!(matches!(f.session(&stop).armed(), Support::Unsupported(_)));
+        // A record that is not ours at all is the same answer, by a different road.
+        fs::write(f.dir.join("s1"), "not-a-record\n").expect("a writable state dir");
+        assert!(matches!(f.session(&stop).armed(), Support::Unsupported(_)));
+        // SessionEnd deletes the file, which is why `paint` reads this BEFORE it
+        // resolves: afterwards there is nothing left to read.
+        let end = payload(r#"{"session_id":"s1","hook_event_name":"SessionEnd"}"#);
+        f.session(&end).resolve(Edge::SessionEnd, &end);
+        assert_eq!(f.record(), "");
+        assert!(matches!(f.session(&end).armed(), Support::Unsupported(_)));
     }
 
     /// The origin is carried by every later write without any of them re-reading
@@ -2531,7 +2673,7 @@ mod tests {
         );
         let start =
             payload(r#"{"session_id":"s1","hook_event_name":"SessionStart","source":"compact"}"#);
-        assert_eq!(f.session(&start).resolve(Edge::SessionStart, &start), None);
+        assert_eq!(f.session(&start).resolve(Edge::SessionStart, &start).paint(), None);
         assert_eq!(f.record(), before);
     }
 
@@ -2809,6 +2951,7 @@ mod tests {
                     Wait { who: Owner::Unknown, raised: 1_000_000 },
                 ],
                 completed: Vec::new(),
+                armed: None,
             },
             // The edges of the numbers, because all of them go through `itoa` and
             // `digits` rather than the formatter and `parse`.
@@ -2818,6 +2961,7 @@ mod tests {
                 origin: Some(Origin { pid: u32::MAX, start: u64::MAX }),
                 waits: vec![Wait { who: Owner::Main, raised: u64::MAX }],
                 completed: Vec::new(),
+                armed: None,
             },
         ];
         for r in cases {
@@ -2831,10 +2975,28 @@ mod tests {
                 origin: Some(Origin { pid: 42, start: 7 }),
                 waits: vec![Wait { who: Owner::Agent("ab-c_D".to_owned()), raised: 99 }],
                 completed: Vec::new(),
+                armed: None,
             }
             .render(),
             format!("cts5\nb w\n{} 42 7\nw ab-c_D:99\n", sys::ORIGIN_KEY)
         );
+    }
+
+    // Use an actual exited pid rather than u32::MAX: macOS deliberately
+    // refuses to pass the latter to kill(2), whose signed argument names groups.
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    fn exited_origin() -> Origin {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start a disposable process");
+        let pid = child.id();
+        assert!(child.wait().expect("reap the child").success());
+        assert_eq!(sys::process_alive(pid), Some(false));
+        Origin { pid, start: 1 }
     }
 
     /// The reaper's decision, which is the one piece of this module that deletes
@@ -2842,7 +3004,7 @@ mod tests {
     /// never reapable however old it is, and nothing the reaper cannot PROVE is
     /// ours is reapable at all.
     #[test]
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn the_reaper_reaps_a_dead_session_and_provably_not_a_live_one() {
         let f = Fixture::new("reap");
         fs::create_dir_all(&f.dir).expect("a writable state dir");
@@ -2864,7 +3026,7 @@ mod tests {
 
         // THE LIVE CASE. Our own pid, with its real start time: this is exactly
         // what a live session's record looks like, and no age can make it stale.
-        let mine = Origin::mine_from(std::process::id()).expect("our own /proc entry");
+        let mine = Origin::mine_from(std::process::id()).expect("our own process start time");
         let live = write(
             "live",
             &Record { origin: Some(mine), ..Record::fresh() }.render(),
@@ -2873,12 +3035,12 @@ mod tests {
         assert!(mine.alive());
         assert_eq!(verdict(&live), None);
 
-        // A pid that cannot be running: the kernel's own maximum plus nothing.
-        // /proc/<pid> is absent, so the origin is gone.
+        // A real child that has exited and been waited for. An out-of-range
+        // pid is unverifiable on macOS, not evidence of a dead process.
         let dead = write(
             "dead",
             &Record {
-                origin: Some(Origin { pid: u32::MAX, start: 1 }),
+                origin: Some(exited_origin()),
                 ..Record::fresh()
             }
             .render(),
@@ -2925,6 +3087,22 @@ mod tests {
         // id - and a directory, which `remove_file` cannot take and which doctor
         // must therefore not promise.
         let mut untouchable = Vec::new();
+        if cfg!(target_os = "macos") {
+            // kill(2) cannot ask about this unsigned pid. Even age must not
+            // turn an unverifiable origin into proof that a session has died.
+            let unknown = write(
+                "unverifiable",
+                &Record {
+                    origin: Some(Origin { pid: u32::MAX, start: 1 }),
+                    ..Record::fresh()
+                }
+                .render(),
+            );
+            age(&unknown);
+            assert_eq!(sys::process_alive(u32::MAX), None);
+            assert_eq!(verdict(&unknown), None);
+            untouchable.push(unknown);
+        }
         for (name, body) in [
             ("notes.txt", "a shopping list"),
             ("id_rsa", "-----BEGIN OPENSSH PRIVATE KEY-----"),
@@ -2986,11 +3164,11 @@ mod tests {
 
     /// `doctor`'s report is generated from the same verdicts the reaper acts on.
     #[test]
-    #[cfg(any(target_os = "linux", windows))]
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     fn doctor_reports_where_the_records_are_what_they_hold_and_which_are_stale() {
         let f = Fixture::new("survey");
         fs::create_dir_all(&f.dir).expect("a writable state dir");
-        let mine = Origin::mine_from(std::process::id()).expect("our own /proc entry");
+        let mine = Origin::mine_from(std::process::id()).expect("our own process start time");
         fs::write(
             f.dir.join("live"),
             Record {
@@ -3002,6 +3180,7 @@ mod tests {
                     raised: 999_990,
                 }],
                 completed: Vec::new(),
+                armed: None,
             }
             .render(),
         )
@@ -3009,7 +3188,7 @@ mod tests {
         fs::write(
             f.dir.join("dead"),
             Record {
-                origin: Some(Origin { pid: u32::MAX, start: 1 }),
+                origin: Some(exited_origin()),
                 ..Record::fresh()
             }
             .render(),
@@ -3276,10 +3455,10 @@ mod tests {
         let report = survey();
         let line = report.records.iter().find(|(n, _)| n == "s1").map(|(_, w)| w.clone());
         assert!(line.as_deref().is_some_and(|w| w.contains("waiting on 1")), "{line:?}");
-        assert_eq!(s2.resolve(Edge::Working, &other), Some(Paint::Line(Glyph::Idle)), "s2 is not blocked");
+        assert_eq!(s2.resolve(Edge::Working, &other).paint(), Some(Paint::Line(Glyph::Idle)), "s2 is not blocked");
         drop(held);
         let painted = rx.recv_timeout(Duration::from_secs(10)).expect("released, it proceeds");
-        assert_eq!(painted, Some(Paint::Line(Glyph::Idle)));
+        assert_eq!(painted.paint(), Some(Paint::Line(Glyph::Idle)));
         waiter.join().expect("join");
         assert!(!f.record().contains("\nw "));
     }
@@ -3298,7 +3477,7 @@ mod tests {
         let path = f.dir.join("s1");
         let queued = fs::OpenOptions::new().read(true).write(true).open(&path).expect("open");
         let old = s.lock(false).expect("lockable");
-        let (was, mut now) = s.load();
+        let (was, mut now, _) = s.load();
         now.base = Glyph::Idle;
         s.write_if_changed(&was, &mut now);
         assert_eq!(f.record(), format!("cts5\nb i\n{}", f.origin_line()), "replaced while held");
@@ -3469,4 +3648,247 @@ mod tests {
         eprintln!("400 rounds, lost (clear, wait, eight-way of 50): with the lock {with:?}, without {without:?}");
         assert_eq!(with, [0, 0, 0]);
     }
+
+    /// #14's whole reason for this seam. Every assertion above this one is about
+    /// the PAINT, and the paint is exactly what cannot tell a dialog going up from
+    /// a dialog that is still up: the two orange edges below are byte-identical,
+    /// which is why a backend that rings on the paint rings on every repeat.
+    #[test]
+    fn the_stateful_path_reports_entering_remaining_in_and_leaving_the_wait() {
+        let f = Fixture::new("transition-waiting");
+        let work = main_tool();
+        let ask = payload(r#"{"session_id":"s1","hook_event_name":"PermissionRequest"}"#);
+        // No record yet: the first decision cannot establish prior idle.
+        assert_eq!(
+            f.session(&work).resolve(Edge::Working, &work).map(|r| r.transition),
+            Some(Transition::Unknown)
+        );
+        let up = f.session(&ask).resolve(Edge::Waiting, &ask);
+        let still_up = f.session(&ask).resolve(Edge::Waiting, &ask);
+        assert_eq!(up.paint(), Some(Paint::Line(Glyph::Waiting)));
+        assert_eq!(up.paint(), still_up.paint(), "the paint cannot tell these apart");
+        assert_eq!(up.map(|r| r.transition), Some(Transition::Entered));
+        assert_eq!(still_up.map(|r| r.transition), Some(Transition::Remained));
+        // The dialog is answered: the same edge that unpaints orange is the one a
+        // persistent indicator has to be cleared on.
+        let done = quiet_stop();
+        let gone = f.session(&done).resolve(Edge::Idle, &done);
+        assert_eq!(gone.paint(), Some(Paint::Line(Glyph::Idle)));
+        assert_eq!(gone.map(|r| r.transition), Some(Transition::Left));
+    }
+
+    fn assert_decision(f: &Fixture, edge: Edge, p: &Payload, paint: Option<Paint>, transition: Transition) {
+        assert_eq!(f.session(p).resolve(edge, p), Some(Resolved { paint, transition }), "{edge:?}");
+    }
+
+    #[test]
+    fn attention_expiry_is_observed_even_without_a_paint() {
+        let f = Fixture::new("attention-expiry");
+        // Cover every branch which can apply expiry, including a result for a
+        // different request: it writes a tombstone but must not paint.
+        for (edge, event, paint) in [
+            (Edge::Idle, quiet_stop(), Some(Paint::Line(Glyph::Idle))),
+            (Edge::Notify, notify("idle_prompt"), Some(Paint::Line(Glyph::Idle))),
+            (Edge::Working, main_tool(), Some(Paint::Line(Glyph::Working))),
+            (Edge::Working, agent_ev("unrelated"), None),
+            (Edge::SubagentStop, agent_stop("unrelated"), None),
+            (Edge::ElicitationResult, elicitation("server", "other", Some("accept")), None),
+        ] {
+            let session = f.session(&event);
+            fs::write(&session.path, "cts5\nb i\nw aaa:999000\n").unwrap();
+            assert_decision(&f, edge, &event, paint, Transition::Left);
+            assert!(!Record::parse(&f.record()).unwrap().asking());
+            // The persisted expiry is not reported again.
+            assert_decision(&f, edge, &event, paint, Transition::Remained);
+        }
+        // A replay suppressed by a still-live tombstone can expire another wait.
+        let request = elicitation("server", "done", None);
+        let session = f.session(&request);
+        let mut old = Record::fresh();
+        old.raise(Owner::Main, 999000);
+        old.complete(elicitation_key(&request).unwrap(), 999900);
+        fs::write(&session.path, old.render()).unwrap();
+        assert_decision(&f, Edge::Elicitation, &request, None, Transition::Left);
+        assert_eq!(Record::parse(&f.record()).unwrap().completed, old.completed);
+    }
+
+    #[test]
+    fn attention_expiry_then_new_wait_is_one_net_comparison() {
+        let f = Fixture::new("attention-replacement");
+        for (edge, event) in [
+            (Edge::Waiting, agent_ev("new")),
+            (Edge::Notify, notify("permission_prompt")),
+            (Edge::Notify, notify("elicitation_dialog")),
+            (Edge::Elicitation, elicitation("server", "new", None)),
+        ] {
+            let session = f.session(&event);
+            fs::write(&session.path, "cts5\nb i\nw old:999000\n").unwrap();
+            assert_decision(&f, edge, &event, Some(Paint::Line(Glyph::Waiting)), Transition::Remained);
+            let record = Record::parse(&f.record()).unwrap();
+            assert_eq!(record.waits.len(), 1);
+            assert_eq!(record.waits[0].raised, 1000000);
+            assert_ne!(record.waits[0].who, Owner::Agent("old".into()));
+        }
+        // The exact TTL boundary and clock rollback do not expire; zero disables it.
+        for (now, ttl) in [(1000900, "900"), (999999, "900"), (2000000, "0")] {
+            let event = agent_stop("unrelated");
+            std::env::set_var("CCTAB_TTL_WAITING", ttl);
+            let mut session = f.session(&event);
+            session.now = now;
+            fs::write(&session.path, "cts5\nb i\nw old:1000000\n").unwrap();
+            assert_eq!(session.resolve(Edge::SubagentStop, &event),
+                Some(Resolved { paint: None, transition: Transition::Remained }));
+            assert_eq!(f.record(), "cts5\nb i\nw old:1000000\n");
+        }
+    }
+
+    #[test]
+    fn attention_clearance_waits_for_the_last_owner() {
+        let f = Fixture::new("attention-overlap");
+        let work = main_tool();
+        f.session(&work).resolve(Edge::Working, &work);
+        let agent = agent_ev("aaa");
+        let request = elicitation("server", "A", None);
+        assert_decision(&f, Edge::Waiting, &agent, Some(Paint::Line(Glyph::Waiting)), Transition::Entered);
+        assert_decision(&f, Edge::Elicitation, &request, Some(Paint::Line(Glyph::Waiting)), Transition::Remained);
+        // Base updates and unrelated completions do not lower attention.
+        assert_decision(&f, Edge::Working, &work, None, Transition::Remained);
+        assert_decision(&f, Edge::SubagentStop, &agent_stop("other"), None, Transition::Remained);
+        assert_decision(&f, Edge::SubagentStop, &agent_stop("aaa"), None, Transition::Remained);
+        let done = elicitation("server", "A", Some("accept"));
+        assert_decision(&f, Edge::ElicitationResult, &done, Some(Paint::Line(Glyph::Working)), Transition::Left);
+        assert_decision(&f, Edge::ElicitationResult, &done, None, Transition::Remained);
+        // Reverse completion order: removing the direct wait is also silent.
+        f.session(&agent).resolve(Edge::Waiting, &agent);
+        let second = elicitation("server", "B", None);
+        f.session(&second).resolve(Edge::Elicitation, &second);
+        let done = elicitation("server", "B", Some("cancel"));
+        assert_decision(&f, Edge::ElicitationResult, &done, None, Transition::Remained);
+        assert_decision(&f, Edge::Working, &agent, Some(Paint::Line(Glyph::Working)), Transition::Left);
+        // One expired owner alongside one live owner is still attention.
+        fs::write(f.dir.join("s1"), "cts5\nb i\nw old:999000 live:1000000\n").unwrap();
+        assert_decision(&f, Edge::SubagentStop, &agent_stop("old"), None, Transition::Remained);
+        assert_decision(&f, Edge::Idle, &quiet_stop(), Some(Paint::Line(Glyph::Idle)), Transition::Left);
+    }
+
+    #[test]
+    fn attention_reset_and_end_compare_the_stored_state() {
+        let f = Fixture::new("attention-lifecycle");
+        for source in ["startup", "resume", "clear", "fork"] {
+            let start = payload(&format!(r#"{{"session_id":"s1","source":"{source}"}}"#));
+            let session = f.session(&start);
+            for (record, expected) in [
+                ("cts5\nb i\nw aaa:1000000\n", Transition::Left),
+                ("cts5\nb i\nw aaa:999000\n", Transition::Left),
+                ("cts5\nb w\n", Transition::Remained),
+            ] {
+                fs::write(&session.path, record).unwrap();
+                assert_decision(&f, Edge::SessionStart, &start, Some(Paint::SessionStart), expected);
+                assert!(!Record::parse(&f.record()).unwrap().asking());
+                fs::write(&session.path, record).unwrap();
+                assert_decision(&f, Edge::SessionEnd, &start, Some(Paint::SessionEnd), expected);
+                assert!(!session.path.exists());
+                assert_decision(&f, Edge::SessionEnd, &start, Some(Paint::SessionEnd), Transition::Unknown);
+            }
+            assert_decision(&f, Edge::SessionStart, &start, Some(Paint::SessionStart), Transition::Unknown);
+            assert_decision(&f, Edge::SessionStart, &start, Some(Paint::SessionStart), Transition::Remained);
+        }
+    }
+
+    #[test]
+    fn attention_filtered_events_do_not_observe_or_expire_state() {
+        let f = Fixture::new("attention-filtered");
+        for (edge, event) in [
+            (Edge::SessionStart, payload(r#"{"session_id":"s1","source":"compact"}"#)),
+            (Edge::Notify, notify("agent_completed")),
+            (Edge::Working, agent_ev("invalid/id")),
+            (Edge::SubagentStop, main_tool()),
+            (Edge::Elicitation, payload(r#"{"session_id":"s1","hook_event_name":"Other"}"#)),
+            (Edge::ElicitationResult, elicitation("server", "A", Some("unsupported"))),
+            (Edge::ElicitationResult, payload(r#"{"session_id":"s1","hook_event_name":"ElicitationResult","action":"accept"}"#)),
+        ] {
+            let session = f.session(&event);
+            let old = "cts5\nb i\nw aaa:999000\n";
+            fs::write(&session.path, old).unwrap();
+            assert_eq!(session.resolve(edge, &event), None, "{edge:?}");
+            assert_eq!(f.record(), old);
+        }
+    }
+
+    #[test]
+    fn attention_requires_a_recognised_prior_record() {
+        let f = Fixture::new("attention-unknown");
+        let event = main_tool();
+        let session = f.session(&event);
+        for record in ["", "foreign\nb i\n", "cts99\nb i\n", &"x".repeat(MAX_RECORD + 1)] {
+            for (edge, paint) in [
+                (Edge::Waiting, Paint::Line(Glyph::Waiting)),
+                (Edge::Elicitation, Paint::Line(Glyph::Waiting)),
+                (Edge::SessionStart, Paint::SessionStart),
+                (Edge::SessionEnd, Paint::SessionEnd),
+            ] {
+                fs::write(&session.path, record).unwrap();
+                let event = elicitation("server", "A", None);
+                assert_decision(&f, edge, &event, Some(paint), Transition::Unknown);
+            }
+        }
+        // A missing record must not turn the lock's empty placeholder into idle.
+        assert!(!session.path.exists());
+        assert_decision(&f, Edge::Waiting, &event, Some(Paint::Line(Glyph::Waiting)), Transition::Unknown);
+        session.remove();
+        let result = elicitation("server", "A", Some("accept"));
+        assert_decision(&f, Edge::ElicitationResult, &result, None, Transition::Unknown);
+        session.remove();
+        fs::create_dir(&session.path).unwrap();
+        assert_decision(&f, Edge::Waiting, &event, Some(Paint::Line(Glyph::Waiting)), Transition::Unknown);
+        assert_eq!(session.resolve(Edge::Working, &event), None);
+        assert_decision(&f, Edge::SessionEnd, &event, Some(Paint::SessionEnd), Transition::Unknown);
+        assert!(session.path.is_dir(), "failed deletion does not change the logical decision");
+        // A file where the directory should be disables state and selects the
+        // stateless resolver, whose explicit Unknown is tested in edge.rs.
+        let blocked = f.dir.join("blocked");
+        fs::write(&blocked, "file").unwrap();
+        assert!(Session::open(Some(blocked.join("child")), &event).is_none());
+        assert!(Session::open(Some(f.dir.clone()), &Payload::empty()).is_none());
+        assert!(Session::open(None, &event).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attention_unreadable_records_do_not_supply_a_prior_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new("attention-unreadable");
+        let event = main_tool();
+        let session = f.session(&event);
+        fs::write(&session.path, "cts5\nb i\nw aaa:1000000\n").unwrap();
+        fs::set_permissions(&session.path, fs::Permissions::from_mode(0o400)).unwrap();
+        if fs::OpenOptions::new().write(true).open(&session.path).is_ok() {
+            eprintln!("skipped: this user can write mode-400 files");
+            return;
+        }
+        // Readable evidence does not authorise a transition without the lock.
+        assert!(matches!(stored_at(&session.path), Stored::Ours(_)));
+        assert_decision(&f, Edge::Waiting, &event, Some(Paint::Line(Glyph::Waiting)), Transition::Unknown);
+        assert_eq!(session.resolve(Edge::Working, &event), None);
+        fs::set_permissions(&session.path, fs::Permissions::from_mode(0)).unwrap();
+        if fs::read(&session.path).is_ok() {
+            eprintln!("skipped: this user can read mode-000 files");
+            return;
+        }
+        assert_decision(&f, Edge::Waiting, &event, Some(Paint::Line(Glyph::Waiting)), Transition::Unknown);
+        assert_eq!(session.resolve(Edge::Working, &event), None);
+        assert_decision(&f, Edge::SessionStart, &event, Some(Paint::SessionStart), Transition::Unknown);
+        assert_decision(&f, Edge::SessionEnd, &event, Some(Paint::SessionEnd), Transition::Unknown);
+    }
+
+    #[test]
+    fn attention_legacy_waiting_base_is_logical_state() {
+        let f = Fixture::new("attention-legacy-base");
+        let event = agent_ev("other");
+        let session = f.session(&event);
+        fs::write(&session.path, "cts1\nb a\n").unwrap();
+        assert_decision(&f, Edge::Working, &event, None, Transition::Remained);
+        assert_decision(&f, Edge::Idle, &quiet_stop(), Some(Paint::Line(Glyph::Idle)), Transition::Left);
+    }
+
 }

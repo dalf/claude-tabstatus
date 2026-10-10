@@ -97,6 +97,60 @@ truncated or prefix-matched. Wrong JSON types reject the input. The record store
 hex-encoded complete identity components, not messages, schemas, answers, URLs,
 credentials, or tool data.
 
+## Logical attention transitions
+
+The resolver reports an optional title paint independently of an attention
+transition. Attention means the logical waiting state: at least one recorded
+wait, or the legacy `waiting` base. It does not mean that a terminal displayed
+orange or delivered an alert.
+
+For each eligible stateful event, compare the recognised record **as stored,
+before expiry**, with the logical state computed **after expiry and the event**:
+
+| Before | After | Transition |
+|---|---|---|
+| Not waiting | Waiting | `Entered` |
+| Waiting | Waiting | `Remained` |
+| Waiting | Not waiting | `Left` |
+| Not waiting | Not waiting | `Remained` |
+| Unknown | Either | `Unknown` |
+
+This is one net comparison per event, not a sequence of intermediate changes.
+Expiry followed immediately by a new wait therefore reports `Remained`, even
+when the owner changes. Expiry leaving no wait reports `Left`, including on an
+eligible event that paints nothing. Clearing one of several owners reports
+`Remained` while another remains. Time passing without an eligible event produces
+no transition; tmux's independent title decay is not an input to this comparison.
+
+Non-compaction session start compares the previous record with the reset idle
+state. Session end observes the record before deletion and compares it with the
+ended, non-waiting state. Both report `Left` for a previously waiting record,
+including expired waits, and `Remained` for a known non-waiting record.
+Session end retains the existing unlocked, quiescent-teardown requirement.
+
+Only a recognised readable record supplies a known prior state. A missing file,
+an empty lock placeholder, unrecognised contents, an unsupported version, or an
+inaccessible record does not establish prior idle. The existing tolerant parser
+still defines the logical interpretation of recognised records. Stateless and
+fallback paint decisions report `Unknown`. A failed lock supplies no known
+transition, even if a conservative waiting paint is possible.
+
+`Option<Resolved>` distinguishes an evaluated decision from an event for which
+no comparison or fallback paint was made. `Some` carries `paint: Option<Paint>`
+and a transition; a silent evaluated event can therefore expose a transition.
+`None` is no observation, never evidence of `Remained` or `Left`. Events filtered
+before loading state retain their existing no-mutation, no-expiry and no-output
+rules. Eligible events that load state report the comparison even if their
+paint is suppressed or the record is unchanged.
+
+The after-state is the resolver's decision, not confirmation of a successful
+write or deletion. Persistence remains best effort, so a subsequent hook can
+observe an older record and report the same transition again. No transition
+guarantees title or attention delivery, ordering of output after unlocking, or
+exactly-once effects. Future consumers must handle `Unknown` and persistence or
+delivery failures explicitly. No attention effects or delivery history are
+implemented, and no record-format change is needed for this contract.
+
 ## Transitions and retirement
 
 Rules below operate after expiry on an edge that successfully locks and loads
@@ -208,8 +262,9 @@ display decay is described above.
 
 Persistence requires a valid session ID and either the dedicated
 `CCTAB_STATE_DIR` override or `$XDG_RUNTIME_DIR/claude-tabstatus`
-(`%LOCALAPPDATA%\claude-tabstatus` on Windows); there is no HOME fallback. On
-Windows the directory must be on a volume with POSIX rename semantics (NTFS, not
+(`$TMPDIR/claude-tabstatus` on macOS, `%LOCALAPPDATA%\claude-tabstatus` on Windows);
+there is no HOME fallback. On Windows the directory must be on a volume with
+POSIX rename semantics (NTFS, not
 FAT, exFAT or WSL's 9P share), because every write replaces a file its writer
 holds open. Missing/invalid session IDs, no configured directory, a directory
 without that capability, or failure to create the directory select the stateless
@@ -253,9 +308,23 @@ the record, so no ordering guarantee is made across teardown. Reaping on startup
 and explicit uninstall are also separate from the ordinary update guards.
 This is an existing lifecycle limitation, not an ownership-retirement rule.
 
+Shared tmux appearance ownership uses a separate cold lifecycle lock and explicit
+membership for the actual tmux session. It serialises different Claude sessions'
+startup/teardown delivery and policy retirement independently of pane-title
+parsing. It does not change the unlocked per-Claude deletion rule above or
+serialise ordinary hot paints. See
+[tmux lifecycle coordination](architecture.md#tmux-lifecycle-coordination).
+
 The wire writer emits `cts5`, preserving both anonymous permission provenance
-(`?p`) and known background (`g <epoch>`). Readers also accept `cts1`–`cts4`,
-without interpreting their reserved `g` fields. Guarded older readers refuse
+(`?p`) and known background (`g <epoch>`). The optional `s <surface>` line records
+a conservative restore obligation when startup routing selects appearance bytes.
+It is not a delivery receipt: skipped/headless delivery and failed or partial
+writes do not cancel it. Sessions with no appearance route add no `s` line, and
+absence cannot state a negative arming policy. A surface name this build has no
+row for reads as absent rather than as a different terminal. The
+[arming and restore contract](backend-architecture.md#the-armed-record) describes
+source precedence, delivery ordering and the stable-topology limitation.
+Readers also accept `cts1`–`cts4`, without interpreting their reserved `g` fields. Guarded older readers refuse
 ordinary updates of newer records rather than silently dropping activity.
 Recognized older records migrate on a changed write; missing historical owner
 provenance or background knowledge cannot be reconstructed. Unknown fields are ignored; invalid individual
@@ -266,9 +335,10 @@ path checks do not promise resistance to malicious concurrent filesystem changes
 
 Startup examines at most 256 directory entries for stale records. Known records
 with a stored process ID/start-time pair can be reaped when that origin no longer
-matches. The pair is stored under a per-platform key (`p` on Unix, `q` with the
-process creation time on Windows); a record carrying the other platform's key reads
-as having no origin. Records without origin, future-version records and recognized temporary
+matches. The pair is stored under a per-platform key (`p` with Linux start-time
+clock ticks, `r` with Darwin epoch microseconds, `q` with Windows creation FILETIME);
+a record carrying another platform's key reads as having no origin. Records
+without origin, future-version records and recognised temporary
 files (`<id>.<pid>.<16 lowercase hex>.tmp`, and the older `<id>.<pid>.tmp`) use a 24-hour mtime recovery rule; future mtimes count as stale. Recognized
 background records without origin are exempt: missing process metadata cannot
 prove their work ended. Alien record
@@ -319,3 +389,10 @@ for identity and bounded lifecycle behavior, Rust state unit tests for exact clo
 wire parsing and reaping, and [private tmux tests](../tests/test_tmux_status.py)
 for actual display decay and rendering. Physical output, record semantics and
 capture provenance are tested and reported separately.
+
+The `attention_*` Rust state tests and the entry/repeated-wait/clearance test
+assert `Resolved` directly, including its transition and optional paint. They
+cover silent expiry, expiry followed by a new wait, overlapping owners, reset,
+end, filtered events, legacy state and unavailable prior state. These assertions
+exercise the dormant attention API without adding a diagnostic output mode to
+the shipped binary. The Python traces and golden output do not observe that API.

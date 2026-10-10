@@ -23,7 +23,11 @@ carries the management verbs (`install`, `uninstall`, `doctor`, `version`,
 | `src/text.rs` | the crossing from filesystem bytes to display text (`repair`) |
 | `src/render.rs` | `compose`: length cap, ssh prefix, JSON-safety pass, glyph placement, in that order |
 | `src/emit.rs` | delivery: `terminalSequence` JSON, raw OSC to a pane pty, or a console title |
-| `src/tmux.rs` | the tmux integration: the record, `set-titles-string`, window-status formats, restore |
+| `src/support.rs` | one vocabulary for absence: `Support<T>` says available, unsupported, disabled by a knob of ours, unverifiable or failed, each with the reason a user can act on |
+| `src/surface/` | the leaf terminal, chosen at runtime and dispatched statically: `probe.rs` the detection table and the `CCTAB_TERMINAL` override, `rows.rs` the fourteen capability rows as `const` data with their provenance, `compose.rs` the bytes a row spells |
+| `src/mux/` | the multiplexer axis: `mod.rs` detects tmux or screen and `route`s who owns the title and which channel the leaf's bytes ride; `tmux.rs` the tmux integration: the record, `set-titles-string`, window-status formats, restore; `tmux/lifecycle.rs` serialises cold lifecycle membership and delivery |
+| `src/clock.rs` | the one clock (`CCTAB_NOW` pins it) and the one TTL grammar, shared by the state record's expiry and the tmux carrier |
+| `src/armed.rs` | restore obligations and their provenance, read by `SessionEnd`: tmux's `@cctab_armed`, then the record's `s` line, then the old assumption under its own name |
 | `src/manage.rs` | all management verbs: `install`, `uninstall`, `doctor`, `version`, `tmux-format`, `tmux-arm`, `print-embedded`, `help` |
 | `src/tree.rs` | the generated plugin tree that `install` materialises and Claude Code loads |
 | `src/embedded.rs` | `hooks/hooks.json` and `.claude-plugin/plugin.json`, compiled in with `include_str!` |
@@ -33,6 +37,8 @@ carries the management verbs (`install`, `uninstall`, `doctor`, `version`,
 | `.claude-plugin/plugin.json` | the plugin manifest. **Source**, compiled in like `hooks.json` |
 | `scripts/build.sh` | builds `bin/` and its source digests |
 | `scripts/bench-state.sh` | measures what the state layer costs per edge |
+| `scripts/bench-hot.sh` | optional stateless dry-run timing against an explicit baseline, or `--calibrate` for self-comparison |
+| `tests/check_hot_subprocesses.py` | required Linux subprocess gate: traces actual protocol and private tmux delivery with syscall controls |
 | `tests/` | integration suites, fixtures, the golden corpus and the shell oracle (see [Tests](#tests)) |
 | `examples/tmux.conf` | an optional tmux configuration users can copy |
 | `docs/` | design and contract documents (see [Documentation map](#documentation-map)) |
@@ -58,13 +64,14 @@ sh scripts/build.sh --all    # every target this host can build
 | `x86_64-unknown-linux-musl` | **default on Linux**, static-pie |
 | `x86_64-unknown-linux-gnu` | builds; dynamic, needs `GLIBC_2.34` |
 | `x86_64-pc-windows-msvc` | **default on Windows**, static CRT, built on Windows only |
+| `aarch64-apple-darwin`, `x86_64-apple-darwin` | native validation builds only; `build.sh` selects the Darwin host architecture; no release assets |
 
 - **Each host lists only the targets it can build**, so `--all` is a success
   signal: on Linux it is the two Linux targets, on Windows the one MSVC target.
-  Windows is a native port behind `src/sys`, not a cross-compile, so it is built
-  and tested on Windows. `x86_64-pc-windows-gnu` is not a target. There is no
-  macOS target ([issue #1](https://github.com/dalf/claude-tabstatus/issues/1))
-  and no aarch64 one; on macOS `build.sh` would wrongly pick the Linux list.
+  Darwin lists only its native architecture. Windows is a native port behind
+  `src/sys`, built and tested on Windows. `x86_64-pc-windows-gnu` is not a target.
+  There is no aarch64 Linux build target. macOS arm64 native CI has passed;
+  see [validation scope](docs/architecture.md#macos-validation).
 - **musl is the Linux default** because it starts faster and carries no glibc
   requirement on a remote box; the measurements are in
   [docs/architecture.md](docs/architecture.md).
@@ -142,17 +149,37 @@ when they agree.
 
 | suite | command | platforms |
 |---|---|---|
-| in-crate unit tests | `cargo test --locked` (CI: `--all-targets` on Windows, per target on Linux) | Linux, Windows |
+| in-crate unit tests | `cargo test --locked` (CI: `--all-targets` on Windows, per target on Linux and macOS) | Linux, Windows, macOS |
 | shell integration suite | `sh tests/run.sh` | Linux |
-| payload policy | `python3 tests/test_payload.py` | Linux, Windows |
-| semantic state traces | `python3 tests/test_state_contract.py -v` | Linux, Windows |
-| background lifecycle traces | `python3 tests/test_background.py` | Linux, Windows |
-| direct MCP elicitation | `python3 tests/test_elicitation.py` | Linux, Windows |
-| persistence and concurrency | `python3 tests/test_state_guarantees.py` | Linux (`fcntl`) |
-| tmux window status | `python3 tests/test_tmux_status.py` | Linux (tmux) |
+| payload policy | `python3 tests/test_payload.py` | Linux, Windows, macOS |
+| semantic state traces | `python3 tests/test_state_contract.py -v` | Linux, Windows, macOS |
+| background lifecycle traces | `python3 tests/test_background.py` | Linux, Windows, macOS |
+| direct MCP elicitation | `python3 tests/test_elicitation.py` | Linux, Windows, macOS |
+| persistence and concurrency | `python3 tests/test_state_guarantees.py` | Linux, macOS (`fcntl`; strace fault injection Linux-only) |
+| direct Unix delivery | `python3 tests/test_unix_delivery.py -v` | Linux, macOS (disposable PTYs) |
+| installer path identity, containment and missing Unicode probes | `python3 tests/test_install_paths.py` | Linux; native macOS with mandatory APFS/APFSX fixtures |
+| installer ownership, interruption and recovery | `python3 tests/test_install_ownership.py -v` | Linux (both binaries), Windows, native macOS arm64 |
+| settings ACLs, ownership and backup metadata | `python3 tests/test_macos_acl.py` | native macOS (chmod/ls/stat, SDK fault interposition) |
+| SSH hostname precedence, native lookup, bypasses and failures | `python3 tests/test_macos_hostname.py` | native macOS (SDK kernel observer and dyld faults; dry-run rendering) |
+| terminal-family detection, doctor evidence and title protocol | `python3 tests/test_terminal_detection.py` | Linux, Windows; macOS-specific cases require native macOS |
+| tmux end-to-end acceptance | `python3 tests/test_tmux_status.py -v` | Linux, native macOS (tmux; `CCTAB_TEST_REQUIRE_TMUX=1` in CI) |
 | corpus fixture helpers | `python3 -m unittest discover -s tests/corpus -p 'test_*.py' -v` | Linux |
 | golden corpus | `sh tests/corpus/replay.sh bin/tabstatus` | Linux |
 | ConPTY end to end | part of `cargo test` (`tests/conpty.rs`) | Windows |
+
+The macOS suites, including the native terminal-open observer, have passed in
+arm64 CI; see
+[macOS validation](docs/architecture.md#macos-validation) for the recorded run.
+The missing Unicode probes, corrected case-sensitive path fixtures and fault-message
+assertions have also passed natively. See the recorded results and remaining
+coverage in the validation document. These suites do not establish behaviour in
+a terminal application.
+The exact reviewed head `67a0823` passed the hostname suite and all 40 required
+native tmux tests without skips on macOS 15.7.9 arm64, tmux 3.7c:
+see the recorded [native job](https://github.com/dalf/claude-tabstatus/actions/runs/37151974515/job/111287539736).
+Earlier hostname and tmux milestones remain recorded in the validation document.
+SDK compilation, recording controls, PTY attachment and required observations
+fail when unavailable; tmux absence fails in CI.
 
 The in-crate unit tests are not replaced by the shell and Python harnesses: they
 check argv and environment parsing, the location walk, the length cap and its
@@ -169,8 +196,8 @@ example `target/release/tabstatus` or one triple's `bin/tabstatus-<triple>`.
 
 ### The shell suite (`tests/run.sh`)
 
-Dependency-free (no bats, no jq) and exits non-zero on any failure; 596
-assertions, 81 of them in the tmux section. Sections cover glyph per edge, location, JSON-hostile and
+Dependency-free (no bats, no jq) and exits non-zero on any failure; 843
+assertions at `67a0823`, including tmux. Sections cover glyph per edge, location, JSON-hostile and
 non-UTF-8 names, glyph overrides and position, stdin draining, the
 payload-discriminated edges, `hooks.json`, exit status, install and uninstall,
 the embedded manifests and source digests, `CCTAB_TERMINAL`, the state layer and
@@ -232,8 +259,9 @@ the binary.
   `XDG_RUNTIME_DIR`, `CCTAB_STATE_DIR` and `LOCALAPPDATA` at the top and pins them
   per case.
 - **The state layer is off unless a case turns it on.** With no
-  `XDG_RUNTIME_DIR`/`LOCALAPPDATA` and no `CCTAB_STATE_DIR` there is no record,
-  so every assertion outside the state section is the stateless answer and does
+  `XDG_RUNTIME_DIR`/`LOCALAPPDATA` (`TMPDIR` on macOS) and no
+  `CCTAB_STATE_DIR` there is no record, so every assertion outside the state
+  section is the stateless answer and does
   not depend on what an earlier case left behind. The state section sets
   `CCTAB_STATE_DIR` per case under the suite's temporary directory.
 - **Pin `CLAUDE_PID` per case** in anything that writes a record. This project is
@@ -252,7 +280,8 @@ the binary.
 
 `state::tests::concurrent_hooks_of_one_session_lose_no_update` runs hooks of one
 session as separate processes, released together, and must lose no update, on
-Linux and Windows. Its controls switch the lock off in the test build only:
+Linux, Windows and the native macOS job. Its controls switch the lock off in the
+test build only:
 
 ```sh
 cargo test race_control -- --ignored --nocapture   # stops at the first lost update
@@ -299,13 +328,45 @@ the test process. Keep it that way in any new test.
   concurrent waits, bounded tracking and migration.
 - `test_elicitation.py`: direct MCP elicitation sequences from a synthetic
   fixture (`tests/fixtures/elicitation-v1.json`); no MCP server needed.
+- `test_macos_hostname.py`: independent native kernel hostname observation,
+  compiled-binary precedence, lazy lookup, repair/rendering and doctor checks,
+  with SDK-built dyld faults and validated recording fixtures. Dry-run output
+  only, fresh environments and isolated directories; no hostname changes.
+- `test_install_ownership.py`: actual-binary management lifecycles with verified,
+  bounded filesystem barriers. Covers failed install followed by a user-owned
+  key, concurrent edits, abrupt interruption before/after settings replacement,
+  real settings/receipt rename failures, retained refresh ownership/history, tree
+  moves, legacy compatibility/ambiguity and explicit force/backup recovery. Required
+  CI runs it on both Linux binaries, Windows and native macOS arm64. The principal
+  preservation assertion fails on `b38e5fd` with only its test barrier added;
+  the freshly built uninstrumented pre-fix binary reproduced the original defect.
 - `test_state_guarantees.py`: persistence and concurrency guarantees beyond the
   traces.
 - `test_tmux_status.py`: window-list rendering, split panes, background windows,
   TTL decay and exact format restoration, on private servers with a unique socket
   and isolated configuration each. It attaches a disposable PTY client and checks
   the displayed status text, excluding outer-title escapes so they cannot satisfy
-  an assertion. `CCTAB_TEST_TMUX` selects another tmux build.
+  an assertion. `CCTAB_TEST_TMUX` selects an absolute executable path and puts
+  its directory on the isolated PATH for the binary's cold tmux calls. CI sets
+  `CCTAB_TEST_REQUIRE_TMUX=1`, so missing tmux or the compiled binary fails.
+  Short sockets under canonical `/tmp`, native UTF-8 locales, fresh environments
+  without Darwin's `TMPDIR` state fallback, and bounded attachment/delivery
+  observations keep the same suite portable. It checks real hook carriers,
+  attached working/waiting/idle/background status and clock-only decay, shared
+  arming in both exit orders, detach/reattach, exact uninstall restoration and
+  headless refusals. Deterministic cold lifecycle barriers cover old-end/new-start
+  overlap, concurrent final exits, duplicate/replacement events, interrupted hooks
+  and surviving children, dead-owner recovery and session isolation. Missing
+  delivery, a broken carrier and OSC-only text are
+  negative observer controls. Fresh status observations clear capture and request
+  a full client redraw; an unchanged cached status and disabled status delivery
+  are required controls, including an acknowledged terminal query and refresh
+  execution markers. Forced Konsole/WezTerm selections are protocol
+  tests, not terminal-application evidence. The reviewed 40-test suite passed
+  natively without skips; six lifecycle regressions and two redraw controls bring
+  the current suite to 48.
+  Local root runs skip only the read-only-record case because root
+  bypasses mode-bit permissions.
 
 ### The golden corpus
 
@@ -339,17 +400,32 @@ limitation it closes; the pre-fix freeze is kept as `cases.jsonl.before-fixes`.
 
 ### What the suite does not assert
 
-- The real emitting path of `session-start` and `session-end` on Unix needs an
-  allocated pty, which would cost a dependency in `tests/run.sh`. The golden corpus
-  covers it byte for byte (82 bytes for a startup: the Konsole OSC 50 arming pair
-  then the idle title; 0 bytes for a compaction), and it is checked by hand. On
-  Windows `tests/conpty.rs` covers it.
+- The shell suite does not allocate PTYs. `tests/test_unix_delivery.py` checks
+  exact Unix startup/exit delivery and headless guards using Python's standard
+  library; the Linux golden corpus independently preserves its historical bytes.
+  On Windows `tests/conpty.rs` covers delivery.
 - tmux re-emitting the title to an attached client from `set-titles-string`: the
   shell suite asserts the whole server side, including that the same paint
   renders differently after a wait with no hook firing, but not the client
   stream. `test_tmux_status.py` checks the window status line on an attached
   client, not the outer title.
-- Anything on macOS.
+- `test_macos_acl.py`: isolated installer lifecycles, explicit and inherited ACLs,
+  no ACL in an inheriting directory, symlink targets, restrictive umasks, backup
+  metadata, owner/group preservation and native inspection/application/verification
+  faults. Uses `chmod`, `ls`, `stat` and Darwin's `xattr` tool plus a separate native
+  text observer independently of production helpers. The group fixture differs from the parent
+  directory, and passwordless `sudo` exercises foreign owners with and without
+  privileges. CI sets `CCTAB_TEST_REQUIRE_SUDO=1` to require these fixtures; local
+  runs skip the privileged cases if unavailable. Privileged installer runs receive
+  only isolated HOME/config/data/state locations. Lifecycle cases use umasks 022
+  and 077 so installer directories remain traversable; fixture edits restore any
+  set-ID mode bits they clear before the next preservation check. Its SDK-built
+  dyld interposer observes private, empty staging files through `fstatx_np`; a Rust test separately
+  observes the intended staging ACL and ownership before writing bytes. Apple
+  cross-checks compile that Rust test but cannot establish native preservation.
+- macOS terminal applications, Intel macOS runtime behaviour, older macOS
+  versions and untested tmux versions. Native arm64 CI covers the documented
+  process, state, PTY and real-server tmux scenarios.
 
 ## Benchmarking
 
@@ -357,6 +433,10 @@ limitation it closes; the pre-fix freeze is kept as `cases.jsonl.before-fixes`.
 sh scripts/bench-state.sh                      # bin/tabstatus, state layer against itself switched off
 sh scripts/bench-state.sh <baseline-binary>    # ...and against another build
 CCTAB_BENCH_EXECS=200 CCTAB_BENCH_ROUNDS=21 sh scripts/bench-state.sh
+python3 tests/check_hot_subprocesses.py        # required by Linux CI; needs strace, tmux, cc
+sh scripts/bench-hot.sh --calibrate           # self-comparison, no regression verdict
+sh scripts/bench-hot.sh <baseline-binary>      # optional stateless dry-run comparison
+CCTAB_BENCH=1 sh tests/run.sh                  # optional calibration; set CCTAB_BENCH_BASELINE for comparison
 ```
 
 `CCTAB_BENCH_BIN` picks the binary under test (default `bin/tabstatus`). Arms are
@@ -364,7 +444,8 @@ interleaved within each round; the report gives each arm's minimum, its spread,
 and the **median of per-round paired deltas** against the baseline arm. Read the
 deltas, not the absolutes: every arm pays one fork, not Claude Code's own launch
 cost. Do not quote remembered numbers in code or docs; re-run the script. The last
-recorded results and how to read the negative arms are in
+recorded results, comparable baseline-build procedure, enforced subprocess scope
+and how to read the negative arms are in
 [docs/architecture.md](docs/architecture.md).
 
 ## CI and releases
@@ -372,20 +453,33 @@ recorded results and how to read the negative arms are in
 **Test** ([`.github/workflows/test.yml`](.github/workflows/test.yml)) runs on every
 branch push, pull request, manual dispatch, and as a reusable workflow.
 
-- *Linux* (`ubuntu-24.04`): installs `musl-tools` and `tmux`; `cargo test --locked`
+- *Linux* (`ubuntu-24.04`): installs `musl-tools`, `tmux` and `strace`; `cargo test --locked`
   for both Linux targets; `sh scripts/build.sh --all`; the corpus fixture unit
-  tests; then, for **each** Linux binary, all six Python suites, `tests/run.sh`
-  and the golden corpus. Uploads both binaries and their `SHA256SUMS` as the
-  `linux-binaries` artifact.
+  tests and subprocess-checker tests; then, for **each** Linux binary, the required
+  subprocess/delivery gate, all six existing Python suites, the Unix delivery suite,
+  the installer path suite, `tests/run.sh` and the golden corpus. Uploads both binaries
+  and their `SHA256SUMS` as the `linux-binaries` artifact.
+- *macOS* (`macos-15`, arm64 / `aarch64-apple-darwin`): links and executes
+  `cargo test --locked --all-targets`, builds a native validation binary, and runs
+  the payload, state-contract, background, elicitation, state-guarantees and Unix
+  delivery suites, required real-server tmux acceptance with attached PTY clients
+  (absolute executable discovery or Homebrew installation; version recorded),
+  the terminal-detection suite, plus the native settings ACL and
+  SSH hostname suites (mandatory SDK observation and fault controls), and the
+  installer path suites with mandatory disposable case-insensitive APFS and case-sensitive APFSX volumes
+  (lookup semantics verified). No artifacts are uploaded. Both Apple ABI cross-checks
+  remain in the Linux job, including Intel. Native arm64 execution has passed;
+  [evidence, scope and limits](docs/architecture.md#macos-validation).
 - *Windows* (`windows-2025`, steps under Git Bash): `cargo test --locked
   --all-targets` (including the ConPTY, lock and junction tests);
   `sh scripts/build.sh --all`; a check of the `.exe`'s import table that fails on
   any Visual C++ runtime DLL (`vcruntime*`, `msvcp*`, `ucrtbase`,
   `api-ms-win-crt-*`); then `test_payload`, `test_state_contract`,
   `test_background` and `test_elicitation`. `tests/run.sh`, the corpus,
-  `test_state_guarantees` and `test_tmux_status` assume a Unix userland and run on
-  Linux only. Uploads the `.exe` and its `SHA256SUMS` (written with `--text`, so
-  the line format matches Linux) as `windows-binaries`.
+  `test_state_guarantees`, `test_unix_delivery` and `test_tmux_status` require Unix;
+  the shell and corpus suites run only on Linux; tmux also runs on native macOS.
+  Uploads the `.exe` and its
+  `SHA256SUMS` (written with `--text`, so the line format matches Linux) as `windows-binaries`.
 
 **Release** ([`.github/workflows/release.yml`](.github/workflows/release.yml)) runs
 on every pushed tag. It calls the Test workflow on the tagged commit, downloads the
@@ -420,6 +514,12 @@ tag each time.
 | [docs/state-contract.md](docs/state-contract.md) | contributors | the normative state record and transition rules |
 | [docs/indicator-semantics.md](docs/indicator-semantics.md) | contributors, curious users | what each colour means and the precedence between them |
 | [docs/history.md](docs/history.md) | anyone | slices 1-7 and the shell-to-Rust port, with its comparison table |
+| [docs/backend-architecture.md](docs/backend-architecture.md) | contributors | the backend abstraction: how a terminal, a multiplexer and an operating system plug in without any of the three learning about the others; the migration table and what was dropped as superseded by #28 |
+| [docs/backend-scouting.md](docs/backend-scouting.md) | contributors | findings, not design: what Windows, KDE and macOS would actually need, as a dated snapshot with markers where #28 answered a question |
+| [docs/research/terminal-capability-matrix.md](docs/research/terminal-capability-matrix.md) | contributors | the cross-terminal capability matrix every row in `src/surface/rows.rs` cites, each claim marked verified or inferred |
+| [docs/research/portability-census.md](docs/research/portability-census.md) | contributors | the measured portability census, kept as history with a re-measured header |
+| [docs/research/dbus_notify.rs](docs/research/dbus_notify.rs) | contributors | a dependency-free, hand-rolled D-Bus `Notify` call: the measurement behind the D-Bus decision |
+| [docs/research/attribution.md](docs/research/attribution.md) | contributors | provenance and licences of what the macOS session-terminal route took from `libc`, XNU and lsof, and what was deliberately not taken |
 | [COMPARISON.md](COMPARISON.md) | anyone | how this project relates to similar ones |
 | [tests/corpus/USAGE.txt](tests/corpus/USAGE.txt) | contributors | the golden corpus tools |
 
@@ -437,9 +537,12 @@ Rules:
 
 ## Roadmap: not yet built
 
-- **macOS** ([issue #1](https://github.com/dalf/claude-tabstatus/issues/1)): no
-  target in `scripts/build.sh`, no release asset, no tested `src/sys/unix.rs` path
-  for the session-start and session-end titles or tmux.
+- **macOS** ([issue #1](https://github.com/dalf/claude-tabstatus/issues/1)):
+  native source builds and arm64 automated validation have passed CI. Native
+  tmux acceptance has passed on macOS 15 arm64 with tmux 3.7c. Terminal applications,
+  live Claude Code integration, Intel runtime behaviour and older macOS remain
+  unvalidated. No release asset or product support claim is added; see
+  [validation scope](docs/architecture.md#macos-validation).
 - **aarch64 Linux**: add `aarch64-unknown-linux-musl` to `TARGETS` in
   `scripts/build.sh` and to the release assets. Until then the x86_64 binary
   fails at `exec` with *Exec format error*; `doctor` already compares the tree's
@@ -473,6 +576,19 @@ Rules:
   state-contract decisions in
   [issue #10](https://github.com/dalf/claude-tabstatus/issues/10) are unchanged).
 
+The inherited P2 installer ownership defect is corrected: state_version 4 separates
+pending restoration history from a settings receipt, preserves established receipts
+on failed refreshes, and serialises management operations. Incomplete installs and
+ambiguous legacy records refuse automatic restoration. See
+[ownership and recovery](docs/architecture.md#install-and-uninstall-are-ordered-both-ways).
+
+The P3 tmux acceptance observer defect is corrected: clearing captured PTY bytes
+then requesting only `refresh-client -S` could falsely fail when the status was
+already correct. Fresh observations now request a full redraw. The deterministic
+cached-status regression fails with the old observer; disabled delivery rejects
+stale capture, and OSC-only and broken-carrier controls remain required. See
+[observer correction and evidence](docs/architecture.md#tmux-status-observer-correction).
+
 ### Known defects, reproduced and deferred
 
 - **`doctor` aborts when `settings.json` is a directory.** The read error in the
@@ -481,15 +597,6 @@ Rules:
   unparseable, an array, missing, a dangling symlink) is reported and exits 0.
   Reproduce with `mkdir <config>/settings.json && tabstatus doctor`. Fix: report the
   I/O error as one more `env key: FAIL` line and let the rest of the report run.
-- **`install` writes its record before it edits `settings.json`.** An install that
-  aborts between the two (the concurrent-modification guard is one reachable way)
-  leaves a record saying `env_had: false` with no key written. If the user then
-  sets `CLAUDE_CODE_DISABLE_TERMINAL_TITLE` themselves, `uninstall` reads that
-  orphan, concludes the key is ours and removes it; the refusal meant to prevent
-  this fires only when there is no record at all. Recoverable from the
-  `.cctab-preuninstall` copy, which is written first. Fix: write the record only
-  after `settings.json` has actually changed, or cross-check the recorded
-  `settings_path` before editing.
 
 ### Deliberately not built
 

@@ -210,9 +210,10 @@ fn abbreviate(logical: &Path, home: Option<&Path>) -> Vec<u8> {
     }
 }
 
-/// The host name, in order: `CCTAB_HOST` overrides outright, `/proc` is the
-/// fork-free path (where there is one - [`sys::kernel_hostname_file`]), `$HOSTNAME` is next (bash sets it, dash and ash do not), and
-/// `hostname` is the last resort and the ONLY fork in this binary.
+/// The host name: non-empty `CCTAB_HOST`, then the platform's kernel file (Linux
+/// `/proc`), then non-empty `$HOSTNAME`, then [`sys::hostname_fallback`]. That
+/// last source is native on Darwin and the existing command on Linux/Windows.
+/// Only SSH rendering and doctor's explicit diagnostic row call this lookup.
 ///
 /// `None` means no name resolved, and what to paint instead is the caller's
 /// business. This never returns `Some("")`: a source that answers with nothing is
@@ -222,7 +223,7 @@ pub fn hostname(cfg: &Config) -> Option<String> {
 }
 
 fn hostname_raw(cfg: &Config) -> Option<Vec<u8>> {
-    if let Some(h) = &cfg.host_override {
+    if let Some(h) = cfg.host_override.as_ref().filter(|h| !h.is_empty()) {
         return Some(h.as_encoded_bytes().to_vec());
     }
     // A one-line system file, read the same way git's own metadata is - where
@@ -236,32 +237,29 @@ fn hostname_raw(cfg: &Config) -> Option<Vec<u8>> {
                 .map(|h| h.as_encoded_bytes().to_vec())
                 .filter(|h| !h.is_empty())
         })
-        .or_else(hostname_command)
-}
-
-fn hostname_command() -> Option<Vec<u8>> {
-    use std::process::{Command, Stdio};
-    let out = Command::new("hostname")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    // Command substitution strips every trailing newline, and a name that is
-    // nothing but newlines is no name. Windows' `hostname.exe` ends its line with
-    // CRLF, and there the CR belongs to the line ending too.
-    let mut v = out.stdout;
-    while v.last().is_some_and(|&c| sys::is_line_end(c)) {
-        v.pop();
-    }
-    (!v.is_empty()).then_some(v)
+        .or_else(sys::hostname_fallback)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_override_wins_and_empty_overrides_fall_through() {
+        let mut cfg = Config::for_test();
+        cfg.hostname_env = Some("environment.example".into());
+        cfg.host_override = Some("explicit.example".into());
+        assert_eq!(hostname(&cfg).as_deref(), Some("explicit.example"));
+        cfg.host_override = None;
+        let automatic = hostname(&cfg);
+        cfg.host_override = Some("".into());
+        assert_eq!(hostname(&cfg), automatic);
+        cfg.host_override = None;
+        cfg.hostname_env = None;
+        let automatic = hostname(&cfg);
+        cfg.hostname_env = Some("".into());
+        assert_eq!(hostname(&cfg), automatic);
+    }
 
     /// An absolute path on this platform: `/x` on Unix, and `C:\x` on Windows,
     /// where a bare `/x` is not absolute.

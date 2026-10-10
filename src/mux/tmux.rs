@@ -32,8 +32,8 @@
 //! column, extractable from either end, and the glyph it stands for is looked up
 //! in a server option the same SessionStart wrote.
 //!
-//! THE HOT PATH EXECS NOTHING. Only SessionStart runs tmux, and SessionEnd only
-//! in Konsole mode. Measured on this machine: one `tmux set-option` costs 2.84ms
+//! THE HOT PATH EXECS NOTHING. Only SessionStart and SessionEnd run tmux.
+//! Measured on this machine: one `tmux set-option` costs 2.84ms
 //! against a 0.37ms fork floor. The original twelve-command title batch measured
 //! 3.1ms end to end - thirteen commands and 4.9ms in Konsole mode, where it
 //! also lists the clients and writes the arming. The cost is the fork and the
@@ -46,15 +46,21 @@
 //! Only windows that start Claude receive local format decorators. Window names,
 //! automatic renaming, global window formats and the outer aggregate stay intact.
 
-use crate::config::{self, Config, GlyphPos, Terminal};
+use crate::armed::Armed;
+use crate::clock::{self, DEFAULT_TTL_GONE, DEFAULT_TTL_WAITING, DEFAULT_TTL_WORKING, NEVER};
+use crate::config::{self, Config, GlyphPos};
 use crate::edge::{Glyph, Paint};
-use crate::emit;
+use crate::mux::{Channel, Route};
+use crate::support::Support;
+use crate::surface::{self, Surface};
 use crate::sys;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+mod lifecycle;
+pub use lifecycle::Lifecycle;
 
 /// The tag that marks a pane title as ours. Version 1 of the wire, so a future
 /// shape can change it and let an old format ignore the new panes rather than
@@ -112,6 +118,30 @@ const WINDOW_FORMATS: [WindowFormat; 2] = [
 /// option's value is substituted LITERALLY, which is what spares the hook every
 /// layer of quoting; see [`ARM_HOOK`].
 const OPT_EXE: &str = "@cctab_exe";
+
+/// THE ARMED RECORD - rung 1 of [`crate::armed`]. The shared restore obligation
+/// for this tmux session's outer tab, retained until the last Claude pane ends.
+///
+/// It is the only option in this file set at SESSION scope rather than server
+/// scope, and that is deliberate: every other option feeds `set-titles-string`,
+/// which is server-wide and genuinely is "the last SessionStart wins". An arming
+/// is not. It goes to the ptys of the clients attached to ONE session, so two tmux
+/// sessions on one server are two different outer tabs, and a server-wide record
+/// would let either one's SessionEnd delete the other's. Measured on tmux 3.7c: a
+/// session value shadows a server value, and unsetting it falls back to the server
+/// one - which is why the unset below leaves the empty string that reads as "no
+/// record" rather than as "no retained arming policy".
+const OPT_ARMED: &str = "@cctab_armed";
+
+/// What [`OPT_ARMED`] holds when no shared arming policy has been retained.
+///
+/// A sentinel rather than an empty value, because the two are different answers
+/// and the empty one has to keep meaning "no record here". Without it, every tmux
+/// server that predates this commit - and every session whose SessionStart hook
+/// never ran - would read as "no retained arming policy" and silently lose its restore.
+/// No surface is named `-`, so [`crate::surface::by_name`] answers `None` for it
+/// the same way it answers `None` for a name from the future.
+const ARMED_NONE: &str = "-";
 
 /// Is this pane carrying one of our records? ASCII and anchored at the end.
 ///
@@ -236,6 +266,10 @@ pub struct Tmux {
     /// `$TMUX_PANE`. Targets every command at OUR pane's session, so a second
     /// session on the same server is never touched.
     pane: Option<OsString>,
+    // Cold lifecycle commands inherit the locked file as stdin. If the hook is
+    // killed while a tmux command is in flight, that child keeps the same lock
+    // until it exits; a successor cannot overtake its pending mutation.
+    lifecycle_lock: std::cell::RefCell<Option<std::fs::File>>,
 }
 
 impl Tmux {
@@ -256,15 +290,35 @@ impl Tmux {
         }
         Some(Tmux {
             pane: config::var_nonempty("TMUX_PANE"),
+            lifecycle_lock: Default::default(),
         })
     }
 
     /// `-t <our pane>`, so a command lands on our session and not on whichever
     /// one tmux would have picked.
     fn target(&self, c: &mut Command) {
+        self.inherit_lock(c);
         if let Some(p) = &self.pane {
             c.arg("-t").arg(p);
         }
+    }
+
+    fn inherit_lock(&self, c: &mut Command) {
+        if let Some(file) = self.lifecycle_lock.borrow().as_ref() {
+            // A failed clone must not allow an uncoordinated mutation.
+            match file.try_clone() {
+                Ok(file) => { c.stdin(file); }
+                Err(_) => { c.arg("--cctab-lock-unavailable"); }
+            }
+        }
+    }
+
+    /// A handle with no pane, for the routing tests in [`crate::mux`]. The pane
+    /// is the one thing `route` never reads, and a test that had to name one would
+    /// be asserting about a target rather than about a channel.
+    #[cfg(test)]
+    pub fn for_test() -> Tmux {
+        Tmux { pane: None, lifecycle_lock: Default::default() }
     }
 }
 
@@ -288,7 +342,7 @@ fn digits(b: &[u8]) -> bool {
 /// Session end has no glyph and therefore no record - its EMPTY title is what
 /// clears `pane_title`, which is what removes the cell.
 pub fn carrier(paint: Paint, place: &str) -> String {
-    carrier_at(paint, place, now())
+    carrier_at(paint, place, clock::now())
 }
 
 fn carrier_at(paint: Paint, place: &str, epoch: u64) -> String {
@@ -305,77 +359,12 @@ fn carrier_at(paint: Paint, place: &str, epoch: u64) -> String {
     format!("{place} {tag} {state} {epoch}")
 }
 
-/// The epoch the record carries. `CCTAB_NOW` pins it, which is the only reason
-/// a corpus case that goes through tmux can be frozen at all.
-///
-/// No width is imposed: every extraction below is anchored, not offset, so a
-/// mocked `CCTAB_NOW=5` works exactly like a real ten-digit one.
-pub fn now() -> u64 {
-    epoch(config::var_nonempty("CCTAB_NOW").as_deref())
-}
-
-fn epoch(raw: Option<&OsStr>) -> u64 {
-    if let Some(b) = raw.map(OsStr::as_encoded_bytes) {
-        if b.len() <= 10 && digits(b) {
-            return b.iter().fold(0u64, |a, c| a * 10 + u64::from(c - b'0'));
-        }
-    }
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-/// Seconds before a state decays. `0` disables the tier, which is expressed as a
-/// deadline no age can reach rather than as a second shape of format: the
-/// generated string then stays one constant per glyph position.
-const NEVER: u32 = 2_147_483_647;
-/// MEASURED, not reasoned. `working` is repainted by `UserPromptSubmit`,
-/// `PostToolUse` and `PostToolUseFailure` only, so during one long tool call
-/// nothing paints at all - `PreToolUse` is matched to `AskUserQuestion` and
-/// `ExitPlanMode` alone. Over the 91 most recent real transcripts on this
-/// machine, 7709 WITHIN-TURN gaps between two successive `working` paints:
-/// median 9.9s, p95 77s, p99 173s, p99.9 646s, and 39 gaps (0.51%) over 300s -
-/// the old default. 1200s covers 99.95% of them; the four above it are 3343s,
-/// 5677s, 23700s and 27751s, which are sessions resumed the next day rather than
-/// a tool call still running.
-///
-/// The asymmetry is the whole argument: a lingering blue says "still busy" about
-/// a session that has finished, which the next paint corrects in seconds, while a
-/// premature white says "finished, come back" about a build that is still
-/// running - the exact class of lie this slice exists to remove, pointed the
-/// other way. The 3600s disappear horizon still catches a genuinely stuck one.
-const DEFAULT_TTL_WORKING: u32 = 1200;
-pub const DEFAULT_TTL_WAITING: u32 = 900;
-const DEFAULT_TTL_GONE: u32 = 3600;
-
 /// One to six digits with no leading zero; `0` is "never"; anything else is the
-/// default. The same grammar `Cap` uses, for the same reason - `str::parse`
-/// would read `08` as 8 and `0000000` as 0.
+/// default, as a STRING for the format the server evaluates. The grammar and the
+/// clock behind it are [`crate::clock`]'s, because the state layer expires waits
+/// on the same setting without needing a multiplexer to do it.
 fn ttl(key: &str, default: u32) -> String {
-    ttl_secs(key, default).to_string()
-}
-
-/// The same TTL as a NUMBER for state wait expiry. State and tmux share the
-/// setting and grammar, but expire independently: state on an eligible hook,
-/// the tmux carrier against its last paint time.
-pub fn ttl_secs(key: &str, default: u32) -> u64 {
-    u64::from(ttl_of(config::var(key).as_deref(), default))
-}
-
-fn ttl_of(raw: Option<&OsStr>, default: u32) -> u32 {
-    match raw.map(OsStr::as_encoded_bytes) {
-        // "never", expressed as a deadline no age can reach rather than as a
-        // second shape of format.
-        Some(b"0") => NEVER,
-        Some(v)
-            if (1..=6).contains(&v.len())
-                && (b'1'..=b'9').contains(&v[0])
-                && v.iter().all(u8::is_ascii_digit) =>
-        {
-            v.iter().fold(0u32, |a, c| a * 10 + u32::from(c - b'0'))
-        }
-        _ => default,
-    }
+    clock::ttl_secs(key, default).to_string()
 }
 
 /// Configure the server title in one batch, then decorate this pane's window.
@@ -393,11 +382,11 @@ fn ttl_of(raw: Option<&OsStr>, default: u32) -> u32 {
 /// and then never again - so a cell whitens and never disappears. Turning the
 /// status line on anyway would run a user's `#(...)` in `status-right` on our
 /// schedule, which is not ours to decide. doctor reports it instead.
-pub fn session_start(cfg: &Config) {
-    let Some(t) = &cfg.tmux else { return };
+pub fn session_start(cfg: &Config, route: Route) {
+    let Some(t) = cfg.stack.tmux() else { return };
     let fmt = title_format(cfg.glyph_pos);
     let sts = set_titles_string(cfg.glyph_pos);
-    let mut c = Command::new("tmux");
+    let mut c = command();
     set(&mut c, OPT_GW, cfg.glyph(Glyph::Working));
     set(&mut c, OPT_GA, cfg.glyph(Glyph::Waiting));
     set(&mut c, OPT_GI, cfg.glyph(Glyph::Idle));
@@ -416,30 +405,30 @@ pub fn session_start(cfg: &Config) {
     ));
     c.arg(";").arg("set").arg("-g").arg("set-titles").arg("on");
     c.arg(";").arg("set").arg("-g").arg("set-titles-string").arg(sts);
+    // The obligation belongs to the shared tab, not to the latest Claude start.
+    // A non-arming start may initialise `-`, but cannot erase an earlier arm.
+    // tmux's set -o checks and writes on the server, without a read/write race.
+    let armed = route.arms(Channel::Clients);
+    remember_armed(&mut c, t, armed);
     // LAST in the batch, deliberately: `client-attached[N]` is an array option,
     // which a tmux older than 3.0 has no syntax for, and measured, a command that
     // fails at the END of a `;`-chained batch leaves every command before it
     // applied. So an old tmux loses the re-arm and keeps the whole decay.
-    match (cfg.terminal, exe_path()) {
+    // The hook and record retain the SAME policy, before any client write.
+    // Detached starts legitimately install both without delivering any bytes.
+    match (armed, exe_path()) {
         // A path with a single quote in it has no representation inside ARM_HOOK's
         // sh quoting, and a path that is not UTF-8 cannot go into a format at all.
         // Both drop the re-arm and keep everything else.
-        (Terminal::Konsole, Some(exe)) => {
+        (Some(_), Some(exe)) => {
             set(&mut c, OPT_EXE, &exe);
             c.arg(";").arg("set-hook");
             t.target(&mut c);
             c.arg(HOOK).arg(ARM_HOOK);
         }
-        // Not Konsole: take any hook of ours back off. The layout and the TTLs are
-        // already "the last SessionStart on this server wins", and leaving the
-        // arming in force while the strip moved back to the end Konsole elides is
-        // the one combination that is worse than either. doctor's `arm: WARN` then
-        // names /clear as the way back.
-        _ => {
-            c.arg(";").arg("set-hook").arg("-u");
-            t.target(&mut c);
-            c.arg(HOOK);
-        }
+        // Another Claude may still need the existing re-arm hook. Only the
+        // final SessionEnd (or uninstall) releases this shared obligation.
+        _ => {}
     }
     run(c);
     install_window_status(t);
@@ -464,14 +453,15 @@ fn valid_window_id(id: &str) -> bool {
 /// show without -A reports only explicitly local values. Keeping the option
 /// name distinguishes an explicit empty string from an inherited value.
 fn local_window_option(id: &str, option: &str) -> Result<bool, Fail> {
-    let mut c = Command::new("tmux");
+    let mut c = command();
     c.args(["show-options", "-wq", "-t", id, option]);
     capture(c).map(|s| !s.is_empty())
 }
 
 fn install_window_status(t: &Tmux) {
     let Some(id) = window_id(t) else { return };
-    let mut c = Command::new("tmux");
+    let mut c = command();
+    t.inherit_lock(&mut c);
     for f in &WINDOW_FORMATS {
         let Ok(local) = local_window_option(&id, f.option) else { return };
         if c.get_args().next().is_some() {
@@ -509,6 +499,19 @@ fn set(c: &mut Command, name: &str, value: &str) {
         c.arg(";");
     }
     c.arg("set").arg("-s").arg("--").arg(name).arg(value);
+}
+
+/// Record shared policy at SESSION scope before delivery, or initialise `-`.
+fn remember_armed(c: &mut Command, t: &Tmux, armed: Option<Surface>) {
+    if c.get_args().next().is_some() {
+        c.arg(";");
+    }
+    c.arg("set");
+    if armed.is_none() {
+        c.arg("-o");
+    }
+    t.target(c);
+    c.arg("--").arg(OPT_ARMED).arg(armed.map_or(ARMED_NONE, |s| s.caps().name));
 }
 
 /// The array index our `client-attached` hook occupies.
@@ -565,19 +568,79 @@ fn exe_path() -> Option<String> {
 ///
 /// It takes the pty as an argument instead of asking tmux, so the hook costs one
 /// fork and no socket round trip, and so the verb needs no `$TMUX` of its own.
-/// [`sys::write_tty`] is the guard: /dev/pts or /dev/tty, a character device,
-/// writable, and silent about any of that failing.
-pub fn arm_tty(path: &OsStr) {
-    sys::write_tty(Path::new(path), emit::KONSOLE_ARM);
+/// [`sys::write_tty`] checks the pathname and the acquired terminal descriptor.
+/// The caller keeps this hook silent even on an inspection or write failure.
+pub fn arm_tty(path: &OsStr) -> io::Result<bool> {
+    // The verb exists only for Konsole, so it reads Konsole's row directly rather
+    // than resolving a surface it has no environment for: the hook fires in a tmux
+    // server's own environment, where nothing names the leaf.
+    if let Some(a) = &Surface::Konsole.caps().arming {
+        return sys::write_tty(Path::new(path), a.pair().0);
+    }
+    Ok(false)
 }
 
-/// Take the re-arm hook back off.
-fn drop_hook(t: &Tmux) {
-    let mut c = Command::new("tmux");
+/// Take the re-arm hook back off, and the armed record with it.
+///
+/// ONE function, because the two have exactly one lifetime between them: the hook
+/// exists to apply the retained policy on reattach, and the record exists to
+/// select its eventual restore bytes. Dropping one without the other leaves a
+/// hook without a restore obligation, or policy that reattachment cannot renew.
+///
+/// The record is UNSET rather than set to [`ARMED_NONE`]: the session option
+/// falls back to the server's, which we never write, so the answer becomes the
+/// empty string - "no record here" - and the next rung gets to speak. Saying
+/// "no retained arming policy" would be a claim about a session that no longer exists.
+fn disarm(t: &Tmux) {
+    let mut c = command();
     c.arg("set-hook").arg("-u");
     t.target(&mut c);
     c.arg(HOOK);
+    c.arg(";").arg("set").arg("-u");
+    t.target(&mut c);
+    c.arg("--").arg(OPT_ARMED);
     run(c);
+}
+
+/// RUNG 1: this tmux session's retained arming policy, read back out of the
+/// multiplexer's own key-value store.
+///
+/// An `Available` answer STOPS the ladder, so every way of not knowing has to be
+/// one of the other words - a tmux that is not on PATH, a socket that went away
+/// between the two hooks, a server whose SessionStart predates this record, or a
+/// value naming a surface this build has no row for. Any of those falls through to
+/// the state record and then to the assumption; only the server's own `-` is
+/// allowed to say "no retained arming policy", and only because SessionStart writes it.
+///
+/// ONE round trip, on SessionEnd and on doctor, both of which already exec tmux.
+/// Nothing on the paint path reaches this.
+pub fn armed(t: &Tmux) -> Support<Option<Surface>> {
+    match ask(t, &[&format!("#{{{OPT_ARMED}}}")]) {
+        Ok(f) => armed_value(f.first().map_or("", String::as_str)),
+        Err(Fail::NoBinary) => Support::Unsupported("tmux(1) is not on PATH"),
+        Err(Fail::NoAnswer) => {
+            Support::Unsupported("the tmux server did not answer, so it remembers nothing")
+        }
+    }
+}
+
+/// What one [`OPT_ARMED`] value means. Split out of [`armed`] because doctor
+/// already has the value - it reads the option in the same one round trip it makes
+/// for everything else - and a report that re-derived the verdict from a second
+/// query is a report that can disagree with the paint path.
+fn armed_value(v: &str) -> Support<Option<Surface>> {
+    if v.is_empty() {
+        return Support::Unsupported("this tmux session holds no retained arming policy");
+    }
+    if v == ARMED_NONE {
+        return Support::Available(None);
+    }
+    // ABSENT, never DIFFERENT: a name from a later version, or one a user set by
+    // hand, must not choose escape bytes.
+    match surface::by_name(v.as_bytes()) {
+        Some(leaf) => Support::Available(Some(leaf)),
+        None => Support::Unsupported("the record names a surface this build has no row for"),
+    }
 }
 
 /// Arm the outer terminal's tab, from inside tmux.
@@ -593,35 +656,50 @@ fn drop_hook(t: &Tmux) {
 /// Opt-in via `CCTAB_TERMINAL=konsole`, because in the topology this is for -
 /// Konsole, ssh, tmux - `KONSOLE_*` does not survive the ssh and there is
 /// nothing to detect.
-pub fn arm_konsole(cfg: &Config) {
-    if cfg.terminal != Terminal::Konsole {
-        return;
+///
+/// WHETHER to arm, and to whom, is [`crate::mux::route`]'s answer and not this
+/// function's: what used to be here was `surface != Konsole` with the tmux half
+/// of the condition hidden inside [`to_clients`], while `emit::session_start`
+/// carried the complementary half. Two halves in two files is how a pane gets
+/// armed twice.
+pub fn arm_konsole(cfg: &Config, route: Route) -> io::Result<bool> {
+    let Some(surface) = route.arms(Channel::Clients) else { return Ok(false) };
+    let Some(t) = cfg.stack.tmux() else { return Ok(false) };
+    if let Some(a) = &surface.caps().arming {
+        return to_clients(t, a.pair().0);
     }
-    to_clients(cfg, emit::KONSOLE_ARM);
+    Ok(false)
 }
 
 /// Put the tab formats back, but only when no OTHER claude is left in this
 /// session - the arming is per TAB, and inside tmux one tab holds every window.
 ///
-/// Our own pane is excluded from the count rather than relied on to have been
-/// cleared already: session end's empty title travels through the pty and tmux's
-/// parser, and racing that would silently skip the restore.
-pub fn session_end(cfg: &Config) {
-    let Some(t) = &cfg.tmux else { return };
-    if cfg.terminal != Terminal::Konsole {
-        return;
+/// The lifecycle guard has already retired our explicit membership. It holds
+/// the shared session lock through these writes and disarm; a successor cannot
+/// register or publish until retirement finishes. Registered panes do not rely
+/// on asynchronous title parsing for either ownership or retirement.
+pub fn session_end(cfg: &Config, route: Route, lifecycle: &Lifecycle<'_>) -> io::Result<bool> {
+    // WHOSE bytes came out of the record, not out of this hook's environment; see
+    // [`crate::armed`]. All this function still decides is whether anyone else is
+    // using them.
+    let Some(surface) = route.arms(Channel::Clients) else { return Ok(false) };
+    let Some(t) = cfg.stack.tmux() else { return Ok(false) };
+    // Another claude is still painting into this tab, so the arming is still in
+    // force for it. Leaving the RECORD alone here is the same decision as leaving
+    // the tab armed: the session that does turn the lights out has to still be
+    // able to read what to put back.
+    if lifecycle.has_owners() {
+        return Ok(false);
     }
-    let mut c = Command::new("tmux");
-    c.arg("display-message").arg("-p");
-    t.target(&mut c);
-    c.arg(others_expr(t));
-    if capture(c).is_ok_and(|s| s.contains('1')) {
-        return;
-    }
-    to_clients(cfg, emit::KONSOLE_RESTORE);
-    // The last claude in this session is going: nothing is left for a reattach to
-    // re-arm, so the hook goes with it.
-    drop_hook(t);
+    let delivered = match &surface.caps().arming {
+        Some(a) => to_clients(t, a.pair().1),
+        None => Ok(false),
+    };
+    // Retire the policy even if restoration failed or no client was attached:
+    // the last Claude is leaving, so future attaches must not arm again. This
+    // is best-effort cleanup, not an acknowledgement or a pending retry queue.
+    disarm(t);
+    delivered
 }
 
 /// `1` once per pane of this session that carries a record and is not ours.
@@ -638,16 +716,39 @@ fn others_expr(t: &Tmux) -> String {
 }
 
 /// Write `bytes` to the pty of every client attached to OUR session.
-fn to_clients(cfg: &Config, bytes: &[u8]) {
-    let Some(t) = &cfg.tmux else { return };
-    let mut c = Command::new("tmux");
+///
+/// It takes the handle rather than the whole `Config` because the multiplexer's
+/// presence is no longer its business: it used to carry the tmux half of the
+/// arming condition in that `let Some` - the half `emit.rs` complemented, and the
+/// half that made lifting the caller's body into a method an unconditional arm.
+///
+/// `Ok(true)` means at least one completed write, `Ok(false)` none (detached or
+/// all destinations skipped). Return the first error after trying every client;
+/// it can coexist with complete or partial writes to other clients. No outcome
+/// proves terminal application or changes the retained arming policy.
+fn to_clients(t: &Tmux, bytes: &[u8]) -> io::Result<bool> {
+    let mut c = command();
     c.arg("list-clients");
     t.target(&mut c);
     c.arg("-F").arg("#{client_tty}");
-    let Ok(out) = capture(c) else { return };
+    let out = capture(c).map_err(|_| io::Error::other("tmux client listing failed"))?;
+    write_clients(&out, bytes, sys::write_tty)
+}
+
+fn write_clients(
+    out: &str,
+    bytes: &[u8],
+    mut write: impl FnMut(&Path, &[u8]) -> io::Result<bool>,
+) -> io::Result<bool> {
+    let mut result = Ok(false);
     for line in out.lines().filter(|l| !l.is_empty()) {
-        sys::write_tty(Path::new(line), bytes);
+        // Evaluate the next write even when an earlier client failed.
+        result = match (result, write(Path::new(line), bytes)) {
+            (Ok(any), Ok(wrote)) => Ok(any || wrote),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        };
     }
+    result
 }
 
 /// Make a value safe to splice into a format's TEXT, which is a different
@@ -671,6 +772,13 @@ fn inert(s: &str) -> String {
     out
 }
 
+/// Default to no hook input; a lifecycle target replaces stdin with its lock.
+fn command() -> Command {
+    let mut c = Command::new("tmux");
+    c.stdin(Stdio::null());
+    c
+}
+
 /// Run a tmux command and throw everything away.
 ///
 /// stdout AND stderr go to /dev/null, and neither is belt and braces: stdout
@@ -680,7 +788,6 @@ fn inert(s: &str) -> String {
 /// catch as a failure.
 fn run(mut c: Command) {
     let _ = c
-        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -703,7 +810,7 @@ enum Fail {
 
 /// Run a tmux command and read its stdout.
 fn capture(mut c: Command) -> Result<String, Fail> {
-    let out = match c.stdin(Stdio::null()).stderr(Stdio::null()).output() {
+    let out = match c.stderr(Stdio::null()).output() {
         Ok(o) => o,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Fail::NoBinary),
         Err(_) => return Err(Fail::NoAnswer),
@@ -720,14 +827,14 @@ fn capture(mut c: Command) -> Result<String, Fail> {
 /// and linked windows. Saved values remain inside tmux and travel through format
 /// expansions, never diagnostic stdout or interpolated command strings.
 fn restore_window_status() -> Result<Vec<String>, Fail> {
-    let mut list = Command::new("tmux");
+    let mut list = command();
     list.args(["list-windows", "-a", "-F", "#{window_id}"]);
     let ids: std::collections::BTreeSet<_> = capture(list)?
         .lines().filter(|id| valid_window_id(id)).map(str::to_owned).collect();
     let mut restored = 0;
     let mut kept = 0;
     for id in ids {
-        let target = Tmux { pane: Some(OsString::from(&id)) };
+        let target = Tmux { pane: Some(OsString::from(&id)), lifecycle_lock: Default::default() };
         for f in &WINDOW_FORMATS {
             // The previous value goes last, preserving embedded/trailing
             // newlines. These reads inspect ownership only: tmux 3.4 escapes
@@ -744,7 +851,7 @@ fn restore_window_status() -> Result<Vec<String>, Fail> {
                 }
                 continue;
             }
-            let mut c = Command::new("tmux");
+            let mut c = command();
             if current[0] == window_status_format(f.previous) {
                 // An absent original is not an explicitly empty original. If
                 // metadata is incomplete, retain the wrapper and shared options
@@ -796,7 +903,7 @@ fn report_window_status(t: &Tmux) -> String {
     let Some(id) = window_id(t) else {
         return "           window list: WARN no known TMUX_PANE; no window format is selected for decoration".to_owned();
     };
-    let target = Tmux { pane: Some(OsString::from(id)) };
+    let target = Tmux { pane: Some(OsString::from(id)), lifecycle_lock: Default::default() };
     let mut installed = 0;
     let mut custom = 0;
     let mut changed = 0;
@@ -886,14 +993,20 @@ pub fn uninstall() -> Vec<String> {
     }
     // Ours, and not in the batch below: `client-attached[N]` is an array option an
     // old tmux cannot parse, and an error inside a `;`-chained batch stops the
-    // commands after it - which would be the restore.
-    drop_hook(&t);
+    // commands after it - which would be the restore. It takes the armed record
+    // with it - a SESSION option, which the server-scope sweep below cannot reach.
+    disarm(&t);
+    let mut members = command();
+    members.args(["set-option", "-u"]);
+    t.target(&mut members);
+    members.args(["--", lifecycle::MEMBERS]);
+    run(members);
 
     // Ours come off whatever happens: they are our own namespace, and an orphaned
     // @cctab_title is exactly what would make a later doctor lie. Keep the saved
     // title until the final batch so restoration never reimports diagnostic
     // stdout (tmux 3.4 escapes dollar signs there).
-    let mut c = Command::new("tmux");
+    let mut c = command();
     for o in OURS {
         if flag == "1" && o == OPT_PREV_STRING {
             continue;
@@ -951,7 +1064,7 @@ pub fn uninstall() -> Vec<String> {
     // OTHER glyph position holds a different string of ours, and it points at the
     // same option.
     let ours_saved = prev_string.contains("@cctab_");
-    let mut c = Command::new("tmux");
+    let mut c = command();
     let mut restored: Vec<String> = Vec::new();
     if *prev_titles != def_titles {
         let v = if prev_titles == "1" { "on" } else { "off" };
@@ -1004,7 +1117,13 @@ pub fn uninstall() -> Vec<String> {
 }
 
 /// Every option SessionStart writes, so that uninstall cannot forget one.
-const OURS: [&str; 15] = [
+///
+/// The sweep that reads this list unsets at SERVER scope. [`OPT_ARMED`] is written
+/// at SESSION scope and is removed by [`disarm`], which uninstall calls first; it
+/// is listed here anyway, because the list is also the answer to "what is in our
+/// namespace", and because a `@cctab_armed` someone set at server scope by hand
+/// would otherwise outlive an uninstall.
+const OURS: [&str; 16] = [
     OPT_GW,
     OPT_GA,
     OPT_GI,
@@ -1018,6 +1137,7 @@ const OURS: [&str; 15] = [
     OPT_PREV_STRING,
     OPT_PREV_TITLES,
     OPT_EXE,
+    OPT_ARMED,
     OPT_WINDOW_STRIP,
     OPT_WINDOW_COLOR,
 ];
@@ -1033,7 +1153,7 @@ const OURS: [&str; 15] = [
 /// user's format string can - so everything after the first `n - 1` lines belongs
 /// to it. Put the risky one last.
 fn ask(t: &Tmux, exprs: &[&str]) -> Result<Vec<String>, Fail> {
-    let mut c = Command::new("tmux");
+    let mut c = command();
     c.arg("display-message").arg("-p");
     t.target(&mut c);
     c.arg(exprs.join("\n"));
@@ -1069,7 +1189,10 @@ pub fn report(cfg: &Config) -> Vec<String> {
         return out;
     };
     let shown = String::from_utf8_lossy(raw.as_encoded_bytes()).into_owned();
-    let Some(t) = Tmux::detect() else {
+    // The handle from the stack doctor resolved, not a second `Tmux::detect()`: the
+    // two cannot disagree today, and the one that is reached through `Config` is the
+    // one the paint path used.
+    let Some(t) = cfg.stack.tmux() else {
         out.push(format!(
             "tmux:      WARN $TMUX={shown} is not <socket>,<pid>,<session>, so it is \
              treated as NOT tmux"
@@ -1097,6 +1220,7 @@ pub fn report(cfg: &Config) -> Vec<String> {
             &ours,
             &format!("#{{{OPT_SAVED}}}"),
             &format!("#{{{OPT_STRING}}}"),
+            &format!("#{{{OPT_ARMED}}}"),
             &format!("#{{{HOOK}}}"),
         ],
     ) {
@@ -1203,12 +1327,34 @@ pub fn report(cfg: &Config) -> Vec<String> {
                 .to_owned(),
         );
     }
-    if cfg.terminal == Terminal::Konsole {
+    // THE ARMED RECORD - rung 1, and which rung would answer if it were empty.
+    // Printed for every session inside tmux and not only in Konsole mode, because
+    // "this tab is armed and nothing here can say by whom" is the shape of the
+    // defect, and a line that only spoke when the environment already agreed could
+    // never show it.
+    //
+    // Labelled `restore:` and not `record:`, because doctor already prints a
+    // column-zero `record:` for the state directory and two labels reading the
+    // same in one report is a reader's problem, not a naming preference. It also
+    // names the ACT a user is looking for when a tab is stuck.
+    let record = Armed::resolve(
+        armed_value(get(8)),
+        Support::Unsupported("doctor has no session id, so it cannot read a state record"),
+        cfg.stack.leaf,
+    );
+    out.push(format!(
+        "           restore: {}",
+        match record.surface().filter(|s| s.caps().arming.is_some()) {
+            Some(s) => format!("{}, {}", s.caps().name, record.source().why()),
+            None => format!("no arming policy, {}", record.source().why()),
+        }
+    ));
+    if cfg.stack.leaf == Surface::Konsole {
         out.push(format!(
             "           arm: {}",
-            match get(8) {
+            match get(9) {
                 h if h == ARM_HOOK =>
-                    "OK   client-attached re-arms this tab's Konsole format on every \
+                    "OK   client-attached attempts Konsole arming on every \
                      reattach",
                 "" => "WARN no client-attached hook, so a detach/reattach lands in an \
                        un-armed tab. Remedy: /clear, which re-runs SessionStart",
@@ -1217,7 +1363,7 @@ pub fn report(cfg: &Config) -> Vec<String> {
             }
         ));
     }
-    let mut c = Command::new("tmux");
+    let mut c = command();
     c.arg("list-clients");
     t.target(&mut c);
     c.arg("-F")
@@ -1248,7 +1394,7 @@ pub fn report(cfg: &Config) -> Vec<String> {
     }
     out.push(format!(
         "           konsole: {}",
-        if cfg.terminal == Terminal::Konsole {
+        if cfg.stack.leaf == Surface::Konsole {
             "on   CCTAB_TERMINAL=konsole - OSC 50 goes to each attached client's pty"
         } else {
             "off  set CCTAB_TERMINAL=konsole when the outer terminal is Konsole \
@@ -1304,6 +1450,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn client_writes_distinguish_skips_and_continue_after_failure() {
+        assert!(!write_clients("", b"arm", |_, _| panic!("detached")).unwrap());
+        assert!(!write_clients("skipped\n", b"arm", |_, _| Ok(false)).unwrap());
+        assert!(write_clients("skipped\nwritten\n", b"arm", |p, _| {
+            Ok(p == Path::new("written"))
+        }).unwrap());
+        let mut seen = Vec::new();
+        let result = write_clients("failed\nwritten\nskipped\nfailed-again\n", b"arm", |p, bytes| {
+            assert_eq!(bytes, b"arm");
+            seen.push(p.to_path_buf());
+            match p.to_str().unwrap() {
+                "failed" => Err(io::Error::other("first failure, possibly partial")),
+                "failed-again" => Err(io::Error::other("second failure")),
+                "written" => Ok(true),
+                _ => Ok(false),
+            }
+        });
+        assert_eq!(seen.len(), 4);
+        assert_eq!(result.unwrap_err().to_string(), "first failure, possibly partial");
+    }
+
+    #[test]
     fn a_tmux_env_is_a_socket_path_and_two_numbers() {
         assert!(is_tmux_env(b"/tmp/tmux-1000/default,1234,0"));
         assert!(is_tmux_env(b"/t,1,0"));
@@ -1331,19 +1499,6 @@ mod tests {
         // The record is what the FORMAT matches, so the two cannot drift apart.
         let place = "srv:~/a b,c}d#{host}e:f|g";
         assert!(carrier_at(Paint::Line(Glyph::Waiting), place, 5).starts_with(place));
-    }
-
-    #[test]
-    fn the_ttl_grammar_is_the_caps_grammar() {
-        let t = |v: Option<&str>| ttl_of(v.map(OsStr::new), 300);
-        assert_eq!(t(Some("0")), NEVER);
-        assert_eq!(t(Some("1")), 1);
-        assert_eq!(t(Some("999999")), 999_999);
-        // A leading zero, a seventh digit, a sign and a word are all the default.
-        for bad in ["08", "0300", "1000000", "-1", "3.5", "nope", " 8", ""] {
-            assert_eq!(t(Some(bad)), 300, "{bad:?}");
-        }
-        assert_eq!(t(None), 300);
     }
 
     /// The format is one constant per glyph position, so it can be pinned here
@@ -1451,7 +1606,40 @@ mod tests {
         // and @cctab_exe is the one this slice added.
         assert!(OURS.contains(&OPT_EXE));
         assert!(OURS.contains(&OPT_WINDOW_STRIP));
-        assert_eq!(OURS.len(), 15);
+        assert!(OURS.contains(&OPT_ARMED));
+        assert_eq!(OURS.len(), 16);
+    }
+
+    /// The armed record's grammar, which is the whole of rung 1's reliability.
+    ///
+    /// Three answers and not two: "no retained arming policy" is a STATEMENT, and the
+    /// empty string has to keep meaning "no record here", or every tmux server
+    /// that predates this option - and every session whose SessionStart hook never
+    /// ran - would read as a session that armed nothing and silently lose its
+    /// restore.
+    #[test]
+    fn the_armed_record_reads_an_unknown_value_as_absent_and_never_as_a_surface() {
+        let seen = |v: &str| matches!(armed_value(v), Support::Available(Some(s)) if s == Surface::Konsole);
+        assert!(seen("konsole"));
+        // The option is written from `caps().name`, so it arrives canonical; the
+        // reader is case-insensitive anyway, because `CCTAB_TERMINAL` taught this
+        // crate what a byte compare costs.
+        assert!(seen("KONSOLE"));
+        assert!(matches!(armed_value(ARMED_NONE), Support::Available(None)));
+        // Everything else has to fall THROUGH to the next rung rather than choose
+        // bytes: a name from a later version, a name from no version at all, a
+        // hand-edited value, and the empty string a server that never wrote one
+        // gives back.
+        for miss in ["", "konsol", "konsolex", "kitty-next", "-x", "1", " konsole"] {
+            assert!(!matches!(armed_value(miss), Support::Available(Some(_))), "{miss}");
+        }
+        // And a name this build DOES know but which arms nothing is still read
+        // back faithfully - the routing, not the reader, is what declines to send
+        // bytes for it.
+        assert!(matches!(armed_value("wezterm"), Support::Available(Some(s)) if s == Surface::WezTerm));
+        assert!(Surface::WezTerm.caps().arming.is_none());
+        // No surface may ever be named `-`, or the sentinel would become a row.
+        assert!(surface::by_name(ARMED_NONE.as_bytes()).is_none());
     }
 
     #[test]
@@ -1469,16 +1657,5 @@ mod tests {
         // A string that is not ours at all is reported as the default end rather
         // than guessed at; the branch is only reached when it IS ours.
         assert_eq!(end_of("MY OWN TITLE"), "first");
-    }
-
-    #[test]
-    fn the_epoch_can_be_pinned_for_a_test_and_bad_values_are_ignored() {
-        let e = |v: Option<&str>| epoch(v.map(OsStr::new));
-        assert_eq!(e(Some("1700000000")), 1_700_000_000);
-        assert_eq!(e(Some("5")), 5);
-        assert_eq!(e(Some("0")), 0);
-        for bad in [None, Some(""), Some("12345678901"), Some("17000000x0"), Some("-1")] {
-            assert!(e(bad) > 1_700_000_000, "{bad:?} must not be believed");
-        }
     }
 }
