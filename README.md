@@ -597,4 +597,4 @@ The wait-ownership model is partly taken from
 
 ## Licence
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).

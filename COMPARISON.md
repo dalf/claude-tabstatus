@@ -338,7 +338,7 @@ The local test figures are from the preceding repository review in this conversa
 
 CI inspection establishes configured checks, not that the most recent remote run passed. Unit-test counts also do not measure comparative product maturity: a native terminal integration may depend heavily on UI behavior that mocks cannot cover. The strongest next step for all state-oriented approaches is a shared corpus of sanitized, versioned event/session traces with explicit expected user-visible states.
 
-The inspected licenses are GPL-3.0-or-later for this repository and MIT for wt-tab-status, JasperSui, headsup and the task-title project. No license file was present in the pinned fancy-tabs tree. These are source metadata observations, not a legal assessment. [Local manifest][local-cargo], [wt license][wt-license], [JasperSui license][jasper-license], [headsup license][headsup-license], [task-title license][title-license], [fancy-tabs tree][fancy-tree].
+The inspected licenses are MIT for this repository, wt-tab-status, JasperSui, headsup and the task-title project. No license file was present in the pinned fancy-tabs tree. These are source metadata observations, not a legal assessment. [Local licence](LICENSE), [wt license][wt-license], [JasperSui license][jasper-license], [headsup license][headsup-license], [task-title license][title-license], [fancy-tabs tree][fancy-tree].
 
 ## Priorities suggested by the comparison
 

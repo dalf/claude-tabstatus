@@ -10,7 +10,7 @@ edition = "2021"
 # there covers the whole file and refuses readers. Toolchain here: 1.98.1.
 rust-version = "1.89"
 description = "Puts the Claude Code session state into the terminal tab title."
-license = "GPL-3.0-or-later"
+license = "MIT"
 publish = false
 
 # Hook metadata is parsed structurally without constructing unused JSON values.
