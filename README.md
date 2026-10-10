@@ -144,6 +144,7 @@ null). Duplicate recognized keys are rejected, including escaped spellings of th
 same key; unknown keys are skipped. Missing and null fields are absent; empty
 session and agent IDs are absent too. Only the first decoded prompt character and
 whether the background array is empty are retained from those two fields.
+Artifact watches do not count (see [state contract](docs/state-contract.md)).
 
 Read errors, malformed input, wrong field types and oversized input are **silent
 no-ops, exiting zero before any state record is opened or changed**. Zero-byte

@@ -2,7 +2,10 @@
 //! skipped with `IgnoredAny`, never materialized as a JSON tree. JSON whitespace,
 //! member order and escapes do not change a field's meaning.
 
-use serde::de::{self, Deserialize, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::de::{
+    self, Deserialize, DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor,
+};
+use serde_json::value::RawValue;
 use std::fmt;
 use std::io::{self, Read};
 
@@ -91,6 +94,7 @@ impl Payload {
     pub fn prompt_first(&self) -> Option<char> {
         self.prompt_first
     }
+    /// Whether `background_tasks` holds nothing but artifact watches.
     pub fn background_tasks_empty(&self) -> Option<bool> {
         self.background_tasks_empty
     }
@@ -284,13 +288,105 @@ impl<'de> Deserialize<'de> for EmptyArray {
             }
             fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<EmptyArray, S::Error> {
                 let mut empty = true;
-                while seq.next_element::<IgnoredAny>()?.is_some() {
-                    empty = false;
+                while let Some(entry) = seq.next_element::<&RawValue>()? {
+                    let mut entry = serde_json::Deserializer::from_str(entry.get());
+                    empty &= Probe::Entry.deserialize(&mut entry).unwrap_or(false);
                 }
                 Ok(EmptyArray(empty))
             }
         }
         d.deserialize_seq(Array)
+    }
+}
+
+// Claude Code re-arms an artifact's live-update watch on session resume as a
+// monitor that never ends, so counting it would hold the tab purple for good.
+// Only a `monitor` whose description names a claude.ai artifact is skipped. Any
+// other entry - other monitors, malformed or non-object entries, an entry
+// repeating `type` or `description` - still counts, as does wording Claude Code
+// may change: a miss fails toward purple. Each entry is skipped as leniently as
+// any unused value, then reread; a strict decoding error there (a lone surrogate,
+// an out-of-range number) counts the entry instead of rejecting the payload.
+// Strings are inspected in place, never retained.
+#[derive(Clone, Copy)]
+enum Probe {
+    Entry,
+    Text(fn(&str) -> bool),
+}
+impl<'de> DeserializeSeed<'de> for Probe {
+    type Value = bool;
+    fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<bool, D::Error> {
+        d.deserialize_any(self)
+    }
+}
+impl<'de> Visitor<'de> for Probe {
+    type Value = bool;
+    fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str("any JSON value")
+    }
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<bool, M::Error> {
+        let (mut kind, mut text, mut repeated) = (None, None, false);
+        while let Some(key) = map.next_key::<EntryKey>()? {
+            let (slot, test): (_, fn(&str) -> bool) = match (self, key) {
+                (Self::Entry, EntryKey::Type) => (&mut kind, |s| s == "monitor"),
+                (Self::Entry, EntryKey::Description) => (&mut text, |s| {
+                    s.contains("claude.ai/artifact/") || s.contains("claude.ai/code/artifact/")
+                }),
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                    continue;
+                }
+            };
+            repeated |= slot.is_some();
+            *slot = Some(map.next_value_seed(Self::Text(test))?);
+        }
+        Ok(!repeated && kind == Some(true) && text == Some(true))
+    }
+    fn visit_str<E>(self, s: &str) -> Result<bool, E> {
+        Ok(matches!(self, Self::Text(test) if test(s)))
+    }
+    fn visit_seq<S: SeqAccess<'de>>(self, mut seq: S) -> Result<bool, S::Error> {
+        while seq.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(false)
+    }
+    fn visit_bool<E>(self, _: bool) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_i64<E>(self, _: i64) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_u64<E>(self, _: u64) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_f64<E>(self, _: f64) -> Result<bool, E> {
+        Ok(false)
+    }
+    fn visit_unit<E>(self) -> Result<bool, E> {
+        Ok(false)
+    }
+}
+enum EntryKey {
+    Type,
+    Description,
+    Other,
+}
+impl<'de> Deserialize<'de> for EntryKey {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Keys;
+        impl Visitor<'_> for Keys {
+            type Value = EntryKey;
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("an object key")
+            }
+            fn visit_str<E: de::Error>(self, s: &str) -> Result<EntryKey, E> {
+                Ok(match s {
+                    "type" => EntryKey::Type,
+                    "description" => EntryKey::Description,
+                    _ => EntryKey::Other,
+                })
+            }
+        }
+        d.deserialize_identifier(Keys)
     }
 }
 
@@ -352,6 +448,45 @@ mod tests {
             parse(r#"{"background_tasks":[null,{},[1]]}"#).background_tasks_empty(),
             Some(false)
         );
+    }
+    #[test]
+    fn only_artifact_watches_leave_background_tasks_empty() {
+        let empty = |tasks: &str| {
+            parse(&format!(r#"{{"background_tasks":[{tasks}]}}"#)).background_tasks_empty()
+        };
+        let watch = r#"{"id":"ss33q6quc","type":"monitor","status":"running","description":"live updates for artifact https://claude.ai/artifact/TdSu4K4Nq5fSMbGLoStgbz (re-armed on session resume)"}"#;
+        let workflow = r#"{"id":"wqot22fdh","type":"workflow","status":"running","description":"tiny test","name":"tiny"}"#;
+        assert_eq!(empty(watch), Some(true));
+        assert_eq!(empty(&format!("{watch},{watch}")), Some(true));
+        assert_eq!(empty(&format!("{watch},{workflow}")), Some(false));
+        assert_eq!(empty(&format!("{workflow},{watch}")), Some(false));
+        for tasks in [
+            r#"{"description":"x claude.ai/code/artifact/abc","type":"monitor"}"#,
+            r#"{"type":"\u006donitor","description":"claude.ai\/artifact\/x"}"#,
+            r#"{"type":"monitor","nested":{"type":"x"},"description":"claude.ai/artifact/x"}"#,
+        ] {
+            assert_eq!(empty(tasks), Some(true), "{tasks}");
+        }
+        // Repeated `type` or `description` cannot reject the input as a repeated
+        // top-level field does: that would leave the tab unpainted, not purple.
+        for tasks in [
+            r#"{"type":"monitor","description":"CI run 123"}"#,
+            r#"{"type":"monitor"}"#,
+            r#"{"type":"monitor","description":null}"#,
+            r#"{"type":"monitor","description":["claude.ai/artifact/x"]}"#,
+            r#"{"type":"Monitor","description":"claude.ai/artifact/x"}"#,
+            r#"{"type":"workflow","description":"claude.ai/artifact/x"}"#,
+            r#"{"type":"monitor","description":"claude.ai/artifact/x","type":"monitor"}"#,
+            r#"{"type":"monitor","description":"claude.ai/artifact/x","description":"CI"}"#,
+            r#"{"type":"monitor","descr\u0069ption":"claude.ai/artifact/x","description":"claude.ai/artifact/x"}"#,
+            r#""claude.ai/artifact/x""#,
+            r#"null,{},[1]"#,
+            r#"{"type":"monitor","description":"claude.ai/artifact/x \uD800"}"#,
+            r#"{"type":"monitor","description":"claude.ai/artifact/x","\uD800":1}"#,
+            r#""\uDC00",1e999"#,
+        ] {
+            assert_eq!(empty(tasks), Some(false), "{tasks}");
+        }
     }
     #[test]
     fn wrong_types_and_duplicate_recognized_keys_are_rejected() {

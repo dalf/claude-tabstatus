@@ -2839,6 +2839,9 @@ mod tests {
         assert!(nothing_running(&payload(
             r#"{"session_id":"s1","background_tasks": []}"#
         )));
+        assert!(nothing_running(&payload(
+            r#"{"session_id":"s1","background_tasks":[{"type":"monitor","description":"claude.ai/artifact/x"}]}"#
+        )));
         assert!(!nothing_running(&payload(
             r#"{"session_id":"s1","background_tasks":[{"id":"a","status":"running"}]}"#
         )));

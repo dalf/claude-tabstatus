@@ -56,7 +56,8 @@ fact. Ordinary main progress, replies without metadata, idle notifications,
 This is one bounded aggregate, not a task inventory or a count. It includes
 session-owned workflows, subagents and background shells, including pending work
 already registered to an active workflow. Unknown task kinds also count because
-they occupy the in-flight registry. No entry is evicted when many tasks are
+they occupy the in-flight registry, except artifact watches, which never end
+(see [state contract](state-contract.md)). No entry is evicted when many tasks are
 present. `session_crons` and scheduled future occurrences do not count by
 existence alone; their registered in-flight executions do. Unrelated OS processes
 do not count. The shared 16 MiB payload limit still applies; rejected payloads

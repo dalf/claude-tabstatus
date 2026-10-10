@@ -48,7 +48,9 @@ Recognized fields are `session_id`, `agent_id`, `source`, `notification_type`,
 including equivalent escaped spellings, reject the entire input. Missing and
 null fields are absent; empty session and agent IDs are also absent. Only the
 first decoded prompt character and the background array's emptiness are retained
-from those fields. Unknown fields are skipped.
+from those fields. An array holding only artifact watches (`monitor` entries
+whose `description` contains `claude.ai/artifact/` or
+`claude.ai/code/artifact/`) is empty. Unknown fields are skipped.
 
 The parser accepts one complete UTF-8 JSON object, at most 16 MiB including
 whitespace. It buffers that complete input and drains oversized input to EOF.

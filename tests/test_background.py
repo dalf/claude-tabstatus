@@ -120,6 +120,16 @@ class BackgroundTests(unittest.TestCase):
         self.assertEqual(self.event("idle", "Stop", background_tasks=tasks[:1]), "background")
         self.assertEqual(self.event("idle", "Stop", background_tasks=[]), "idle")
 
+    def test_resumed_artifact_watch_alone_is_not_background(self):
+        watch = {"id": "ss33q6quc", "type": "monitor", "status": "running",
+                 "description": "live updates for artifact https://claude.ai/artifact/TdSu4K4Nq5fSMbGLoStgbz"
+                                " (re-armed on session resume)"}
+        self.background()
+        self.assertEqual(self.event("idle", "Stop", background_tasks=[watch]), "idle")
+        self.assertFalse(self.record()["background"])
+        self.assertEqual(self.event("idle", "Stop", background_tasks=[{**watch, "description": "CI run 123"}]),
+                         "background")
+
     def test_scheduled_future_work_does_not_count_as_in_flight(self):
         self.assertEqual(self.event("idle", "Stop", session_crons=[{"id": "schedule"}], background_tasks=[]), "idle")
         self.assertFalse(self.record()["background"])
