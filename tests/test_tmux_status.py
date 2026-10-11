@@ -237,6 +237,19 @@ class TmuxStatusTests(unittest.TestCase):
         self.start()
         self.assertIn("background: OK", doctor())
 
+    def test_doctor_reports_a_label_the_installed_title_format_ignores(self):
+        self.start()
+        env = dict(self.env, TMUX=f"{self.socket},1,0", TMUX_PANE=self.pane, CLAUDE_PID="0")
+        def doctor():
+            return subprocess.run([str(BIN), "doctor"], env=env, cwd=self.root,
+                                  capture_output=True, text=True, timeout=10).stdout
+        self.tm("set", "-g", "@cctab_label", "#{host_short}")
+        self.assertNotIn("label: WARN", doctor())
+        self.tm("set", "-s", "@cctab_title", "old format")
+        self.assertIn("label: WARN", doctor())
+        self.tm("set", "-gu", "@cctab_label")
+        self.assertNotIn("label: WARN", doctor())
+
     @unittest.skipIf(os.geteuid() == 0, "root bypasses read-only record permissions")
     def test_unwritable_record_keeps_background_in_the_waiting_carrier(self):
         self.start(CCTAB_TTL_WAITING="1", CCTAB_TTL_GONE="1")

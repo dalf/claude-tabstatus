@@ -380,6 +380,24 @@ which decide the layout - are **server-wide**: the last Claude to start on a tmu
 server wins for every window on it. Set them the same for every Claude on one
 server; `doctor` prints a `layout: WARN` line when they disagree.
 
+#### The tab label
+
+By default the text after the strip is where you are. To show something else, set
+`@cctab_label` to a tmux format; a non-empty value replaces the label, and the
+strip stays where it was:
+
+```tmux
+set -g @cctab_label '#{host_short}'              # 🔵🟠 fedora
+set -g @cctab_label '#{?@host,#{@host},#{host_short}}'  # a session's @host, else the hostname
+```
+
+The format is expanded once, and a value it pulls in from another option stays
+literal, so `set -t work @host 'me@box#1'` shows exactly `me@box#1`. In the
+format text itself write `%%` for `%` and `##` for `#`. Unset or empty means the
+default label; `uninstall` leaves this option alone. The last Claude to start on
+the server must run a tabstatus that knows this option; `doctor` prints a
+`label: WARN` line when it did not.
+
 #### Themes
 
 For a theme with rounded tabs or embedded colours, place

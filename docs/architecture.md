@@ -1356,6 +1356,21 @@ set-hook -t <our session> 'client-attached[1971]' \
     'run-shell -b "'\''#{@cctab_exe}'\''  tmux-arm '\''#{client_tty}'\''"'
 ```
 
+**The label is user-settable.** `@cctab_label` is read, never written: when its
+value is non-empty, `@cctab_title` renders it in place of the default label
+(`<location>` or `session:index:window`), on the same side of the strip.
+`SessionStart` does not set it and `uninstall` does not remove it. The title
+format holds `#{?#{!=:#{@cctab_label},},#{E:@cctab_label},<default label>}`, so:
+
+- it is looked up like any user option from the attached session's active pane:
+  measured, server (`set -s`), pane, window, global window (`set -gw`), session,
+  then global (`set -g`), so only a `set -g` value yields to a session's own;
+- `E:` expands its text once, so `#{host_short}` or `#{@other}` in it render;
+- a value it substitutes is not expanded again: measured, `#{@x}` holding
+  `a#{host}%H##,b` renders exactly that;
+- the enclosing `T:` runs strftime over its text, so a literal `%` in the label
+  text itself is written `%%`, and a literal `#` is written `##`.
+
 `@cctab_window_color` returns the highest-priority visible state across all Claude
 panes in the window (orange > blue > purple > white), sharing the strip's carrier
 recognition and expiry rules, including background's protection from expiry; empty
