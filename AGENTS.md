@@ -38,6 +38,7 @@ carries the management verbs (`install`, `uninstall`, `doctor`, `version`,
 | `docs/` | design and contract documents (see [Documentation map](#documentation-map)) |
 | `.github/workflows/` | `test.yml` (every push and PR) and `release.yml` (every tag) |
 | `.cargo/config.toml` | `+crt-static` for the Windows MSVC target |
+| `release.toml` | `cargo release` settings (see [CI and releases](#ci-and-releases)) |
 
 `hooks/hooks.json` invokes `${CLAUDE_PLUGIN_ROOT}/bin/tabstatus`, which is the
 copy inside the generated tree, never the checkout's `bin/`. A `git checkout`
@@ -388,23 +389,31 @@ branch push, pull request, manual dispatch, and as a reusable workflow.
   the line format matches Linux) as `windows-binaries`.
 
 **Release** ([`.github/workflows/release.yml`](.github/workflows/release.yml)) runs
-on every pushed tag. It calls the Test workflow on the tagged commit, downloads the
-tested artifacts, checks each against the `SHA256SUMS` its own test job recorded,
-joins those lines into one `SHA256SUMS` (never a recomputed digest), checks it once
-more, and creates a GitHub release with generated notes and these assets:
+on every pushed tag. It first fails unless the tag equals the `version` in both
+`Cargo.toml` and `.claude-plugin/plugin.json`, then calls the Test workflow on the
+tagged commit, downloads the tested artifacts, checks each against the `SHA256SUMS`
+its own test job recorded, joins those lines into one `SHA256SUMS` (never a
+recomputed digest), checks it once more, and creates a GitHub release with
+generated notes and these assets:
 
 - `tabstatus-x86_64-unknown-linux-musl`
 - `tabstatus-x86_64-unknown-linux-gnu`
 - `tabstatus-x86_64-pc-windows-msvc.exe` (not code-signed)
 - `SHA256SUMS`
 
-To cut a release:
+To cut a release, from an up-to-date `main` (install the tool once with
+`cargo install cargo-release --locked`, which needs
+`openssl-devel` on Fedora or `libssl-dev` on Debian):
 
-1. Bump `version` in `Cargo.toml` and `.claude-plugin/plugin.json` (they must
-   agree: a unit test in `src/embedded.rs` fails otherwise, and `tests/run.sh`
-   checks the binary's `version` against `Cargo.toml`), rebuild
-   so `Cargo.lock` and `bin/` follow, and commit.
-2. `git tag v0.1.0 && git push origin v0.1.0` (with the new version).
+```sh
+cargo release patch            # or minor, major: dry run, changes nothing
+cargo release patch --execute
+```
+
+[`release.toml`](release.toml) makes it bump `version` in `Cargo.toml`,
+`Cargo.lock` and `.claude-plugin/plugin.json`, run `cargo test --locked`, commit
+`Release X.Y.Z`, tag `X.Y.Z` (no `v`) and push `main` and the tag to `origin`.
+Nothing is published to crates.io.
 
 Every tag name triggers a release, and a tag can be released only once; use a new
 tag each time.

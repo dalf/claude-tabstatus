@@ -12,8 +12,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  version:
+    name: Check tag matches version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          cargo=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          plugin=$(jq -r .version .claude-plugin/plugin.json)
+          echo "tag $GITHUB_REF_NAME, Cargo.toml $cargo, plugin.json $plugin"
+          test "$GITHUB_REF_NAME" = "$cargo" && test "$GITHUB_REF_NAME" = "$plugin"
+
   test:
     name: Validate tagged commit
+    needs: version
     uses: ./.github/workflows/test.yml
 
   release:
