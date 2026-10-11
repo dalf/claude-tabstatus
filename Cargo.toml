@@ -1,6 +1,6 @@
 [package]
 name = "tabstatus"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Raised from 1.74 for `std::fs::File::lock`, stable since 1.89, which is what
 # makes the state layer's read-modify-write atomic without a dependency. The
