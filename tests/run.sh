@@ -3023,6 +3023,33 @@ else
                "$bin" tmux-format | sed -n 1p)")"
     tsession_start "$tmp/code/one"
 
+    # @cctab_label replaces the label and leaves the strip alone. Its text is a
+    # format, expanded once; an option value it substitutes stays literal.
+    tm set -g @cctab_label 'alex@aflament'
+    check 'a literal @cctab_label replaces the label' '🔵 alex@aflament' "$(trender)"
+    tm set -g @cctab_label '#{?@tlabel_host,#{@tlabel_host},#{host_short}}'
+    check '@cctab_label is expanded as a format' \
+        "🔵 $(tm display-message -p '#{host_short}')" "$(trender)"
+    tm set -t t @tlabel_host 'u#{host}%H##@a,b'
+    check 'a value it substitutes stays literal' '🔵 u#{host}%H##@a,b' "$(trender)"
+    check 'and a suffix strip goes after it' 'u#{host}%H##@a,b 🔵' \
+        "$(tsession_start "$tmp/code/one" CCTAB_GLYPH_POS=suffix
+           tm display-message -p -t t:w0.0 "$(env -u TMUX CCTAB_GLYPH_POS=suffix \
+               "$bin" tmux-format | sed -n 1p)")"
+    tsession_start "$tmp/code/one"
+    tput_title t:w0.0 ''
+    check 'with no claude @cctab_label stands alone' 'u#{host}%H##@a,b' "$(trender)"
+    check 'in either layout' 'u#{host}%H##@a,b' \
+        "$(tsession_start "$tmp/code/one" CCTAB_GLYPH_POS=suffix
+           tm display-message -p -t t:w0.0 "$(env -u TMUX CCTAB_GLYPH_POS=suffix \
+               "$bin" tmux-format | sed -n 1p)")"
+    tsession_start "$tmp/code/one"
+    tput_title t:w0.0 "$(trec working "$tmp/code/one" "$(tm display-message -p '%s')")"
+    tm set -g @cctab_label ''
+    check 'an empty @cctab_label is the default label' '🔵 ~/code/one' "$(trender)"
+    tm set -gu @cctab_label
+    tm set -t t -u @tlabel_host
+
     # Konsole, inside tmux: the arming goes to the attached CLIENT's pty, never
     # to our own pane, and with no client attached there is nothing to write and
     # nothing to fail. The strip also moves to the end Konsole does not elide.

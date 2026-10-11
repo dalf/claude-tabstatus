@@ -84,6 +84,9 @@ const OPT_PREV_STRING: &str = "@cctab_prev_string";
 const OPT_PREV_TITLES: &str = "@cctab_prev_titles";
 const OPT_WINDOW_STRIP: &str = "@cctab_window_strip";
 const OPT_WINDOW_COLOR: &str = "@cctab_window_color";
+/// The user's own label format, read and never written: when non-empty it
+/// replaces the tab label. Not in [`OURS`], so uninstall leaves it alone.
+const OPT_LABEL: &str = "@cctab_label";
 
 /// Each local decorator has independent ownership and inheritance metadata, so
 /// a user can replace one format without preventing restoration of the other.
@@ -188,10 +191,17 @@ fn window_color() -> String {
 /// The session loop `#{S:}` is deliberately absent. One terminal tab shows one
 /// attached session; looping every session would put another tab's claudes into
 /// this tab's title.
+///
+/// A non-empty `@cctab_label` replaces the label. `E:` expands its text once, so
+/// `#{host_short}` in it renders, while an option value it substitutes, such as
+/// `#{@host}`, arrives literally. The enclosing `T:` also runs strftime over that
+/// text, so a literal `%` in it is written `%%`.
 fn title_format(pos: GlyphPos) -> String {
     let strip = format!("#{{W:#{{P:{}}}}}", cell());
-    let label =
-        format!("#{{?{IS},{LOC},#{{session_name}}:#{{window_index}}:#{{window_name}}}}");
+    let label = format!(
+        "#{{?#{{!=:#{{{OPT_LABEL}}},}},#{{E:{OPT_LABEL}}},\
+         #{{?{IS},{LOC},#{{session_name}}:#{{window_index}}:#{{window_name}}}}}}"
+    );
     match pos {
         // Konsole elides the tab label from the LEFT, so there the strip goes
         // last. `both` is not doubled: a strip is not a marker, and six cells at
@@ -1177,8 +1187,14 @@ pub fn report(cfg: &Config) -> Vec<String> {
                   SessionStart has run on this server yet",
         }
     ));
-    if let Ok(formats) = ask(&t, &[&format!("#{{{OPT_TITLE}}}"), &format!("#{{{OPT_WINDOW_STRIP}}}")]) {
-        if formats.iter().any(|f| !f.contains(HAS_BACKGROUND)) {
+    if let Ok(formats) = ask(
+        &t,
+        &[&format!("#{{{OPT_TITLE}}}"), &format!("#{{{OPT_WINDOW_STRIP}}}"), &format!("#{{{OPT_LABEL}}}")],
+    ) {
+        if !formats[2].is_empty() && !formats[0].contains(OPT_LABEL) {
+            out.push("           label: WARN @cctab_label is set but the installed title format predates it, so it is ignored; update all plugin copies and start a new Claude session to refresh this server".to_owned());
+        }
+        if formats[..2].iter().any(|f| !f.contains(HAS_BACKGROUND)) {
             out.push("           background: WARN installed formats cannot reliably display ct2 background work; update all plugin copies and start a new Claude session to refresh this server".to_owned());
         } else {
             out.push("           background: OK   ct1/ct2 consumers installed; known background never expires".to_owned());
@@ -1351,7 +1367,10 @@ mod tests {
     /// private tmux server.
     #[test]
     fn the_generated_format_is_a_strip_and_a_label_either_way_round() {
-        let label = format!("#{{?{IS},{LOC},#{{session_name}}:#{{window_index}}:#{{window_name}}}}");
+        let label = format!(
+            "#{{?#{{!=:#{{@cctab_label}},}},#{{E:@cctab_label}},\
+             #{{?{IS},{LOC},#{{session_name}}:#{{window_index}}:#{{window_name}}}}}}"
+        );
         let label = label.as_str();
         let prefix = title_format(GlyphPos::Prefix);
         let suffix = title_format(GlyphPos::Suffix);
