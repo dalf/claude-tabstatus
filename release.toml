@@ -1,0 +1,12 @@
+# cargo-release configuration; see AGENTS.md "CI and releases".
+allow-branch = ["main"]
+tag-name = "{{version}}"
+tag-message = "Release {{version}}"
+pre-release-commit-message = "Release {{version}}"
+# Claude Code reads the plugin version from here; it must equal Cargo.toml's.
+pre-release-replacements = [
+  { file = ".claude-plugin/plugin.json", search = '"version": "[^"]*"', replace = '"version": "{{version}}"', exactly = 1 },
+]
+# Runs on the bumped tree before the commit and tag: a version that fails here
+# is never tagged, so it is not burnt on a release CI would refuse.
+pre-release-hook = ["cargo", "test", "--locked"]
